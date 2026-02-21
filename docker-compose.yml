@@ -1,0 +1,28 @@
+services:
+  peadb:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: peadb
+    ports:
+      - "${PEADB_PORT:-6379}:6379"
+    volumes:
+      - peadb-data:/data
+    environment:
+      - PEADB_LOGLEVEL=${PEADB_LOGLEVEL:-info}
+    ulimits:
+      nofile:
+        soft: ${PEADB_NOFILE_SOFT:-65536}
+        hard: ${PEADB_NOFILE_HARD:-65536}
+    restart: unless-stopped
+    # Override CMD to pick up env-var driven log level
+    command: ["--port", "6379", "--bind", "0.0.0.0", "--dir", "/data", "--loglevel", "${PEADB_LOGLEVEL:-info}"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6379'"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  peadb-data:

@@ -1,0 +1,13 @@
+FLUSHALL
+DBSIZE
+SET foo_a 1
+SET foo_b 2
+SET bar_c 3
+KEYS foo_*
+DBSIZE
+SETEX exp_a 2 v
+PSETEX exp_b 1000 v
+GET exp_a
+GET exp_b
+FLUSHDB
+DBSIZE

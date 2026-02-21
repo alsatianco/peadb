@@ -1,0 +1,10 @@
+# Exclude local build artifacts that conflict with in-container builds
+build/
+build-asan/
+build.clean/
+
+# Large / irrelevant directories
+artifacts/
+.git/
+data/
+*.out.*

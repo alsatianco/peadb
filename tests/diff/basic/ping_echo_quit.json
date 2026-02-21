@@ -1,0 +1,6 @@
+[
+  ["PING"],
+  ["PING", "hello"],
+  ["ECHO", "world"],
+  ["QUIT"]
+]

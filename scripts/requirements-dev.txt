@@ -1,0 +1,5 @@
+# doc: Optional developer tooling for working on scripts/ locally (linting/formatting).
+
+# Optional developer tooling for scripts/.
+
+ruff>=0.5.0

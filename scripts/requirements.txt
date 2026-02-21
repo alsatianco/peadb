@@ -1,0 +1,8 @@
+# doc: Python runtime dependencies for scripts under scripts/ (primarily scripts/examples/*).
+
+# Third-party Python dependencies for scripts in this folder.
+#
+# Many scripts are stdlib-only; dependencies here are for optional utilities
+# (e.g. scripts/examples/*).
+
+redis>=5.0.0
