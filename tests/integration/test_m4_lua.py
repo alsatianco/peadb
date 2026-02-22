@@ -1,6 +1,26 @@
 #!/usr/bin/env python3
 import pathlib,socket,subprocess,time
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+PEADB_BIN = ROOT/'build/peadb-server' if (ROOT/'build/peadb-server').exists() else ROOT/'peadb-server'
+
+def free_port():
+ s=socket.socket(socket.AF_INET,socket.SOCK_STREAM)
+ s.bind(('127.0.0.1',0))
+ p=s.getsockname()[1]
+ s.close()
+ return p
+
+def wait_ready(port,p,secs=2.0):
+ end=time.time()+secs
+ while time.time()<end:
+  if p.poll() is not None:
+   raise RuntimeError('peadb-server exited before becoming ready')
+  try:
+   with socket.create_connection(('127.0.0.1',port),timeout=0.1):
+    return
+  except OSError:
+   time.sleep(0.02)
+ raise RuntimeError('peadb-server did not become ready in time')
 
 def rx(s,n):
  b=b''
@@ -38,10 +58,11 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6405','--bind','127.0.0.1','--loglevel','error'])
+ port=free_port()
+ p=subprocess.Popen([str(PEADB_BIN),'--port',str(port),'--bind','127.0.0.1','--loglevel','error'])
  try:
-  time.sleep(0.2)
-  with socket.create_connection(('127.0.0.1',6405),timeout=2) as s:
+  wait_ready(port,p)
+  with socket.create_connection(('127.0.0.1',port),timeout=2) as s:
    assert cmd(s,'FLUSHALL')=='OK'
    assert cmd(s,'SCRIPT','FLUSH')=='OK'
    sha=cmd(s,'SCRIPT','LOAD',"return ARGV[1]")

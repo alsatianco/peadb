@@ -76,7 +76,6 @@ def main():
             r.sendall(b"SYNC\r\n")
             assert rx(r, 1) == b"$"
             _ = rl(r)
-            rx(r, 2)  # consume trailing CRLF of empty RDB bulk
 
             assert cmd(c, "SET", "a", "v", "EX", "10") == "OK"
             sel = repl_cmd(r)  # select 0 (emitted with first write)

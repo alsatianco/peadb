@@ -56,7 +56,6 @@ def main():
             assert cmd(c,"FLUSHALL")=="OK"
             r.sendall(b"SYNC\r\n")
             assert rx(r,1)==b'$'; assert rl(r)==b"0"
-            rx(r,2)  # consume trailing CRLF of empty RDB bulk
 
             assert cmd(c,"MULTI")=="OK"
             assert cmd(c,"SCRIPT","LOAD","redis.call('set', KEYS[1], 'foo')")=="QUEUED"

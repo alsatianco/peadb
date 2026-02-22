@@ -51,6 +51,99 @@ cd "$ROOT_DIR"
 
 SKIP="${SKIP:-}"
 
+BUILD_DIR="${BUILD_DIR:-}"
+PEADB_BIN="${PEADB_BIN:-}"
+
+resolve_build_dir() {
+    if [[ -n "$BUILD_DIR" ]]; then
+        if [[ -d "$BUILD_DIR" ]]; then
+            printf "%s" "$BUILD_DIR"
+            return 0
+        fi
+        return 1
+    fi
+
+    local candidates=("build" "build-asan" "build-debug" "build-release")
+    local d
+
+    # First pass: prefer a directory that actually has tests registered.
+    for d in "${candidates[@]}"; do
+        if [[ -f "$ROOT_DIR/$d/CTestTestfile.cmake" ]]; then
+            printf "%s" "$ROOT_DIR/$d"
+            return 0
+        fi
+    done
+
+    # Second pass: fall back to any configured CMake build directory.
+    for d in "${candidates[@]}"; do
+        if [[ -f "$ROOT_DIR/$d/CMakeCache.txt" ]]; then
+            printf "%s" "$ROOT_DIR/$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+resolve_peadb_bin() {
+    if [[ -n "$PEADB_BIN" ]]; then
+        if [[ "$PEADB_BIN" = /* ]]; then
+            printf "%s" "$PEADB_BIN"
+        else
+            printf "%s" "$ROOT_DIR/$PEADB_BIN"
+        fi
+        return 0
+    fi
+
+    if [[ -x "$ROOT_DIR/peadb-server" ]]; then
+        printf "%s" "$ROOT_DIR/peadb-server"
+        return 0
+    fi
+
+    if [[ -n "$CTEST_DIR" && -x "$CTEST_DIR/peadb-server" ]]; then
+        printf "%s" "$CTEST_DIR/peadb-server"
+        return 0
+    fi
+
+    local candidates=(
+        "$ROOT_DIR/build/peadb-server"
+        "$ROOT_DIR/build-asan/peadb-server"
+        "$ROOT_DIR/build-debug/peadb-server"
+        "$ROOT_DIR/build-release/peadb-server"
+    )
+    local b
+    for b in "${candidates[@]}"; do
+        if [[ -x "$b" ]]; then
+            printf "%s" "$b"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+CTEST_DIR=""
+if CTEST_DIR="$(resolve_build_dir)"; then
+    :
+fi
+
+RESOLVED_PEADB_BIN=""
+if RESOLVED_PEADB_BIN="$(resolve_peadb_bin)"; then
+    export PEADB_BIN="$RESOLVED_PEADB_BIN"
+fi
+
+ROOT_BIN_LINK_CREATED=0
+if [[ ! -x "$ROOT_DIR/peadb-server" && -n "$RESOLVED_PEADB_BIN" && -x "$RESOLVED_PEADB_BIN" ]]; then
+    ln -sf "$RESOLVED_PEADB_BIN" "$ROOT_DIR/peadb-server"
+    ROOT_BIN_LINK_CREATED=1
+fi
+
+cleanup() {
+    if [[ "$ROOT_BIN_LINK_CREATED" -eq 1 ]]; then
+        rm -f "$ROOT_DIR/peadb-server"
+    fi
+}
+trap cleanup EXIT
+
 passed=0
 failed=0
 skipped=0
@@ -92,9 +185,17 @@ run_stage() {
     fi
 }
 
+run_ctest_stage() {
+    if [[ -z "$CTEST_DIR" ]]; then
+        echo "No CMake build directory found. Set BUILD_DIR or create build/." >&2
+        return 1
+    fi
+    (cd "$CTEST_DIR" && ctest --output-on-failure --no-tests=error)
+}
+
 # ── 1. C++ unit tests (CTest) ──────────────────────────────────────────
 run_stage unit "C++ unit tests (ctest)" \
-    bash -c "cd build && ctest --output-on-failure"
+    run_ctest_stage
 
 # ── 2. Integration tests ───────────────────────────────────────────────
 run_stage integration "Integration tests" \

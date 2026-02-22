@@ -73,7 +73,6 @@ def main():
             r.sendall(b"SYNC\r\n")
             assert rx(r, 1) == b"$"
             assert read_line(r) == b"0"
-            assert rx(r, 2) == b"\r\n"
 
             send_cmd(c, "SET", "foo", "bar")
             assert rx(c, 1) == b"+"

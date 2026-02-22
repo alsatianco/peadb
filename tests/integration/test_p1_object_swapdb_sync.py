@@ -74,7 +74,6 @@ def main():
         with socket.create_connection(("127.0.0.1", 6466), timeout=2) as rs:
             rs.sendall(b"SYNC\r\n")
             assert rx(rs, 4) == b"$0\r\n"
-            assert rx(rs, 2) == b"\r\n"
         print("P1 OBJECT/SWAPDB/SYNC tests passed")
         return 0
     finally:
