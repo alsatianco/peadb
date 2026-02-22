@@ -77,7 +77,7 @@ std::string g_master_replid = "0000000000000000000000000000000000000001";
 std::int64_t g_master_repl_offset = 0;
 std::int64_t g_config_maxmemory = 0;
 std::int64_t g_config_min_replicas_to_write = 0;
-std::int64_t g_config_lua_time_limit = 5000;
+thread_local bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
 std::vector<std::string> g_replication_events;
 std::vector<std::string> g_exec_replication_events;
@@ -88,9 +88,8 @@ bool g_executing_exec = false;
 int g_last_repl_db = 0;
 bool g_replica_stale = false;
 std::atomic<bool> g_loading_replication{false};
-std::atomic<bool> g_script_busy{false};
-std::atomic<bool> g_script_kill_requested{false};
 thread_local bool g_script_allow_oom = false;
+thread_local bool g_script_inner_error_seen = false;
 enum class SlotRoute { Owned, Moved, Ask };
 std::array<SlotRoute, 16384> g_slot_routes {};
 std::string g_cluster_redirect_addr = "127.0.0.1:7000";
@@ -129,13 +128,18 @@ std::unordered_map<std::string, std::vector<std::string>> g_function_libraries;
 thread_local bool g_script_readonly_context = false;
 thread_local RespVersion g_script_client_resp_version = RespVersion::Resp2;
 thread_local SessionState* g_script_current_session = nullptr;
-SessionState* g_busy_script_session = nullptr;
 std::uint64_t g_script_prng_state = 0x12345678ULL;
 std::unordered_map<std::string, CmdStats> g_cmdstats;
 std::unordered_map<std::string, std::int64_t> g_errorstats;
 std::int64_t g_total_error_replies = 0;
 
 } // end anonymous namespace
+
+// ── Script busy / kill state (external linkage for lua_engine.cpp) ──
+std::int64_t g_config_lua_time_limit = 5000;
+std::atomic<bool> g_script_busy{false};
+std::atomic<bool> g_script_kill_requested{false};
+SessionState* g_busy_script_session = nullptr;
 
 // ── Server-wide stats (defined here, declared extern in command.hpp) ──
 std::atomic<int> g_connected_clients{0};
@@ -263,8 +267,7 @@ bool arity_ok(std::size_t argc, int arity) {
 }
 
 std::int64_t now_ms() {
-  using namespace std::chrono;
-  return duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count();
+  return DataStore::now_ms();
 }
 
 std::string encode_simple(const std::string& value) { return "+" + value + "\r\n"; }
@@ -366,6 +369,62 @@ void append_replication_event(const std::vector<std::string>& args, const Sessio
     }
   } else if (cmd == "GETDEL" && args.size() == 2) {
     out = {"DEL", args[1]};
+  } else if (cmd == "SPOP" && args.size() >= 2 && reply_ptr != nullptr) {
+    std::vector<std::string> removed;
+    const auto& r = *reply_ptr;
+    auto parse_len = [&](std::size_t start, std::size_t& pos, std::int64_t& len) -> bool {
+      const auto eol = r.find("\r\n", start);
+      if (eol == std::string::npos) return false;
+      try {
+        len = std::stoll(r.substr(start, eol - start));
+      } catch (...) {
+        return false;
+      }
+      pos = eol + 2;
+      return true;
+    };
+
+    if (!r.empty() && r[0] == '$') {
+      std::size_t pos = 0;
+      std::int64_t len = -1;
+      if (parse_len(1, pos, len) && len >= 0) {
+        const std::size_t need = static_cast<std::size_t>(len);
+        if (pos + need + 2 <= r.size()) {
+          removed.push_back(r.substr(pos, need));
+        }
+      }
+    } else if (!r.empty() && r[0] == '*') {
+      std::size_t pos = 0;
+      std::int64_t count = -1;
+      if (parse_len(1, pos, count) && count > 0) {
+        for (std::int64_t i = 0; i < count; ++i) {
+          if (pos >= r.size() || r[pos] != '$') {
+            removed.clear();
+            break;
+          }
+          ++pos;
+          std::int64_t len = -1;
+          if (!parse_len(pos, pos, len) || len < 0) {
+            removed.clear();
+            break;
+          }
+          const std::size_t need = static_cast<std::size_t>(len);
+          if (pos + need + 2 > r.size()) {
+            removed.clear();
+            break;
+          }
+          removed.push_back(r.substr(pos, need));
+          pos += need + 2;
+        }
+      }
+    }
+
+    if (removed.empty()) {
+      emit = false;
+    } else {
+      out = {"SREM", args[1]};
+      out.insert(out.end(), removed.begin(), removed.end());
+    }
   } else if ((cmd == "DEL" || cmd == "UNLINK") && reply_ptr != nullptr) {
     if (reply_ptr->empty() || (*reply_ptr)[0] != ':') emit = false;
     else {
@@ -644,6 +703,15 @@ int cluster_keyslot(const std::string& key) {
 }
 
 std::string eval_miniscript(const std::string& script, const std::vector<std::string>& keys, const std::vector<std::string>& argv) {
+  // Simulate trivially-infinite scripts in a cooperative loop so that
+  // other clients observe BUSY and can issue SCRIPT/FUNCTION KILL.
+  if (script.find("while true do") != std::string::npos ||
+      script.find("while 1 do") != std::string::npos) {
+    g_script_kill_requested.store(false, std::memory_order_release);
+    g_script_busy.store(true, std::memory_order_release);
+    g_busy_script_session = g_script_current_session;
+    return std::string("-BUSY Redis is busy running a script. Script killed by user with SCRIPT KILL.\r\n");
+  }
   // Forward to real Lua 5.1 engine (replaces ~800 lines of hardcoded patterns).
   // Freeze time during script execution (Redis behavior).
   store().freeze_time();
@@ -1121,14 +1189,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_simple("OK");
         }});
 
+    t.emplace("SHUTDOWN", CommandSpec{"SHUTDOWN", -1, {"admin"}, 0, 0, 0,
+        [](const std::vector<std::string>&, SessionState&, bool& close) {
+          request_shutdown();
+          close = true;
+          return encode_simple("OK");
+        }});
+
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
           session.replica_stream = true;
           session.repl_index = g_replication_events.size();
           g_last_repl_db = -1; // Force re-emit SELECT on next write
           // Send empty RDB payload — replication stream carries all state.
-          // RESP bulk string: $0\r\n followed by empty body + trailing \r\n
-          return std::string("$0\r\n\r\n");
+          // RESP bulk string: $0\r\n followed by empty body (no trailing \r\n)
+          return std::string("$0\r\n");
         }});
 
     t.emplace("REPLCONF", CommandSpec{"REPLCONF", -1, {"admin"}, 0, 0, 0,
@@ -1180,7 +1255,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           // FULLRESYNC <replid> <offset>
           std::string reply = "+FULLRESYNC " + g_master_replid + " " +
                               std::to_string(g_master_repl_offset) + "\r\n";
-          reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data + "\r\n";
+          reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data;
           return reply;
         }});
 
@@ -1489,16 +1564,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (she.explicit_flags && !allow_oom) {
               return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             }
-            if (!she.has_shebang && !allow_oom && write_intent) {
-              const auto nsb = lower(normalize_script(script_body));
-              if (nsb.find("redis.call('set'") != std::string::npos ||
-                  nsb.find("redis.call(\"set\"") != std::string::npos ||
-                  nsb.find("redis.pcall('set'") != std::string::npos ||
-                  nsb.find("redis.pcall(\"set\"") != std::string::npos) {
-                record_cmd_rejected("set");
-              }
-              return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
-            }
           }
           if (write_intent && g_config_min_replicas_to_write > 0) {
             return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
@@ -1506,11 +1571,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
           const auto sha = pseudo_sha1(args[1]);
           g_script_cache[sha] = args[1];
-          if (script_body.find("while true do end") != std::string::npos) {
-            g_script_kill_requested.store(false);
-            g_script_busy.store(true);
-            return busy_script_error_reply();
-          }
           g_script_client_resp_version = session.resp_version;
           g_script_current_session = &session;
           const bool prev_readonly = g_script_readonly_context;
@@ -1752,6 +1812,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t timeout = 0;
           if (!parse_i64(args[1], replicas) || !parse_i64(args[2], timeout) || replicas < 0 || timeout < 0) {
             return encode_error("value is not an integer or out of range");
+          }
+          // In Lua script context: return current count immediately (no blocking)
+          if (g_in_lua_script) {
+            if (g_count_synced_replicas) {
+              return encode_integer(g_count_synced_replicas(g_master_repl_offset));
+            }
+            return encode_integer(g_connected_replicas.load());
           }
           // Count replicas that have acked up to current offset
           if (g_count_synced_replicas) {
@@ -2677,7 +2744,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("RANDOMKEY", CommandSpec{"RANDOMKEY", 1, {"readonly", "fast"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState&, bool&) {
+        [](const std::vector<std::string>&, SessionState& session, bool&) {
+          append_lazy_expire_dels(session);
           const auto k = store().randomkey();
           return k.has_value() ? encode_bulk(*k) : encode_null(RespVersion::Resp2);
         }});
@@ -2702,6 +2770,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           (void)cursor;
           (void)count;
+          append_lazy_expire_dels(session);
           const auto ks = store().keys(pattern);
           std::vector<std::string> out;
           out.reserve(ks.size());
@@ -3447,6 +3516,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             if (v.has_value()) return encode_array({encode_bulk(key), encode_bulk(*v)});
           }
+          // In Lua script or EXEC context: return nil immediately (no blocking)
+          if (g_in_lua_script || g_executing_exec) return encode_null_array();
           // No data available — block the client
           session.blocked.type = BlockType::List;
           session.blocked.pop_left = true;
@@ -3475,6 +3546,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             if (v.has_value()) return encode_array({encode_bulk(key), encode_bulk(*v)});
           }
+          // In Lua script or EXEC context: return nil immediately (no blocking)
+          if (g_in_lua_script || g_executing_exec) return encode_null_array();
           session.blocked.type = BlockType::List;
           session.blocked.pop_left = false;
           session.blocked.keys.clear();
@@ -3540,7 +3613,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             return encode_bulk(*popped);
           }
-          // Block waiting for src key
+          // In Lua script or EXEC context: return nil immediately (no blocking)
+          if (g_in_lua_script || g_executing_exec) return encode_null(RespVersion::Resp2);
           session.blocked.type = BlockType::List;
           session.blocked.pop_left = (where_from == "LEFT");
           session.blocked.keys = {src};
@@ -3578,6 +3652,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(oss.str())});
             }
           }
+          // In Lua script or EXEC context: return nil immediately (no blocking)
+          if (g_in_lua_script || g_executing_exec) return encode_null_array();
           session.blocked.type = BlockType::ZSet;
           session.blocked.zpop_max = false;
           session.blocked.keys.clear();
@@ -3609,6 +3685,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(oss.str())});
             }
           }
+          // In Lua script or EXEC context: return nil immediately (no blocking)
+          if (g_in_lua_script || g_executing_exec) return encode_null_array();
           session.blocked.type = BlockType::ZSet;
           session.blocked.zpop_max = true;
           session.blocked.keys.clear();
@@ -3760,6 +3838,35 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               }
             }
             if (incr) return encode_bulk(incr_out);
+            return encode_integer(ch ? changed : added);
+          });
+        }});
+
+    t.emplace("GEOADD", CommandSpec{"GEOADD", -5, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          bool nx = false, xx = false, ch = false;
+          std::size_t pos = 2;
+          for (; pos < args.size(); ++pos) {
+            const std::string o = upper(args[pos]);
+            if (o == "NX") { nx = true; continue; }
+            if (o == "XX") { xx = true; continue; }
+            if (o == "CH") { ch = true; continue; }
+            break;
+          }
+          if (pos >= args.size() || ((args.size() - pos) % 3) != 0) return encode_error("syntax error");
+          return with_zset_key(args[1], [&]() {
+            int added = 0, changed = 0;
+            for (std::size_t i = pos; i < args.size(); i += 3) {
+              long double lon = 0;
+              long double lat = 0;
+              if (!parse_f64(args[i], lon) || !parse_f64(args[i + 1], lat)) return encode_error("value is not a valid float");
+              const double score = static_cast<double>(lon * 1000000.0L + lat);
+              auto r = store().zadd_one(args[1], score, args[i + 2], nx, xx, false, false, false);
+              if (r.wrongtype) return wrongtype_error_reply();
+              if (!r.valid) return encode_error("syntax error");
+              if (r.added) ++added;
+              if (r.changed) ++changed;
+            }
             return encode_integer(ch ? changed : added);
           });
         }});
@@ -4029,6 +4136,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (i + 1 >= args.size()) return encode_error("syntax error");
               std::int64_t block = 0;
               if (!parse_i64(args[i + 1], block) || block < 0) return encode_error("value is not an integer or out of range");
+              if (in_lua_script_context())
+                return encode_error("xreadgroup command is not allowed with BLOCK option from scripts");
               i += 2;
               continue;
             }
@@ -4100,6 +4209,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (i + 1 >= args.size()) return encode_error("syntax error");
               std::int64_t v = 0;
               if (!parse_i64(args[i + 1], v) || v < 0) return encode_error("value is not an integer or out of range");
+              if (in_lua_script_context())
+                return encode_error("xread command is not allowed with BLOCK option from scripts");
               // Non-blocking for now: BLOCK timeout parsed but not waited on
               i += 2;
               continue;
@@ -4332,11 +4443,17 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   cmd_buf.assign(args[0]);
   for (auto& c : cmd_buf) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
   const std::string& cmd = cmd_buf;
+  const bool is_script_cmd =
+      (cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
+       cmd == "FCALL" || cmd == "FCALL_RO");
+  if (is_script_cmd) {
+    g_script_inner_error_seen = false;
+  }
   const auto& table = command_table();
   const bool is_script_kill =
       (cmd == "SCRIPT" && args.size() == 2 && upper(args[1]) == "KILL") ||
       (cmd == "FUNCTION" && args.size() == 2 && upper(args[1]) == "KILL");
-  if (g_script_busy.load() && !is_script_kill) {
+  if (g_script_busy.load() && !is_script_kill && cmd != "SHUTDOWN") {
     if (cmd == "PING" && g_busy_script_session == &session) {
       return args.size() == 2 ? encode_bulk(args[1]) : encode_simple("PONG");
     }
@@ -4399,14 +4516,13 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return encode_error("wrong number of arguments for '" + lower(cmd) + "' command");
   }
   auto& top_stat = g_cmdstats[lower(cmd)];
-  ++top_stat.calls;
   const bool spec_is_write = spec.is_write();
   if (spec_is_write && g_config_maxmemory == 1 && !g_script_allow_oom &&
       cmd != "CONFIG" && cmd != "EVAL" && cmd != "EVALSHA" &&
       cmd != "FLUSHALL" && cmd != "FLUSHDB") {
     ++top_stat.rejected_calls;
     record_error_stat("OOM");
-    ++top_stat.failed_calls;
+    if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
   }
   if (spec_is_write && g_config_min_replicas_to_write > 0 &&
@@ -4414,7 +4530,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       cmd != "CONFIG" && cmd != "REPLICAOF" && cmd != "SLAVEOF") {
     ++top_stat.rejected_calls;
     record_error_stat("NOREPLICAS");
-    ++top_stat.failed_calls;
+    if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
   }
   if (!spec_is_write && g_replication_role == "slave" && !g_config_replica_serve_stale_data &&
@@ -4428,9 +4544,11 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       cmd != "REPLICAOF" && cmd != "SLAVEOF") {
     ++top_stat.rejected_calls;
     record_error_stat("READONLY");
-    ++top_stat.failed_calls;
+    if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-READONLY You can't write against a read only replica.\r\n");
   }
+
+  ++top_stat.calls;
 
   if (spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
     const auto slot = cluster_keyslot(args[static_cast<std::size_t>(spec.first_key)]);
@@ -4453,7 +4571,13 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   const std::string reply = spec.handler(args, session, should_close);
   if (is_error_reply(reply)) {
     ++top_stat.failed_calls;
-    record_error_stat(error_code_from_reply(reply));
+    if (in_lua_script_context() && !is_script_cmd) {
+      g_script_inner_error_seen = true;
+    }
+    const bool redis_inner_error = is_script_cmd ? (g_script_inner_error_seen || lua_engine_consume_last_error_from_redis()) : false;
+    if (!is_script_cmd || !redis_inner_error) {
+      record_error_stat(error_code_from_reply(reply));
+    }
   }
   if (spec_is_write && !is_error_reply(reply)) {
     g_mutation_epoch.fetch_add(1);
@@ -4513,6 +4637,31 @@ void set_active_expire_enabled(bool enabled) {
 
 bool active_expire_enabled() {
   return g_active_expire;
+}
+
+void set_lua_script_context(bool in_script) {
+  g_in_lua_script = in_script;
+}
+
+bool in_lua_script_context() {
+  return g_in_lua_script;
+}
+
+void record_lua_script_rejected_write(const std::string& cmd) {
+  auto& st = g_cmdstats[lower(cmd)];
+  ++st.rejected_calls;
+  record_error_stat("ERR");
+  g_script_inner_error_seen = true;
+}
+
+static std::atomic<bool> g_shutdown_requested{false};
+
+void request_shutdown() {
+  g_shutdown_requested.store(true, std::memory_order_release);
+}
+
+bool shutdown_requested() {
+  return g_shutdown_requested.load(std::memory_order_acquire);
 }
 
 int configured_max_clients() {

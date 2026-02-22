@@ -310,7 +310,7 @@ int run_server(const ServerConfig& config) {
     }
   };
 
-  while (true) {
+  while (!shutdown_requested()) {
     const int nready = epoll_wait(epoll_fd, ep_events.data(),
                                   static_cast<int>(ep_events.size()), 100);
     if (nready < 0) {

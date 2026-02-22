@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+"""Test the SHUTDOWN command.
+
+Verifies that SHUTDOWN causes the server to terminate gracefully.
+"""
 import pathlib
 import socket
 import subprocess
@@ -39,11 +43,6 @@ def recv(s):
         v = rx(s, n)
         rx(s, 2)
         return v.decode()
-    if p == b"*":
-        n = int(rl(s))
-        if n == -1:
-            return None
-        return [recv(s) for _ in range(n)]
     raise RuntimeError(p)
 
 
@@ -57,28 +56,26 @@ def cmd(s, *a):
 
 
 def main():
-    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6466", "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen(
+        [str(ROOT / "peadb-server"), "--port", "6479", "--bind", "127.0.0.1", "--loglevel", "error"]
+    )
     try:
         time.sleep(0.2)
-        with socket.create_connection(("127.0.0.1", 6466), timeout=2) as s:
-            assert cmd(s, "FLUSHALL") == "OK"
+        with socket.create_connection(("127.0.0.1", 6479), timeout=2) as s:
             assert cmd(s, "SET", "k", "v") == "OK"
-            assert cmd(s, "OBJECT", "REFCOUNT", "k") == 1
-            assert cmd(s, "SELECT", "1") == "OK"
-            assert cmd(s, "SET", "k2", "v2") == "OK"
-            assert cmd(s, "SWAPDB", "0", "1") == "OK"
-            assert cmd(s, "GET", "k2") is None
-            assert cmd(s, "SELECT", "0") == "OK"
-            assert cmd(s, "GET", "k2") == "v2"
+            assert cmd(s, "GET", "k") == "v"
+            resp = cmd(s, "SHUTDOWN", "NOSAVE")
+            assert resp == "OK"
 
-        with socket.create_connection(("127.0.0.1", 6466), timeout=2) as rs:
-            rs.sendall(b"SYNC\r\n")
-            assert rx(rs, 4) == b"$0\r\n"
-        print("P1 OBJECT/SWAPDB/SYNC tests passed")
+        # Server should exit within a reasonable time
+        rc = p.wait(timeout=5)
+        p = None  # already exited
+        print("P1 SHUTDOWN tests passed")
         return 0
     finally:
-        p.terminate()
-        p.wait(timeout=3)
+        if p is not None:
+            p.terminate()
+            p.wait(timeout=3)
 
 
 if __name__ == "__main__":

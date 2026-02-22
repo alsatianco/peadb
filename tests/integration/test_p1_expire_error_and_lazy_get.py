@@ -95,7 +95,6 @@ def main():
             r.sendall(b"SYNC\r\n")
             assert rx(r, 1) == b"$"
             _ = rl(r)
-            rx(r, 2)  # consume trailing CRLF of empty RDB bulk
             time.sleep(0.12)
             assert cmd(c, "GET", "foo") is None
             assert cmd(c, "SET", "x", "1") == "OK"

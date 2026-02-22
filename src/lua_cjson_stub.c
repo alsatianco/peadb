@@ -15,10 +15,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* ── Configuration globals ─────────────────────────────────────────────────── */
+
+static int g_encode_max_depth = 128;
+static int g_decode_max_depth = 1000;
+static int g_encode_invalid_numbers = 0;
+
 /* ── Forward declarations ──────────────────────────────────────────────────── */
 
 static void json_encode_value(lua_State *L, luaL_Buffer *b, int idx, int depth);
-static int  json_decode_value(lua_State *L, const char *s, int len, int *pos);
+static int  json_decode_value(lua_State *L, const char *s, int len, int *pos, int depth);
 
 /* ── Encode ────────────────────────────────────────────────────────────────── */
 
@@ -69,7 +75,7 @@ static int table_is_array(lua_State *L, int idx) {
 }
 
 static void json_encode_value(lua_State *L, luaL_Buffer *b, int idx, int depth) {
-    if (depth > 128)
+    if (depth > g_encode_max_depth)
         luaL_error(L, "cjson.encode: nesting too deep");
 
     /* Normalize index to absolute */
@@ -84,16 +90,22 @@ static void json_encode_value(lua_State *L, luaL_Buffer *b, int idx, int depth) 
             break;
         case LUA_TNUMBER: {
             double n = lua_tonumber(L, idx);
-            char buf[64];
             if (isinf(n) || isnan(n)) {
-                luaL_error(L, "cjson.encode: cannot encode inf/nan");
-            }
-            if (n == (long long)n && fabs(n) < 1e15) {
-                snprintf(buf, sizeof(buf), "%lld", (long long)n);
+                if (!g_encode_invalid_numbers)
+                    luaL_error(L, "cjson.encode: cannot encode inf/nan");
+                else if (isnan(n))
+                    luaL_addstring(b, "null");
+                else
+                    luaL_addstring(b, n > 0 ? "1e+9999" : "-1e+9999");
             } else {
-                snprintf(buf, sizeof(buf), "%.14g", n);
+                char buf[64];
+                if (n == (long long)n && fabs(n) < 1e15) {
+                    snprintf(buf, sizeof(buf), "%lld", (long long)n);
+                } else {
+                    snprintf(buf, sizeof(buf), "%.14g", n);
+                }
+                luaL_addstring(b, buf);
             }
-            luaL_addstring(b, buf);
             break;
         }
         case LUA_TSTRING: {
@@ -214,9 +226,11 @@ static int decode_string(lua_State *L, const char *s, int len, int *pos) {
     return 1;
 }
 
-static int json_decode_value(lua_State *L, const char *s, int len, int *pos) {
+static int json_decode_value(lua_State *L, const char *s, int len, int *pos, int depth) {
     skip_ws(s, len, pos);
     if (*pos >= len) return 0;
+    if (depth > g_decode_max_depth)
+        return luaL_error(L, "cjson.decode: too many nested data structures");
 
     switch (s[*pos]) {
         case '"':
@@ -234,7 +248,7 @@ static int json_decode_value(lua_State *L, const char *s, int len, int *pos) {
                 skip_ws(s, len, pos);
                 if (*pos >= len || s[*pos] != ':') return 0;
                 (*pos)++;
-                if (!json_decode_value(L, s, len, pos)) { lua_pop(L, 1); return 0; }
+                if (!json_decode_value(L, s, len, pos, depth + 1)) { lua_pop(L, 1); return 0; }
                 lua_settable(L, -3);
                 skip_ws(s, len, pos);
                 if (*pos >= len) return 0;
@@ -251,7 +265,7 @@ static int json_decode_value(lua_State *L, const char *s, int len, int *pos) {
             if (*pos < len && s[*pos] == ']') { (*pos)++; return 1; }
             int i = 1;
             while (1) {
-                if (!json_decode_value(L, s, len, pos)) return 0;
+                if (!json_decode_value(L, s, len, pos, depth + 1)) return 0;
                 lua_rawseti(L, -2, i++);
                 skip_ws(s, len, pos);
                 if (*pos >= len) return 0;
@@ -307,7 +321,7 @@ static int cjson_decode(lua_State *L) {
     size_t len;
     const char *s = luaL_checklstring(L, 1, &len);
     int pos = 0;
-    if (!json_decode_value(L, s, (int)len, &pos))
+    if (!json_decode_value(L, s, (int)len, &pos, 0))
         return luaL_error(L, "invalid JSON");
     return 1;
 }
@@ -317,10 +331,46 @@ static int cjson_encode_empty_as_object(lua_State *L) {
     return 0; /* no-op compatibility stub */
 }
 
+/* encode_keep_buffer(bool) — no-op stub, returns cjson module for chaining */
+static int cjson_encode_keep_buffer(lua_State *L) {
+    (void)luaL_checkany(L, 1);
+    lua_getglobal(L, "cjson");
+    return 1;
+}
+
+/* encode_max_depth(int) — sets max nesting depth for encode */
+static int cjson_encode_max_depth(lua_State *L) {
+    int d = (int)luaL_checkinteger(L, 1);
+    if (d <= 0) return luaL_error(L, "bad argument #1 to 'encode_max_depth' (expected positive integer)");
+    g_encode_max_depth = d;
+    lua_getglobal(L, "cjson");
+    return 1;
+}
+
+/* decode_max_depth(int) — sets max nesting depth for decode */
+static int cjson_decode_max_depth(lua_State *L) {
+    int d = (int)luaL_checkinteger(L, 1);
+    if (d <= 0) return luaL_error(L, "bad argument #1 to 'decode_max_depth' (expected positive integer)");
+    g_decode_max_depth = d;
+    lua_getglobal(L, "cjson");
+    return 1;
+}
+
+/* encode_invalid_numbers(bool) — controls whether inf/nan are allowed */
+static int cjson_encode_invalid_numbers(lua_State *L) {
+    g_encode_invalid_numbers = lua_toboolean(L, 1);
+    lua_getglobal(L, "cjson");
+    return 1;
+}
+
 static const luaL_Reg cjson_funcs[] = {
-    {"encode",       cjson_encode},
-    {"decode",       cjson_decode},
+    {"encode",                       cjson_encode},
+    {"decode",                       cjson_decode},
     {"encode_empty_table_as_object", cjson_encode_empty_as_object},
+    {"encode_keep_buffer",           cjson_encode_keep_buffer},
+    {"encode_max_depth",             cjson_encode_max_depth},
+    {"decode_max_depth",             cjson_decode_max_depth},
+    {"encode_invalid_numbers",       cjson_encode_invalid_numbers},
     {NULL, NULL}
 };
 

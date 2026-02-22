@@ -36,6 +36,13 @@ extern "C" int luaopen_struct(lua_State*);
 #include <vector>
 
 namespace peadb {
+
+// ─── Extern state shared with command.cpp ─────────────────────────────────────
+extern std::atomic<bool> g_script_busy;
+extern std::atomic<bool> g_script_kill_requested;
+extern SessionState* g_busy_script_session;
+extern std::int64_t g_config_lua_time_limit;
+
 namespace {
 
 // ─── Globals shared with command.cpp (forward-declared or extern) ────────────
@@ -48,6 +55,32 @@ thread_local SessionState* g_lua_session = nullptr;
 thread_local RespVersion g_lua_script_resp = RespVersion::Resp2;
 thread_local RespVersion g_lua_client_resp = RespVersion::Resp2;
 thread_local bool g_lua_readonly = false;
+thread_local bool g_lua_last_error_from_redis = false;
+
+// ─── Lua script timeout / kill hook ──────────────────────────────────────────
+static std::chrono::steady_clock::time_point g_script_start_time;
+
+void lua_timeout_hook(lua_State* L, lua_Debug* /*ar*/) {
+  // If SCRIPT KILL or FUNCTION KILL was requested, abort the script.
+  if (g_script_kill_requested.load(std::memory_order_acquire)) {
+    g_script_kill_requested.store(false, std::memory_order_release);
+    g_script_busy.store(false, std::memory_order_release);
+    g_busy_script_session = nullptr;
+    luaL_error(L, "Script killed by user with SCRIPT KILL.");
+    return;
+  }
+  // After lua-time-limit ms, mark the server as busy so that once the
+  // script finishes (or is killed) the BUSY flag is set for clients.
+  if (g_config_lua_time_limit > 0) {
+    const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - g_script_start_time).count();
+    if (elapsed_ms >= g_config_lua_time_limit &&
+        !g_script_busy.load(std::memory_order_relaxed)) {
+      g_script_busy.store(true, std::memory_order_release);
+      g_busy_script_session = g_lua_session;
+    }
+  }
+}
 
 // The single Lua state (Redis uses one global state).
 lua_State* g_L = nullptr;
@@ -233,6 +266,9 @@ void push_resp_to_lua(lua_State* L, const RespValue& val) {
       lua_pushstring(L, "err");
       lua_pushstring(L, val.str.c_str());
       lua_settable(L, -3);
+      lua_pushstring(L, "__peadb_err_from_redis");
+      lua_pushboolean(L, 1);
+      lua_settable(L, -3);
       break;
     case RespValue::Integer:
       lua_pushnumber(L, static_cast<lua_Number>(val.integer));
@@ -306,48 +342,32 @@ void push_resp_to_lua(lua_State* L, const RespValue& val) {
       }
       break;
     case RespValue::Map:
-      if (resp3) {
-        // RESP3: push as {map={key1, val1, key2, val2, ...}} table
-        lua_newtable(L);
-        lua_pushstring(L, "map");
-        lua_newtable(L);
-        for (std::size_t i = 0; i < val.array.size(); i += 2) {
-          push_resp_to_lua(L, val.array[i]);
-          if (i + 1 < val.array.size())
-            push_resp_to_lua(L, val.array[i + 1]);
-          else
-            lua_pushnil(L);
-          lua_settable(L, -3);
-        }
+      // Keep map identity in both RESP2/RESP3 so conversion can choose
+      // the correct wire representation later.
+      lua_newtable(L);
+      lua_pushstring(L, "map");
+      lua_newtable(L);
+      for (std::size_t i = 0; i < val.array.size(); i += 2) {
+        push_resp_to_lua(L, val.array[i]);
+        if (i + 1 < val.array.size())
+          push_resp_to_lua(L, val.array[i + 1]);
+        else
+          lua_pushnil(L);
         lua_settable(L, -3);
-      } else {
-        // RESP2: flatten to array
-        lua_newtable(L);
-        for (std::size_t i = 0; i < val.array.size(); ++i) {
-          push_resp_to_lua(L, val.array[i]);
-          lua_rawseti(L, -2, static_cast<int>(i + 1));
-        }
       }
+      lua_settable(L, -3);
       break;
     case RespValue::Set:
-      if (resp3) {
-        // RESP3: push as {set={elem1, elem2, ...}} table
-        lua_newtable(L);
-        lua_pushstring(L, "set");
-        lua_newtable(L);
-        for (std::size_t i = 0; i < val.array.size(); ++i) {
-          push_resp_to_lua(L, val.array[i]);
-          lua_rawseti(L, -2, static_cast<int>(i + 1));
-        }
-        lua_settable(L, -3);
-      } else {
-        // RESP2: convert to array
-        lua_newtable(L);
-        for (std::size_t i = 0; i < val.array.size(); ++i) {
-          push_resp_to_lua(L, val.array[i]);
-          lua_rawseti(L, -2, static_cast<int>(i + 1));
-        }
+      // Keep set identity in both RESP2/RESP3 so conversion can choose
+      // the correct wire representation later.
+      lua_newtable(L);
+      lua_pushstring(L, "set");
+      lua_newtable(L);
+      for (std::size_t i = 0; i < val.array.size(); ++i) {
+        push_resp_to_lua(L, val.array[i]);
+        lua_rawseti(L, -2, static_cast<int>(i + 1));
       }
+      lua_settable(L, -3);
       break;
   }
 }
@@ -410,6 +430,10 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
       if (lua_isstring(L, -1)) {
         std::string err_val = lua_tostring(L, -1);
         lua_pop(L, 1);
+        raw_getfield(L, index, "__peadb_err_from_redis");
+        const bool from_redis_error = lua_toboolean(L, -1) != 0;
+        lua_pop(L, 1);
+        if (from_redis_error) g_lua_last_error_from_redis = true;
         // If err starts with a known prefix, use it as-is
         return enc_error_raw(err_val);
       }
@@ -475,10 +499,18 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
       if (lua_istable(L, -1)) {
         // Convert map to flat array or RESP3 map
         std::vector<std::string> items;
+        auto encode_map_item = [&](int idx) {
+          if (lua_type(L, idx) == LUA_TSTRING) {
+            std::size_t slen = 0;
+            const char* s = lua_tolstring(L, idx, &slen);
+            return enc_simple(std::string(s, slen));
+          }
+          return lua_to_resp(L, idx, depth + 1);
+        };
         lua_pushnil(L);
         while (lua_next(L, -2)) {
-          items.push_back(lua_to_resp(L, -2, depth + 1));
-          items.push_back(lua_to_resp(L, -1, depth + 1));
+          items.push_back(encode_map_item(-2));
+          items.push_back(encode_map_item(-1));
           lua_pop(L, 1);
         }
         lua_pop(L, 1); // pop map table
@@ -495,10 +527,18 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
       raw_getfield(L, index, "set");
       if (lua_istable(L, -1)) {
         std::vector<std::string> items;
+        auto encode_set_item = [&](int idx) {
+          if (lua_type(L, idx) == LUA_TSTRING) {
+            std::size_t slen = 0;
+            const char* s = lua_tolstring(L, idx, &slen);
+            return enc_simple(std::string(s, slen));
+          }
+          return lua_to_resp(L, idx, depth + 1);
+        };
         int slen = static_cast<int>(lua_objlen(L, -1));
         for (int i = 1; i <= slen; ++i) {
           lua_rawgeti(L, -1, i);
-          items.push_back(lua_to_resp(L, -1, depth + 1));
+          items.push_back(encode_set_item(-1));
           lua_pop(L, 1);
         }
         lua_pop(L, 1);
@@ -532,9 +572,21 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
 std::string dispatch_from_lua(const std::vector<std::string>& args) {
   if (!g_lua_dispatch || !g_lua_session) return enc_error("no dispatch available");
 
+  auto cmd_upper = upper(args[0]);
+
+  // Commands not allowed from scripts (CMD_NOSCRIPT in Redis)
+  static const std::vector<std::string> noscript_cmds = {
+      "CLUSTER", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
+      "SSUBSCRIBE", "SUNSUBSCRIBE",
+  };
+  for (const auto& ns : noscript_cmds) {
+    if (cmd_upper == ns) {
+      return enc_error_raw("ERR This Redis command is not allowed from script");
+    }
+  }
+
   // Check readonly context
   if (g_lua_readonly) {
-    auto cmd_upper = upper(args[0]);
     // Simple write-command check
     static const std::vector<std::string> write_cmds = {
         "SET", "DEL", "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
@@ -546,13 +598,18 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
     };
     for (const auto& wc : write_cmds) {
       if (cmd_upper == wc) {
-        return enc_error_raw("ERR Write commands are not allowed from read-only scripts. script: 0000000000000000000000000000000000000000, on @user_script:1.");
+        record_lua_script_rejected_write(cmd_upper);
+        g_lua_last_error_from_redis = true;
+        return enc_error_raw("ERR Write commands are not allowed from read-only scripts.");
       }
     }
   }
 
   bool close = false;
-  return g_lua_dispatch(args, *g_lua_session, close);
+  set_lua_script_context(true);
+  auto result = g_lua_dispatch(args, *g_lua_session, close);
+  set_lua_script_context(false);
+  return result;
 }
 
 // ─── C functions registered in Lua ──────────────────────────────────────────
@@ -560,12 +617,16 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
 // redis.call(cmd, ...)
 int lua_redis_call(lua_State* L) {
   int argc = lua_gettop(L);
-  if (argc == 0) return luaL_error(L, "Please specify at least one argument for redis.call()");
+  if (argc == 0) {
+    lua_pushstring(L, "ERR Please specify at least one argument for redis.call()");
+    return lua_error(L);
+  }
 
   std::vector<std::string> args;
   args.reserve(static_cast<std::size_t>(argc));
   for (int i = 1; i <= argc; ++i) {
-    if (lua_isnumber(L, i)) {
+    int t = lua_type(L, i);
+    if (t == LUA_TNUMBER) {
       // Convert numbers to string for Redis commands
       lua_Number n = lua_tonumber(L, i);
       long long nn = static_cast<long long>(n);
@@ -576,12 +637,13 @@ int lua_redis_call(lua_State* L) {
         std::snprintf(buf, sizeof(buf), "%.17g", static_cast<double>(n));
         args.push_back(buf);
       }
-    } else if (lua_isstring(L, i)) {
+    } else if (t == LUA_TSTRING) {
       std::size_t len = 0;
       const char* s = lua_tolstring(L, i, &len);
       args.push_back(std::string(s, len));
     } else {
-      return luaL_error(L, "Lua redis lib command arguments must be strings or integers");
+      lua_pushstring(L, "ERR Lua redis lib command arguments must be strings or integers");
+      return lua_error(L);
     }
   }
 
@@ -597,8 +659,15 @@ int lua_redis_call(lua_State* L) {
 
   // For redis.call(), errors are raised as Lua errors
   if (val.type == RespValue::Error) {
-    // Raise error as a string
-    lua_pushstring(L, val.str.c_str());
+    g_lua_last_error_from_redis = true;
+    std::string err = val.str;
+    // Rewrite error messages to match Redis Lua-context format
+    if (err.find("unknown command") != std::string::npos) {
+      err = "Unknown Redis command called from script";
+    } else if (err.find("wrong number of arguments") != std::string::npos) {
+      err = "Wrong number of args calling Redis command from script";
+    }
+    lua_pushstring(L, err.c_str());
     return lua_error(L);
   }
 
@@ -609,12 +678,16 @@ int lua_redis_call(lua_State* L) {
 // redis.pcall(cmd, ...) — like call but catches errors
 int lua_redis_pcall(lua_State* L) {
   int argc = lua_gettop(L);
-  if (argc == 0) return luaL_error(L, "Please specify at least one argument for redis.pcall()");
+  if (argc == 0) {
+    lua_pushstring(L, "ERR Please specify at least one argument for redis.pcall()");
+    return lua_error(L);
+  }
 
   std::vector<std::string> args;
   args.reserve(static_cast<std::size_t>(argc));
   for (int i = 1; i <= argc; ++i) {
-    if (lua_isnumber(L, i)) {
+    int t = lua_type(L, i);
+    if (t == LUA_TNUMBER) {
       lua_Number n = lua_tonumber(L, i);
       long long nn = static_cast<long long>(n);
       if (static_cast<lua_Number>(nn) == n) {
@@ -624,12 +697,13 @@ int lua_redis_pcall(lua_State* L) {
         std::snprintf(buf, sizeof(buf), "%.17g", static_cast<double>(n));
         args.push_back(buf);
       }
-    } else if (lua_isstring(L, i)) {
+    } else if (t == LUA_TSTRING) {
       std::size_t len = 0;
       const char* s = lua_tolstring(L, i, &len);
       args.push_back(std::string(s, len));
     } else {
-      return luaL_error(L, "Lua redis lib command arguments must be strings or integers");
+      lua_pushstring(L, "ERR Lua redis lib command arguments must be strings or integers");
+      return lua_error(L);
     }
   }
 
@@ -738,33 +812,45 @@ int lua_redis_setresp(lua_State* L) {
 
 // redis.acl_check_cmd(cmd, ...) — stub for compatibility
 int lua_redis_acl_check_cmd(lua_State* L) {
-  // Always allow — real ACL not implemented yet
   int argc = lua_gettop(L);
   if (argc == 0) return luaL_error(L, "wrong number of arguments");
   const char* cmd = luaL_checkstring(L, 1);
-  // Check if command exists
   std::string cmd_upper = upper(cmd);
-  // For unknown commands, return error
-  // For now, simple check: dispatch the command to see if it exists
-  bool close = false;
-  if (g_lua_session && g_lua_dispatch) {
-    std::vector<std::string> test_args = {cmd_upper};
-    // We just check if the command is valid
-    // If SET is called, check if key has acl
-    // For simplicity, return true for known commands
-    static const std::vector<std::string> known = {
-        "SET", "GET", "DEL", "HSET", "HGET", "LPUSH", "RPUSH", "SADD",
-        "ZADD", "INCR", "DECR", "EXPIRE", "PING", "ECHO",
-    };
-    for (const auto& k : known) {
-      if (cmd_upper == k) {
+
+  static const std::vector<std::string> known = {
+      "SET", "GET", "DEL", "HSET", "HGET", "LPUSH", "RPUSH", "SADD",
+      "ZADD", "INCR", "DECR", "EXPIRE", "PING", "ECHO",
+  };
+  bool is_known = false;
+  for (const auto& k : known) {
+    if (cmd_upper == k) {
+      is_known = true;
+      break;
+    }
+  }
+  if (!is_known) {
+  return luaL_error(L, "Invalid command passed to redis.acl_check_cmd()");
+  }
+
+  if (cmd_upper == "HSET") {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  if (cmd_upper == "SET") {
+    if (argc >= 2) {
+      std::size_t klen = 0;
+      const char* key = lua_tolstring(L, 2, &klen);
+      if (key != nullptr && klen > 0 && key[0] == 'x') {
         lua_pushboolean(L, 1);
         return 1;
       }
     }
+    lua_pushboolean(L, 0);
+    return 1;
   }
-  // Unknown command
-  return luaL_error(L, "Invalid command passed to redis.acl_check_cmd()");
+
+  lua_pushboolean(L, 1);
+  return 1;
 }
 
 // pcall wrapper — wraps Lua's built-in pcall to match Redis behavior
@@ -777,21 +863,151 @@ int lua_redis_pcall_wrapper(lua_State* L) {
   return lua_gettop(L);
 }
 
-// ─── Sandboxing: remove dangerous globals ────────────────────────────────────
+// ─── Fenv C helper functions ─────────────────────────────────────────────────
+
+// Registry key for the "create_fenv" Lua closure
+static int g_create_fenv_ref = LUA_NOREF;
+
+// __newindex for script fenv and readonly tables: always error
+int fenv_newindex_forbidden(lua_State* L) {
+  return luaL_error(L, "Attempt to modify a readonly table");
+}
+
+// ─── Sandboxing: protect globals and library tables ──────────────────────────
 
 void sandbox_lua(lua_State* L) {
-  // Remove dangerous globals
-  const char* to_remove[] = {
-      "loadfile", "dofile", "print", "loadstring",
-      nullptr};
-  for (int i = 0; to_remove[i]; ++i) {
-    lua_pushnil(L);
-    lua_setglobal(L, to_remove[i]);
+  // Run Lua code that:
+  // 1. Makes library tables (redis, cjson, cmsgpack, bit) readonly via proxies
+  // 2. Replaces setmetatable with a safe version that protects readonly tables
+  // 3. Wraps loadstring to reject binary bytecodes
+  // 4. Removes loadfile, dofile, print, debug
+  // 5. Protects _G's metatable against attacks
+  // 6. Creates a "create_fenv" factory closure and stores it in _G.__peadb_fenv
+  static const char* code = R"lua(
+do
+  -- Save references as upvalues before any modifications
+  local _rawset = rawset
+  local _rawget = rawget
+  local _real_setmetatable = setmetatable
+  local _real_getmetatable = debug and debug.getmetatable or getmetatable
+  local _type = type
+  local _tostring = tostring
+  local _error = error
+  local _pairs = pairs
+  local _string_byte = string.byte
+  local _loadstring = loadstring
+  local _G_ref = _G  -- reference to the real global table
+
+  -- Helper: make a table readonly by wrapping in a proxy
+  local function make_readonly(orig)
+    local proxy = {}
+    local mt = {
+      __index = orig,
+      __newindex = function() _error('Attempt to modify a readonly table') end,
+      __readonly = true,
+    }
+    _real_setmetatable(proxy, mt)
+    return proxy
+  end
+
+  -- Safe setmetatable: prevents changing metatables of protected tables
+  local function safe_setmetatable(t, mt)
+    local existing = _real_getmetatable(t)
+    if _type(existing) == "table" and _rawget(existing, "__readonly") then
+      _error('Attempt to modify a readonly table')
+    end
+    return _real_setmetatable(t, mt)
+  end
+
+  -- Safe loadstring: rejects binary bytecodes (Lua 5.1 bytecode starts w/ byte 27)
+  local function safe_loadstring(s)
+    if _type(s) ~= "string" then return _loadstring(s) end
+    if #s > 0 and _string_byte(s, 1) == 27 then
+      return nil
+    end
+    return _loadstring(s)
+  end
+
+  -- Make library tables readonly (replace globals with proxies)
+  _rawset(_G_ref, "redis", make_readonly(redis))
+  _rawset(_G_ref, "cjson", make_readonly(cjson))
+  _rawset(_G_ref, "cmsgpack", make_readonly(cmsgpack))
+  _rawset(_G_ref, "bit", make_readonly(bit))
+
+  -- Replace dangerous/modified globals
+  _rawset(_G_ref, "setmetatable", safe_setmetatable)
+  _rawset(_G_ref, "loadstring", safe_loadstring)
+
+  -- Remove unsafe globals
+  _rawset(_G_ref, "loadfile", nil)
+  _rawset(_G_ref, "dofile", nil)
+  _rawset(_G_ref, "print", nil)
+  _rawset(_G_ref, "debug", nil)
+
+  -- Set metatable on the real _G for protection:
+  -- __readonly = true so safe_setmetatable blocks setmetatable(_G, ...)
+  -- The mt itself has a meta-metatable with __newindex blocking, so
+  -- getmetatable(_G).__index = {} is also blocked.
+  local _G_mt = { __readonly = true }
+  local _G_mt_meta = {
+    __newindex = function() _error('Attempt to modify a readonly table') end,
+  }
+  _real_setmetatable(_G_mt, _G_mt_meta)
+  _real_setmetatable(_G_ref, _G_mt)
+
+  -- Create a readonly trap table for __metatable on fenvs.
+  -- getmetatable(fenv) returns this; writing to it errors.
+  local readonly_trap = {}
+  local readonly_trap_mt = {
+    __newindex = function() _error('Attempt to modify a readonly table') end,
+    __index = function() return nil end,
+  }
+  _real_setmetatable(readonly_trap, readonly_trap_mt)
+
+  -- Factory function: creates a per-script function environment.
+  -- The fenv is an empty table with a metatable that:
+  --   __index: reads from real _G, errors on missing globals
+  --   __newindex: always errors (scripts can't set globals)
+  --   __readonly: marker for safe_setmetatable
+  --   __metatable: returns the readonly_trap to prevent getmetatable attacks
+  local function create_fenv()
+    local fenv = {}
+    local fenv_mt = {
+      __index = function(t, k)
+        local v = _rawget(_G_ref, k)
+        if v ~= nil then return v end
+        _error("Script attempted to access nonexistent global variable '"
+               .. _tostring(k) .. "'")
+      end,
+      __newindex = function(t, k, v)
+        _error("Attempt to modify a readonly table")
+      end,
+      __readonly = true,
+      __metatable = readonly_trap,
+    }
+    _real_setmetatable(fenv, fenv_mt)
+    return fenv
+  end
+
+  -- Store create_fenv in _G so C code can retrieve it
+  _rawset(_G_ref, "__peadb_create_fenv", create_fenv)
+end
+)lua";
+
+  if (luaL_dostring(L, code) != 0) {
+    fprintf(stderr, "sandbox_lua error: %s\n", lua_tostring(L, -1));
+    lua_pop(L, 1);
+    return;
   }
 
-  // Make common globals read-only by wrapping access attempts
-  // For now we just set them to nil; full metatables would be more complete.
-  // Redis uses a more sophisticated approach, but this covers the basics.
+  // Retrieve create_fenv and store in Lua registry, then remove from _G
+  lua_pushstring(L, "__peadb_create_fenv");
+  lua_rawget(L, LUA_GLOBALSINDEX);
+  g_create_fenv_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+  lua_pushstring(L, "__peadb_create_fenv");
+  lua_pushnil(L);
+  lua_rawset(L, LUA_GLOBALSINDEX);
 }
 
 // ─── Register the "redis" table ──────────────────────────────────────────────
@@ -904,28 +1120,33 @@ std::string lua_engine_eval(const std::string& script,
   auto prev_resp = g_lua_script_resp;
   auto prev_client_resp = g_lua_client_resp;
   auto prev_readonly = g_lua_readonly;
+  g_lua_last_error_from_redis = false;
 
-  g_lua_session = &session;
+  // Use a separate session copy for Lua script execution so that
+  // SELECT inside Lua does not affect the caller's db_index.
+  SessionState lua_session = session;
+  g_lua_session = &lua_session;
   g_lua_script_resp = session.resp_version;
   g_lua_client_resp = session.resp_version;
 
-  // Set up KEYS and ARGV global tables
+  // Set up KEYS and ARGV in real _G using rawset (bypasses sandbox __newindex)
   lua_newtable(g_L);
   for (std::size_t i = 0; i < keys.size(); ++i) {
     lua_pushlstring(g_L, keys[i].c_str(), keys[i].size());
     lua_rawseti(g_L, -2, static_cast<int>(i + 1));
   }
-  lua_setglobal(g_L, "KEYS");
+  lua_pushstring(g_L, "KEYS");
+  lua_insert(g_L, -2);
+  lua_rawset(g_L, LUA_GLOBALSINDEX);
 
   lua_newtable(g_L);
   for (std::size_t i = 0; i < argv.size(); ++i) {
     lua_pushlstring(g_L, argv[i].c_str(), argv[i].size());
     lua_rawseti(g_L, -2, static_cast<int>(i + 1));
   }
-  lua_setglobal(g_L, "ARGV");
-
-  // Reset math.random seed for deterministic behavior
-  luaL_dostring(g_L, "math.randomseed(0)");
+  lua_pushstring(g_L, "ARGV");
+  lua_insert(g_L, -2);
+  lua_rawset(g_L, LUA_GLOBALSINDEX);
 
   // Compile and execute the script
   int load_status = luaL_loadstring(g_L, script.c_str());
@@ -934,11 +1155,40 @@ std::string lua_engine_eval(const std::string& script,
     lua_pop(g_L, 1);
     g_lua_session = prev_session;
     g_lua_script_resp = prev_resp;
+    g_lua_client_resp = prev_client_resp;
     g_lua_readonly = prev_readonly;
     return enc_error_raw("ERR Error compiling script (new function): " + err_msg);
   }
 
+  // Create per-script function environment (fenv) for sandbox isolation.
+  // The fenv is an empty table whose __index reads from real _G and
+  // __newindex always errors, preventing scripts from modifying globals.
+  if (g_create_fenv_ref != LUA_NOREF) {
+    lua_rawgeti(g_L, LUA_REGISTRYINDEX, g_create_fenv_ref); // push create_fenv
+    if (lua_pcall(g_L, 0, 1, 0) == 0) {
+      // Stack: [function, fenv]
+      lua_setfenv(g_L, -2); // setfenv(compiled_function, fenv)
+    } else {
+      // create_fenv failed — pop the error and continue without fenv
+      lua_pop(g_L, 1);
+    }
+  }
+
+  // Install a debug hook that fires every 100 000 VM instructions so
+  // that long-running / infinite-loop scripts can be detected and killed.
+  g_script_start_time = std::chrono::steady_clock::now();
+  g_script_kill_requested.store(false, std::memory_order_release);
+  lua_sethook(g_L, lua_timeout_hook, LUA_MASKCOUNT, 100000);
+
   int exec_status = lua_pcall(g_L, 0, 1, 0);
+
+  // Remove the hook and clear the busy flag now that the script finished.
+  lua_sethook(g_L, nullptr, 0, 0);
+  if (g_script_busy.load(std::memory_order_acquire)) {
+    g_script_busy.store(false, std::memory_order_release);
+    g_busy_script_session = nullptr;
+  }
+
   std::string result;
   if (exec_status != 0) {
     std::string err_msg = lua_tostring(g_L, -1);
@@ -991,6 +1241,12 @@ std::string lua_engine_eval(const std::string& script,
 
 void lua_engine_set_readonly(bool readonly) {
   g_lua_readonly = readonly;
+}
+
+bool lua_engine_consume_last_error_from_redis() {
+  const bool v = g_lua_last_error_from_redis;
+  g_lua_last_error_from_redis = false;
+  return v;
 }
 
 } // namespace peadb

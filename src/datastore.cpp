@@ -275,7 +275,7 @@ std::optional<std::string> DataStore::randomkey() {
   ks.reserve(db.size());
   for (auto it = db.begin(); it != db.end();) {
     if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now_ms()) {
-      it = db.erase(it);
+      ++it;
       continue;
     }
     ks.push_back(it->first);
