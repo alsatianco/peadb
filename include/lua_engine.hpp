@@ -30,4 +30,8 @@ void lua_engine_set_dispatch(CommandDispatchFn fn);
 // Set readonly mode for script execution (used by EVAL_RO / EVALSHA_RO).
 void lua_engine_set_readonly(bool readonly);
 
+// Returns whether the most recent script error was produced by an inner
+// Redis command (redis.call / redis.pcall path), and clears the flag.
+bool lua_engine_consume_last_error_from_redis();
+
 } // namespace peadb

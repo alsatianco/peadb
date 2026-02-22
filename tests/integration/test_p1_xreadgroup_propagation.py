@@ -61,7 +61,6 @@ def main():
 
             r.sendall(b"SYNC\r\n")
             assert rx(r,1)==b'$'; assert rl(r)==b"0"
-            rx(r,2)  # consume trailing CRLF of empty RDB bulk
 
             assert cmd(c,"MULTI")=="OK"
             assert cmd(c,"XREADGROUP","GROUP","mygroup","c1","COUNT","2","STREAMS","mystream",">")=="QUEUED"

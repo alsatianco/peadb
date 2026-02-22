@@ -138,7 +138,6 @@ static int mp_table_is_array(lua_State *L, int idx) {
 }
 
 static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
-    if (depth > 128) luaL_error(L, "cmsgpack.pack: nesting too deep");
     if (idx < 0) idx = lua_gettop(L) + idx + 1;
 
     switch (lua_type(L, idx)) {
@@ -164,6 +163,11 @@ static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
             break;
         }
         case LUA_TTABLE: {
+            /* Depth limit only applies to tables (Redis compat) */
+            if (depth >= 16) {
+                mp_pack_nil(b);
+                break;
+            }
             if (mp_table_is_array(L, idx)) {
                 int n = (int)lua_objlen(L, idx);
                 if (n <= 15) {
@@ -270,7 +274,7 @@ static int mp_unpack_value(lua_State *L, const uint8_t *d, int len, int *pos, in
     if (tag >= 0xe0) { lua_pushnumber(L, (int8_t)tag); return 1; }
 
     switch (tag) {
-        case 0xc0: lua_pushboolean(L, 0); return 1; /* nil → false (Redis compat) */
+        case 0xc0: lua_pushnil(L); return 1; /* msgpack nil → Lua nil */
         case 0xc2: lua_pushboolean(L, 0); return 1;
         case 0xc3: lua_pushboolean(L, 1); return 1;
         case 0xcc: lua_pushnumber(L, rd_u8(d, pos)); return 1;
@@ -345,9 +349,49 @@ static int cmsgpack_unpack(lua_State *L) {
     return 1;
 }
 
+/* cmsgpack.unpack_one(str, offset) — unpack a single value, return next_offset, value
+ * offset is 0-based; returns -1 when buffer is fully consumed */
+static int cmsgpack_unpack_one(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    int pos = 0;
+    if (lua_gettop(L) >= 2) {
+        pos = (int)lua_tointeger(L, 2); /* 0-based */
+        if (pos < 0) pos = 0;
+    }
+    mp_unpack_value(L, (const uint8_t *)s, (int)len, &pos, 0);
+    /* Return offset first, then value (matches Redis cmsgpack API) */
+    int next_offset = (pos >= (int)len) ? -1 : pos;
+    lua_pushinteger(L, next_offset);
+    lua_insert(L, -2); /* move offset before value */
+    return 2;
+}
+
+/* cmsgpack.unpack_limit(str, count, offset) — unpack count values from offset
+ * Returns next_offset, then all unpacked values */
+static int cmsgpack_unpack_limit(lua_State *L) {
+    size_t len;
+    const char *s = luaL_checklstring(L, 1, &len);
+    int count = (int)luaL_checkinteger(L, 2);
+    int pos = 0;
+    if (lua_gettop(L) >= 3) {
+        pos = (int)lua_tointeger(L, 3);
+        if (pos < 0) pos = 0;
+    }
+    for (int i = 0; i < count && pos < (int)len; i++) {
+        mp_unpack_value(L, (const uint8_t *)s, (int)len, &pos, 0);
+    }
+    int next_offset = (pos >= (int)len) ? -1 : pos;
+    lua_pushinteger(L, next_offset);
+    lua_insert(L, -(count + 1)); /* move offset before all values */
+    return count + 1;
+}
+
 static const luaL_Reg cmsgpack_funcs[] = {
-    {"pack",   cmsgpack_pack},
-    {"unpack", cmsgpack_unpack},
+    {"pack",         cmsgpack_pack},
+    {"unpack",       cmsgpack_unpack},
+    {"unpack_one",   cmsgpack_unpack_one},
+    {"unpack_limit", cmsgpack_unpack_limit},
     {NULL, NULL}
 };
 

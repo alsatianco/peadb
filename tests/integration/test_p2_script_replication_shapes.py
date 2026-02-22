@@ -64,7 +64,6 @@ def main():
             assert cmd(c,"FLUSHALL")=="OK"
             r.sendall(b"SYNC\r\n")
             assert rx(r,1)==b'$'; assert rl(r)==b"0"
-            rx(r,2)  # consume trailing CRLF of empty RDB bulk
 
             assert cmd(c,"MSET","a{t}","1","b{t}","2","c{t}","3","d{t}","4")=="OK"
             assert cmd(c,"EVAL","return redis.call('mget', 'a{t}', 'b{t}', 'c{t}', 'd{t}')","0")==["1","2","3","4"]

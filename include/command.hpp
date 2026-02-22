@@ -62,6 +62,15 @@ std::string replication_event_at(std::size_t idx);
 void notify_key_written(const std::string& key, int db_index);
 std::string try_unblock_client(SessionState& session);
 
+// ── Lua script context (set by lua_engine, read by blocking command handlers) ──
+void set_lua_script_context(bool in_script);
+bool in_lua_script_context();
+void record_lua_script_rejected_write(const std::string& cmd);
+
+// ── Shutdown request (set by SHUTDOWN command, checked by server loop) ──
+void request_shutdown();
+bool shutdown_requested();
+
 // ── Server stats (set from server.cpp, read from command.cpp INFO handler) ──
 extern std::atomic<int> g_connected_clients;
 extern std::atomic<std::int64_t> g_total_connections_received;

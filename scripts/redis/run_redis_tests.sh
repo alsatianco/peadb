@@ -49,6 +49,9 @@
 #                     against an already-running instance).
 #   OUT_DIR           Output directory for logs and artifacts
 #                     (default: artifacts/redis-stage-a).
+#   SUITE_TIMEOUT     Per-suite timeout in seconds (default: 120).
+#                     Suites that exceed this are killed and marked
+#                     TIMEOUT in the output.
 #
 # Prerequisites
 #   - tar, make, tclsh (for building and running the Redis test harness).
@@ -74,6 +77,7 @@
 #   1   One or more suites failed, or prerequisites are missing.
 set -euo pipefail
 
+PORT_ARG="${1:-}"
 PORT="${1:-6389}"
 HOST="${2:-127.0.0.1}"
 REDIS_VERSION="${REDIS_VERSION:-7.2.5}"
@@ -83,6 +87,7 @@ PEADB_BIN="${PEADB_BIN:-./peadb-server}"
 START_PEADB="${START_PEADB:-1}"
 PEADB_PID=""
 OUT_DIR="${OUT_DIR:-artifacts/redis-stage-a}"
+SUITE_TIMEOUT="${SUITE_TIMEOUT:-120}"
 SUITES=(
   "unit/keyspace"
   "unit/type/string"
@@ -101,6 +106,40 @@ fi
 if [[ "$PEADB_BIN" != /* ]]; then
   PEADB_BIN="$ROOT_DIR/$PEADB_BIN"
 fi
+
+port_is_available() {
+  local host="$1"
+  local port="$2"
+  python3 - "$host" "$port" <<'PY'
+import socket
+import sys
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+try:
+    s.bind((host, port))
+except OSError:
+    sys.exit(1)
+finally:
+    s.close()
+PY
+}
+
+find_available_port() {
+  local host="$1"
+  local start="$2"
+  local end="$3"
+  local p
+  for ((p=start; p<=end; p++)); do
+    if port_is_available "$host" "$p"; then
+      printf "%s" "$p"
+      return 0
+    fi
+  done
+  return 1
+}
 
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -148,17 +187,66 @@ cleanup() {
 }
 trap cleanup EXIT
 
+mkdir -p "$OUT_DIR"
+
 if [[ "$START_PEADB" == "1" ]]; then
   if [[ ! -x "$PEADB_BIN" ]]; then
     echo "Missing PeaDB binary at $PEADB_BIN" >&2
     exit 1
   fi
-  "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel error &
-  PEADB_PID="$!"
-  sleep 1
-fi
 
-mkdir -p "$OUT_DIR"
+  if ! port_is_available "$HOST" "$PORT"; then
+    if [[ -z "$PORT_ARG" ]]; then
+      if alt_port="$(find_available_port "$HOST" 6390 6499)"; then
+        echo "Port $PORT is busy; using free port $alt_port for Redis Tcl tests"
+        PORT="$alt_port"
+      else
+        echo "Port $PORT is busy and no free fallback port found in range 6390-6499" >&2
+        exit 1
+      fi
+    else
+      echo "Requested port $PORT is already in use on $HOST" >&2
+      echo "Choose a different port, or run with START_PEADB=0 to target an existing server" >&2
+      exit 1
+    fi
+  fi
+
+  "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel error >"$OUT_DIR/peadb-start.log" 2>&1 &
+  PEADB_PID="$!"
+  if ! python3 - "$HOST" "$PORT" "$PEADB_PID" <<'PY'
+import socket
+import sys
+import time
+
+host = sys.argv[1]
+port = int(sys.argv[2])
+pid = int(sys.argv[3])
+
+deadline = time.time() + 5.0
+while time.time() < deadline:
+    try:
+        with socket.create_connection((host, port), timeout=0.2):
+            sys.exit(0)
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8"):
+            pass
+    except OSError:
+        sys.exit(1)
+    time.sleep(0.05)
+sys.exit(2)
+PY
+  then
+    rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+      echo "peadb-server exited before becoming ready (log: $OUT_DIR/peadb-start.log)" >&2
+    else
+      echo "peadb-server did not become ready on $HOST:$PORT (log: $OUT_DIR/peadb-start.log)" >&2
+    fi
+    exit 1
+  fi
+fi
 FAILED=()
 REPRO_FILE="$OUT_DIR/repro_commands.txt"
 : > "$REPRO_FILE"
@@ -168,15 +256,22 @@ for suite in "${SUITES[@]}"; do
   log_name="${suite//\//_}.log"
   log_path="$OUT_DIR/$log_name"
   echo "=== Running $suite ==="
-  if ! ./runtest \
+  rc=0
+  timeout --signal=TERM --kill-after=10 "$SUITE_TIMEOUT" \
+    ./runtest \
       --host "$HOST" \
       --port "$PORT" \
       --clients 1 \
       --single "$suite" \
       --dont-clean \
-      --verbose >"$log_path" 2>&1; then
+      --verbose >"$log_path" 2>&1 || rc=$?
+  if [[ $rc -ne 0 ]]; then
+    if [[ $rc -eq 124 ]]; then
+      echo "TIMEOUT $suite after ${SUITE_TIMEOUT}s (log: $log_path)" >&2
+    else
+      echo "FAILED $suite (log: $log_path)" >&2
+    fi
     FAILED+=("$suite")
-    echo "FAILED $suite (log: $log_path)" >&2
     echo "cd $REDIS_DIR && ./runtest --host $HOST --port $PORT --clients 1 --single $suite --dont-clean --verbose" >> "$REPRO_FILE"
   fi
 done
