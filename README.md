@@ -2,6 +2,8 @@
 
 A high-performance, drop-in replacement for Redis, written in modern C++20.
 
+Docker image: `alsatianco/peadb-server` on [Docker Hub](https://hub.docker.com/repository/docker/alsatianco/peadb-server).
+
 PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same protocol, same commands, same edge-case semantics — while leveraging multi-core CPUs and cache-friendly data structures for superior throughput.
 
 ## Highlights
@@ -13,7 +15,7 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 - **Cluster** — 16 384 hash-slot routing, `MOVED`/`ASK` redirection, slot migration, gossip protocol.
 - **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries.
 - **Redis Modules API** — partial `RedisModule_*` C API; load `.so` modules at runtime via `MODULE LOAD`.
-- **Docker-ready** — multi-stage Dockerfile and docker-compose included.
+- **Docker-ready** — published image at `alsatianco/peadb-server`, plus multi-stage Dockerfile and docker-compose for local builds.
 
 ## Quick Start
 
@@ -68,12 +70,27 @@ scripts/dev/quick_start.sh
 
 ### Docker
 
+Run the published image directly:
+
+```bash
+docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest
+```
+
+Available public tags:
+
+- `alsatianco/peadb-server:latest`
+- `alsatianco/peadb-server:0.1`
+
+Or build and run locally with Docker Compose:
+
 ```bash
 docker compose up -d
 ```
 
 The container exposes port `6379` (configurable via `PEADB_PORT`) and persists data to a named volume.
 For high-connection load tests, compose sets `ulimits.nofile` by default (`PEADB_NOFILE_SOFT` / `PEADB_NOFILE_HARD`, both default to `65536`).
+
+Docker Hub: https://hub.docker.com/repository/docker/alsatianco/peadb-server
 
 ## Configuration
 
