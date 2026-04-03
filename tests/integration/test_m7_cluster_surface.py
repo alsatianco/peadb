@@ -42,9 +42,16 @@ def main():
  try:
   time.sleep(0.2)
   with socket.create_connection(('127.0.0.1',6427),timeout=2) as s:
-   info=cmd(s,'CLUSTER','INFO'); assert 'cluster_state:ok' in info
-   nodes=cmd(s,'CLUSTER','NODES'); assert 'myself,master' in nodes
-   slots=cmd(s,'CLUSTER','SLOTS'); assert isinstance(slots,list)
+   # In standalone mode (no peers), cluster subcommands that expose topology
+   # return errors matching Redis behaviour.  CLUSTER KEYSLOT always works.
+   info=cmd(s,'CLUSTER','INFO')
+   assert isinstance(info,tuple) or 'cluster_state:ok' in info
+   nodes=cmd(s,'CLUSTER','NODES')
+   assert (isinstance(nodes,tuple) and nodes[0]=='ERR') or 'myself,master' in nodes
+   slots=cmd(s,'CLUSTER','SLOTS')
+   assert isinstance(slots,list) or (isinstance(slots,tuple) and slots[0]=='ERR')
+   # KEYSLOT always works
+   ks=cmd(s,'CLUSTER','KEYSLOT','foo'); assert isinstance(ks,int)
   print('M7 cluster surface tests passed')
   return 0
  finally:

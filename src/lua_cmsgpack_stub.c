@@ -8,6 +8,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include "lua_compat.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -185,7 +186,8 @@ static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
                     lua_pop(L, 1);
                 }
             } else {
-                /* Count entries */
+                /* Map: collect keys and sort them for deterministic output
+                   across Lua versions (5.1 vs 5.2+ have different hash orders). */
                 int count = 0;
                 lua_pushnil(L);
                 while (lua_next(L, idx) != 0) { count++; lua_pop(L, 1); }
@@ -198,12 +200,33 @@ static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
                     mp_write_byte(b, 0xdf);
                     mp_write_u32be(b, (uint32_t)count);
                 }
+                /* Collect keys into an array at stack top, then sort. */
+                lua_newtable(L); /* temp array for keys */
+                int kidx = lua_gettop(L);
+                int ki = 0;
                 lua_pushnil(L);
                 while (lua_next(L, idx) != 0) {
-                    mp_pack_value(L, b, lua_gettop(L) - 1, depth + 1);
-                    mp_pack_value(L, b, lua_gettop(L), depth + 1);
-                    lua_pop(L, 1);
+                    lua_pop(L, 1); /* pop value, keep key */
+                    lua_pushvalue(L, -1); /* dup key */
+                    lua_rawseti(L, kidx, ++ki); /* keys[ki] = key */
                 }
+                /* Sort keys table using table.sort for deterministic order */
+                lua_getglobal(L, "table");
+                lua_getfield(L, -1, "sort");
+                lua_remove(L, -2); /* remove 'table' */
+                lua_pushvalue(L, kidx);
+                if (lua_pcall(L, 1, 0, 0) != 0) lua_pop(L, 1); /* ignore sort errors */
+                /* Emit key-value pairs in sorted order */
+                for (int i = 1; i <= ki; i++) {
+                    lua_rawgeti(L, kidx, i); /* push key */
+                    int key_top = lua_gettop(L);
+                    mp_pack_value(L, b, key_top, depth + 1); /* pack key */
+                    lua_pushvalue(L, key_top); /* dup key for gettable */
+                    lua_gettable(L, idx); /* push value = t[key] */
+                    mp_pack_value(L, b, lua_gettop(L), depth + 1); /* pack value */
+                    lua_pop(L, 2); /* pop key and value */
+                }
+                lua_pop(L, 1); /* pop temp keys array */
             }
             break;
         }
@@ -240,7 +263,7 @@ static int mp_unpack_value(lua_State *L, const uint8_t *d, int len, int *pos, in
     uint8_t tag = rd_u8(d, pos);
 
     /* Positive fixint 0x00-0x7f */
-    if (tag <= 0x7f) { lua_pushnumber(L, tag); return 1; }
+    if (tag <= 0x7f) { lua_pushinteger(L, tag); return 1; }
     /* Fixmap 0x80-0x8f */
     if ((tag & 0xf0) == 0x80) {
         int n = tag & 0x0f;
@@ -271,20 +294,20 @@ static int mp_unpack_value(lua_State *L, const uint8_t *d, int len, int *pos, in
         return 1;
     }
     /* Negative fixint 0xe0-0xff */
-    if (tag >= 0xe0) { lua_pushnumber(L, (int8_t)tag); return 1; }
+    if (tag >= 0xe0) { lua_pushinteger(L, (int8_t)tag); return 1; }
 
     switch (tag) {
         case 0xc0: lua_pushnil(L); return 1; /* msgpack nil → Lua nil */
         case 0xc2: lua_pushboolean(L, 0); return 1;
         case 0xc3: lua_pushboolean(L, 1); return 1;
-        case 0xcc: lua_pushnumber(L, rd_u8(d, pos)); return 1;
-        case 0xcd: lua_pushnumber(L, rd_u16(d, pos)); return 1;
-        case 0xce: lua_pushnumber(L, rd_u32(d, pos)); return 1;
+        case 0xcc: lua_pushinteger(L, (lua_Integer)rd_u8(d, pos)); return 1;
+        case 0xcd: lua_pushinteger(L, (lua_Integer)rd_u16(d, pos)); return 1;
+        case 0xce: lua_pushinteger(L, (lua_Integer)rd_u32(d, pos)); return 1;
         case 0xcf: lua_pushnumber(L, (double)rd_u64(d, pos)); return 1;
-        case 0xd0: { int8_t  v = (int8_t)rd_u8(d, pos);   lua_pushnumber(L, v); return 1; }
-        case 0xd1: { int16_t v = (int16_t)rd_u16(d, pos);  lua_pushnumber(L, v); return 1; }
-        case 0xd2: { int32_t v = (int32_t)rd_u32(d, pos);  lua_pushnumber(L, v); return 1; }
-        case 0xd3: { int64_t v = (int64_t)rd_u64(d, pos);  lua_pushnumber(L, (double)v); return 1; }
+        case 0xd0: { int8_t  v = (int8_t)rd_u8(d, pos);   lua_pushinteger(L, (lua_Integer)v); return 1; }
+        case 0xd1: { int16_t v = (int16_t)rd_u16(d, pos);  lua_pushinteger(L, (lua_Integer)v); return 1; }
+        case 0xd2: { int32_t v = (int32_t)rd_u32(d, pos);  lua_pushinteger(L, (lua_Integer)v); return 1; }
+        case 0xd3: { int64_t v = (int64_t)rd_u64(d, pos);  lua_pushinteger(L, (lua_Integer)v); return 1; }
         case 0xcb: { /* float64 */
             uint64_t u = rd_u64(d, pos);
             double v; memcpy(&v, &u, 8);

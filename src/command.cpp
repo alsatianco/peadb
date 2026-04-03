@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <optional>
 #include <sstream>
@@ -149,6 +150,119 @@ std::atomic<std::int64_t> g_server_start_time{0};
 std::atomic<int> g_connected_replicas{0};
 std::atomic<int> g_runtime_max_clients{10000};
 std::function<int(std::int64_t)> g_count_synced_replicas;
+std::atomic<std::uint64_t> g_next_client_id{1};
+std::function<std::string()> g_client_list_callback;
+std::function<bool(int fd, const std::string& data)> g_pubsub_send;
+
+// ── Pub/Sub registry ──
+namespace {
+// channel -> set of subscriber fds
+std::unordered_map<std::string, std::unordered_set<int>> g_channel_subscribers;
+// pattern -> set of subscriber fds
+std::unordered_map<std::string, std::unordered_set<int>> g_pattern_subscribers;
+// fd -> set of subscribed channels (for cleanup on disconnect)
+std::unordered_map<int, std::unordered_set<std::string>> g_fd_channels;
+// fd -> set of subscribed patterns
+std::unordered_map<int, std::unordered_set<std::string>> g_fd_patterns;
+} // anonymous
+
+void pubsub_subscribe(int fd, const std::string& channel) {
+  g_channel_subscribers[channel].insert(fd);
+  g_fd_channels[fd].insert(channel);
+}
+void pubsub_unsubscribe(int fd, const std::string& channel) {
+  auto it = g_channel_subscribers.find(channel);
+  if (it != g_channel_subscribers.end()) {
+    it->second.erase(fd);
+    if (it->second.empty()) g_channel_subscribers.erase(it);
+  }
+  auto fit = g_fd_channels.find(fd);
+  if (fit != g_fd_channels.end()) {
+    fit->second.erase(channel);
+    if (fit->second.empty()) g_fd_channels.erase(fit);
+  }
+}
+void pubsub_psubscribe(int fd, const std::string& pattern) {
+  g_pattern_subscribers[pattern].insert(fd);
+  g_fd_patterns[fd].insert(pattern);
+}
+void pubsub_punsubscribe(int fd, const std::string& pattern) {
+  auto it = g_pattern_subscribers.find(pattern);
+  if (it != g_pattern_subscribers.end()) {
+    it->second.erase(fd);
+    if (it->second.empty()) g_pattern_subscribers.erase(it);
+  }
+  auto fit = g_fd_patterns.find(fd);
+  if (fit != g_fd_patterns.end()) {
+    fit->second.erase(pattern);
+    if (fit->second.empty()) g_fd_patterns.erase(fit);
+  }
+}
+void pubsub_unsubscribe_all(int fd) {
+  auto cit = g_fd_channels.find(fd);
+  if (cit != g_fd_channels.end()) {
+    for (const auto& ch : cit->second) {
+      auto sit = g_channel_subscribers.find(ch);
+      if (sit != g_channel_subscribers.end()) {
+        sit->second.erase(fd);
+        if (sit->second.empty()) g_channel_subscribers.erase(sit);
+      }
+    }
+    g_fd_channels.erase(cit);
+  }
+  auto pit = g_fd_patterns.find(fd);
+  if (pit != g_fd_patterns.end()) {
+    for (const auto& pat : pit->second) {
+      auto sit = g_pattern_subscribers.find(pat);
+      if (sit != g_pattern_subscribers.end()) {
+        sit->second.erase(fd);
+        if (sit->second.empty()) g_pattern_subscribers.erase(sit);
+      }
+    }
+    g_fd_patterns.erase(pit);
+  }
+}
+
+namespace {
+std::string encode_pubsub_message(const std::string& type, const std::string& channel, const std::string& data) {
+  return "*3\r\n$" + std::to_string(type.size()) + "\r\n" + type + "\r\n"
+       + "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n"
+       + "$" + std::to_string(data.size()) + "\r\n" + data + "\r\n";
+}
+std::string encode_pmessage(const std::string& pattern, const std::string& channel, const std::string& data) {
+  return std::string("*4\r\n$8\r\npmessage\r\n")
+       + "$" + std::to_string(pattern.size()) + "\r\n" + pattern + "\r\n"
+       + "$" + std::to_string(channel.size()) + "\r\n" + channel + "\r\n"
+       + "$" + std::to_string(data.size()) + "\r\n" + data + "\r\n";
+}
+bool pattern_matches(const std::string& pattern, const std::string& str) {
+  return fnmatch(pattern.c_str(), str.c_str(), 0) == 0;
+}
+} // anonymous
+
+std::int64_t pubsub_publish(const std::string& channel, const std::string& message) {
+  std::int64_t receivers = 0;
+  if (!g_pubsub_send) return 0;
+
+  // Exact channel subscribers
+  auto it = g_channel_subscribers.find(channel);
+  if (it != g_channel_subscribers.end()) {
+    std::string msg = encode_pubsub_message("message", channel, message);
+    for (int fd : it->second) {
+      if (g_pubsub_send(fd, msg)) ++receivers;
+    }
+  }
+  // Pattern subscribers
+  for (const auto& [pat, fds] : g_pattern_subscribers) {
+    if (pattern_matches(pat, channel)) {
+      std::string msg = encode_pmessage(pat, channel, message);
+      for (int fd : fds) {
+        if (g_pubsub_send(fd, msg)) ++receivers;
+      }
+    }
+  }
+  return receivers;
+}
 
 namespace {
 
@@ -542,6 +656,9 @@ void try_send_cluster_meetback(const std::string& host, int port) {
     if (rc <= 0) break;
     sent += static_cast<std::size_t>(rc);
   }
+  // Read the +OK reply before closing so the peer has time to process.
+  char buf[32];
+  (void)read(fd, buf, sizeof(buf));
   close(fd);
 }
 
@@ -1167,9 +1284,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_error("wrong number of arguments for 'ping' command");
         }});
 
-    t.emplace("PUBLISH", CommandSpec{"PUBLISH", 3, {"write", "pubsub"}, 1, 1, 1,
-        [](const std::vector<std::string>&, SessionState&, bool&) {
-          return encode_integer(0);
+    t.emplace("PUBLISH", CommandSpec{"PUBLISH", 3, {"write", "pubsub", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          auto receivers = pubsub_publish(args[1], args[2]);
+          return encode_integer(static_cast<long long>(receivers));
         }});
 
     t.emplace("TIME", CommandSpec{"TIME", 1, {"readonly", "fast"}, 0, 0, 0,
@@ -1672,7 +1790,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "uptime_in_seconds:" + std::to_string(uptime_s) + "\r\n"
                    "uptime_in_days:" + std::to_string(uptime_s / 86400) + "\r\n"
                    "executable:peadb-server\r\n"
-                   "config_file:\r\n\r\n";
+                   "config_file:\r\n"
+                   "cluster_enabled:" + std::string(g_cluster_peers.empty() ? "0" : "1") + "\r\n\r\n";
           }
           if (want("CLIENTS")) {
             out += "# Clients\r\n"
@@ -1880,6 +1999,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("CLUSTER", CommandSpec{"CLUSTER", -2, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           const auto sub = upper(args[1]);
+          // Note: RedisInsight / ioredis detect cluster mode via
+          // cluster_enabled:0 in INFO server — not via CLUSTER SLOTS.
+          // All cluster subcommands remain available so users can set up
+          // clustering (CLUSTER MEET / SETSLOT) and tests can inspect state.
           if (sub == "KEYSLOT" && args.size() == 3) {
             return encode_integer(cluster_keyslot(args[2]));
           }
@@ -1918,17 +2041,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_error("Unsupported CLUSTER SETSLOT mode");
           }
           if (sub == "INFO") {
-            std::size_t cluster_size = 1 + g_cluster_peers.size();
-            std::size_t slots_assigned = 16384;
-            std::size_t slots_ok = 16384;
+            // In standalone mode (no peers), return an error matching Redis.
+            if (g_cluster_peers.empty()) {
+              return std::string("-ERR This instance has cluster support disabled\r\n");
+            }
+            // In cluster mode, report full cluster info.
+            bool cluster_active = !g_cluster_peers.empty();
+            std::size_t cluster_size = cluster_active ? (1 + g_cluster_peers.size()) : 0;
+            std::size_t slots_assigned = cluster_active ? 16384 : 0;
+            std::size_t slots_ok = cluster_active ? 16384 : 0;
             return encode_bulk(
-                "cluster_enabled:1\r\n"
+                "cluster_enabled:" + std::string(cluster_active ? "1" : "0") + "\r\n"
                 "cluster_state:ok\r\n"
                 "cluster_slots_assigned:" + std::to_string(slots_assigned) + "\r\n"
                 "cluster_slots_ok:" + std::to_string(slots_ok) + "\r\n"
                 "cluster_slots_pfail:0\r\n"
                 "cluster_slots_fail:0\r\n"
-                "cluster_known_nodes:" + std::to_string(cluster_size) + "\r\n"
+                "cluster_known_nodes:" + std::to_string(cluster_active ? cluster_size : 1) + "\r\n"
                 "cluster_size:" + std::to_string(cluster_size) + "\r\n"
                 "cluster_current_epoch:1\r\n"
                 "cluster_my_epoch:1\r\n"
@@ -1959,7 +2088,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_bulk(g_master_replid);
           }
           if (sub == "SLOTS") {
-            return std::string("*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:0\r\n");
+            // In standalone mode (no peers), return an error matching Redis
+            // behaviour.  This prevents ioredis/RedisInsight from switching
+            // to cluster connection mode.
+            if (g_cluster_peers.empty()) {
+              return std::string("-ERR This instance has cluster support disabled\r\n");
+            }
+            return std::string("*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + std::to_string(g_server_port) + "\r\n");
+          }
+          if (sub == "SHARDS") {
+            if (g_cluster_peers.empty()) {
+              return std::string("-ERR This instance has cluster support disabled\r\n");
+            }
+            return encode_array({});
           }
           return encode_error("unknown subcommand for CLUSTER");
         }});
@@ -2754,28 +2895,29 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::uint64_t cursor = 0;
           try { cursor = static_cast<std::uint64_t>(std::stoull(args[1])); } catch (...) { return encode_error("invalid cursor"); }
-          std::string pattern = "*";
+          std::string match_pattern = "*";
           std::size_t count = 10;
-          for (std::size_t i = 2; i < args.size(); ++i) {
-            const auto opt = upper(args[i]);
-            if (opt == "MATCH" && i + 1 < args.size()) {
-              pattern = args[++i];
-              continue;
+          std::string type_filter;
+          for (std::size_t i = 2; i < args.size(); i += 2) {
+            if (i + 1 >= args.size()) return encode_error("syntax error");
+            auto opt = upper(args[i]);
+            if (opt == "COUNT") {
+              try { count = static_cast<std::size_t>(std::stoull(args[i + 1])); }
+              catch (...) { return encode_error("value is not an integer or out of range"); }
+            } else if (opt == "MATCH") {
+              match_pattern = args[i + 1];
+            } else if (opt == "TYPE") {
+              type_filter = lower(args[i + 1]);
+            } else {
+              return encode_error("syntax error");
             }
-            if (opt == "COUNT" && i + 1 < args.size()) {
-              try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-              continue;
-            }
-            return encode_error("syntax error");
           }
-          (void)cursor;
-          (void)count;
           append_lazy_expire_dels(session);
-          const auto ks = store().keys(pattern);
-          std::vector<std::string> out;
-          out.reserve(ks.size());
-          for (const auto& k : ks) out.push_back(encode_bulk(k));
-          return encode_array({encode_bulk("0"), encode_array(out)});
+          auto [next, keys] = store().scan(cursor, count, match_pattern, type_filter);
+          std::vector<std::string> inner;
+          inner.reserve(keys.size());
+          for (const auto& k : keys) inner.push_back(encode_bulk(k));
+          return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
         }});
 
     t.emplace("SORT", CommandSpec{"SORT", -2, {"write"}, 1, 1, 1,
@@ -4011,15 +4153,79 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("XADD", CommandSpec{"XADD", -5, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          if (((args.size() - 3) % 2) != 0) return encode_error("wrong number of arguments for 'xadd' command");
+          // Parse optional flags: [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold [LIMIT count]] id field value ...
+          std::size_t idx = 2;
+          bool nomkstream = false;
+          std::int64_t maxlen = -1;
+          std::string minid_threshold;
+          bool trim_approx = false;
+
+          while (idx < args.size()) {
+            const auto opt = upper(args[idx]);
+            if (opt == "NOMKSTREAM") { nomkstream = true; ++idx; continue; }
+            if (opt == "MAXLEN" || opt == "MINID") {
+              bool is_maxlen = (opt == "MAXLEN");
+              ++idx;
+              if (idx >= args.size()) return encode_error("syntax error");
+              // Optional = or ~
+              if (args[idx] == "~" || args[idx] == "=") { trim_approx = (args[idx] == "~"); ++idx; }
+              if (idx >= args.size()) return encode_error("syntax error");
+              if (is_maxlen) {
+                if (!parse_i64(args[idx], maxlen)) return encode_error("value is not an integer or out of range");
+              } else {
+                minid_threshold = args[idx];
+              }
+              ++idx;
+              // Optional LIMIT count
+              if (idx < args.size() && upper(args[idx]) == "LIMIT") {
+                idx += 2; // skip LIMIT and count (we don't enforce it)
+              }
+              continue;
+            }
+            break; // First non-option is the ID
+          }
+          if (idx >= args.size()) return encode_error("wrong number of arguments for 'xadd' command");
+          const std::string& stream_id = args[idx];
+          ++idx;
+          if (((args.size() - idx) % 2) != 0) return encode_error("wrong number of arguments for 'xadd' command");
+          if (args.size() == idx) return encode_error("wrong number of arguments for 'xadd' command");
+
+          // If NOMKSTREAM and key doesn't exist, return null
+          if (nomkstream && store().type_of(args[1]) == "none") return encode_null(RespVersion::Resp2);
+
           return with_stream_key(args[1], [&]() {
             std::vector<std::pair<std::string, std::string>> fields;
-            for (std::size_t i = 3; i < args.size(); i += 2) fields.push_back({args[i], args[i + 1]});
+            for (std::size_t i = idx; i < args.size(); i += 2) fields.push_back({args[i], args[i + 1]});
             bool wrongtype = false;
             std::string err;
-            auto id = store().xadd(args[1], args[2], fields, wrongtype, err);
+            auto id = store().xadd(args[1], stream_id, fields, wrongtype, err);
             if (wrongtype) return wrongtype_error_reply();
             if (!id.has_value()) return encode_error(err.empty() ? "ERR" : err);
+
+            // Apply MAXLEN trimming after the add
+            if (maxlen >= 0) {
+              bool wt = false;
+              auto entries = store().xrange(args[1], "-", "+", false, wt);
+              if (!wt && static_cast<std::int64_t>(entries.size()) > maxlen) {
+                std::size_t to_remove = entries.size() - static_cast<std::size_t>(maxlen);
+                std::vector<std::string> ids_to_del;
+                for (std::size_t i = 0; i < to_remove; ++i) ids_to_del.push_back(entries[i].first);
+                store().xdel(args[1], ids_to_del, wt);
+              }
+            }
+            // Apply MINID trimming
+            if (!minid_threshold.empty()) {
+              bool wt = false;
+              auto entries = store().xrange(args[1], "-", "+", false, wt);
+              if (!wt) {
+                std::vector<std::string> ids_to_del;
+                for (const auto& [eid, _] : entries) {
+                  if (eid < minid_threshold) ids_to_del.push_back(eid);
+                }
+                if (!ids_to_del.empty()) store().xdel(args[1], ids_to_del, wt);
+              }
+            }
+
             return encode_bulk(*id);
           });
         }});
@@ -4322,86 +4528,1793 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           });
         }});
 
-    // ─── SCAN (top-level keyspace scan) ──────────────────────────────────
-    t.emplace("SCAN", CommandSpec{"SCAN", -2, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::uint64_t cursor = 0;
-          try { cursor = static_cast<std::uint64_t>(std::stoull(args[1])); }
-          catch (...) { return encode_error("invalid cursor"); }
-          std::size_t count = 10;
-          std::string match_pattern = "*";
-          std::string type_filter;
-          for (std::size_t i = 2; i < args.size(); i += 2) {
-            if (i + 1 >= args.size()) return encode_error("syntax error");
-            auto opt = upper(args[i]);
-            if (opt == "COUNT") {
-              try { count = static_cast<std::size_t>(std::stoull(args[i + 1])); }
-              catch (...) { return encode_error("value is not an integer or out of range"); }
-            } else if (opt == "MATCH") {
-              match_pattern = args[i + 1];
-            } else if (opt == "TYPE") {
-              type_filter = lower(args[i + 1]);
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          auto [next, keys] = store().scan(cursor, count, match_pattern, type_filter);
-          std::vector<std::string> inner;
-          inner.reserve(keys.size());
-          for (const auto& k : keys) inner.push_back(encode_bulk(k));
-          return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
-        }});
-
     // ─── SUBSCRIBE / UNSUBSCRIBE / PSUBSCRIBE / PUNSUBSCRIBE ────────────
     t.emplace("SUBSCRIBE", CommandSpec{"SUBSCRIBE", -2, {"pubsub"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          // In-memory stub: we acknowledge the subscription but actual message
-          // delivery requires server-level integration.
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::string out;
           for (std::size_t i = 1; i < args.size(); ++i) {
+            pubsub_subscribe(session.fd, args[i]);
+            auto& chans = g_fd_channels[session.fd];
+            auto& pats = g_fd_patterns[session.fd];
+            long long total = static_cast<long long>(chans.size() + pats.size());
             out += encode_array({encode_bulk("subscribe"), encode_bulk(args[i]),
-                                 encode_integer(static_cast<long long>(i))});
+                                 encode_integer(total)});
           }
           return out;
         }});
 
     t.emplace("UNSUBSCRIBE", CommandSpec{"UNSUBSCRIBE", -1, {"pubsub"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::string out;
           if (args.size() == 1) {
-            // unsubscribe all
-            out = encode_array({encode_bulk("unsubscribe"), encode_null(RespVersion::Resp2), encode_integer(0)});
+            // Unsubscribe all channels
+            auto cit = g_fd_channels.find(session.fd);
+            if (cit != g_fd_channels.end()) {
+              auto channels_copy = cit->second; // copy since we modify during iteration
+              for (const auto& ch : channels_copy) {
+                pubsub_unsubscribe(session.fd, ch);
+              }
+            }
+            auto& pats = g_fd_patterns[session.fd];
+            out = encode_array({encode_bulk("unsubscribe"), encode_null(RespVersion::Resp2),
+                                encode_integer(static_cast<long long>(pats.size()))});
           } else {
             for (std::size_t i = 1; i < args.size(); ++i) {
+              pubsub_unsubscribe(session.fd, args[i]);
+              auto& chans = g_fd_channels[session.fd];
+              auto& pats = g_fd_patterns[session.fd];
+              long long total = static_cast<long long>(chans.size() + pats.size());
               out += encode_array({encode_bulk("unsubscribe"), encode_bulk(args[i]),
-                                   encode_integer(static_cast<long long>(args.size() - 1 - i))});
+                                   encode_integer(total)});
             }
           }
           return out;
         }});
 
     t.emplace("PSUBSCRIBE", CommandSpec{"PSUBSCRIBE", -2, {"pubsub"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::string out;
           for (std::size_t i = 1; i < args.size(); ++i) {
+            pubsub_psubscribe(session.fd, args[i]);
+            auto& chans = g_fd_channels[session.fd];
+            auto& pats = g_fd_patterns[session.fd];
+            long long total = static_cast<long long>(chans.size() + pats.size());
             out += encode_array({encode_bulk("psubscribe"), encode_bulk(args[i]),
-                                 encode_integer(static_cast<long long>(i))});
+                                 encode_integer(total)});
           }
           return out;
         }});
 
     t.emplace("PUNSUBSCRIBE", CommandSpec{"PUNSUBSCRIBE", -1, {"pubsub"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::string out;
           if (args.size() == 1) {
-            out = encode_array({encode_bulk("punsubscribe"), encode_null(RespVersion::Resp2), encode_integer(0)});
+            auto pit = g_fd_patterns.find(session.fd);
+            if (pit != g_fd_patterns.end()) {
+              auto patterns_copy = pit->second;
+              for (const auto& pat : patterns_copy) {
+                pubsub_punsubscribe(session.fd, pat);
+              }
+            }
+            auto& chans = g_fd_channels[session.fd];
+            out = encode_array({encode_bulk("punsubscribe"), encode_null(RespVersion::Resp2),
+                                encode_integer(static_cast<long long>(chans.size()))});
           } else {
             for (std::size_t i = 1; i < args.size(); ++i) {
+              pubsub_punsubscribe(session.fd, args[i]);
+              auto& chans = g_fd_channels[session.fd];
+              auto& pats = g_fd_patterns[session.fd];
+              long long total = static_cast<long long>(chans.size() + pats.size());
               out += encode_array({encode_bulk("punsubscribe"), encode_bulk(args[i]),
-                                   encode_integer(static_cast<long long>(args.size() - 1 - i))});
+                                   encode_integer(total)});
             }
           }
           return out;
+        }});
+
+    // ─── CLIENT ────────────────────────────────────────────────────────
+    t.emplace("CLIENT", CommandSpec{"CLIENT", -2, {"admin", "loading", "stale"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          if (sub == "SETNAME") {
+            if (args.size() != 3) return encode_error("wrong number of arguments for 'client|setname' command");
+            // Redis rejects names with spaces
+            for (char c : args[2]) {
+              if (c == ' ') return encode_error("Client names cannot contain spaces, newlines or special characters.");
+            }
+            session.client_name = args[2];
+            return encode_simple("OK");
+          }
+          if (sub == "GETNAME") {
+            if (session.client_name.empty()) return encode_null(session.resp_version);
+            return encode_bulk(session.client_name);
+          }
+          if (sub == "ID") {
+            return encode_integer(static_cast<long long>(session.client_id));
+          }
+          if (sub == "SETINFO") {
+            if (args.size() != 4) return encode_error("wrong number of arguments for 'client|setinfo' command");
+            const auto attr = upper(args[2]);
+            if (attr == "LIB-NAME") {
+              session.lib_name = args[3];
+              return encode_simple("OK");
+            }
+            if (attr == "LIB-VER") {
+              session.lib_ver = args[3];
+              return encode_simple("OK");
+            }
+            return encode_error("Unrecognized option '" + args[2] + "'");
+          }
+          if (sub == "LIST") {
+            if (g_client_list_callback) {
+              return encode_bulk(g_client_list_callback());
+            }
+            return encode_bulk("");
+          }
+          if (sub == "INFO") {
+            // Return info about the current session in CLIENT LIST format
+            std::string out;
+            out += "id=" + std::to_string(session.client_id);
+            out += " fd=" + std::to_string(session.fd);
+            out += " name=" + session.client_name;
+            out += " lib-name=" + session.lib_name;
+            out += " lib-ver=" + session.lib_ver;
+            out += " db=" + std::to_string(session.db_index);
+            out += " sub=0 psub=0 ssub=0";
+            out += " multi=" + std::string(session.in_multi ? std::to_string(static_cast<int>(session.queued.size())) : "-1");
+            out += " watch=" + std::to_string(session.watched_digests.size());
+            out += " qbuf=0 qbuf-free=32768 argv-mem=0 multi-mem=0 tot-mem=20512";
+            out += " net-i=0 net-o=0 age=0 idle=0 flags=N";
+            out += " cmd=client|info user=default redir=-1";
+            out += " resp=" + std::to_string(static_cast<int>(session.resp_version));
+            out += "\n";
+            return encode_bulk(out);
+          }
+          if (sub == "NO-EVICT" || sub == "NO-TOUCH") {
+            return encode_simple("OK");
+          }
+          if (sub == "PAUSE" || sub == "UNPAUSE") {
+            return encode_simple("OK");
+          }
+          if (sub == "REPLY") {
+            return encode_simple("OK");
+          }
+          return encode_error("unknown subcommand or wrong number of arguments for 'client|" + lower(args[1]) + "' command");
+        }});
+
+    // ─── MEMORY ──────────────────────────────────────────────────────────
+    t.emplace("MEMORY", CommandSpec{"MEMORY", -2, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          if (sub == "USAGE") {
+            if (args.size() < 3) return encode_error("wrong number of arguments for 'memory|usage' command");
+            const auto& key = args[2];
+            if (store().type_of(key) == "none") return encode_null(RespVersion::Resp2);
+            // Approximate memory usage — return a reasonable estimate
+            const auto enc = store().object_encoding(key);
+            std::int64_t bytes = 64; // base overhead
+            const auto type = store().type_of(key);
+            if (type == "string") {
+              auto val = store().get(key);
+              if (val) bytes += static_cast<std::int64_t>(val->size()) + 48;
+            } else if (type == "list") {
+              bool wt = false;
+              bytes += store().llen(key, wt) * 64 + 128;
+            } else if (type == "hash") {
+              bool wt = false;
+              bytes += store().hlen(key, wt) * 96 + 128;
+            } else if (type == "set") {
+              bool wt = false;
+              bytes += store().scard(key, wt) * 64 + 128;
+            } else if (type == "zset") {
+              // Approximate: we don't have a zcard method exposed yet, use zrange
+              bool wt = false;
+              auto items = store().zrange(key, 0, -1, false, wt);
+              bytes += static_cast<std::int64_t>(items.size()) * 96 + 128;
+            } else if (type == "stream") {
+              bool wt = false;
+              bytes += store().xlen(key, wt) * 128 + 256;
+            }
+            return encode_integer(bytes);
+          }
+          if (sub == "DOCTOR") {
+            return encode_bulk("Sam, I have no memory problems");
+          }
+          if (sub == "STATS") {
+            // Minimal stub matching Redis output format
+            return encode_bulk("peak.allocated:0\ntotal.allocated:0\nstartup.allocated:0\n"
+                               "replication.backlog:0\nclients.slaves:0\nclients.normal:0\n"
+                               "aof.buffer:0\nlua.caches:0\ndbnum:16\n");
+          }
+          if (sub == "MALLOC-STATS") {
+            return encode_bulk("Memory allocator stats not available\n");
+          }
+          if (sub == "PURGE") {
+            return encode_simple("OK");
+          }
+          if (sub == "HELP") {
+            std::vector<std::string> items;
+            items.push_back(encode_bulk("MEMORY <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"));
+            items.push_back(encode_bulk("DOCTOR"));
+            items.push_back(encode_bulk("MALLOC-STATS"));
+            items.push_back(encode_bulk("PURGE"));
+            items.push_back(encode_bulk("STATS"));
+            items.push_back(encode_bulk("USAGE <key> [SAMPLES <count>]"));
+            return encode_array(items);
+          }
+          return encode_error("unknown subcommand or wrong number of arguments for 'memory|" + lower(args[1]) + "' command");
+        }});
+
+    // ─── SLOWLOG ─────────────────────────────────────────────────────────
+    t.emplace("SLOWLOG", CommandSpec{"SLOWLOG", -2, {"admin"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          if (sub == "GET") {
+            return encode_array({}); // empty slow log
+          }
+          if (sub == "LEN") {
+            return encode_integer(0);
+          }
+          if (sub == "RESET") {
+            return encode_simple("OK");
+          }
+          if (sub == "HELP") {
+            std::vector<std::string> items;
+            items.push_back(encode_bulk("SLOWLOG <subcommand> [<arg> [value] ...]. Subcommands are:"));
+            items.push_back(encode_bulk("GET [<count>]"));
+            items.push_back(encode_bulk("LEN"));
+            items.push_back(encode_bulk("RESET"));
+            return encode_array(items);
+          }
+          return encode_error("unknown subcommand or wrong number of arguments for 'slowlog|" + lower(args[1]) + "' command");
+        }});
+
+    // ─── LATENCY ─────────────────────────────────────────────────────────
+    t.emplace("LATENCY", CommandSpec{"LATENCY", -2, {"admin"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          if (sub == "LATEST" || sub == "HISTORY" || sub == "GRAPH" || sub == "HISTOGRAM") {
+            return encode_array({});
+          }
+          if (sub == "RESET") {
+            return encode_integer(0);
+          }
+          if (sub == "DOCTOR") {
+            return encode_bulk("I have no latency reports to show you at this time.");
+          }
+          if (sub == "HELP") {
+            std::vector<std::string> items;
+            items.push_back(encode_bulk("LATENCY <subcommand> [<arg> ...]. Subcommands are:"));
+            items.push_back(encode_bulk("DOCTOR"));
+            items.push_back(encode_bulk("GRAPH <event>"));
+            items.push_back(encode_bulk("LATEST"));
+            items.push_back(encode_bulk("HISTORY <event>"));
+            items.push_back(encode_bulk("RESET [<event> ...]"));
+            return encode_array(items);
+          }
+          return encode_error("unknown subcommand or wrong number of arguments for 'latency|" + lower(args[1]) + "' command");
+        }});
+
+    // ─── TOUCH ───────────────────────────────────────────────────────────
+    t.emplace("TOUCH", CommandSpec{"TOUCH", -2, {"readonly", "fast"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          long long count = 0;
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            if (store().type_of(args[i]) != "none") ++count;
+          }
+          return encode_integer(count);
+        }});
+
+    // ─── ROLE ────────────────────────────────────────────────────────────
+    t.emplace("ROLE", CommandSpec{"ROLE", 1, {"readonly", "fast", "loading", "stale"}, 0, 0, 0,
+        [](const std::vector<std::string>&, SessionState&, bool&) -> std::string {
+          std::vector<std::string> items;
+          items.push_back(encode_bulk(g_replication_role));
+          if (g_replication_role == "master") {
+            items.push_back(encode_integer(g_master_repl_offset));
+            items.push_back(encode_array({})); // replica list
+          } else {
+            items.push_back(encode_bulk(g_replication_master_host));
+            items.push_back(encode_integer(g_replication_master_port));
+            items.push_back(encode_bulk("connected"));
+            items.push_back(encode_integer(g_master_repl_offset));
+          }
+          return encode_array(items);
+        }});
+
+    // ─── RESET ───────────────────────────────────────────────────────────
+    t.emplace("RESET", CommandSpec{"RESET", 1, {"fast", "loading", "stale", "no_auth"}, 0, 0, 0,
+        [](const std::vector<std::string>&, SessionState& session, bool&) -> std::string {
+          session.db_index = 0;
+          session.in_multi = false;
+          session.multi_dirty = false;
+          session.queued.clear();
+          session.watched_epoch.reset();
+          session.watched_digests.clear();
+          session.client_name.clear();
+          session.resp_version = RespVersion::Resp2;
+          return "+RESET\r\n";
+        }});
+
+    // ─── LINDEX ──────────────────────────────────────────────────────────
+    t.emplace("LINDEX", CommandSpec{"LINDEX", 3, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          std::int64_t index;
+          if (!parse_i64(args[2], index)) return encode_error("value is not an integer or out of range");
+          bool wt = false;
+          auto items = store().lrange(args[1], 0, -1, wt);
+          if (wt) return wrongtype_error_reply();
+          if (items.empty()) return encode_null(session.resp_version);
+          std::int64_t len = static_cast<std::int64_t>(items.size());
+          if (index < 0) index += len;
+          if (index < 0 || index >= len) return encode_null(session.resp_version);
+          return encode_bulk(items[static_cast<std::size_t>(index)]);
+        }});
+
+    // ─── LSET ────────────────────────────────────────────────────────────
+    t.emplace("LSET", CommandSpec{"LSET", 4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          if (store().type_of(args[1]) == "none") return encode_error("no such key");
+          std::int64_t index;
+          if (!parse_i64(args[2], index)) return encode_error("value is not an integer or out of range");
+          bool wt = false;
+          auto items = store().lrange(args[1], 0, -1, wt);
+          if (wt) return wrongtype_error_reply();
+          std::int64_t len = static_cast<std::int64_t>(items.size());
+          if (index < 0) index += len;
+          if (index < 0 || index >= len) return encode_error("index out of range");
+          items[static_cast<std::size_t>(index)] = args[3];
+          // Rebuild list: delete and re-push
+          store().del(args[1]);
+          std::vector<std::string> all(items.begin(), items.end());
+          store().rpush(args[1], all, wt);
+          return encode_simple("OK");
+        }});
+
+    // ─── LREM ────────────────────────────────────────────────────────────
+    t.emplace("LREM", CommandSpec{"LREM", 4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          std::int64_t count;
+          if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
+          bool wt = false;
+          auto items = store().lrange(args[1], 0, -1, wt);
+          if (wt) return wrongtype_error_reply();
+          long long removed = 0;
+          std::deque<std::string> result;
+          if (count > 0) {
+            for (const auto& item : items) {
+              if (item == args[3] && removed < count) ++removed;
+              else result.push_back(item);
+            }
+          } else if (count < 0) {
+            std::int64_t limit = -count;
+            // Remove from tail
+            for (auto it = items.rbegin(); it != items.rend(); ++it) {
+              if (*it == args[3] && removed < limit) ++removed;
+              else result.push_front(*it);
+            }
+          } else {
+            // count == 0: remove all
+            for (const auto& item : items) {
+              if (item == args[3]) ++removed;
+              else result.push_back(item);
+            }
+          }
+          store().del(args[1]);
+          if (!result.empty()) {
+            std::vector<std::string> all(result.begin(), result.end());
+            store().rpush(args[1], all, wt);
+          }
+          return encode_integer(removed);
+        }});
+
+    // ─── LPOS ────────────────────────────────────────────────────────────
+    t.emplace("LPOS", CommandSpec{"LPOS", -3, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          std::int64_t rank = 1;
+          std::int64_t count_opt = -1; // -1 means not specified
+          std::int64_t maxlen = 0;
+          for (std::size_t i = 3; i < args.size(); i += 2) {
+            if (i + 1 >= args.size()) return encode_error("syntax error");
+            const auto opt = upper(args[i]);
+            if (opt == "RANK") { if (!parse_i64(args[i + 1], rank)) return encode_error("value is not an integer or out of range"); if (rank == 0) return encode_error("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative values meaning the same but counting from the end of the list."); }
+            else if (opt == "COUNT") { if (!parse_i64(args[i + 1], count_opt)) return encode_error("value is not an integer or out of range"); if (count_opt < 0) return encode_error("COUNT can't be negative"); }
+            else if (opt == "MAXLEN") { if (!parse_i64(args[i + 1], maxlen)) return encode_error("value is not an integer or out of range"); if (maxlen < 0) return encode_error("MAXLEN can't be negative"); }
+            else return encode_error("syntax error");
+          }
+          bool wt = false;
+          auto items = store().lrange(args[1], 0, -1, wt);
+          if (wt) return wrongtype_error_reply();
+          bool return_array = (count_opt >= 0);
+          std::int64_t max_results = (count_opt == 0) ? static_cast<std::int64_t>(items.size()) : (count_opt > 0 ? count_opt : 1);
+          std::vector<long long> positions;
+          std::int64_t skip = (rank > 0) ? rank - 1 : -rank - 1;
+          if (rank > 0) {
+            std::int64_t limit = (maxlen > 0) ? std::min(maxlen, static_cast<std::int64_t>(items.size())) : static_cast<std::int64_t>(items.size());
+            for (std::int64_t j = 0; j < limit && static_cast<std::int64_t>(positions.size()) < max_results; ++j) {
+              if (items[static_cast<std::size_t>(j)] == args[2]) {
+                if (skip > 0) { --skip; continue; }
+                positions.push_back(j);
+              }
+            }
+          } else {
+            std::int64_t start = static_cast<std::int64_t>(items.size()) - 1;
+            std::int64_t limit_pos = (maxlen > 0) ? std::max(start - maxlen + 1, static_cast<std::int64_t>(0)) : 0;
+            for (std::int64_t j = start; j >= limit_pos && static_cast<std::int64_t>(positions.size()) < max_results; --j) {
+              if (items[static_cast<std::size_t>(j)] == args[2]) {
+                if (skip > 0) { --skip; continue; }
+                positions.push_back(j);
+              }
+            }
+          }
+          if (return_array) {
+            std::vector<std::string> enc;
+            for (auto p : positions) enc.push_back(encode_integer(p));
+            return encode_array(enc);
+          }
+          if (positions.empty()) return encode_null(session.resp_version);
+          return encode_integer(positions[0]);
+        }});
+
+    // ─── LPUSHX ──────────────────────────────────────────────────────────
+    t.emplace("LPUSHX", CommandSpec{"LPUSHX", -3, {"write", "denyoom"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          if (store().type_of(args[1]) == "none") return encode_integer(0);
+          std::vector<std::string> vals(args.begin() + 2, args.end());
+          bool wt = false;
+          auto len = store().lpush(args[1], vals, wt);
+          if (wt) return wrongtype_error_reply();
+          return encode_integer(len);
+        }});
+
+    // ─── RPUSHX ──────────────────────────────────────────────────────────
+    t.emplace("RPUSHX", CommandSpec{"RPUSHX", -3, {"write", "denyoom"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          if (store().type_of(args[1]) == "none") return encode_integer(0);
+          std::vector<std::string> vals(args.begin() + 2, args.end());
+          bool wt = false;
+          auto len = store().rpush(args[1], vals, wt);
+          if (wt) return wrongtype_error_reply();
+          return encode_integer(len);
+        }});
+
+    // ─── LINSERT ─────────────────────────────────────────────────────────
+    t.emplace("LINSERT", CommandSpec{"LINSERT", 5, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          if (store().type_of(args[1]) == "none") return encode_integer(0);
+          const auto dir = upper(args[2]);
+          if (dir != "BEFORE" && dir != "AFTER") return encode_error("syntax error");
+          bool wt = false;
+          auto items = store().lrange(args[1], 0, -1, wt);
+          if (wt) return wrongtype_error_reply();
+          bool found = false;
+          std::vector<std::string> result;
+          for (const auto& item : items) {
+            if (!found && item == args[3]) {
+              found = true;
+              if (dir == "BEFORE") { result.push_back(args[4]); result.push_back(item); }
+              else { result.push_back(item); result.push_back(args[4]); }
+            } else {
+              result.push_back(item);
+            }
+          }
+          if (!found) return encode_integer(-1);
+          store().del(args[1]);
+          store().rpush(args[1], result, wt);
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    // ─── RPOPLPUSH ───────────────────────────────────────────────────────
+    t.emplace("RPOPLPUSH", CommandSpec{"RPOPLPUSH", 3, {"write"}, 1, 2, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          if (store().is_wrongtype_for_list(args[2])) return wrongtype_error_reply();
+          bool wt = false;
+          auto val = store().rpop(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          if (!val) return encode_null(session.resp_version);
+          store().lpush(args[2], {*val}, wt);
+          return encode_bulk(*val);
+        }});
+
+    // ─── LTRIM ───────────────────────────────────────────────────────────
+    t.emplace("LTRIM", CommandSpec{"LTRIM", 4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+          std::int64_t start, stop;
+          if (!parse_i64(args[2], start) || !parse_i64(args[3], stop))
+            return encode_error("value is not an integer or out of range");
+          bool wt = false;
+          auto items = store().lrange(args[1], start, stop, wt);
+          if (wt) return wrongtype_error_reply();
+          store().del(args[1]);
+          if (!items.empty()) store().rpush(args[1], items, wt);
+          return encode_simple("OK");
+        }});
+
+    // ─── LMPOP ───────────────────────────────────────────────────────────
+    t.emplace("LMPOP", CommandSpec{"LMPOP", -4, {"write"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[1], numkeys) || numkeys <= 0)
+            return encode_error("numkeys can't be non-positive value");
+          if (static_cast<std::size_t>(numkeys + 2) >= args.size())
+            return encode_error("syntax error");
+          std::size_t dir_idx = static_cast<std::size_t>(numkeys) + 2;
+          if (dir_idx >= args.size()) return encode_error("syntax error");
+          const auto dir = upper(args[dir_idx]);
+          if (dir != "LEFT" && dir != "RIGHT") return encode_error("syntax error");
+          std::int64_t count = 1;
+          for (std::size_t i = dir_idx + 1; i < args.size(); i += 2) {
+            if (i + 1 >= args.size()) return encode_error("syntax error");
+            if (upper(args[i]) == "COUNT") {
+              if (!parse_i64(args[i + 1], count) || count <= 0) return encode_error("value is not an integer or out of range");
+            } else return encode_error("syntax error");
+          }
+          for (std::int64_t k = 0; k < numkeys; ++k) {
+            const auto& key = args[static_cast<std::size_t>(k + 2)];
+            if (store().is_wrongtype_for_list(key)) return wrongtype_error_reply();
+            bool wt = false;
+            if (store().llen(key, wt) == 0) continue;
+            std::vector<std::string> popped;
+            for (std::int64_t c = 0; c < count; ++c) {
+              auto val = (dir == "LEFT") ? store().lpop(key, wt) : store().rpop(key, wt);
+              if (!val) break;
+              popped.push_back(*val);
+            }
+            if (popped.empty()) continue;
+            std::vector<std::string> enc;
+            for (const auto& v : popped) enc.push_back(encode_bulk(v));
+            return encode_array({encode_bulk(key), encode_array(enc)});
+          }
+          return encode_null_array();
+        }});
+
+    // ─── ZCARD ───────────────────────────────────────────────────────────
+    t.emplace("ZCARD", CommandSpec{"ZCARD", 2, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, false, wt);
+          if (wt) return wrongtype_error_reply();
+          return encode_integer(static_cast<long long>(items.size()));
+        }});
+
+    // ─── ZSCORE ──────────────────────────────────────────────────────────
+    t.emplace("ZSCORE", CommandSpec{"ZSCORE", 3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          for (const auto& [member, score] : items) {
+            if (member == args[2]) {
+              std::ostringstream oss;
+              oss << score;
+              return encode_bulk(oss.str());
+            }
+          }
+          return encode_null(session.resp_version);
+        }});
+
+    // ─── ZMSCORE ─────────────────────────────────────────────────────────
+    t.emplace("ZMSCORE", CommandSpec{"ZMSCORE", -3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_map<std::string, double> score_map;
+          for (const auto& [m, s] : items) score_map[m] = s;
+          std::vector<std::string> results;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            auto it = score_map.find(args[i]);
+            if (it != score_map.end()) {
+              std::ostringstream oss;
+              oss << it->second;
+              results.push_back(encode_bulk(oss.str()));
+            } else {
+              results.push_back(encode_null(session.resp_version));
+            }
+          }
+          return encode_array(results);
+        }});
+
+    // ─── ZCOUNT ──────────────────────────────────────────────────────────
+    t.emplace("ZCOUNT", CommandSpec{"ZCOUNT", 4, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
+            exclusive = false;
+            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
+            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
+            std::string v = s;
+            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
+            try { val = std::stod(v); return true; } catch (...) { return false; }
+          };
+          double min_val, max_val;
+          bool min_ex, max_ex;
+          if (!parse_bound(args[2], min_val, min_ex) || !parse_bound(args[3], max_val, max_ex))
+            return encode_error("min or max is not a float");
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          long long count = 0;
+          for (const auto& [m, s] : items) {
+            bool above_min = min_ex ? (s > min_val) : (s >= min_val);
+            bool below_max = max_ex ? (s < max_val) : (s <= max_val);
+            if (above_min && below_max) ++count;
+          }
+          return encode_integer(count);
+        }});
+
+    // ─── ZRANK ───────────────────────────────────────────────────────────
+    t.emplace("ZRANK", CommandSpec{"ZRANK", -3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          // Sort by score ascending (zrange should already be sorted)
+          for (std::size_t i = 0; i < items.size(); ++i) {
+            if (items[i].first == args[2]) {
+              bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
+              if (withscore) {
+                std::ostringstream oss;
+                oss << items[i].second;
+                return encode_array({encode_integer(static_cast<long long>(i)), encode_bulk(oss.str())});
+              }
+              return encode_integer(static_cast<long long>(i));
+            }
+          }
+          return encode_null(session.resp_version);
+        }});
+
+    // ─── ZREVRANK ────────────────────────────────────────────────────────
+    t.emplace("ZREVRANK", CommandSpec{"ZREVRANK", -3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          for (std::size_t i = 0; i < items.size(); ++i) {
+            if (items[i].first == args[2]) {
+              bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
+              long long rev_rank = static_cast<long long>(items.size() - 1 - i);
+              if (withscore) {
+                std::ostringstream oss;
+                oss << items[i].second;
+                return encode_array({encode_integer(rev_rank), encode_bulk(oss.str())});
+              }
+              return encode_integer(rev_rank);
+            }
+          }
+          return encode_null(session.resp_version);
+        }});
+
+    // ─── ZREM ────────────────────────────────────────────────────────────
+    t.emplace("ZREM", CommandSpec{"ZREM", -3, {"write", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> to_remove(args.begin() + 2, args.end());
+          long long removed = 0;
+          // Delete and re-add remaining
+          std::vector<std::pair<std::string, double>> remaining;
+          for (const auto& [m, s] : items) {
+            if (to_remove.count(m)) ++removed;
+            else remaining.push_back({m, s});
+          }
+          if (removed > 0) {
+            store().del(args[1]);
+            for (const auto& [m, s] : remaining) {
+              store().zadd_one(args[1], s, m, false, false, false, false, false);
+            }
+          }
+          return encode_integer(removed);
+        }});
+
+    // ─── ZINCRBY ─────────────────────────────────────────────────────────
+    t.emplace("ZINCRBY", CommandSpec{"ZINCRBY", 4, {"write", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          double incr;
+          try { incr = std::stod(args[2]); } catch (...) { return encode_error("value is not a valid float"); }
+          auto result = store().zadd_one(args[1], incr, args[3], false, false, false, false, true);
+          if (result.wrongtype) return wrongtype_error_reply();
+          std::ostringstream oss;
+          oss << result.score;
+          return encode_bulk(oss.str());
+        }});
+
+    // ─── ZRANGEBYSCORE ───────────────────────────────────────────────────
+    t.emplace("ZRANGEBYSCORE", CommandSpec{"ZRANGEBYSCORE", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
+            exclusive = false;
+            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
+            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
+            std::string v = s;
+            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
+            try { val = std::stod(v); return true; } catch (...) { return false; }
+          };
+          double min_val, max_val;
+          bool min_ex, max_ex;
+          if (!parse_bound(args[2], min_val, min_ex) || !parse_bound(args[3], max_val, max_ex))
+            return encode_error("min or max is not a float");
+          bool withscores = false;
+          std::int64_t offset = 0, limit_count = -1;
+          for (std::size_t i = 4; i < args.size(); ++i) {
+            if (upper(args[i]) == "WITHSCORES") withscores = true;
+            else if (upper(args[i]) == "LIMIT" && i + 2 < args.size()) {
+              if (!parse_i64(args[i + 1], offset) || !parse_i64(args[i + 2], limit_count))
+                return encode_error("value is not an integer or out of range");
+              i += 2;
+            }
+          }
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          std::vector<std::pair<std::string, double>> matched;
+          for (const auto& [m, s] : items) {
+            bool above = min_ex ? (s > min_val) : (s >= min_val);
+            bool below = max_ex ? (s < max_val) : (s <= max_val);
+            if (above && below) matched.push_back({m, s});
+          }
+          // Apply LIMIT
+          if (offset > 0) {
+            if (static_cast<std::size_t>(offset) >= matched.size()) matched.clear();
+            else matched.erase(matched.begin(), matched.begin() + offset);
+          }
+          if (limit_count >= 0 && static_cast<std::size_t>(limit_count) < matched.size()) {
+            matched.resize(static_cast<std::size_t>(limit_count));
+          }
+          std::vector<std::string> enc;
+          for (const auto& [m, s] : matched) {
+            enc.push_back(encode_bulk(m));
+            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── ZREVRANGEBYSCORE ────────────────────────────────────────────────
+    t.emplace("ZREVRANGEBYSCORE", CommandSpec{"ZREVRANGEBYSCORE", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
+            exclusive = false;
+            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
+            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
+            std::string v = s;
+            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
+            try { val = std::stod(v); return true; } catch (...) { return false; }
+          };
+          // Note: for ZREVRANGEBYSCORE, args[2] is max, args[3] is min (reversed)
+          double max_val, min_val;
+          bool max_ex, min_ex;
+          if (!parse_bound(args[2], max_val, max_ex) || !parse_bound(args[3], min_val, min_ex))
+            return encode_error("min or max is not a float");
+          bool withscores = false;
+          std::int64_t offset = 0, limit_count = -1;
+          for (std::size_t i = 4; i < args.size(); ++i) {
+            if (upper(args[i]) == "WITHSCORES") withscores = true;
+            else if (upper(args[i]) == "LIMIT" && i + 2 < args.size()) {
+              if (!parse_i64(args[i + 1], offset) || !parse_i64(args[i + 2], limit_count))
+                return encode_error("value is not an integer or out of range");
+              i += 2;
+            }
+          }
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          std::vector<std::pair<std::string, double>> matched;
+          for (auto it = items.rbegin(); it != items.rend(); ++it) {
+            bool above = min_ex ? (it->second > min_val) : (it->second >= min_val);
+            bool below = max_ex ? (it->second < max_val) : (it->second <= max_val);
+            if (above && below) matched.push_back(*it);
+          }
+          if (offset > 0) {
+            if (static_cast<std::size_t>(offset) >= matched.size()) matched.clear();
+            else matched.erase(matched.begin(), matched.begin() + offset);
+          }
+          if (limit_count >= 0 && static_cast<std::size_t>(limit_count) < matched.size()) {
+            matched.resize(static_cast<std::size_t>(limit_count));
+          }
+          std::vector<std::string> enc;
+          for (const auto& [m, s] : matched) {
+            enc.push_back(encode_bulk(m));
+            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── ZREVRANGE ───────────────────────────────────────────────────────
+    t.emplace("ZREVRANGE", CommandSpec{"ZREVRANGE", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          std::int64_t start, stop;
+          if (!parse_i64(args[2], start) || !parse_i64(args[3], stop))
+            return encode_error("value is not an integer or out of range");
+          bool withscores = (args.size() >= 5 && upper(args[4]) == "WITHSCORES");
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          // Reverse the items
+          std::reverse(items.begin(), items.end());
+          std::int64_t len = static_cast<std::int64_t>(items.size());
+          if (start < 0) start += len;
+          if (stop < 0) stop += len;
+          if (start < 0) start = 0;
+          if (stop >= len) stop = len - 1;
+          std::vector<std::string> enc;
+          if (start <= stop) {
+            for (std::int64_t i = start; i <= stop; ++i) {
+              enc.push_back(encode_bulk(items[static_cast<std::size_t>(i)].first));
+              if (withscores) { std::ostringstream oss; oss << items[static_cast<std::size_t>(i)].second; enc.push_back(encode_bulk(oss.str())); }
+            }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── ZLEXCOUNT ───────────────────────────────────────────────────────
+    t.emplace("ZLEXCOUNT", CommandSpec{"ZLEXCOUNT", 4, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          auto parse_lex = [](const std::string& s, std::string& val, bool& exclusive, bool& is_unbounded) -> bool {
+            is_unbounded = false;
+            exclusive = false;
+            if (s == "-") { is_unbounded = true; val = ""; return true; }
+            if (s == "+") { is_unbounded = true; val = "\xff"; return true; }
+            if (s.size() < 2) return false;
+            if (s[0] == '[') { exclusive = false; val = s.substr(1); return true; }
+            if (s[0] == '(') { exclusive = true; val = s.substr(1); return true; }
+            return false;
+          };
+          std::string min_val, max_val;
+          bool min_ex, max_ex, min_unb, max_unb;
+          if (!parse_lex(args[2], min_val, min_ex, min_unb) || !parse_lex(args[3], max_val, max_ex, max_unb))
+            return encode_error("min or max not valid string range item");
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, false, wt);
+          if (wt) return wrongtype_error_reply();
+          // Sort lexicographically (items from zrange are sorted by score then by member)
+          std::vector<std::string> members;
+          for (const auto& [m, _] : items) members.push_back(m);
+          long long count = 0;
+          for (const auto& m : members) {
+            bool above = min_unb ? true : (min_ex ? (m > min_val) : (m >= min_val));
+            bool below = max_unb ? true : (max_ex ? (m < max_val) : (m <= max_val));
+            if (above && below) ++count;
+          }
+          return encode_integer(count);
+        }});
+
+    // ─── ZRANDMEMBER ─────────────────────────────────────────────────────
+    t.emplace("ZRANDMEMBER", CommandSpec{"ZRANDMEMBER", -2, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          if (items.empty()) {
+            if (args.size() >= 3) return encode_array({});
+            return encode_null(session.resp_version);
+          }
+          if (args.size() == 2) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(items.size()));
+            return encode_bulk(items[idx].first);
+          }
+          std::int64_t count;
+          if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
+          bool withscores = (args.size() >= 4 && upper(args[3]) == "WITHSCORES");
+          bool allow_dups = (count < 0);
+          std::int64_t abs_count = std::abs(count);
+          std::vector<std::string> enc;
+          for (std::int64_t i = 0; i < abs_count; ++i) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(items.size()));
+            enc.push_back(encode_bulk(items[idx].first));
+            if (withscores) { std::ostringstream oss; oss << items[idx].second; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE ─────────────────────────
+    t.emplace("ZUNIONSTORE", CommandSpec{"ZUNIONSTORE", -4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
+          // Collect all scores from all keys
+          std::unordered_map<std::string, double> result;
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(3 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) {
+              auto it = result.find(m);
+              if (it != result.end()) it->second += s; // default AGGREGATE SUM
+              else result[m] = s;
+            }
+          }
+          store().del(args[1]);
+          for (const auto& [m, s] : result) {
+            store().zadd_one(args[1], s, m, false, false, false, false, false);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    t.emplace("ZINTERSTORE", CommandSpec{"ZINTERSTORE", -4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
+          // Start with first key's members
+          std::unordered_map<std::string, double> result;
+          {
+            const auto& key = args[3];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) result[m] = s;
+          }
+          for (std::int64_t i = 1; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(3 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            std::unordered_set<std::string> members_in_key;
+            for (const auto& [m, s] : items) {
+              members_in_key.insert(m);
+              if (result.count(m)) result[m] += s;
+            }
+            // Remove members not in this key
+            for (auto it = result.begin(); it != result.end();) {
+              if (!members_in_key.count(it->first)) it = result.erase(it);
+              else ++it;
+            }
+          }
+          store().del(args[1]);
+          for (const auto& [m, s] : result) {
+            store().zadd_one(args[1], s, m, false, false, false, false, false);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    t.emplace("ZDIFFSTORE", CommandSpec{"ZDIFFSTORE", -4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
+          std::unordered_map<std::string, double> result;
+          {
+            const auto& key = args[3];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) result[m] = s;
+          }
+          for (std::int64_t i = 1; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(3 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, _] : items) result.erase(m);
+          }
+          store().del(args[1]);
+          for (const auto& [m, s] : result) {
+            store().zadd_one(args[1], s, m, false, false, false, false, false);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    // ─── ZUNION / ZINTER / ZDIFF (read-only) ────────────────────────────
+    t.emplace("ZUNION", CommandSpec{"ZUNION", -3, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
+          bool withscores = false;
+          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
+            if (upper(args[i]) == "WITHSCORES") withscores = true;
+          }
+          std::unordered_map<std::string, double> result;
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(2 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) {
+              auto it = result.find(m);
+              if (it != result.end()) it->second += s;
+              else result[m] = s;
+            }
+          }
+          // Sort by score, then by member
+          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
+          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.second < b.second || (a.second == b.second && a.first < b.first);
+          });
+          std::vector<std::string> enc;
+          for (const auto& [m, s] : sorted) {
+            enc.push_back(encode_bulk(m));
+            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    t.emplace("ZINTER", CommandSpec{"ZINTER", -3, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
+          bool withscores = false;
+          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
+            if (upper(args[i]) == "WITHSCORES") withscores = true;
+          }
+          std::unordered_map<std::string, double> result;
+          {
+            const auto& key = args[2];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) result[m] = s;
+          }
+          for (std::int64_t i = 1; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(2 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            std::unordered_set<std::string> members_in_key;
+            for (const auto& [m, s] : items) {
+              members_in_key.insert(m);
+              if (result.count(m)) result[m] += s;
+            }
+            for (auto it = result.begin(); it != result.end();) {
+              if (!members_in_key.count(it->first)) it = result.erase(it);
+              else ++it;
+            }
+          }
+          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
+          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.second < b.second || (a.second == b.second && a.first < b.first);
+          });
+          std::vector<std::string> enc;
+          for (const auto& [m, s] : sorted) {
+            enc.push_back(encode_bulk(m));
+            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    t.emplace("ZDIFF", CommandSpec{"ZDIFF", -3, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
+          bool withscores = false;
+          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
+            if (upper(args[i]) == "WITHSCORES") withscores = true;
+          }
+          std::unordered_map<std::string, double> result;
+          {
+            const auto& key = args[2];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) result[m] = s;
+          }
+          for (std::int64_t i = 1; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(2 + i)];
+            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+            bool wt = false;
+            auto items = store().zrange(key, 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, _] : items) result.erase(m);
+          }
+          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
+          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
+            return a.second < b.second || (a.second == b.second && a.first < b.first);
+          });
+          std::vector<std::string> enc;
+          for (const auto& [m, s] : sorted) {
+            enc.push_back(encode_bulk(m));
+            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── SRANDMEMBER ─────────────────────────────────────────────────────
+    t.emplace("SRANDMEMBER", CommandSpec{"SRANDMEMBER", -2, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_set(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto members = store().smembers(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          if (members.empty()) {
+            if (args.size() >= 3) return encode_array({});
+            return encode_null(session.resp_version);
+          }
+          if (args.size() == 2) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(members.size()));
+            return encode_bulk(members[idx]);
+          }
+          std::int64_t count;
+          if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
+          bool allow_dups = (count < 0);
+          std::int64_t abs_count = std::abs(count);
+          std::vector<std::string> enc;
+          for (std::int64_t i = 0; i < abs_count; ++i) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(members.size()));
+            enc.push_back(encode_bulk(members[idx]));
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── SINTER ──────────────────────────────────────────────────────────
+    t.emplace("SINTER", CommandSpec{"SINTER", -2, {"readonly"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool wt = false;
+          auto result_set = store().smembers(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> current(result_set.begin(), result_set.end());
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            std::unordered_set<std::string> mset(members.begin(), members.end());
+            for (auto it = current.begin(); it != current.end();) {
+              if (!mset.count(*it)) it = current.erase(it);
+              else ++it;
+            }
+          }
+          std::vector<std::string> enc;
+          for (const auto& m : current) enc.push_back(encode_bulk(m));
+          return encode_array(enc);
+        }});
+
+    // ─── SINTERCARD ──────────────────────────────────────────────────────
+    t.emplace("SINTERCARD", CommandSpec{"SINTERCARD", -3, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys;
+          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("numkeys can't be non-positive value");
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
+          std::int64_t limit = 0;
+          std::size_t opt_start = static_cast<std::size_t>(2 + numkeys);
+          for (std::size_t i = opt_start; i < args.size(); i += 2) {
+            if (upper(args[i]) == "LIMIT" && i + 1 < args.size()) {
+              if (!parse_i64(args[i + 1], limit) || limit < 0) return encode_error("value is not an integer or out of range");
+            } else return encode_error("syntax error");
+          }
+          bool wt = false;
+          auto first_members = store().smembers(args[2], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> current(first_members.begin(), first_members.end());
+          for (std::int64_t i = 1; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(2 + i)];
+            if (store().is_wrongtype_for_set(key)) return wrongtype_error_reply();
+            auto members = store().smembers(key, wt);
+            if (wt) return wrongtype_error_reply();
+            std::unordered_set<std::string> mset(members.begin(), members.end());
+            for (auto it = current.begin(); it != current.end();) {
+              if (!mset.count(*it)) it = current.erase(it);
+              else ++it;
+            }
+          }
+          long long result = static_cast<long long>(current.size());
+          if (limit > 0 && result > limit) result = limit;
+          return encode_integer(result);
+        }});
+
+    // ─── SUNION ──────────────────────────────────────────────────────────
+    t.emplace("SUNION", CommandSpec{"SUNION", -2, {"readonly"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::unordered_set<std::string> result;
+          bool wt = false;
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& m : members) result.insert(m);
+          }
+          std::vector<std::string> enc;
+          for (const auto& m : result) enc.push_back(encode_bulk(m));
+          return encode_array(enc);
+        }});
+
+    // ─── SDIFF ───────────────────────────────────────────────────────────
+    t.emplace("SDIFF", CommandSpec{"SDIFF", -2, {"readonly"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool wt = false;
+          auto first_members = store().smembers(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> result(first_members.begin(), first_members.end());
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& m : members) result.erase(m);
+          }
+          std::vector<std::string> enc;
+          for (const auto& m : result) enc.push_back(encode_bulk(m));
+          return encode_array(enc);
+        }});
+
+    // ─── SINTERSTORE / SUNIONSTORE / SDIFFSTORE ─────────────────────────
+    t.emplace("SINTERSTORE", CommandSpec{"SINTERSTORE", -3, {"write"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool wt = false;
+          auto first = store().smembers(args[2], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> result(first.begin(), first.end());
+          for (std::size_t i = 3; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            std::unordered_set<std::string> mset(members.begin(), members.end());
+            for (auto it = result.begin(); it != result.end();) {
+              if (!mset.count(*it)) it = result.erase(it);
+              else ++it;
+            }
+          }
+          store().del(args[1]);
+          if (!result.empty()) {
+            std::vector<std::string> vals(result.begin(), result.end());
+            store().sadd(args[1], vals, wt);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    t.emplace("SUNIONSTORE", CommandSpec{"SUNIONSTORE", -3, {"write"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::unordered_set<std::string> result;
+          bool wt = false;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& m : members) result.insert(m);
+          }
+          store().del(args[1]);
+          if (!result.empty()) {
+            std::vector<std::string> vals(result.begin(), result.end());
+            store().sadd(args[1], vals, wt);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    t.emplace("SDIFFSTORE", CommandSpec{"SDIFFSTORE", -3, {"write"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool wt = false;
+          auto first = store().smembers(args[2], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> result(first.begin(), first.end());
+          for (std::size_t i = 3; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_set(args[i])) return wrongtype_error_reply();
+            auto members = store().smembers(args[i], wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& m : members) result.erase(m);
+          }
+          store().del(args[1]);
+          if (!result.empty()) {
+            std::vector<std::string> vals(result.begin(), result.end());
+            store().sadd(args[1], vals, wt);
+          }
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    // ─── SMISMEMBER ──────────────────────────────────────────────────────
+    t.emplace("SMISMEMBER", CommandSpec{"SMISMEMBER", -3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_set(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto members = store().smembers(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          std::unordered_set<std::string> mset(members.begin(), members.end());
+          std::vector<std::string> enc;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            enc.push_back(encode_integer(mset.count(args[i]) ? 1 : 0));
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── HRANDFIELD ──────────────────────────────────────────────────────
+    t.emplace("HRANDFIELD", CommandSpec{"HRANDFIELD", -2, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_hash(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto all = store().hgetall(args[1], wt);
+          if (wt) return wrongtype_error_reply();
+          if (all.empty()) {
+            if (args.size() >= 3) return encode_array({});
+            return encode_null(session.resp_version);
+          }
+          if (args.size() == 2) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(all.size()));
+            return encode_bulk(all[idx].first);
+          }
+          std::int64_t count;
+          if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
+          bool withvalues = (args.size() >= 4 && upper(args[3]) == "WITHVALUES");
+          std::int64_t abs_count = std::abs(count);
+          std::vector<std::string> enc;
+          for (std::int64_t i = 0; i < abs_count; ++i) {
+            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(all.size()));
+            enc.push_back(encode_bulk(all[idx].first));
+            if (withvalues) enc.push_back(encode_bulk(all[idx].second));
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── BITCOUNT ────────────────────────────────────────────────────────
+    t.emplace("BITCOUNT", CommandSpec{"BITCOUNT", -2, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
+          auto val = store().get(args[1]);
+          if (!val) return encode_integer(0);
+          const std::string& s = *val;
+          std::int64_t start = 0, end = static_cast<std::int64_t>(s.size()) - 1;
+          bool bit_mode = false;
+          if (args.size() >= 4) {
+            if (!parse_i64(args[2], start) || !parse_i64(args[3], end))
+              return encode_error("value is not an integer or out of range");
+            if (args.size() >= 5) {
+              auto unit = upper(args[4]);
+              if (unit == "BIT") bit_mode = true;
+              else if (unit != "BYTE") return encode_error("syntax error");
+            }
+          }
+          if (bit_mode) {
+            // Bit-level range
+            std::int64_t total_bits = static_cast<std::int64_t>(s.size()) * 8;
+            if (start < 0) start += total_bits;
+            if (end < 0) end += total_bits;
+            if (start < 0) start = 0;
+            if (end >= total_bits) end = total_bits - 1;
+            if (start > end) return encode_integer(0);
+            long long count = 0;
+            for (std::int64_t i = start; i <= end; ++i) {
+              std::size_t byte_idx = static_cast<std::size_t>(i / 8);
+              int bit_idx = 7 - static_cast<int>(i % 8);
+              if (byte_idx < s.size() && ((static_cast<unsigned char>(s[byte_idx]) >> bit_idx) & 1)) ++count;
+            }
+            return encode_integer(count);
+          }
+          // Byte-level range
+          std::int64_t len = static_cast<std::int64_t>(s.size());
+          if (start < 0) start += len;
+          if (end < 0) end += len;
+          if (start < 0) start = 0;
+          if (end >= len) end = len - 1;
+          if (start > end) return encode_integer(0);
+          long long count = 0;
+          for (std::int64_t i = start; i <= end; ++i) {
+            unsigned char byte = static_cast<unsigned char>(s[static_cast<std::size_t>(i)]);
+            count += __builtin_popcount(byte);
+          }
+          return encode_integer(count);
+        }});
+
+    // ─── BITPOS ──────────────────────────────────────────────────────────
+    t.emplace("BITPOS", CommandSpec{"BITPOS", -3, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
+          std::int64_t bit;
+          if (!parse_i64(args[2], bit) || (bit != 0 && bit != 1))
+            return encode_error("bit is not an integer or out of range");
+          auto val = store().get(args[1]);
+          std::string s = val ? *val : "";
+          if (s.empty()) {
+            if (bit == 0) return encode_integer(0);
+            return encode_integer(-1);
+          }
+          std::int64_t start = 0, end = static_cast<std::int64_t>(s.size()) - 1;
+          bool has_end = false;
+          bool bit_mode = false;
+          if (args.size() >= 4) { if (!parse_i64(args[3], start)) return encode_error("value is not an integer or out of range"); }
+          if (args.size() >= 5) { if (!parse_i64(args[4], end)) return encode_error("value is not an integer or out of range"); has_end = true; }
+          if (args.size() >= 6) {
+            auto unit = upper(args[5]);
+            if (unit == "BIT") bit_mode = true;
+            else if (unit != "BYTE") return encode_error("syntax error");
+          }
+          std::int64_t len = static_cast<std::int64_t>(s.size());
+          if (!bit_mode) {
+            if (start < 0) start += len;
+            if (end < 0) end += len;
+            if (start < 0) start = 0;
+            if (end >= len) end = len - 1;
+            if (start > end) return encode_integer(-1);
+            for (std::int64_t byte_i = start; byte_i <= end; ++byte_i) {
+              unsigned char byte = static_cast<unsigned char>(s[static_cast<std::size_t>(byte_i)]);
+              for (int bi = 7; bi >= 0; --bi) {
+                if (((byte >> bi) & 1) == static_cast<unsigned>(bit)) {
+                  return encode_integer(byte_i * 8 + (7 - bi));
+                }
+              }
+            }
+            if (bit == 0 && !has_end) return encode_integer(static_cast<long long>(s.size()) * 8);
+            return encode_integer(-1);
+          }
+          // Bit mode
+          std::int64_t total_bits = len * 8;
+          if (start < 0) start += total_bits;
+          if (end < 0) end += total_bits;
+          if (start < 0) start = 0;
+          if (end >= total_bits) end = total_bits - 1;
+          if (start > end) return encode_integer(-1);
+          for (std::int64_t i = start; i <= end; ++i) {
+            std::size_t byte_idx = static_cast<std::size_t>(i / 8);
+            int bit_idx = 7 - static_cast<int>(i % 8);
+            int b = (static_cast<unsigned char>(s[byte_idx]) >> bit_idx) & 1;
+            if (b == static_cast<int>(bit)) return encode_integer(i);
+          }
+          return encode_integer(-1);
+        }});
+
+    // ─── BITOP ───────────────────────────────────────────────────────────
+    t.emplace("BITOP", CommandSpec{"BITOP", -4, {"write"}, 2, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const auto op = upper(args[1]);
+          if (op != "AND" && op != "OR" && op != "XOR" && op != "NOT")
+            return encode_error("BITOP requires AND, OR, XOR or NOT operation");
+          if (op == "NOT" && args.size() != 4)
+            return encode_error("BITOP NOT requires one and only one key");
+          // Gather source strings
+          std::vector<std::string> sources;
+          for (std::size_t i = 3; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_string(args[i])) return wrongtype_error_reply();
+            auto val = store().get(args[i]);
+            sources.push_back(val ? *val : "");
+          }
+          // Determine max length
+          std::size_t maxlen = 0;
+          for (const auto& s : sources) maxlen = std::max(maxlen, s.size());
+          std::string result(maxlen, '\0');
+          for (std::size_t i = 0; i < maxlen; ++i) {
+            unsigned char byte = (i < sources[0].size()) ? static_cast<unsigned char>(sources[0][i]) : 0;
+            if (op == "NOT") {
+              result[i] = static_cast<char>(~byte);
+            } else {
+              for (std::size_t j = 1; j < sources.size(); ++j) {
+                unsigned char b = (i < sources[j].size()) ? static_cast<unsigned char>(sources[j][i]) : 0;
+                if (op == "AND") byte &= b;
+                else if (op == "OR") byte |= b;
+                else if (op == "XOR") byte ^= b;
+              }
+              result[i] = static_cast<char>(byte);
+            }
+          }
+          store().set(args[2], result, false, false, std::nullopt, false);
+          return encode_integer(static_cast<long long>(result.size()));
+        }});
+
+    // ─── BITFIELD ────────────────────────────────────────────────────────
+    t.emplace("BITFIELD", CommandSpec{"BITFIELD", -2, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // Simplified BITFIELD: supports GET, SET, INCRBY with unsigned/signed integer types
+          if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
+          auto val = store().get(args[1]);
+          std::string s = val ? *val : "";
+          auto get_bit = [&](std::size_t bit_pos) -> int {
+            std::size_t byte_idx = bit_pos / 8;
+            int bit_idx = 7 - static_cast<int>(bit_pos % 8);
+            if (byte_idx >= s.size()) return 0;
+            return (static_cast<unsigned char>(s[byte_idx]) >> bit_idx) & 1;
+          };
+          auto set_bit_fn = [&](std::size_t bit_pos, int val_bit) {
+            std::size_t byte_idx = bit_pos / 8;
+            int bit_idx = 7 - static_cast<int>(bit_pos % 8);
+            while (s.size() <= byte_idx) s.push_back('\0');
+            if (val_bit) s[byte_idx] = static_cast<char>(static_cast<unsigned char>(s[byte_idx]) | (1 << bit_idx));
+            else s[byte_idx] = static_cast<char>(static_cast<unsigned char>(s[byte_idx]) & ~(1 << bit_idx));
+          };
+          auto parse_type = [](const std::string& t, bool& is_signed, int& bits) -> bool {
+            if (t.empty()) return false;
+            is_signed = (t[0] == 'i');
+            if (t[0] != 'i' && t[0] != 'u') return false;
+            try { bits = std::stoi(t.substr(1)); return bits > 0 && bits <= 64; }
+            catch (...) { return false; }
+          };
+          auto parse_offset = [](const std::string& s, int bits, std::size_t& off) -> bool {
+            if (s.empty()) return false;
+            if (s[0] == '#') {
+              try { off = static_cast<std::size_t>(std::stoull(s.substr(1))) * static_cast<std::size_t>(bits); return true; }
+              catch (...) { return false; }
+            }
+            try { off = static_cast<std::size_t>(std::stoull(s)); return true; }
+            catch (...) { return false; }
+          };
+          auto read_field = [&](std::size_t offset, int bits, bool is_signed) -> std::int64_t {
+            std::uint64_t v = 0;
+            for (int i = 0; i < bits; ++i) {
+              v = (v << 1) | static_cast<std::uint64_t>(get_bit(offset + static_cast<std::size_t>(i)));
+            }
+            if (is_signed && bits < 64 && (v & (1ULL << (bits - 1)))) {
+              v |= ~((1ULL << bits) - 1);
+            }
+            return static_cast<std::int64_t>(v);
+          };
+          auto write_field = [&](std::size_t offset, int bits, std::int64_t value) {
+            std::uint64_t v = static_cast<std::uint64_t>(value);
+            for (int i = bits - 1; i >= 0; --i) {
+              set_bit_fn(offset + static_cast<std::size_t>(bits - 1 - i), static_cast<int>((v >> i) & 1));
+            }
+          };
+          bool modified = false;
+          std::vector<std::string> results;
+          std::size_t i = 2;
+          while (i < args.size()) {
+            auto subcmd = upper(args[i]);
+            if (subcmd == "OVERFLOW") { ++i; if (i < args.size()) ++i; continue; } // skip overflow mode
+            if (subcmd == "GET") {
+              if (i + 2 >= args.size()) return encode_error("syntax error");
+              bool is_signed; int bits;
+              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
+              std::size_t off;
+              if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
+              results.push_back(encode_integer(read_field(off, bits, is_signed)));
+              i += 3;
+            } else if (subcmd == "SET") {
+              if (i + 3 >= args.size()) return encode_error("syntax error");
+              bool is_signed; int bits;
+              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
+              std::size_t off;
+              if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
+              std::int64_t new_val;
+              if (!parse_i64(args[i + 3], new_val)) return encode_error("value is not an integer or out of range");
+              results.push_back(encode_integer(read_field(off, bits, is_signed)));
+              write_field(off, bits, new_val);
+              modified = true;
+              i += 4;
+            } else if (subcmd == "INCRBY") {
+              if (i + 3 >= args.size()) return encode_error("syntax error");
+              bool is_signed; int bits;
+              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
+              std::size_t off;
+              if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
+              std::int64_t incr;
+              if (!parse_i64(args[i + 3], incr)) return encode_error("value is not an integer or out of range");
+              std::int64_t old_val = read_field(off, bits, is_signed);
+              std::int64_t new_val = old_val + incr;
+              write_field(off, bits, new_val);
+              results.push_back(encode_integer(read_field(off, bits, is_signed)));
+              modified = true;
+              i += 4;
+            } else {
+              return encode_error("syntax error");
+            }
+          }
+          if (modified) {
+            store().set(args[1], s, false, false, std::nullopt, true);
+          }
+          return encode_array(results);
+        }});
+
+    // ─── GEODIST ─────────────────────────────────────────────────────────
+    t.emplace("GEODIST", CommandSpec{"GEODIST", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          // Geo data is stored as zset with geohash as score
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          auto decode_geohash = [](double score, double& lon, double& lat) {
+            lon = std::floor(score / 1000000.0);
+            lat = score - lon * 1000000.0;
+          };
+          double lon1 = 0, lat1 = 0, lon2 = 0, lat2 = 0;
+          bool found1 = false, found2 = false;
+          for (const auto& [m, s] : items) {
+            if (m == args[2]) { decode_geohash(s, lon1, lat1); found1 = true; }
+            if (m == args[3]) { decode_geohash(s, lon2, lat2); found2 = true; }
+          }
+          if (!found1 || !found2) return encode_null(session.resp_version);
+          // Haversine distance
+          constexpr double kEarthRadius = 6372797.560856;
+          constexpr double kPi = 3.14159265358979323846;
+          double lat1r = lat1 * kPi / 180.0, lat2r = lat2 * kPi / 180.0;
+          double dlat = (lat2 - lat1) * kPi / 180.0;
+          double dlon = (lon2 - lon1) * kPi / 180.0;
+          double a = std::sin(dlat / 2) * std::sin(dlat / 2) + std::cos(lat1r) * std::cos(lat2r) * std::sin(dlon / 2) * std::sin(dlon / 2);
+          double c = 2 * std::atan2(std::sqrt(a), std::sqrt(1 - a));
+          double dist = kEarthRadius * c;
+          // Unit conversion
+          std::string unit = "m";
+          if (args.size() >= 5) unit = lower(args[4]);
+          if (unit == "km") dist /= 1000.0;
+          else if (unit == "mi") dist /= 1609.34;
+          else if (unit == "ft") dist /= 0.3048;
+          std::ostringstream oss;
+          oss << std::fixed << std::setprecision(4) << dist;
+          return encode_bulk(oss.str());
+        }});
+
+    // ─── GEOPOS ──────────────────────────────────────────────────────────
+    t.emplace("GEOPOS", CommandSpec{"GEOPOS", -3, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          auto decode_geohash = [](double score, double& lon, double& lat) {
+            lon = std::floor(score / 1000000.0);
+            lat = score - lon * 1000000.0;
+          };
+          std::unordered_map<std::string, std::pair<double, double>> coords;
+          for (const auto& [m, s] : items) {
+            double lon, lat;
+            decode_geohash(s, lon, lat);
+            coords[m] = {lon, lat};
+          }
+          std::vector<std::string> enc;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            auto it = coords.find(args[i]);
+            if (it == coords.end()) {
+              enc.push_back(encode_null_array());
+            } else {
+              std::ostringstream oss_lon, oss_lat;
+              oss_lon << std::fixed << std::setprecision(6) << it->second.first;
+              oss_lat << std::fixed << std::setprecision(6) << it->second.second;
+              enc.push_back(encode_array({encode_bulk(oss_lon.str()), encode_bulk(oss_lat.str())}));
+            }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── GEOHASH ─────────────────────────────────────────────────────────
+    t.emplace("GEOHASH", CommandSpec{"GEOHASH", -3, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          bool wt = false;
+          auto items = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          auto decode_geohash = [](double score, double& lon, double& lat) {
+            lon = std::floor(score / 1000000.0);
+            lat = score - lon * 1000000.0;
+          };
+          constexpr const char* kBase32 = "0123456789bcdefghjkmnpqrstuvwxyz";
+          auto encode_geohash_str = [&](double lon, double lat) -> std::string {
+            double lon_min = -180, lon_max = 180;
+            double lat_min = -90, lat_max = 90;
+            bool is_lon = true;
+            std::uint64_t bits = 0;
+            int num_bits = 0;
+            std::string hash;
+            while (hash.size() < 11) {
+              if (is_lon) {
+                double mid = (lon_min + lon_max) / 2;
+                if (lon >= mid) { bits = (bits << 1) | 1; lon_min = mid; }
+                else { bits <<= 1; lon_max = mid; }
+              } else {
+                double mid = (lat_min + lat_max) / 2;
+                if (lat >= mid) { bits = (bits << 1) | 1; lat_min = mid; }
+                else { bits <<= 1; lat_max = mid; }
+              }
+              is_lon = !is_lon;
+              ++num_bits;
+              if (num_bits == 5) {
+                hash += kBase32[bits & 0x1f];
+                bits = 0;
+                num_bits = 0;
+              }
+            }
+            return hash;
+          };
+          std::unordered_map<std::string, double> score_map;
+          for (const auto& [m, s] : items) score_map[m] = s;
+          std::vector<std::string> enc;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            auto it = score_map.find(args[i]);
+            if (it == score_map.end()) {
+              enc.push_back(encode_null(session.resp_version));
+            } else {
+              double lon, lat;
+              decode_geohash(it->second, lon, lat);
+              enc.push_back(encode_bulk(encode_geohash_str(lon, lat)));
+            }
+          }
+          return encode_array(enc);
+        }});
+
+    // ─── GEORADIUS (deprecated but widely used) ──────────────────────────
+    t.emplace("GEORADIUS", CommandSpec{"GEORADIUS", -6, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // Simplified: return empty array for now (no actual geo computation)
+          // Full implementation would need geohash search
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          return encode_array({});
+        }});
+
+    t.emplace("GEORADIUSBYMEMBER", CommandSpec{"GEORADIUSBYMEMBER", -5, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          return encode_array({});
+        }});
+
+    // ─── GEOSEARCH ───────────────────────────────────────────────────────
+    t.emplace("GEOSEARCH", CommandSpec{"GEOSEARCH", -7, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+          // Simplified stub — full implementation requires geohash range scan
+          return encode_array({});
+        }});
+
+    t.emplace("GEOSEARCHSTORE", CommandSpec{"GEOSEARCHSTORE", -8, {"write"}, 1, 2, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_zset(args[2])) return wrongtype_error_reply();
+          return encode_integer(0);
+        }});
+
+    // ─── XTRIM ───────────────────────────────────────────────────────────
+    t.emplace("XTRIM", CommandSpec{"XTRIM", -4, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_stream(args[1])) return wrongtype_error_reply();
+          // Simplified: for MAXLEN, trim the stream
+          bool wt = false;
+          auto entries = store().xrange(args[1], "-", "+", false, wt);
+          if (wt) return wrongtype_error_reply();
+          const auto strategy = upper(args[2]);
+          if (strategy == "MAXLEN") {
+            std::size_t start = 3;
+            if (start < args.size() && args[start] == "~") ++start; // approximate trimming prefix
+            if (start >= args.size()) return encode_error("syntax error");
+            std::int64_t maxlen;
+            if (!parse_i64(args[start], maxlen)) return encode_error("value is not an integer or out of range");
+            if (maxlen < 0) return encode_error("The MAXLEN argument must be >= 0.");
+            long long trimmed = 0;
+            if (static_cast<std::int64_t>(entries.size()) > maxlen) {
+              std::size_t to_remove = entries.size() - static_cast<std::size_t>(maxlen);
+              std::vector<std::string> ids;
+              for (std::size_t i = 0; i < to_remove; ++i) ids.push_back(entries[i].first);
+              trimmed = store().xdel(args[1], ids, wt);
+            }
+            return encode_integer(trimmed);
+          }
+          if (strategy == "MINID") {
+            std::size_t start = 3;
+            if (start < args.size() && args[start] == "~") ++start;
+            if (start >= args.size()) return encode_error("syntax error");
+            const auto& min_id = args[start];
+            long long trimmed = 0;
+            std::vector<std::string> ids;
+            for (const auto& [id, _] : entries) {
+              if (id < min_id) ids.push_back(id);
+            }
+            if (!ids.empty()) trimmed = store().xdel(args[1], ids, wt);
+            return encode_integer(trimmed);
+          }
+          return encode_error("syntax error");
+        }});
+
+    // ─── XAUTOCLAIM ──────────────────────────────────────────────────────
+    t.emplace("XAUTOCLAIM", CommandSpec{"XAUTOCLAIM", -6, {"write"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          if (store().is_wrongtype_for_stream(args[1])) return wrongtype_error_reply();
+          // Stub: return empty results (next-cursor, claimed-entries, deleted-ids)
+          return encode_array({encode_bulk("0-0"), encode_array({}), encode_array({})});
         }});
 
     // Pre-compute flag bitmasks for fast checking

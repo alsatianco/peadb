@@ -8,6 +8,7 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
+#include "lua_compat.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -99,10 +100,13 @@ static void json_encode_value(lua_State *L, luaL_Buffer *b, int idx, int depth) 
                     luaL_addstring(b, n > 0 ? "1e+9999" : "-1e+9999");
             } else {
                 char buf[64];
-                if (n == (long long)n && fabs(n) < 1e15) {
-                    snprintf(buf, sizeof(buf), "%lld", (long long)n);
-                } else {
-                    snprintf(buf, sizeof(buf), "%.14g", n);
+                snprintf(buf, sizeof(buf), "%.14g", n);
+                /* Redis cjson compat: integer-valued doubles must have a .0
+                   suffix (e.g. "0.0" not "0") so JSON round-trips preserve
+                   the numeric type. */
+                if (!strchr(buf, '.') && !strchr(buf, 'e') && !strchr(buf, 'E')
+                    && !strchr(buf, 'n') /* nan */ && !strchr(buf, 'i') /* inf */) {
+                    strcat(buf, ".0");
                 }
                 luaL_addstring(b, buf);
             }

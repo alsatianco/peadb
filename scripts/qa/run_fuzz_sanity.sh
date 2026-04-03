@@ -101,12 +101,16 @@ LUA_STUB_SOURCES="src/lua_cjson_stub.c src/lua_cmsgpack_stub.c src/lua_bit_stub.
 LUA_STUB_OBJS=""
 for src in $LUA_STUB_SOURCES; do
   obj="/tmp/$(basename "$src" .c).o"
-  gcc -c -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer $LUA_CFLAGS "$src" -o "$obj"
+  gcc -c -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude $LUA_CFLAGS "$src" -o "$obj"
   LUA_STUB_OBJS="$LUA_STUB_OBJS $obj"
 done
 
+PLATFORM_LDFLAGS="-lm -pthread"
+if [ "$(uname)" = "Linux" ]; then
+  PLATFORM_LDFLAGS="$PLATFORM_LDFLAGS -ldl -rdynamic"
+fi
 $CXX $COMMON_FLAGS tests/fuzz/command_dispatcher_stress.cpp \
-    $CORE_SOURCES $LUA_STUB_OBJS $LUA_LIBS -lm -ldl -pthread -rdynamic \
+    $CORE_SOURCES $LUA_STUB_OBJS $LUA_LIBS $PLATFORM_LDFLAGS \
   -o /tmp/command_dispatcher_stress
 
 echo "=== Running resp_parser_stress ($ROUNDS rounds) ==="

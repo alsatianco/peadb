@@ -46,6 +46,12 @@ struct SessionState {
   bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
   BlockedState blocked;
+  // CLIENT command support
+  std::uint64_t client_id = 0;
+  std::string client_name;
+  std::string lib_name;
+  std::string lib_ver;
+  int fd = -1;  // file descriptor for this connection
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
@@ -79,5 +85,23 @@ extern std::atomic<std::int64_t> g_server_start_time;
 extern std::atomic<int> g_connected_replicas;
 // Callback: given a target offset, returns how many replicas have acked >= offset
 extern std::function<int(std::int64_t)> g_count_synced_replicas;
+
+// ── Client registry (set from server.cpp, read by CLIENT LIST/INFO) ──
+extern std::atomic<std::uint64_t> g_next_client_id;
+// Callback: returns formatted CLIENT LIST output for all connections
+extern std::function<std::string()> g_client_list_callback;
+
+// ── Pub/Sub infrastructure ──
+// Callback: enqueue a message string to a specific client fd's write buffer.
+// Returns true if the client fd is still connected.
+extern std::function<bool(int fd, const std::string& data)> g_pubsub_send;
+// Register/unregister a client fd for a channel or pattern.
+void pubsub_subscribe(int fd, const std::string& channel);
+void pubsub_unsubscribe(int fd, const std::string& channel);
+void pubsub_psubscribe(int fd, const std::string& pattern);
+void pubsub_punsubscribe(int fd, const std::string& pattern);
+void pubsub_unsubscribe_all(int fd);
+// Publish a message; returns number of receivers.
+std::int64_t pubsub_publish(const std::string& channel, const std::string& message);
 
 } // namespace peadb

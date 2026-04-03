@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import pathlib
+import platform
 import socket
 import subprocess
 import tempfile
@@ -74,7 +75,8 @@ def main():
             """,
             encoding="utf-8",
         )
-        subprocess.check_call(["g++", "-shared", "-fPIC", "-O2", str(mod_cpp), "-o", str(mod_so)])
+        extra = ["-undefined", "dynamic_lookup"] if platform.system() == "Darwin" else []
+        subprocess.check_call(["g++", "-shared", "-fPIC", "-O2"] + extra + [str(mod_cpp), "-o", str(mod_so)])
 
         p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6435", "--bind", "127.0.0.1", "--loglevel", "error"])
         try:
