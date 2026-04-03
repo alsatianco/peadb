@@ -11,8 +11,14 @@
 #include <filesystem>
 #include <csignal>
 
+static void signal_handler(int) {
+  peadb::request_shutdown();
+}
+
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
+  std::signal(SIGTERM, signal_handler);
+  std::signal(SIGINT, signal_handler);
 
   peadb::ServerConfig config;
   std::string config_path;
