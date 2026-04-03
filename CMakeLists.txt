@@ -10,6 +10,13 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# On macOS with non-bundled Lua (5.2+), -O3 triggers miscompilation in Lua C
+# API interactions.  Cap at -O2 until PeaDB bundles its own Lua 5.1.
+if(APPLE AND CMAKE_BUILD_TYPE STREQUAL "Release")
+  set(CMAKE_C_FLAGS_RELEASE   "-O2 -DNDEBUG" CACHE STRING "" FORCE)
+  set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
+endif()
+
 find_package(Lua 5.1)
 if(NOT LUA_LIBRARIES OR NOT LUA_INCLUDE_DIR)
   message(FATAL_ERROR
@@ -40,8 +47,12 @@ target_include_directories(peadb_core PUBLIC include ${LUA_INCLUDE_DIR})
 target_link_libraries(peadb_core PUBLIC ${LUA_LIBRARIES} m)
 
 add_executable(peadb-server src/main.cpp)
-target_link_libraries(peadb-server PRIVATE peadb_core dl)
-target_link_options(peadb-server PRIVATE -rdynamic)
+if(APPLE)
+  target_link_libraries(peadb-server PRIVATE peadb_core)
+else()
+  target_link_libraries(peadb-server PRIVATE peadb_core dl)
+  target_link_options(peadb-server PRIVATE -rdynamic)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

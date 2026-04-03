@@ -129,7 +129,10 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-command -v redis-cli >/dev/null 2>&1 || fail "redis-cli not found"
+if ! command -v redis-cli >/dev/null 2>&1; then
+  echo "SKIP: redis-cli not found (install with: brew install redis)"
+  exit 0
+fi
 [[ -x "$PEADB_BIN" ]] || fail "peadb-server binary not found at $PEADB_BIN"
 
 echo "=== Starting primary on port $PRIMARY_PORT ==="

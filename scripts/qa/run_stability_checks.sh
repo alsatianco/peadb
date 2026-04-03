@@ -113,7 +113,13 @@ cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build-asan" \
 cmake --build "$ROOT_DIR/build-asan" -j"$NPROC" 2>&1 | tail -3
 
 echo "=== Starting ASAN server on port $PORT ==="
-ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+# detect_leaks is not supported on macOS — disable it there.
+if [[ "$(uname)" == "Darwin" ]]; then
+  ASAN_OPTS="detect_leaks=0:halt_on_error=1"
+else
+  ASAN_OPTS="detect_leaks=1:halt_on_error=1"
+fi
+ASAN_OPTIONS="$ASAN_OPTS" \
   "$ROOT_DIR/build-asan/peadb-server" --port "$PORT" --bind 127.0.0.1 --loglevel error >/tmp/peadb-asan.log 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID:-0} >/dev/null 2>&1 || true; wait ${SERVER_PID:-0} 2>/dev/null || true' EXIT

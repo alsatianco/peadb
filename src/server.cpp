@@ -11,10 +11,15 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <sys/epoll.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+#ifdef __linux__
+#include <sys/epoll.h>
+#else
+#include <sys/event.h>   // kqueue on macOS/BSD
+#endif
 
 #include <string>
 #include <string_view>
@@ -32,10 +37,112 @@ bool set_nonblocking(int fd) {
   return fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
+void set_cloexec(int fd) {
+  const int flags = fcntl(fd, F_GETFD, 0);
+  if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
 bool set_tcp_nodelay(int fd) {
   int yes = 1;
   return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == 0;
 }
+
+int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
+#ifdef __linux__
+  return accept4(listen_fd, addr, addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
+#else
+  int fd = ::accept(listen_fd, addr, addrlen);
+  if (fd >= 0) { set_nonblocking(fd); set_cloexec(fd); }
+  return fd;
+#endif
+}
+
+struct PollEvent { int fd; bool readable; bool writable; bool error; };
+
+struct Poller {
+  int pfd = -1;
+  bool create() {
+#ifdef __linux__
+    pfd = epoll_create1(0);
+#else
+    pfd = kqueue();
+#endif
+    return pfd >= 0;
+  }
+  void destroy() { if (pfd >= 0) { ::close(pfd); pfd = -1; } }
+  bool add_read(int fd) {
+#ifdef __linux__
+    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = fd;
+    return epoll_ctl(pfd, EPOLL_CTL_ADD, fd, &ev) == 0;
+#else
+    struct kevent kev; EV_SET(&kev, fd, EVFILT_READ, EV_ADD|EV_ENABLE, 0, 0, nullptr);
+    return kevent(pfd, &kev, 1, nullptr, 0, nullptr) == 0;
+#endif
+  }
+  bool set_readwrite(int fd) {
+#ifdef __linux__
+    epoll_event ev{}; ev.events = EPOLLIN|EPOLLOUT; ev.data.fd = fd;
+    return epoll_ctl(pfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+#else
+    struct kevent kev[2];
+    EV_SET(&kev[0], fd, EVFILT_READ, EV_ADD|EV_ENABLE, 0, 0, nullptr);
+    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_ADD|EV_ENABLE, 0, 0, nullptr);
+    return kevent(pfd, kev, 2, nullptr, 0, nullptr) == 0;
+#endif
+  }
+  bool set_read_only(int fd) {
+#ifdef __linux__
+    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = fd;
+    return epoll_ctl(pfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+#else
+    struct kevent kev; EV_SET(&kev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    kevent(pfd, &kev, 1, nullptr, 0, nullptr);
+    return true;
+#endif
+  }
+  void remove(int fd) {
+#ifdef __linux__
+    epoll_ctl(pfd, EPOLL_CTL_DEL, fd, nullptr);
+#else
+    struct kevent kev[2];
+    EV_SET(&kev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+    kevent(pfd, kev, 2, nullptr, 0, nullptr);
+#endif
+  }
+  int wait(std::vector<PollEvent>& out, int timeout_ms) {
+#ifdef __linux__
+    thread_local std::vector<epoll_event> raw(1024);
+    int n = epoll_wait(pfd, raw.data(), static_cast<int>(raw.size()), timeout_ms);
+    if (n < 0) return n;
+    out.resize(static_cast<std::size_t>(n));
+    for (int i = 0; i < n; ++i) {
+      out[i] = {raw[i].data.fd, bool(raw[i].events & EPOLLIN),
+                bool(raw[i].events & EPOLLOUT), bool(raw[i].events & (EPOLLERR|EPOLLHUP))};
+    }
+    return n;
+#else
+    thread_local std::vector<struct kevent> raw(1024);
+    struct timespec ts{timeout_ms/1000, (timeout_ms%1000)*1000000L};
+    struct timespec* tsp = (timeout_ms >= 0) ? &ts : nullptr;
+    int n = kevent(pfd, nullptr, 0, raw.data(), static_cast<int>(raw.size()), tsp);
+    if (n < 0) return n;
+    std::unordered_map<int, std::size_t> idx_map;
+    out.clear();
+    for (int i = 0; i < n; ++i) {
+      int fd = static_cast<int>(raw[i].ident);
+      auto it = idx_map.find(fd);
+      std::size_t idx;
+      if (it == idx_map.end()) { idx = out.size(); idx_map[fd] = idx; out.push_back({fd,false,false,false}); }
+      else idx = it->second;
+      if (raw[i].filter == EVFILT_READ)  out[idx].readable = true;
+      if (raw[i].filter == EVFILT_WRITE) out[idx].writable = true;
+      if (raw[i].flags & (EV_EOF|EV_ERROR)) out[idx].error = true;
+    }
+    return static_cast<int>(out.size());
+#endif
+  }
+};
 
 // Offset-tracked write buffer to avoid O(n) erase on partial writes
 struct WriteBuf {
@@ -176,24 +283,16 @@ int run_server(const ServerConfig& config) {
   // Set of cluster bus client fds (gossip connections)
   std::unordered_map<int, std::string> cbus_buffers;
 
-  const int epoll_fd = epoll_create1(0);
-  if (epoll_fd < 0) {
-    log(LogLevel::Error, "epoll_create1() failed: " + std::string(std::strerror(errno)));
+  Poller poller;
+  if (!poller.create()) {
+    log(LogLevel::Error, "poller create failed: " + std::string(std::strerror(errno)));
     close(listen_fd);
     if (cbus_fd >= 0) close(cbus_fd);
     return 1;
   }
-  {
-    epoll_event ev{};
-    ev.events = EPOLLIN;
-    ev.data.fd = listen_fd;
-    epoll_ctl(epoll_fd, EPOLL_CTL_ADD, listen_fd, &ev);
-    if (cbus_fd >= 0) {
-      ev.data.fd = cbus_fd;
-      epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cbus_fd, &ev);
-    }
-  }
-  std::vector<epoll_event> ep_events(1024);
+  poller.add_read(listen_fd);
+  if (cbus_fd >= 0) poller.add_read(cbus_fd);
+  std::vector<PollEvent> ep_events;
   std::unordered_map<int, std::string> buffers;
   std::unordered_map<int, WriteBuf> write_buffers;
   std::unordered_map<int, SessionState> sessions;
@@ -208,6 +307,33 @@ int run_server(const ServerConfig& config) {
       if (sess.replica_stream && sess.repl_ack_offset >= target_offset) ++count;
     }
     return count;
+  };
+
+  // Wire up the CLIENT LIST callback
+  g_client_list_callback = [&]() -> std::string {
+    std::string out;
+    for (auto& [fd, sess] : sessions) {
+      out += "id=" + std::to_string(sess.client_id);
+      out += " fd=" + std::to_string(fd);
+      out += " name=" + sess.client_name;
+      out += " lib-name=" + sess.lib_name;
+      out += " lib-ver=" + sess.lib_ver;
+      out += " db=" + std::to_string(sess.db_index);
+      out += " sub=0 psub=0 ssub=0";
+      out += " multi=" + std::string(sess.in_multi ? std::to_string(static_cast<int>(sess.queued.size())) : "-1");
+      out += " watch=" + std::to_string(sess.watched_digests.size());
+      out += " qbuf=0 qbuf-free=32768 argv-mem=0 multi-mem=0 tot-mem=20512";
+      out += " net-i=0 net-o=0 age=0 idle=0";
+      std::string flags;
+      if (sess.replica_stream) flags += "S";
+      if (sess.blocked.type != BlockType::None) flags += "b";
+      if (flags.empty()) flags = "N";
+      out += " flags=" + flags;
+      out += " cmd=unknown user=default redir=-1";
+      out += " resp=" + std::to_string(static_cast<int>(sess.resp_version));
+      out += "\n";
+    }
+    return out;
   };
 
   // Helper: enqueue output data for a client and attempt immediate non-blocking flush.
@@ -232,12 +358,9 @@ int run_server(const ServerConfig& config) {
     } else if (wbuf.offset > 65536) {
       wbuf.compact();
     }
-    // Register EPOLLOUT interest if data remains in the write buffer.
+    // Register write interest if data remains in the write buffer.
     if (!wbuf.empty() && was_empty) {
-      epoll_event ev{};
-      ev.events = EPOLLIN | EPOLLOUT;
-      ev.data.fd = fd;
-      epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+      poller.set_readwrite(fd);
     }
     return true;
   };
@@ -263,19 +386,23 @@ int run_server(const ServerConfig& config) {
     } else if (wbuf.offset > 65536) {
       wbuf.compact();
     }
-    // Remove EPOLLOUT interest once the write buffer is fully drained.
+    // Remove write interest once the write buffer is fully drained.
     if (wbuf.empty()) {
-      epoll_event ev{};
-      ev.events = EPOLLIN;
-      ev.data.fd = fd;
-      epoll_ctl(epoll_fd, EPOLL_CTL_MOD, fd, &ev);
+      poller.set_read_only(fd);
     }
     return true;
   };
 
+  // Wire up the pub/sub send callback (must be after enqueue_output is defined)
+  g_pubsub_send = [&](int fd, const std::string& data) -> bool {
+    if (!sessions.count(fd)) return false;
+    return enqueue_output(fd, data);
+  };
+
   // Helper: close a client connection and clean up all associated state.
   auto close_client = [&](int fd) {
-    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+    pubsub_unsubscribe_all(fd);
+    poller.remove(fd);
     ::close(fd);
     buffers.erase(fd);
     write_buffers.erase(fd);
@@ -300,7 +427,7 @@ int run_server(const ServerConfig& config) {
       ::close(reserved_fd);
       reserved_fd = -1;
     }
-    const int dropped_fd = ::accept4(listener_fd, nullptr, nullptr, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    const int dropped_fd = accept_nonblock(listener_fd, nullptr, nullptr);
     if (dropped_fd >= 0) {
       ::close(dropped_fd);
     }
@@ -311,11 +438,10 @@ int run_server(const ServerConfig& config) {
   };
 
   while (!shutdown_requested()) {
-    const int nready = epoll_wait(epoll_fd, ep_events.data(),
-                                  static_cast<int>(ep_events.size()), 100);
+    const int nready = poller.wait(ep_events, 100);
     if (nready < 0) {
       if (errno == EINTR) continue;
-      log(LogLevel::Error, "epoll_wait() failed: " + std::string(std::strerror(errno)));
+      log(LogLevel::Error, "poller wait failed: " + std::string(std::strerror(errno)));
       break;
     }
 
@@ -342,8 +468,7 @@ int run_server(const ServerConfig& config) {
     }
 
     for (int i = 0; i < nready; ++i) {
-      const int fd = ep_events[i].data.fd;
-      const uint32_t revents = ep_events[i].events;
+      const int fd = ep_events[i].fd;
 
       // Skip fds already closed (e.g. by blocked-client cleanup above).
       if (fd != listen_fd && fd != cbus_fd &&
@@ -352,9 +477,9 @@ int run_server(const ServerConfig& config) {
       }
 
       // ── Handle errors / hangups ──
-      if ((revents & (EPOLLERR | EPOLLHUP)) && fd != listen_fd && fd != cbus_fd) {
+      if (ep_events[i].error && fd != listen_fd && fd != cbus_fd) {
         if (cbus_buffers.count(fd)) {
-          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+          poller.remove(fd);
           ::close(fd);
           cbus_buffers.erase(fd);
         } else {
@@ -363,24 +488,23 @@ int run_server(const ServerConfig& config) {
         continue;
       }
 
-      // ── Flush pending output on EPOLLOUT ──
-      if ((revents & EPOLLOUT) && fd != listen_fd && fd != cbus_fd) {
+      // ── Flush pending output on writable ──
+      if (ep_events[i].writable && fd != listen_fd && fd != cbus_fd) {
         if (!flush_output(fd)) {
           close_client(fd);
           continue;
         }
       }
 
-      if (!(revents & EPOLLIN)) continue;
+      if (!ep_events[i].readable) continue;
 
       if (fd == listen_fd) {
         // Accept all pending connections (non-blocking accept loop)
         while (true) {
           sockaddr_in client_addr {};
           socklen_t len = sizeof(client_addr);
-          const int client_fd = accept4(listen_fd,
-                                        reinterpret_cast<sockaddr*>(&client_addr), &len,
-                                        SOCK_NONBLOCK | SOCK_CLOEXEC);
+          const int client_fd = accept_nonblock(listen_fd,
+                                        reinterpret_cast<sockaddr*>(&client_addr), &len);
           if (client_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -388,7 +512,7 @@ int run_server(const ServerConfig& config) {
               handle_accept_fd_exhaustion(listen_fd, "client listener");
               break;
             }
-            log(LogLevel::Warn, "accept4() failed: " + std::string(std::strerror(errno)));
+            log(LogLevel::Warn, "accept() failed: " + std::string(std::strerror(errno)));
             break;
           }
 
@@ -402,11 +526,8 @@ int run_server(const ServerConfig& config) {
 
           set_tcp_nodelay(client_fd);
 
-          epoll_event cev{};
-          cev.events = EPOLLIN;
-          cev.data.fd = client_fd;
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &cev) != 0) {
-            log(LogLevel::Warn, "epoll_ctl(ADD) failed for client fd=" + std::to_string(client_fd) +
+          if (!poller.add_read(client_fd)) {
+            log(LogLevel::Warn, "poller add failed for client fd=" + std::to_string(client_fd) +
                                   ": " + std::string(std::strerror(errno)));
             ::close(client_fd);
             continue;
@@ -414,7 +535,12 @@ int run_server(const ServerConfig& config) {
 
           buffers.emplace(client_fd, "");
           write_buffers.emplace(client_fd, WriteBuf{});
-          sessions.emplace(client_fd, SessionState{});
+          {
+            auto& sess = sessions[client_fd];
+            sess = SessionState{};
+            sess.client_id = g_next_client_id.fetch_add(1);
+            sess.fd = client_fd;
+          }
           g_connected_clients.fetch_add(1);
           g_total_connections_received.fetch_add(1);
           log(LogLevel::Debug, "accepted client fd=" + std::to_string(client_fd));
@@ -427,9 +553,8 @@ int run_server(const ServerConfig& config) {
         while (true) {
           sockaddr_in cbus_client_addr {};
           socklen_t clen = sizeof(cbus_client_addr);
-          const int cbus_client_fd = accept4(cbus_fd,
-                                             reinterpret_cast<sockaddr*>(&cbus_client_addr), &clen,
-                                             SOCK_NONBLOCK | SOCK_CLOEXEC);
+          const int cbus_client_fd = accept_nonblock(cbus_fd,
+                                             reinterpret_cast<sockaddr*>(&cbus_client_addr), &clen);
           if (cbus_client_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -437,14 +562,11 @@ int run_server(const ServerConfig& config) {
               handle_accept_fd_exhaustion(cbus_fd, "cluster bus listener");
               break;
             }
-            log(LogLevel::Warn, "cluster bus accept4() failed: " + std::string(std::strerror(errno)));
+            log(LogLevel::Warn, "cluster bus accept() failed: " + std::string(std::strerror(errno)));
             break;
           }
 
-          epoll_event cev{};
-          cev.events = EPOLLIN;
-          cev.data.fd = cbus_client_fd;
-          if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, cbus_client_fd, &cev) != 0) {
+          if (!poller.add_read(cbus_client_fd)) {
             ::close(cbus_client_fd);
             continue;
           }
@@ -461,7 +583,7 @@ int run_server(const ServerConfig& config) {
         const ssize_t cn = read(fd, cbuf, sizeof(cbuf));
         if (cn <= 0) {
           if (cn < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)) continue;
-          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, fd, nullptr);
+          poller.remove(fd);
           ::close(fd);
           cbus_buffers.erase(fd);
         } else {
@@ -555,7 +677,7 @@ int run_server(const ServerConfig& config) {
   close(listen_fd);
   if (cbus_fd >= 0) close(cbus_fd);
   if (reserved_fd >= 0) close(reserved_fd);
-  close(epoll_fd);
+  poller.destroy();
   return 0;
 }
 
