@@ -137,7 +137,10 @@ struct Poller {
       else idx = it->second;
       if (raw[i].filter == EVFILT_READ)  out[idx].readable = true;
       if (raw[i].filter == EVFILT_WRITE) out[idx].writable = true;
-      if (raw[i].flags & (EV_EOF|EV_ERROR)) out[idx].error = true;
+      if (raw[i].flags & EV_ERROR) out[idx].error = true;
+      // EV_EOF on read means peer closed — mark readable so the read()
+      // returns 0 and the normal close path handles it gracefully.
+      if ((raw[i].flags & EV_EOF) && raw[i].filter == EVFILT_READ) out[idx].readable = true;
     }
     return static_cast<int>(out.size());
 #endif

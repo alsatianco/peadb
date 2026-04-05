@@ -74,7 +74,7 @@ fi
 
 # Kill any stale peadb-server processes from previous runs to avoid port conflicts.
 pkill -9 -f "peadb-server" 2>/dev/null || true
-sleep 1
+sleep 2
 
 passed=0
 failed=0

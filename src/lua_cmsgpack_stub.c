@@ -401,13 +401,15 @@ static int cmsgpack_unpack_limit(lua_State *L) {
         pos = (int)lua_tointeger(L, 3);
         if (pos < 0) pos = 0;
     }
+    int actual = 0;
     for (int i = 0; i < count && pos < (int)len; i++) {
         mp_unpack_value(L, (const uint8_t *)s, (int)len, &pos, 0);
+        actual++;
     }
     int next_offset = (pos >= (int)len) ? -1 : pos;
     lua_pushinteger(L, next_offset);
-    lua_insert(L, -(count + 1)); /* move offset before all values */
-    return count + 1;
+    lua_insert(L, -(actual + 1)); /* move offset before all unpacked values */
+    return actual + 1;
 }
 
 static const luaL_Reg cmsgpack_funcs[] = {
