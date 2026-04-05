@@ -95,7 +95,7 @@ fi
 for t in "${tests[@]}"; do
   # Ensure no stale peadb-server from the previous test still occupies a port.
   pkill -9 -f "peadb-server" 2>/dev/null || true
-  sleep 0.3
+  sleep 1
   name=$(basename "$t" .py)
   if [[ -n "$TIMEOUT_CMD" ]]; then
     if "$TIMEOUT_CMD" "$TIMEOUT_SECS" python3 "$t" > "$out_file" 2>&1; then

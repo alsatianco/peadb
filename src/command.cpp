@@ -388,6 +388,13 @@ std::string encode_simple(const std::string& value) { return "+" + value + "\r\n
 std::string encode_error(const std::string& value) { return "-ERR " + value + "\r\n"; }
 std::string encode_integer(long long value) { return ":" + std::to_string(value) + "\r\n"; }
 std::string encode_bulk(const std::string& value) { return "$" + std::to_string(value.size()) + "\r\n" + value + "\r\n"; }
+
+// Format a double score as Redis does: up to 17 significant digits, no trailing zeros.
+std::string format_score(double d) {
+  char buf[64];
+  snprintf(buf, sizeof(buf), "%.17g", d);
+  return buf;
+}
 std::string encode_null(RespVersion version) { return version == RespVersion::Resp3 ? "_\r\n" : "$-1\r\n"; }
 std::string encode_null_array() { return "*-1\r\n"; }
 
@@ -1779,8 +1786,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (want("SERVER")) {
             out += "# Server\r\n"
                    "redis_version:7.2.5\r\n"
-                   "redis_git_sha1:00000000\r\n"
-                   "redis_git_dirty:0\r\n"
+                   "peadb_git_sha1:00000000\r\n"
+                   "peadb_git_dirty:0\r\n"
                    "redis_build_id:peadb-dev\r\n"
                    "peadb_version:0.1.0\r\n"
                    "redis_mode:standalone\r\n"
@@ -3789,9 +3796,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             auto vals = store().zpop(args[i], 1, false, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             if (!vals.empty()) {
-              std::ostringstream oss;
-              oss << vals[0].second;
-              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(oss.str())});
+              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(format_score(vals[0].second))});
             }
           }
           // In Lua script or EXEC context: return nil immediately (no blocking)
@@ -3822,9 +3827,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             auto vals = store().zpop(args[i], 1, true, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             if (!vals.empty()) {
-              std::ostringstream oss;
-              oss << vals[0].second;
-              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(oss.str())});
+              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(format_score(vals[0].second))});
             }
           }
           // In Lua script or EXEC context: return nil immediately (no blocking)
@@ -3974,9 +3977,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (r.added) ++added;
               if (r.changed) ++changed;
               if (incr) {
-                std::ostringstream oss;
-                oss << r.score;
-                incr_out = oss.str();
+                incr_out = format_score(r.score);
               }
             }
             if (incr) return encode_bulk(incr_out);
@@ -4002,7 +4003,25 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               long double lon = 0;
               long double lat = 0;
               if (!parse_f64(args[i], lon) || !parse_f64(args[i + 1], lat)) return encode_error("value is not a valid float");
-              const double score = static_cast<double>(lon * 1000000.0L + lat);
+              // Encode lon/lat as a 52-bit interleaved geohash (matching Redis).
+              auto geohash_encode = [](double longitude, double latitude) -> double {
+                constexpr int BITS = 26;
+                double lon_min = -180, lon_max = 180;
+                double lat_min = -90, lat_max = 90;
+                std::uint64_t bits = 0;
+                for (int i = 0; i < BITS; ++i) {
+                  double mid;
+                  // Interleave: even bits = longitude, odd bits = latitude
+                  mid = (lon_min + lon_max) / 2;
+                  if (longitude >= mid) { bits = (bits << 1) | 1; lon_min = mid; }
+                  else { bits <<= 1; lon_max = mid; }
+                  mid = (lat_min + lat_max) / 2;
+                  if (latitude >= mid) { bits = (bits << 1) | 1; lat_min = mid; }
+                  else { bits <<= 1; lat_max = mid; }
+                }
+                return static_cast<double>(bits);
+              };
+              const double score = geohash_encode(static_cast<double>(lon), static_cast<double>(lat));
               auto r = store().zadd_one(args[1], score, args[i + 2], nx, xx, false, false, false);
               if (r.wrongtype) return wrongtype_error_reply();
               if (!r.valid) return encode_error("syntax error");
@@ -4030,8 +4049,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             for (const auto& [m, s] : vals) {
               out.push_back(encode_bulk(m));
               if (withscores) {
-                std::ostringstream oss; oss << s;
-                out.push_back(encode_bulk(oss.str()));
+                out.push_back(encode_bulk(format_score(s)));
               }
             }
             return encode_array(out);
@@ -4056,9 +4074,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> inner;
             for (const auto& [m, s] : vals) {
-              std::ostringstream oss; oss << s;
               inner.push_back(encode_bulk(m));
-              inner.push_back(encode_bulk(oss.str()));
+              inner.push_back(encode_bulk(format_score(s)));
             }
             return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
           });
@@ -4076,9 +4093,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> out;
             for (const auto& [m, s] : vals) {
-              std::ostringstream oss; oss << s;
               out.push_back(encode_bulk(m));
-              out.push_back(encode_bulk(oss.str()));
+              out.push_back(encode_bulk(format_score(s)));
             }
             return encode_array(out);
           });
@@ -4096,9 +4112,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> out;
             for (const auto& [m, s] : vals) {
-              std::ostringstream oss; oss << s;
               out.push_back(encode_bulk(m));
-              out.push_back(encode_bulk(oss.str()));
+              out.push_back(encode_bulk(format_score(s)));
             }
             return encode_array(out);
           });
@@ -4130,9 +4145,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (vals.empty()) continue;
             std::vector<std::string> flat;
             for (const auto& [m, s] : vals) {
-              std::ostringstream oss; oss << s;
               flat.push_back(encode_bulk(m));
-              flat.push_back(encode_bulk(oss.str()));
+              flat.push_back(encode_bulk(format_score(s)));
             }
             return encode_array({encode_bulk(key), encode_array(flat)});
           }
@@ -5096,9 +5110,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (wt) return wrongtype_error_reply();
           for (const auto& [member, score] : items) {
             if (member == args[2]) {
-              std::ostringstream oss;
-              oss << score;
-              return encode_bulk(oss.str());
+              return encode_bulk(format_score(score));
             }
           }
           return encode_null(session.resp_version);
@@ -5117,9 +5129,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           for (std::size_t i = 2; i < args.size(); ++i) {
             auto it = score_map.find(args[i]);
             if (it != score_map.end()) {
-              std::ostringstream oss;
-              oss << it->second;
-              results.push_back(encode_bulk(oss.str()));
+              results.push_back(encode_bulk(format_score(it->second)));
             } else {
               results.push_back(encode_null(session.resp_version));
             }
@@ -5167,9 +5177,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (items[i].first == args[2]) {
               bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
               if (withscore) {
-                std::ostringstream oss;
-                oss << items[i].second;
-                return encode_array({encode_integer(static_cast<long long>(i)), encode_bulk(oss.str())});
+                return encode_array({encode_integer(static_cast<long long>(i)), encode_bulk(format_score(items[i].second))});
               }
               return encode_integer(static_cast<long long>(i));
             }
@@ -5189,9 +5197,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
               long long rev_rank = static_cast<long long>(items.size() - 1 - i);
               if (withscore) {
-                std::ostringstream oss;
-                oss << items[i].second;
-                return encode_array({encode_integer(rev_rank), encode_bulk(oss.str())});
+                return encode_array({encode_integer(rev_rank), encode_bulk(format_score(items[i].second))});
               }
               return encode_integer(rev_rank);
             }
@@ -5231,9 +5237,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           try { incr = std::stod(args[2]); } catch (...) { return encode_error("value is not a valid float"); }
           auto result = store().zadd_one(args[1], incr, args[3], false, false, false, false, true);
           if (result.wrongtype) return wrongtype_error_reply();
-          std::ostringstream oss;
-          oss << result.score;
-          return encode_bulk(oss.str());
+          return encode_bulk(format_score(result.score));
         }});
 
     // ─── ZRANGEBYSCORE ───────────────────────────────────────────────────
@@ -5282,7 +5286,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::vector<std::string> enc;
           for (const auto& [m, s] : matched) {
             enc.push_back(encode_bulk(m));
-            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
           }
           return encode_array(enc);
         }});
@@ -5333,7 +5337,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::vector<std::string> enc;
           for (const auto& [m, s] : matched) {
             enc.push_back(encode_bulk(m));
-            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
           }
           return encode_array(enc);
         }});
@@ -5360,7 +5364,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (start <= stop) {
             for (std::int64_t i = start; i <= stop; ++i) {
               enc.push_back(encode_bulk(items[static_cast<std::size_t>(i)].first));
-              if (withscores) { std::ostringstream oss; oss << items[static_cast<std::size_t>(i)].second; enc.push_back(encode_bulk(oss.str())); }
+              if (withscores) { enc.push_back(encode_bulk(format_score(items[static_cast<std::size_t>(i)].second))); }
             }
           }
           return encode_array(enc);
@@ -5423,7 +5427,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           for (std::int64_t i = 0; i < abs_count; ++i) {
             auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(items.size()));
             enc.push_back(encode_bulk(items[idx].first));
-            if (withscores) { std::ostringstream oss; oss << items[idx].second; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(items[idx].second))); }
           }
           return encode_array(enc);
         }});
@@ -5554,7 +5558,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::vector<std::string> enc;
           for (const auto& [m, s] : sorted) {
             enc.push_back(encode_bulk(m));
-            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
           }
           return encode_array(enc);
         }});
@@ -5600,7 +5604,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::vector<std::string> enc;
           for (const auto& [m, s] : sorted) {
             enc.push_back(encode_bulk(m));
-            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
           }
           return encode_array(enc);
         }});
@@ -5638,7 +5642,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::vector<std::string> enc;
           for (const auto& [m, s] : sorted) {
             enc.push_back(encode_bulk(m));
-            if (withscores) { std::ostringstream oss; oss << s; enc.push_back(encode_bulk(oss.str())); }
+            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
           }
           return encode_array(enc);
         }});
@@ -6118,10 +6122,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
-          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            lon = std::floor(score / 1000000.0);
-            lat = score - lon * 1000000.0;
+            auto bits = static_cast<std::uint64_t>(score);
+            double lon_min = -180, lon_max = 180;
+            double lat_min = -90, lat_max = 90;
+            for (int i = 51; i >= 0; --i) {
+              int b = (bits >> i) & 1;
+              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
+                double mid = (lon_min + lon_max) / 2;
+                if (b) lon_min = mid; else lon_max = mid;
+              } else { // latitude bits
+                double mid = (lat_min + lat_max) / 2;
+                if (b) lat_min = mid; else lat_max = mid;
+              }
+            }
+            lon = (lon_min + lon_max) / 2;
+            lat = (lat_min + lat_max) / 2;
           };
           double lon1 = 0, lat1 = 0, lon2 = 0, lat2 = 0;
           bool found1 = false, found2 = false;
@@ -6157,10 +6174,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
-          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            lon = std::floor(score / 1000000.0);
-            lat = score - lon * 1000000.0;
+            auto bits = static_cast<std::uint64_t>(score);
+            double lon_min = -180, lon_max = 180;
+            double lat_min = -90, lat_max = 90;
+            for (int i = 51; i >= 0; --i) {
+              int b = (bits >> i) & 1;
+              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
+                double mid = (lon_min + lon_max) / 2;
+                if (b) lon_min = mid; else lon_max = mid;
+              } else { // latitude bits
+                double mid = (lat_min + lat_max) / 2;
+                if (b) lat_min = mid; else lat_max = mid;
+              }
+            }
+            lon = (lon_min + lon_max) / 2;
+            lat = (lat_min + lat_max) / 2;
           };
           std::unordered_map<std::string, std::pair<double, double>> coords;
           for (const auto& [m, s] : items) {
@@ -6190,10 +6220,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
-          // PeaDB GEOADD stores score = lon * 1e6 + lat
+          // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            lon = std::floor(score / 1000000.0);
-            lat = score - lon * 1000000.0;
+            auto bits = static_cast<std::uint64_t>(score);
+            double lon_min = -180, lon_max = 180;
+            double lat_min = -90, lat_max = 90;
+            for (int i = 51; i >= 0; --i) {
+              int b = (bits >> i) & 1;
+              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
+                double mid = (lon_min + lon_max) / 2;
+                if (b) lon_min = mid; else lon_max = mid;
+              } else { // latitude bits
+                double mid = (lat_min + lat_max) / 2;
+                if (b) lat_min = mid; else lat_max = mid;
+              }
+            }
+            lon = (lon_min + lon_max) / 2;
+            lat = (lat_min + lat_max) / 2;
           };
           constexpr const char* kBase32 = "0123456789bcdefghjkmnpqrstuvwxyz";
           auto encode_geohash_str = [&](double lon, double lat) -> std::string {
