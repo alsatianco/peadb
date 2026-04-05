@@ -4632,9 +4632,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const auto sub = upper(args[1]);
           if (sub == "SETNAME") {
             if (args.size() != 3) return encode_error("wrong number of arguments for 'client|setname' command");
-            // Redis rejects names with spaces
-            for (char c : args[2]) {
-              if (c == ' ') return encode_error("Client names cannot contain spaces, newlines or special characters.");
+            // Redis rejects names with any character <= ASCII 32.
+            for (unsigned char c : args[2]) {
+              if (c <= 32) return encode_error("Client names cannot contain spaces, newlines or special characters.");
             }
             session.client_name = args[2];
             return encode_simple("OK");
@@ -6322,7 +6322,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const auto strategy = upper(args[2]);
           if (strategy == "MAXLEN") {
             std::size_t start = 3;
-            if (start < args.size() && args[start] == "~") ++start; // approximate trimming prefix
+            if (start < args.size() && (args[start] == "~" || args[start] == "=")) ++start;
             if (start >= args.size()) return encode_error("syntax error");
             std::int64_t maxlen;
             if (!parse_i64(args[start], maxlen)) return encode_error("value is not an integer or out of range");
@@ -6338,7 +6338,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (strategy == "MINID") {
             std::size_t start = 3;
-            if (start < args.size() && args[start] == "~") ++start;
+            if (start < args.size() && (args[start] == "~" || args[start] == "=")) ++start;
             if (start >= args.size()) return encode_error("syntax error");
             const auto& min_id = args[start];
             long long trimmed = 0;
@@ -6497,7 +6497,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   if (spec_is_write && g_replication_role == "slave" && !g_executing_exec &&
       !g_loading_replication.load() &&
-      cmd != "REPLICAOF" && cmd != "SLAVEOF") {
+      cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH") {
     ++top_stat.rejected_calls;
     record_error_stat("READONLY");
     if (in_lua_script_context()) g_script_inner_error_seen = true;
