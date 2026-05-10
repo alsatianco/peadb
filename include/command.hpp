@@ -102,6 +102,8 @@ extern std::atomic<std::int64_t> g_server_start_time;
 extern std::atomic<int> g_connected_replicas;
 // Callback: given a target offset, returns how many replicas have acked >= offset
 extern std::function<int(std::int64_t)> g_count_synced_replicas;
+// Callback: returns the number of currently-connected replica sessions (replica_stream=true).
+extern std::function<int()> g_count_connected_replicas;
 
 // ── Client registry (set from server.cpp, read by CLIENT LIST/INFO) ──
 extern std::atomic<std::uint64_t> g_next_client_id;

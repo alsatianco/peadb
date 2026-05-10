@@ -97,6 +97,7 @@ std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
 std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
 bool g_aof_rewrite_buf_capped = false; // Set once when the 256 MiB cap is hit per rewrite
+std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
 // Queue for replication commands produced by the streaming thread and consumed
 // by the event loop. All DataStore mutations stay on the event loop thread.
 std::mutex g_replica_cmd_queue_mu;
@@ -224,6 +225,7 @@ std::atomic<std::int64_t> g_server_start_time{0};
 std::atomic<int> g_connected_replicas{0};
 std::atomic<int> g_runtime_max_clients{10000};
 std::function<int(std::int64_t)> g_count_synced_replicas;
+std::function<int()> g_count_connected_replicas;
 std::atomic<std::uint64_t> g_next_client_id{1};
 std::function<std::string()> g_client_list_callback;
 std::function<bool(int fd, const std::string& data)> g_pubsub_send;
@@ -1941,7 +1943,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "rdb_last_bgsave_status:" + g_last_bgsave_status + "\r\n"
                    "aof_enabled:" + std::to_string(g_appendonly ? 1 : 0) + "\r\n"
                    "aof_rewrite_in_progress:" + std::to_string(g_bgrewrite_in_progress.load() ? 1 : 0) + "\r\n"
-                   "aof_last_bgrewrite_status:ok\r\n"
+                   "aof_last_bgrewrite_status:" + g_aof_last_bgrewrite_status + "\r\n"
                    "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n"
                    "aof_rewrite_buffer_length:" + std::to_string(g_aof_rewrite_buf.size()) + "\r\n\r\n";
           }
@@ -1956,9 +1958,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "evicted_keys:" + std::to_string(store().stat_evicted_keys()) + "\r\n\r\n";
           }
           if (want("REPLICATION")) {
+            const int connected_replicas =
+                g_count_connected_replicas ? g_count_connected_replicas() : 0;
             out += "# Replication\r\n"
                    "role:" + g_replication_role + "\r\n"
-                   "connected_slaves:" + std::to_string(g_connected_replicas.load()) + "\r\n"
+                   "connected_slaves:" + std::to_string(connected_replicas) + "\r\n"
                    "master_failover_state:no-failover\r\n"
                    "master_replid:" + g_master_replid + "\r\n"
                    "master_replid2:0000000000000000000000000000000000000000\r\n"
@@ -6642,7 +6646,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return masterdown_stale_reply();
   }
   if (spec_is_write && g_replication_role == "slave" && !g_executing_exec &&
-      !g_loading_replication.load() && !g_replaying_aof &&
+      !g_replaying_aof &&
       cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH") {
     ++top_stat.rejected_calls;
     record_error_stat("READONLY");
@@ -7026,14 +7030,14 @@ bool replica_do_fullsync(const std::string& host, int port) {
         return false;
     }
     // Parse replid and offset: "+FULLRESYNC <replid> <offset>"
+    std::int64_t fullresync_offset = 0;
     {
         auto sp1 = line.find(' ');
         auto sp2 = line.find(' ', sp1 + 1);
         if (sp1 != std::string::npos && sp2 != std::string::npos) {
             g_master_replid = line.substr(sp1 + 1, sp2 - sp1 - 1);
-            std::int64_t off = 0;
-            parse_i64(line.substr(sp2 + 1), off);
-            g_master_repl_offset = off;
+            parse_i64(line.substr(sp2 + 1), fullresync_offset);
+            g_master_repl_offset = fullresync_offset;
         }
     }
 
@@ -7111,10 +7115,11 @@ bool replica_do_fullsync(const std::string& host, int port) {
     stream_buf.reserve(65536);
     std::vector<char> recv_buf(65536);
 
-    // Local counter tracks bytes received from master for REPLCONF ACK.
-    // g_master_repl_offset is the local write-backlog cursor and must not be
-    // conflated with the replica-side receive position.
-    std::int64_t replica_rx_bytes = 0;
+    // Local counter tracks the replica's absolute master-stream offset for REPLCONF ACK.
+    // Seeded from the master's +FULLRESYNC offset so WAIT (which compares against the
+    // master's absolute offset) counts this replica correctly when the master had a
+    // non-zero offset before REPLICAOF.
+    std::int64_t replica_rx_bytes = fullresync_offset;
 
     // Set recv timeout once before the loop so we can send periodic ACKs.
     {
@@ -7191,7 +7196,20 @@ void reap_background_children() {
       // The child renamed the temp AOF into place. Append any commands that
       // arrived during the rewrite window, then reopen the persistent fd.
       if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_appendonly) {
-        if (!g_aof_rewrite_buf.empty()) {
+        if (g_aof_rewrite_buf_capped) {
+          // The diff buffer hit the 256 MiB cap during rewrite; commands beyond
+          // the cap were dropped and are now missing from the rewritten AOF.
+          // Mark the rewrite as failed and discard the partial buffer so we don't
+          // produce a known-incomplete AOF. The next BGREWRITEAOF will rebuild
+          // from the in-memory dataset.
+          log(LogLevel::Error, "BGREWRITEAOF: marked failed because diff buffer hit 256 MiB cap; "
+              "dropping " + std::to_string(g_aof_rewrite_buf.size()) +
+              " bytes of partial diff. The rewritten AOF on disk is incomplete; "
+              "rerun BGREWRITEAOF after reducing write pressure.");
+          g_aof_rewrite_buf.clear();
+          g_aof_last_bgrewrite_status = "err";
+          open_aof_fd();
+        } else if (!g_aof_rewrite_buf.empty()) {
           const int diff_fd = ::open(g_aof_path.c_str(),
                                      O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
           bool diff_ok = false;
@@ -7210,19 +7228,25 @@ void reap_background_children() {
           }
           if (diff_ok) {
             g_aof_rewrite_buf.clear();
+            g_aof_last_bgrewrite_status = "ok";
           } else {
             log(LogLevel::Error, "BGREWRITEAOF: failed to append rewrite diff (" +
                 std::to_string(g_aof_rewrite_buf.size()) + " bytes); AOF may be incomplete");
+            g_aof_last_bgrewrite_status = "err";
             // Buffer not cleared — next successful BGREWRITEAOF can retry.
           }
+          if (g_aof_rewrite_buf.empty()) open_aof_fd();
+        } else {
+          g_aof_last_bgrewrite_status = "ok";
+          open_aof_fd();
         }
-        if (g_aof_rewrite_buf.empty()) open_aof_fd();
       } else {
         if (!g_aof_rewrite_buf.empty()) {
           log(LogLevel::Warn, "BGREWRITEAOF: child failed; discarding " +
               std::to_string(g_aof_rewrite_buf.size()) + " bytes of buffered diff");
         }
         g_aof_rewrite_buf.clear();
+        g_aof_last_bgrewrite_status = "err";
       }
     }
   }
