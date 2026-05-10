@@ -91,6 +91,7 @@ std::int64_t g_bgsave_start_time = 0;
 std::string g_last_bgsave_status = "ok";
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
+std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
 bool g_active_expire = true;
 std::int64_t g_last_save_time = 0;
 std::string g_replication_role = "master";
@@ -529,6 +530,7 @@ std::size_t encode_command_resp_size(const std::vector<std::string>& args) {
 void append_replication_event(const std::vector<std::string>& args, const SessionState& session,
                               const std::string* reply_ptr = nullptr) {
   if (args.empty()) return;
+  if (g_replaying_aof) return;  // Suppress replication broadcast while replaying from master or AOF
   const auto cmd = upper(args[0]);
   std::vector<std::string> out = args;
   bool emit = true;
@@ -704,6 +706,11 @@ void append_aof(const std::vector<std::string>& args) {
     return;
   }
   if (g_appendfsync == "always") ::fsync(g_aof_fd);
+  // Buffer for BGREWRITEAOF diff: commands written while child is rewriting
+  // are collected here and appended to the new AOF when the child finishes.
+  if (g_bgrewrite_in_progress.load(std::memory_order_relaxed)) {
+    g_aof_rewrite_buf.append(payload);
+  }
 }
 
 bool rewrite_aof_file(std::string& err) {
@@ -6608,7 +6615,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return masterdown_stale_reply();
   }
   if (spec_is_write && g_replication_role == "slave" && !g_executing_exec &&
-      !g_loading_replication.load() &&
+      !g_loading_replication.load() && !g_replaying_aof &&
       cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH") {
     ++top_stat.rejected_calls;
     record_error_stat("READONLY");
@@ -7046,9 +7053,14 @@ bool replica_do_fullsync(const std::string& host, int port) {
     ::unlink(tmp_path.c_str());
     log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
 
+    // Release loading gate so client writes are now rejected by the slave readonly guard.
+    // The streaming loop uses g_replaying_aof to bypass the guard for master commands.
+    g_loading_replication.store(false);
+    g_replica_stale = false;
+
     // Stream subsequent replication commands from master.
     // The master sends a continuous RESP stream of write commands after the RDB.
-    // We parse each RESP array and apply it via handle_command with AOF suppressed.
+    // We parse each RESP array and apply it via handle_command with AOF/backlog suppressed.
     std::string stream_buf;
     stream_buf.reserve(65536);
     std::vector<char> recv_buf(65536);
@@ -7056,20 +7068,26 @@ bool replica_do_fullsync(const std::string& host, int port) {
     SessionState repl_session;
     repl_session.db_index = 0;
 
-    // Send periodic ACKs so the master knows our offset.
+    // Local counter tracks bytes received from master for REPLCONF ACK.
+    // g_master_repl_offset is the local write-backlog cursor and must not be
+    // conflated with the replica-side receive position.
+    std::int64_t replica_rx_bytes = 0;
+
+    // Set recv timeout once before the loop so we can send periodic ACKs.
+    {
+        struct timeval tv{1, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     auto last_ack_ms = now_ms();
     while (true) {
         // Non-blocking check: send REPLCONF ACK every ~1s
         const auto now = now_ms();
         if (now - last_ack_ms >= 1000) {
-            const std::string ack = repl_encode_cmd({"REPLCONF", "ACK", std::to_string(g_master_repl_offset)});
+            const std::string ack = repl_encode_cmd({"REPLCONF", "ACK", std::to_string(replica_rx_bytes)});
             repl_send(fd, ack);
             last_ack_ms = now;
         }
-
-        // Set a short recv timeout so we can send periodic ACKs
-        struct timeval tv{1, 0};
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         const ssize_t n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
         if (n == 0) {
@@ -7084,7 +7102,7 @@ bool replica_do_fullsync(const std::string& host, int port) {
         stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
 
         // Parse and apply all complete RESP commands in the buffer.
-        // g_replaying_aof suppresses AOF appends for replicated commands.
+        // g_replaying_aof suppresses AOF writes and backlog updates (append_replication_event).
         g_replaying_aof = true;
         std::size_t consumed = 0;
         while (true) {
@@ -7093,7 +7111,7 @@ bool replica_do_fullsync(const std::string& host, int port) {
             if (!parsed.has_value()) break;
             handle_command(parsed->args, repl_session, close_flag);
             consumed += parsed->consumed;
-            g_master_repl_offset += static_cast<std::int64_t>(parsed->consumed);
+            replica_rx_bytes += static_cast<std::int64_t>(parsed->consumed);
         }
         g_replaying_aof = false;
 
@@ -7125,10 +7143,22 @@ void reap_background_children() {
     if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
       g_bgrewrite_child_pid.store(0);
       g_bgrewrite_in_progress.store(false);
-      // The child renamed the temp AOF into place. Reopen the parent's fd so
-      // subsequent appends go to the new inode, not the pre-rename one.
+      // The child renamed the temp AOF into place. Append any commands that
+      // arrived during the rewrite window, then reopen the persistent fd.
       if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_appendonly) {
+        if (!g_aof_rewrite_buf.empty()) {
+          const int diff_fd = ::open(g_aof_path.c_str(),
+                                     O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+          if (diff_fd >= 0) {
+            ::write(diff_fd, g_aof_rewrite_buf.data(), g_aof_rewrite_buf.size());
+            ::fsync(diff_fd);
+            ::close(diff_fd);
+          }
+          g_aof_rewrite_buf.clear();
+        }
         open_aof_fd();
+      } else {
+        g_aof_rewrite_buf.clear();
       }
     }
   }

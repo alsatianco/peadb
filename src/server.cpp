@@ -396,6 +396,7 @@ int run_server(const ServerConfig& config) {
     if (wait_count > 0) {
       const auto wloop_now = DataStore::now_ms();
       std::vector<int> to_close;
+      std::vector<int> to_drain;
       for (auto& [wfd, session] : sessions) {
         if (!session.wait_state.has_value()) continue;
         auto& ws = session.wait_state.value();
@@ -407,9 +408,42 @@ int run_server(const ServerConfig& config) {
           --wait_count;
           const std::string reply = ":" + std::to_string(synced) + "\r\n";
           if (!enqueue_output(wfd, reply)) to_close.push_back(wfd);
+          else to_drain.push_back(wfd);
         }
       }
       for (int cfd : to_close) close_client(cfd);
+
+      // Drain pipelined commands that were buffered while WAIT was pending.
+      // Without this, the commands sit in buffers[] until the next epoll read
+      // event, causing a deadlock if the client is waiting for those replies.
+      std::vector<int> drain_close;
+      for (int wfd : to_drain) {
+        if (!sessions.count(wfd)) continue;
+        auto& session = sessions[wfd];
+        auto& input = buffers[wfd];
+        if (input.empty()) continue;
+        std::string batch;
+        bool sc = false;
+        std::size_t consumed = 0;
+        while (true) {
+          const std::string_view rem(input.data() + consumed, input.size() - consumed);
+          auto parsed = parse_one_command(rem);
+          if (!parsed.has_value()) break;
+          g_total_commands_processed.fetch_add(1);
+          batch += handle_command(parsed->args, session, sc);
+          consumed += parsed->consumed;
+          if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
+        }
+        if (consumed > 0) {
+          if (consumed == input.size()) input.clear();
+          else input.erase(0, consumed);
+        }
+        if (!batch.empty() && !enqueue_output(wfd, batch)) drain_close.push_back(wfd);
+        else if (sc) drain_close.push_back(wfd);
+        if (session.blocked.type != BlockType::None) ++blocked_count;
+        if (session.wait_state.has_value()) ++wait_count;
+      }
+      for (int cfd : drain_close) close_client(cfd);
     }
 
     for (int i = 0; i < nready; ++i) {

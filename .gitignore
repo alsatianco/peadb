@@ -1,3 +1,6 @@
+# ─ AI
+.AI-LLM/
+
 # ── Build directories ──────────────────────────────────────────
 build/
 build-*/
