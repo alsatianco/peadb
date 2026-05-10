@@ -49,6 +49,9 @@ _deps/
 # ── Artifacts & data ─────────────────────────────────────────
 artifacts/
 data/
+*.rdb
+*.aof
+*.aof.tmp
 
 # ── Python (scripts/) ───────────────────────────────────────
 __pycache__/

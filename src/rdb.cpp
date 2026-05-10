@@ -770,9 +770,8 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
   return true;
 }
 
-std::string rdb_save_to_string() {
-  std::string err;
-  return rdb_build_string(err);  // Caller (PSYNC full-resync) ignores streams — acceptable
+std::string rdb_save_to_string(std::string& err) {
+  return rdb_build_string(err);
 }
 
 // ── RDB Load ───────────────────────────────────────────────────────────

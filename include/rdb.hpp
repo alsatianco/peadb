@@ -10,7 +10,8 @@ namespace peadb {
 bool rdb_save(const std::filesystem::path& path, std::string& err);
 
 // Save all databases to an in-memory RDB blob (for PSYNC full-sync).
-std::string rdb_save_to_string();
+// Sets err on failure (e.g. unsupported key types); returns empty string.
+std::string rdb_save_to_string(std::string& err);
 
 // Load a Redis-compatible RDB file into the datastore.
 bool rdb_load(const std::filesystem::path& path, std::string& err);

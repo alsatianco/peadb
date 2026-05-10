@@ -379,17 +379,49 @@ int run_server(const ServerConfig& config) {
     if (has_pending_wakeups()) clear_pending_wakeups();
     if (blocked_count > 0) {
       std::vector<int> to_close;
+      std::vector<int> to_drain;
       for (auto& [bfd, session] : sessions) {
         if (session.blocked.type == BlockType::None) continue;
         const std::string reply = try_unblock_client(session);
         if (!reply.empty()) {
           --blocked_count;
-          if (!enqueue_output(bfd, reply)) {
-            to_close.push_back(bfd);
-          }
+          if (!enqueue_output(bfd, reply)) to_close.push_back(bfd);
+          else to_drain.push_back(bfd);
         }
       }
       for (int cfd : to_close) close_client(cfd);
+
+      // Drain pipelined commands buffered while the client was blocked.
+      // Without this, a pipelined BLPOP + next command would stall until
+      // the client sends more data (same deadlock the WAIT drain fixed).
+      std::vector<int> drain_close;
+      for (int bfd : to_drain) {
+        if (!sessions.count(bfd)) continue;
+        auto& session = sessions[bfd];
+        auto& input = buffers[bfd];
+        if (input.empty()) continue;
+        std::string batch;
+        bool sc = false;
+        std::size_t consumed = 0;
+        while (true) {
+          const std::string_view rem(input.data() + consumed, input.size() - consumed);
+          auto parsed = parse_one_command(rem);
+          if (!parsed.has_value()) break;
+          g_total_commands_processed.fetch_add(1);
+          batch += handle_command(parsed->args, session, sc);
+          consumed += parsed->consumed;
+          if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
+        }
+        if (consumed > 0) {
+          if (consumed == input.size()) input.clear();
+          else input.erase(0, consumed);
+        }
+        if (!batch.empty() && !enqueue_output(bfd, batch)) drain_close.push_back(bfd);
+        else if (sc) drain_close.push_back(bfd);
+        if (session.blocked.type != BlockType::None) ++blocked_count;
+        if (session.wait_state.has_value()) ++wait_count;
+      }
+      for (int cfd : drain_close) close_client(cfd);
     }
 
     // ── Resolve deferred WAIT commands ────────────────────────────────
