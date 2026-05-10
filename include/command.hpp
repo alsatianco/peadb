@@ -65,7 +65,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
 std::size_t command_count();
 std::vector<std::string> command_names();
 void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
-                           const std::string& appendfilename);
+                           const std::string& appendfilename, const std::string& appendfsync);
 bool load_aof_file(const std::string& path, std::string& err);
 void aof_fsync_if_needed(std::int64_t now_ms);
 void reap_background_children();

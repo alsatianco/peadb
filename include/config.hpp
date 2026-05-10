@@ -14,6 +14,7 @@ struct ServerConfig {
   std::string dbfilename = "dump.rdb";
   bool appendonly = false;
   std::string appendfilename = "appendonly.aof";
+  std::string appendfsync = "everysec";
   std::unordered_map<std::string, std::string> raw;
 };
 

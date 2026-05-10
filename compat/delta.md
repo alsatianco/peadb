@@ -88,12 +88,21 @@ Feature status labels:
 - Tracking: security hardening milestone.
 
 8. REPLICAOF in-process streaming
-- Status: `partial` (functional but fragile)
+- Status: `partial` (functional, no reconnect/failover)
 - Owner: replication-compat
 - Severity: medium
-- Target milestone: P2
-- Implemented: REPLICAOF triggers sync via a Python helper script (system() call).
-  Full-resync only — PSYNC2 always triggers full resync, no partial resync.
-- Missing: in-process replication client (no Python dependency), partial resync,
-  bounded replication backlog.
-- Tracking: P2-2 and P3-1 in improvement plan.
+- Implemented: In-process TCP client (`replica_do_fullsync`). Does PING → REPLCONF →
+  PSYNC ? -1 → RDB load → continuous command stream. Master supports +CONTINUE partial
+  resync via 1 MiB ReplBacklog. Replica emits REPLCONF ACK every ~1 s.
+- Missing: Automatic reconnect on master disconnect, replica INFO accuracy
+  (`connected_slaves` counter), WAIT cross-replica ACK flow.
+- Tracking: P2-2 done; P3-1 done (backlog); reconnect/failover deferred.
+
+9. Sharding (shard_loop.cpp)
+- Status: `stub` (scaffolding only, not wired)
+- Severity: n/a (future work)
+- Implemented: `crc16`, `key_hash_slot`, `ShardLoop`, `shard_init` defined.
+  PEADB_NUM_SHARDS CMake option defaults to 1 (single-threaded, unchanged behaviour).
+- Missing: Actual multi-shard event loops, listener distribution, cross-shard routing.
+  Prerequisites: full P3-3 ServerContext migration + P4-1 Entry variant.
+- Tracking: P4-7 in improvement plan.

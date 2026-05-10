@@ -2077,6 +2077,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (p == 0) {
             return encode_simple("OK");
           }
+          // Threading invariant: this thread accesses only atomics (g_loading_replication,
+          // g_replica_stale) and the DataStore under the implicit "event loop blocks client
+          // writes while g_loading_replication is true" guarantee (enforced at the top of
+          // handle_command). It must NOT call into Lua engine, script-context globals, or
+          // session state owned by the event loop.
           std::thread([host, p]() {
             // Small delay to ensure pending client commands see slave role first
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -2273,6 +2278,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"list-max-ziplist-size", "-2"},
               {"set-max-intset-entries", "512"},
               {"maxclients", std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed))},
+              {"appendfsync", g_appendfsync},
+              {"appendfilename", g_aof_path.filename().string()},
             };
             std::vector<std::string> out;
             for (const auto& [key, value] : config_params) {
@@ -2318,6 +2325,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               std::int64_t v = 0;
               if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
               store().set_zset_max_ziplist_entries(v);
+            }
+            if (k == "appendfsync") {
+              const auto v = lower(args[3]);
+              if (v != "always" && v != "everysec" && v != "no")
+                return encode_error("Invalid argument '" + args[3] + "' for CONFIG SET 'appendfsync'");
+              g_appendfsync = v;
             }
             return encode_simple("OK");
           }
@@ -6636,7 +6649,8 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   if (spec_is_write && !is_error_reply(reply)) {
     store().increment_mutation_epoch();
-    g_master_repl_offset += static_cast<std::int64_t>(encode_command_resp_size(args));
+    // g_master_repl_offset is updated inside append_replication_event → backlog_append
+    // via g_master_repl_offset = g_repl_backlog.total (absolute set, not increment).
     append_replication_event(args, session, &reply);
     append_aof(args);
   }
@@ -6644,10 +6658,11 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
 }
 
 void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
-                           const std::string& appendfilename) {
+                           const std::string& appendfilename, const std::string& appendfsync) {
   g_snapshot_path = std::filesystem::path(dir) / dbfilename;
   g_appendonly = appendonly;
   g_aof_path = std::filesystem::path(dir) / appendfilename;
+  g_appendfsync = appendfsync;
   if (g_appendonly) open_aof_fd();
 }
 
@@ -6818,28 +6833,18 @@ std::string try_unblock_client(SessionState& session) {
   return {}; // still blocked
 }
 
-// Key → set of blocked client fds waiting for that key
-static std::unordered_map<std::string, std::vector<int>> g_key_waiters;
+// Signals that a key was written — the server loop checks this flag to know
+// it should re-evaluate blocked clients on the next tick.
 static bool g_has_pending_wakeups = false;
 
-void register_key_waiter(const std::string& key, int fd) {
-  g_key_waiters[key].push_back(fd);
-}
-
-void unregister_key_waiter(int fd) {
-  for (auto it = g_key_waiters.begin(); it != g_key_waiters.end();) {
-    auto& fds = it->second;
-    fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
-    if (fds.empty()) it = g_key_waiters.erase(it);
-    else ++it;
-  }
-}
+void register_key_waiter(const std::string& /*key*/, int /*fd*/) {}
+void unregister_key_waiter(int /*fd*/) {}
 
 bool has_pending_wakeups() { return g_has_pending_wakeups; }
 void clear_pending_wakeups() { g_has_pending_wakeups = false; }
 
-void notify_key_written(const std::string& key, int /*db_index*/) {
-  if (g_key_waiters.count(key)) g_has_pending_wakeups = true;
+void notify_key_written(const std::string& /*key*/, int /*db_index*/) {
+  g_has_pending_wakeups = true;
 }
 
 std::size_t command_count() { return command_table().size(); }
@@ -7029,16 +7034,75 @@ bool replica_do_fullsync(const std::string& host, int port) {
             return false;
         }
     }
-    ::close(fd);
+    // Note: keep fd open for command streaming after RDB load.
 
     std::string err;
     if (!rdb_load(tmp_path, err)) {
         ::unlink(tmp_path.c_str());
+        ::close(fd);
         log(LogLevel::Error, "REPLICAOF: rdb_load failed: " + err);
         return false;
     }
     ::unlink(tmp_path.c_str());
     log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
+
+    // Stream subsequent replication commands from master.
+    // The master sends a continuous RESP stream of write commands after the RDB.
+    // We parse each RESP array and apply it via handle_command with AOF suppressed.
+    std::string stream_buf;
+    stream_buf.reserve(65536);
+    std::vector<char> recv_buf(65536);
+    bool close_flag = false;
+    SessionState repl_session;
+    repl_session.db_index = 0;
+
+    // Send periodic ACKs so the master knows our offset.
+    auto last_ack_ms = now_ms();
+    while (true) {
+        // Non-blocking check: send REPLCONF ACK every ~1s
+        const auto now = now_ms();
+        if (now - last_ack_ms >= 1000) {
+            const std::string ack = repl_encode_cmd({"REPLCONF", "ACK", std::to_string(g_master_repl_offset)});
+            repl_send(fd, ack);
+            last_ack_ms = now;
+        }
+
+        // Set a short recv timeout so we can send periodic ACKs
+        struct timeval tv{1, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        const ssize_t n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
+        if (n == 0) {
+            log(LogLevel::Warn, "REPLICAOF: master closed connection");
+            break;
+        }
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+            log(LogLevel::Error, "REPLICAOF: recv error: " + std::string(strerror(errno)));
+            break;
+        }
+        stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
+
+        // Parse and apply all complete RESP commands in the buffer.
+        // g_replaying_aof suppresses AOF appends for replicated commands.
+        g_replaying_aof = true;
+        std::size_t consumed = 0;
+        while (true) {
+            const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
+            auto parsed = parse_one_command(view);
+            if (!parsed.has_value()) break;
+            handle_command(parsed->args, repl_session, close_flag);
+            consumed += parsed->consumed;
+            g_master_repl_offset += static_cast<std::int64_t>(parsed->consumed);
+        }
+        g_replaying_aof = false;
+
+        if (consumed > 0) {
+            if (consumed == stream_buf.size()) stream_buf.clear();
+            else stream_buf.erase(0, consumed);
+        }
+    }
+    ::close(fd);
     return true;
 }
 
@@ -7061,6 +7125,11 @@ void reap_background_children() {
     if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
       g_bgrewrite_child_pid.store(0);
       g_bgrewrite_in_progress.store(false);
+      // The child renamed the temp AOF into place. Reopen the parent's fd so
+      // subsequent appends go to the new inode, not the pre-rename one.
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_appendonly) {
+        open_aof_fd();
+      }
     }
   }
 }
