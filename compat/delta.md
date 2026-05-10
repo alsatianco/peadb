@@ -58,13 +58,16 @@ Feature status labels:
 - Tracking: post-M8 expansion of `RedisModule_*` API surface.
 
 5. Stream RDB encoding
-- Status: `surface` (data loss risk)
+- Status: `partial` (loud-fail; AOF path is safe)
 - Owner: persistence-compat
 - Severity: high
 - Target milestone: P2
 - Implemented: XADD/XREAD/XREADGROUP in memory; stream keys are visible and queryable.
-- Missing: RDB save encodes stream keys — they are silently skipped during BGSAVE/SAVE.
-  A warning is logged to identify affected keys. Stream data does NOT survive restart.
+  SAVE/BGSAVE now return an explicit error when stream keys exist (no silent data loss).
+  PSYNC full-resync refuses to proceed for stream-containing datasets (returns -ERR).
+  AOF-based persistence (BGREWRITEAOF) is safe; streams are AOF-encoded via XADD replays.
+- Missing: RDB binary stream encoding (RDB_TYPE_STREAM_LISTPACKS). Until implemented,
+  datasets with stream keys cannot use RDB persistence or replication bootstrap.
 - Tracking: P2-1 in improvement plan.
 
 6. Cluster bus gossip protocol
@@ -95,8 +98,11 @@ Feature status labels:
 - Implemented: In-process TCP client (`replica_do_fullsync`). Does PING → REPLCONF →
   PSYNC ? -1 → RDB load → continuous command stream. Master supports +CONTINUE partial
   resync via 1 MiB ReplBacklog. Replica emits REPLCONF ACK every ~1 s.
+  Note: full-resync fails if master dataset contains stream keys (RDB stream encoding
+  not yet implemented; PSYNC returns -ERR and replica does not sync).
 - Missing: Automatic reconnect on master disconnect, replica INFO accuracy
-  (`connected_slaves` counter), WAIT cross-replica ACK flow.
+  (`connected_slaves` counter), WAIT cross-replica ACK flow, stream RDB support
+  for full-resync bootstrap.
 - Tracking: P2-2 done; P3-1 done (backlog); reconnect/failover deferred.
 
 9. Sharding (shard_loop.cpp)

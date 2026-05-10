@@ -80,7 +80,10 @@ std::unordered_map<std::string, std::string> g_script_cache;
 std::filesystem::path g_snapshot_path = "dump.rdb";
 std::filesystem::path g_aof_path = "appendonly.aof";
 bool g_appendonly = false;
-bool g_replaying_aof = false;
+// thread_local: each thread (event loop, REPLICAOF streaming) maintains its own
+// replay flag so setting it in one thread never silently suppresses AOF writes
+// or bypasses READONLY enforcement in the other.
+thread_local bool g_replaying_aof = false;
 int g_aof_fd = -1;
 std::string g_appendfsync = "everysec";
 bool g_aof_write_error = false;
@@ -709,7 +712,11 @@ void append_aof(const std::vector<std::string>& args) {
   // Buffer for BGREWRITEAOF diff: commands written while child is rewriting
   // are collected here and appended to the new AOF when the child finishes.
   if (g_bgrewrite_in_progress.load(std::memory_order_relaxed)) {
-    g_aof_rewrite_buf.append(payload);
+    // Cap at 256 MiB to bound RSS during a long rewrite on a write-heavy master.
+    constexpr std::size_t kMaxRewriteBuf = 256ULL * 1024 * 1024;
+    if (g_aof_rewrite_buf.size() < kMaxRewriteBuf) {
+      g_aof_rewrite_buf.append(payload);
+    }
   }
 }
 
@@ -1472,8 +1479,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
 
           // Full resync
+          std::string rdb_err;
+          std::string rdb_data = rdb_save_to_string(rdb_err);
+          if (!rdb_err.empty()) {
+            // Cannot serialize dataset — refuse full sync rather than sending a corrupt RDB.
+            log(LogLevel::Error, "PSYNC: full-resync aborted: " + rdb_err);
+            session.replica_stream = false;
+            return "-ERR Full sync failed: " + rdb_err + "\r\n";
+          }
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
-          std::string rdb_data = rdb_save_to_string();
           std::string reply = "+FULLRESYNC " + g_master_replid + " " +
                               std::to_string(g_master_repl_offset) + "\r\n";
           reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data;
@@ -7149,15 +7163,34 @@ void reap_background_children() {
         if (!g_aof_rewrite_buf.empty()) {
           const int diff_fd = ::open(g_aof_path.c_str(),
                                      O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+          bool diff_ok = false;
           if (diff_fd >= 0) {
-            ::write(diff_fd, g_aof_rewrite_buf.data(), g_aof_rewrite_buf.size());
-            ::fsync(diff_fd);
+            const char* p = g_aof_rewrite_buf.data();
+            std::size_t remaining = g_aof_rewrite_buf.size();
+            diff_ok = true;
+            while (remaining > 0) {
+              const ssize_t rc = ::write(diff_fd, p, remaining);
+              if (rc <= 0) { diff_ok = false; break; }
+              p += static_cast<std::size_t>(rc);
+              remaining -= static_cast<std::size_t>(rc);
+            }
+            if (diff_ok && ::fsync(diff_fd) != 0) diff_ok = false;
             ::close(diff_fd);
           }
-          g_aof_rewrite_buf.clear();
+          if (diff_ok) {
+            g_aof_rewrite_buf.clear();
+          } else {
+            log(LogLevel::Error, "BGREWRITEAOF: failed to append rewrite diff (" +
+                std::to_string(g_aof_rewrite_buf.size()) + " bytes); AOF may be incomplete");
+            // Buffer not cleared — next successful BGREWRITEAOF can retry.
+          }
         }
-        open_aof_fd();
+        if (g_aof_rewrite_buf.empty()) open_aof_fd();
       } else {
+        if (!g_aof_rewrite_buf.empty()) {
+          log(LogLevel::Warn, "BGREWRITEAOF: child failed; discarding " +
+              std::to_string(g_aof_rewrite_buf.size()) + " bytes of buffered diff");
+        }
         g_aof_rewrite_buf.clear();
       }
     }
