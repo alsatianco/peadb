@@ -30,6 +30,18 @@
 namespace peadb {
 namespace {
 
+// fsync the parent directory of `path` so an atomic rename is durable across
+// power loss. File fsync alone only flushes contents, not the directory entry.
+bool fsync_parent_dir(const std::filesystem::path& path) {
+  std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) parent = ".";
+  const int dfd = ::open(parent.c_str(), O_RDONLY | O_CLOEXEC);
+  if (dfd < 0) return false;
+  const int rc = ::fsync(dfd);
+  ::close(dfd);
+  return rc == 0;
+}
+
 // ── RDB constants ──────────────────────────────────────────────────────
 
 constexpr uint8_t RDB_OPCODE_EXPIRETIME_MS = 252;
@@ -766,6 +778,12 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
     ::unlink(tmp_path.c_str());
     err = "RDB rename failed";
     return false;
+  }
+  // Crash-durability: fsync the parent directory so the new RDB directory
+  // entry survives power loss. Best-effort: log but do not fail the save.
+  if (!fsync_parent_dir(path)) {
+    log(LogLevel::Warn, "RDB save: parent directory fsync failed; "
+        "rename may not be crash-durable until next sync");
   }
   return true;
 }
