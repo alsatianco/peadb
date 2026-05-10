@@ -43,6 +43,12 @@ Feature status labels:
 - Severity: medium
 - Target milestone: P3
 - Implemented: AOF append + startup replay + rewrite for supported commands.
+  BGREWRITEAOF uses a parent-owns-rename design: the child writes a temp AOF and exits
+  without renaming; the parent appends the diff buffer and only then atomically renames
+  over the live AOF. Any failure (256 MiB diff cap, write/rename error, child crash)
+  unlinks the temp file and leaves the old AOF intact on disk. Failure is surfaced via
+  `INFO persistence aof_last_bgrewrite_status:err`; operators should rerun BGREWRITEAOF
+  after addressing the cause (typically by reducing write pressure during the rewrite).
 - Missing: full Redis-equivalent behavior/edge-case parity across entire command space.
 - Tracking tasks: broader compatibility hardening beyond current milestone.
 
@@ -102,6 +108,12 @@ Feature status labels:
   resync via 1 MiB ReplBacklog. Replica emits REPLCONF ACK every ~1 s.
   Note: full-resync fails if master dataset contains stream keys (RDB stream encoding
   not yet implemented; PSYNC returns -ERR and replica does not sync).
+  Operator-visible behaviour during full-sync RDB load: client writes on the replica
+  return -READONLY and reads return MASTERDOWN if `replica-serve-stale-data no` is set.
+  `INFO persistence loading:1` indicates that the event-loop is currently applying the
+  full-sync RDB snapshot; clients should retry after `loading:0`.
+  RDB load itself runs on the event-loop thread (handed off from the replication TCP
+  thread), so DataStore mutations are never concurrent with client command processing.
 - Missing: Automatic reconnect on master disconnect, replica INFO accuracy
   (`connected_slaves` counter), WAIT cross-replica ACK flow, stream RDB support
   for full-resync bootstrap.
