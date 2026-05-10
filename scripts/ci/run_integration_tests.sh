@@ -88,10 +88,11 @@ stop_server() {
 passed=0
 failed=0
 fail_list=""
-_server_pid=""
 
+# Each integration test starts and stops its own peadb-server in a subprocess,
+# so this runner has no shared server PID to track. Cleanup is just the temp
+# output file; stop_server() remains available for tests that source this file.
 cleanup() {
-  stop_server "$_server_pid"
   rm -f "${out_file:-}"
 }
 trap cleanup EXIT
@@ -108,9 +109,6 @@ if [[ ${#tests[@]} -eq 0 ]]; then
 fi
 
 for t in "${tests[@]}"; do
-  # Stop any server left over from the previous test.
-  stop_server "$_server_pid"
-  _server_pid=""
   name=$(basename "$t" .py)
   if [[ -n "$TIMEOUT_CMD" ]]; then
     if "$TIMEOUT_CMD" "$TIMEOUT_SECS" python3 "$t" > "$out_file" 2>&1; then

@@ -706,6 +706,20 @@ void append_lazy_expire_dels(const SessionState& session) {
   }
 }
 
+// fsync the parent directory of `path`. Required after an atomic rename to
+// ensure the new directory entry is durable across power loss — file fsync
+// alone only flushes contents, not the directory metadata that names the file.
+// Returns false on open or fsync failure; logs are caller's responsibility.
+bool fsync_parent_dir(const std::filesystem::path& path) {
+  std::filesystem::path parent = path.parent_path();
+  if (parent.empty()) parent = ".";
+  const int dfd = ::open(parent.c_str(), O_RDONLY | O_CLOEXEC);
+  if (dfd < 0) return false;
+  const int rc = ::fsync(dfd);
+  ::close(dfd);
+  return rc == 0;
+}
+
 void open_aof_fd() {
   if (g_aof_fd >= 0) { ::close(g_aof_fd); g_aof_fd = -1; }
   g_aof_fd = ::open(g_aof_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
@@ -7281,6 +7295,13 @@ void reap_background_children() {
             }
           }
           if (diff_ok && ::rename(tmp_path.c_str(), g_aof_path.c_str()) == 0) {
+            // Crash-durability: fsync the parent directory so the new AOF
+            // directory entry survives power loss. Without this, the rename
+            // is visible to the running process but may revert after a crash.
+            if (!fsync_parent_dir(g_aof_path)) {
+              log(LogLevel::Warn, "BGREWRITEAOF: parent directory fsync failed; "
+                  "rename may not be crash-durable until next sync");
+            }
             g_aof_rewrite_buf.clear();
             g_aof_last_bgrewrite_status = "ok";
             open_aof_fd();  // reopen on the new inode
