@@ -746,12 +746,25 @@ bool rewrite_aof_file(std::string& err) {
   const auto cmds = store().export_aof_commands();
   for (const auto& cmd : cmds) {
     const auto payload = encode_command_resp(cmd);
-    if (::write(tmp_fd, payload.data(), payload.size()) < 0) {
-      ::close(tmp_fd); ::unlink(tmp_path.c_str());
-      err = "AOF rewrite write error"; return false;
+    // Full-write loop: a single ::write() may return a short (positive) count
+    // under disk pressure or signal interruption; treating that as success
+    // would leave a truncated temp AOF that the parent then commits.
+    const char* p = payload.data();
+    std::size_t remaining = payload.size();
+    while (remaining > 0) {
+      const ssize_t rc = ::write(tmp_fd, p, remaining);
+      if (rc <= 0) {
+        ::close(tmp_fd); ::unlink(tmp_path.c_str());
+        err = "AOF rewrite write error"; return false;
+      }
+      p += static_cast<std::size_t>(rc);
+      remaining -= static_cast<std::size_t>(rc);
     }
   }
-  ::fsync(tmp_fd);
+  if (::fsync(tmp_fd) != 0) {
+    ::close(tmp_fd); ::unlink(tmp_path.c_str());
+    err = "AOF rewrite fsync error"; return false;
+  }
   ::close(tmp_fd);
   // Parent owns the rename + commit point: child writes temp.aof and exits;
   // parent appends the diff buffer and only then atomically renames over the
@@ -7273,13 +7286,20 @@ void reap_background_children() {
             open_aof_fd();  // reopen on the new inode
           } else {
             ::unlink(tmp_path.c_str());
+            const std::size_t dropped = g_aof_rewrite_buf.size();
+            // Clear the buffer: the live AOF (which append_aof has been writing
+            // to throughout the rewrite window) already contains every command
+            // the buffer holds. The next BGREWRITEAOF will fork from the current
+            // in-memory state — which also already reflects these commands — so
+            // re-appending the old buffer would double-apply non-idempotent
+            // operations (INCR, list pushes, set removals, stream appends).
+            g_aof_rewrite_buf.clear();
             g_aof_last_bgrewrite_status = "err";
             log(LogLevel::Error, "BGREWRITEAOF: failed to commit (" +
                 std::string(diff_ok ? "rename" : "diff append") +
-                " failed); old AOF retained, " +
-                std::to_string(g_aof_rewrite_buf.size()) +
-                " buffered diff bytes preserved for retry.");
-            // Buffer not cleared — next rewrite can retry.
+                " failed); old AOF retained on disk, dropping " +
+                std::to_string(dropped) +
+                " bytes of redundant diff buffer (already in live AOF).");
           }
         }
       } else {

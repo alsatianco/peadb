@@ -114,10 +114,10 @@ Feature status labels:
   full-sync RDB snapshot; clients should retry after `loading:0`.
   RDB load itself runs on the event-loop thread (handed off from the replication TCP
   thread), so DataStore mutations are never concurrent with client command processing.
-- Missing: Automatic reconnect on master disconnect, replica INFO accuracy
-  (`connected_slaves` counter), WAIT cross-replica ACK flow, stream RDB support
-  for full-resync bootstrap.
-- Tracking: P2-2 done; P3-1 done (backlog); reconnect/failover deferred.
+- Missing: Automatic reconnect on master disconnect, stream RDB support for
+  full-resync bootstrap.
+- Tracking: P2-2 done; P3-1 done (backlog); `connected_slaves` and WAIT
+  cross-replica ACK both implemented; reconnect/failover deferred.
 
 9. Sharding (shard_loop.cpp)
 - Status: `stub` (scaffolding only, not wired)
