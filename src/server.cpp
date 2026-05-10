@@ -222,6 +222,15 @@ int run_server(const ServerConfig& config) {
     return count;
   };
 
+  // Wire up the INFO replication callback so connected_slaves reflects live sessions.
+  g_count_connected_replicas = [&]() -> int {
+    int count = 0;
+    for (auto& [fd, sess] : sessions) {
+      if (sess.replica_stream) ++count;
+    }
+    return count;
+  };
+
   // Wire up the CLIENT LIST callback
   g_client_list_callback = [&]() -> std::string {
     std::string out;
