@@ -1801,12 +1801,10 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
 
   if (num_buckets == 0 || db.empty()) return {0, out};
 
-  // Walk from the cursor bucket, emitting up to count keys, then return next cursor
-  std::uint64_t bucket = cursor % num_buckets;
-  std::size_t buckets_visited = 0;
+  const bool is_pow2 = (num_buckets & (num_buckets - 1)) == 0;
 
-  while (buckets_visited < num_buckets) {
-    for (auto it = db.begin(bucket); it != db.end(bucket); ++it) {
+  auto emit_bucket = [&](std::uint64_t b) {
+    for (auto it = db.begin(b); it != db.end(b); ++it) {
       if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
       if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
       if (!type.empty()) {
@@ -1823,6 +1821,29 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
       }
       out.push_back(it->first);
     }
+  };
+
+  if (!is_pow2) {
+    // For non-power-of-2 bucket counts (libstdc++ prime-sized tables): advance
+    // monotonically from cursor without wrapping. This guarantees termination
+    // because the cursor increases from 0 to num_buckets-1 and we return 0 when
+    // we fall off the end. Wrapping would allow the cursor to revisit buckets it
+    // has already seen, producing cycles that never return 0.
+    std::uint64_t b = cursor % num_buckets;
+    while (b < num_buckets) {
+      emit_bucket(b);
+      ++b;
+      if (out.size() >= count) break;
+    }
+    return {(b >= num_buckets) ? 0 : b, out};
+  }
+
+  // Power-of-2 path: reverse-binary-increment for resize resilience.
+  std::uint64_t bucket = cursor % num_buckets;
+  std::size_t buckets_visited = 0;
+
+  while (buckets_visited < num_buckets) {
+    emit_bucket(bucket);
     ++buckets_visited;
     bucket = scan_next_cursor(bucket, num_buckets);
     if (bucket == cursor % num_buckets) { bucket = 0; break; } // full cycle

@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <thread>
 #include <cstdlib>
 #include <string_view>
@@ -95,6 +96,11 @@ std::string g_last_bgsave_status = "ok";
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
 std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
+bool g_aof_rewrite_buf_capped = false; // Set once when the 256 MiB cap is hit per rewrite
+// Queue for replication commands produced by the streaming thread and consumed
+// by the event loop. All DataStore mutations stay on the event loop thread.
+std::mutex g_replica_cmd_queue_mu;
+std::vector<std::vector<std::string>> g_replica_cmd_queue;
 bool g_active_expire = true;
 std::int64_t g_last_save_time = 0;
 std::string g_replication_role = "master";
@@ -716,6 +722,11 @@ void append_aof(const std::vector<std::string>& args) {
     constexpr std::size_t kMaxRewriteBuf = 256ULL * 1024 * 1024;
     if (g_aof_rewrite_buf.size() < kMaxRewriteBuf) {
       g_aof_rewrite_buf.append(payload);
+    } else if (!g_aof_rewrite_buf_capped) {
+      g_aof_rewrite_buf_capped = true;
+      log(LogLevel::Warn, "BGREWRITEAOF: rewrite diff buffer reached 256 MiB cap; "
+          "writes beyond this point will not appear in the rewritten AOF. "
+          "Consider reducing write rate or increasing available memory.");
     }
   }
 }
@@ -1931,7 +1942,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "aof_enabled:" + std::to_string(g_appendonly ? 1 : 0) + "\r\n"
                    "aof_rewrite_in_progress:" + std::to_string(g_bgrewrite_in_progress.load() ? 1 : 0) + "\r\n"
                    "aof_last_bgrewrite_status:ok\r\n"
-                   "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n\r\n";
+                   "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n"
+                   "aof_rewrite_buffer_length:" + std::to_string(g_aof_rewrite_buf.size()) + "\r\n\r\n";
           }
           if (want("STATS")) {
             out += "# Stats\r\n"
@@ -1956,7 +1968,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (g_replication_role != "master") {
               out += "master_host:" + g_replication_master_host + "\r\n"
                      "master_port:" + std::to_string(g_replication_master_port) + "\r\n"
-                     "master_link_status:up\r\n";
+                     "master_link_status:" + (g_replica_stale ? "down" : "up") + "\r\n";
             }
             out += "\r\n";
           }
@@ -2045,6 +2057,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           g_bgrewrite_in_progress.store(true);
           g_bgrewrite_child_pid.store(pid);
+          g_aof_rewrite_buf_capped = false; // reset per-rewrite overflow flag
           return encode_simple("Background append only file rewriting started");
         }});
 
@@ -6886,6 +6899,24 @@ void aof_fsync_if_needed(std::int64_t now) {
   }
 }
 
+void drain_replica_cmd_queue() {
+  std::vector<std::vector<std::string>> cmds;
+  {
+    std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+    if (g_replica_cmd_queue.empty()) return;
+    cmds.swap(g_replica_cmd_queue);
+  }
+  // Apply on the event loop thread: g_replaying_aof suppresses AOF writes and
+  // backlog updates so master commands are not re-replicated or double-logged.
+  g_replaying_aof = true;
+  static SessionState repl_session;
+  bool close_flag = false;
+  for (auto& args : cmds) {
+    handle_command(args, repl_session, close_flag);
+  }
+  g_replaying_aof = false;
+}
+
 // ── In-process replication client helpers ────────────────────────────────────
 
 static bool repl_readline(int fd, std::string& out) {
@@ -7067,20 +7098,18 @@ bool replica_do_fullsync(const std::string& host, int port) {
     ::unlink(tmp_path.c_str());
     log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
 
-    // Release loading gate so client writes are now rejected by the slave readonly guard.
-    // The streaming loop uses g_replaying_aof to bypass the guard for master commands.
+    // Release loading gate; from here the event loop's READONLY guard rejects client writes.
+    // Streaming commands are enqueued in g_replica_cmd_queue and applied by the event loop,
+    // so DataStore mutations stay on the event loop thread (no concurrent access).
     g_loading_replication.store(false);
     g_replica_stale = false;
 
     // Stream subsequent replication commands from master.
     // The master sends a continuous RESP stream of write commands after the RDB.
-    // We parse each RESP array and apply it via handle_command with AOF/backlog suppressed.
+    // Commands are enqueued and applied by drain_replica_cmd_queue() in the event loop.
     std::string stream_buf;
     stream_buf.reserve(65536);
     std::vector<char> recv_buf(65536);
-    bool close_flag = false;
-    SessionState repl_session;
-    repl_session.db_index = 0;
 
     // Local counter tracks bytes received from master for REPLCONF ACK.
     // g_master_repl_offset is the local write-backlog cursor and must not be
@@ -7115,19 +7144,21 @@ bool replica_do_fullsync(const std::string& host, int port) {
         }
         stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
 
-        // Parse and apply all complete RESP commands in the buffer.
-        // g_replaying_aof suppresses AOF writes and backlog updates (append_replication_event).
-        g_replaying_aof = true;
+        // Parse commands and enqueue them for the event loop to apply.
+        // This keeps all DataStore mutations on the event loop thread, eliminating
+        // the data race between the streaming thread and concurrent client reads.
         std::size_t consumed = 0;
-        while (true) {
-            const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
-            auto parsed = parse_one_command(view);
-            if (!parsed.has_value()) break;
-            handle_command(parsed->args, repl_session, close_flag);
-            consumed += parsed->consumed;
-            replica_rx_bytes += static_cast<std::int64_t>(parsed->consumed);
+        {
+            std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+            while (true) {
+                const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
+                auto parsed = parse_one_command(view);
+                if (!parsed.has_value()) break;
+                g_replica_cmd_queue.push_back(parsed->args);
+                consumed += parsed->consumed;
+                replica_rx_bytes += static_cast<std::int64_t>(parsed->consumed);
+            }
         }
-        g_replaying_aof = false;
 
         if (consumed > 0) {
             if (consumed == stream_buf.size()) stream_buf.clear();

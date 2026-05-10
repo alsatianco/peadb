@@ -332,6 +332,40 @@ int run_server(const ServerConfig& config) {
     g_connected_clients.fetch_sub(1);
   };
 
+  // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
+  // wakeup. Without this, those commands stall until the client sends more data.
+  // Returns fds that should be closed (connection error or close-on-command).
+  auto drain_pipelined = [&](const std::vector<int>& fds,
+                              int& blocked_count_ref, int& wait_count_ref,
+                              std::vector<int>& to_close_out) {
+    for (int fd : fds) {
+      if (!sessions.count(fd)) continue;
+      auto& session = sessions[fd];
+      auto& input = buffers[fd];
+      if (input.empty()) continue;
+      std::string batch;
+      bool sc = false;
+      std::size_t consumed = 0;
+      while (true) {
+        const std::string_view rem(input.data() + consumed, input.size() - consumed);
+        auto parsed = parse_one_command(rem);
+        if (!parsed.has_value()) break;
+        g_total_commands_processed.fetch_add(1);
+        batch += handle_command(parsed->args, session, sc);
+        consumed += parsed->consumed;
+        if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
+      }
+      if (consumed > 0) {
+        if (consumed == input.size()) input.clear();
+        else input.erase(0, consumed);
+      }
+      if (!batch.empty() && !enqueue_output(fd, batch)) to_close_out.push_back(fd);
+      else if (sc) to_close_out.push_back(fd);
+      if (session.blocked.type != BlockType::None) ++blocked_count_ref;
+      if (session.wait_state.has_value()) ++wait_count_ref;
+    }
+  };
+
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream) return true;
     const std::size_t current_total = replication_event_count();
@@ -374,6 +408,7 @@ int run_server(const ServerConfig& config) {
     }
     aof_fsync_if_needed(loop_now_ms);
     reap_background_children();
+    drain_replica_cmd_queue();
 
     // ── Check blocked clients ──────────────────────────────────────────
     if (has_pending_wakeups()) clear_pending_wakeups();
@@ -391,36 +426,8 @@ int run_server(const ServerConfig& config) {
       }
       for (int cfd : to_close) close_client(cfd);
 
-      // Drain pipelined commands buffered while the client was blocked.
-      // Without this, a pipelined BLPOP + next command would stall until
-      // the client sends more data (same deadlock the WAIT drain fixed).
       std::vector<int> drain_close;
-      for (int bfd : to_drain) {
-        if (!sessions.count(bfd)) continue;
-        auto& session = sessions[bfd];
-        auto& input = buffers[bfd];
-        if (input.empty()) continue;
-        std::string batch;
-        bool sc = false;
-        std::size_t consumed = 0;
-        while (true) {
-          const std::string_view rem(input.data() + consumed, input.size() - consumed);
-          auto parsed = parse_one_command(rem);
-          if (!parsed.has_value()) break;
-          g_total_commands_processed.fetch_add(1);
-          batch += handle_command(parsed->args, session, sc);
-          consumed += parsed->consumed;
-          if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
-        }
-        if (consumed > 0) {
-          if (consumed == input.size()) input.clear();
-          else input.erase(0, consumed);
-        }
-        if (!batch.empty() && !enqueue_output(bfd, batch)) drain_close.push_back(bfd);
-        else if (sc) drain_close.push_back(bfd);
-        if (session.blocked.type != BlockType::None) ++blocked_count;
-        if (session.wait_state.has_value()) ++wait_count;
-      }
+      drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
       for (int cfd : drain_close) close_client(cfd);
     }
 
@@ -445,36 +452,8 @@ int run_server(const ServerConfig& config) {
       }
       for (int cfd : to_close) close_client(cfd);
 
-      // Drain pipelined commands that were buffered while WAIT was pending.
-      // Without this, the commands sit in buffers[] until the next epoll read
-      // event, causing a deadlock if the client is waiting for those replies.
       std::vector<int> drain_close;
-      for (int wfd : to_drain) {
-        if (!sessions.count(wfd)) continue;
-        auto& session = sessions[wfd];
-        auto& input = buffers[wfd];
-        if (input.empty()) continue;
-        std::string batch;
-        bool sc = false;
-        std::size_t consumed = 0;
-        while (true) {
-          const std::string_view rem(input.data() + consumed, input.size() - consumed);
-          auto parsed = parse_one_command(rem);
-          if (!parsed.has_value()) break;
-          g_total_commands_processed.fetch_add(1);
-          batch += handle_command(parsed->args, session, sc);
-          consumed += parsed->consumed;
-          if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
-        }
-        if (consumed > 0) {
-          if (consumed == input.size()) input.clear();
-          else input.erase(0, consumed);
-        }
-        if (!batch.empty() && !enqueue_output(wfd, batch)) drain_close.push_back(wfd);
-        else if (sc) drain_close.push_back(wfd);
-        if (session.blocked.type != BlockType::None) ++blocked_count;
-        if (session.wait_state.has_value()) ++wait_count;
-      }
+      drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
       for (int cfd : drain_close) close_client(cfd);
     }
 
