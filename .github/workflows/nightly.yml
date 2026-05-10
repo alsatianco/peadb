@@ -1,0 +1,56 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  asan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake g++ liblua5.1-0-dev redis-server
+
+      - name: Configure (ASAN+UBSAN)
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Build
+        run: cmake --build build-asan -j$(nproc)
+
+      - name: Unit tests (ASAN)
+        run: cd build-asan && ctest --output-on-failure
+
+      - name: Integration smoke (ASAN)
+        run: cd build-asan && ../scripts/ci/run_integration_tests.sh
+
+  stability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake g++ liblua5.1-0-dev redis-server
+
+      - name: Configure (Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Full integration suite
+        run: cd build && ../scripts/ci/run_integration_tests.sh
+
+      - name: Compat scoreboard
+        run: |
+          if [ -f scripts/ci/generate_compat_scoreboard.py ]; then
+            python3 scripts/ci/generate_compat_scoreboard.py
+          fi

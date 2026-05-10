@@ -3,7 +3,9 @@
 #include "command.hpp"
 #include "datastore.hpp"
 #include "logger.hpp"
+#include "poller.hpp"
 #include "protocol.hpp"
+#include "server_context.hpp"
 
 #include <arpa/inet.h>
 #include <cerrno>
@@ -14,12 +16,6 @@
 #include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
-
-#ifdef __linux__
-#include <sys/epoll.h>
-#else
-#include <sys/event.h>   // kqueue on macOS/BSD
-#endif
 
 #include <string>
 #include <string_view>
@@ -57,96 +53,6 @@ int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
 #endif
 }
 
-struct PollEvent { int fd; bool readable; bool writable; bool error; };
-
-struct Poller {
-  int pfd = -1;
-  bool create() {
-#ifdef __linux__
-    pfd = epoll_create1(0);
-#else
-    pfd = kqueue();
-#endif
-    return pfd >= 0;
-  }
-  void destroy() { if (pfd >= 0) { ::close(pfd); pfd = -1; } }
-  bool add_read(int fd) {
-#ifdef __linux__
-    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = fd;
-    return epoll_ctl(pfd, EPOLL_CTL_ADD, fd, &ev) == 0;
-#else
-    struct kevent kev; EV_SET(&kev, fd, EVFILT_READ, EV_ADD|EV_ENABLE, 0, 0, nullptr);
-    return kevent(pfd, &kev, 1, nullptr, 0, nullptr) == 0;
-#endif
-  }
-  bool set_readwrite(int fd) {
-#ifdef __linux__
-    epoll_event ev{}; ev.events = EPOLLIN|EPOLLOUT; ev.data.fd = fd;
-    return epoll_ctl(pfd, EPOLL_CTL_MOD, fd, &ev) == 0;
-#else
-    struct kevent kev[2];
-    EV_SET(&kev[0], fd, EVFILT_READ, EV_ADD|EV_ENABLE, 0, 0, nullptr);
-    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_ADD|EV_ENABLE, 0, 0, nullptr);
-    return kevent(pfd, kev, 2, nullptr, 0, nullptr) == 0;
-#endif
-  }
-  bool set_read_only(int fd) {
-#ifdef __linux__
-    epoll_event ev{}; ev.events = EPOLLIN; ev.data.fd = fd;
-    return epoll_ctl(pfd, EPOLL_CTL_MOD, fd, &ev) == 0;
-#else
-    struct kevent kev; EV_SET(&kev, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-    kevent(pfd, &kev, 1, nullptr, 0, nullptr);
-    return true;
-#endif
-  }
-  void remove(int fd) {
-#ifdef __linux__
-    epoll_ctl(pfd, EPOLL_CTL_DEL, fd, nullptr);
-#else
-    struct kevent kev[2];
-    EV_SET(&kev[0], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-    EV_SET(&kev[1], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-    kevent(pfd, kev, 2, nullptr, 0, nullptr);
-#endif
-  }
-  int wait(std::vector<PollEvent>& out, int timeout_ms) {
-#ifdef __linux__
-    thread_local std::vector<epoll_event> raw(1024);
-    int n = epoll_wait(pfd, raw.data(), static_cast<int>(raw.size()), timeout_ms);
-    if (n < 0) return n;
-    out.resize(static_cast<std::size_t>(n));
-    for (int i = 0; i < n; ++i) {
-      out[i] = {raw[i].data.fd, bool(raw[i].events & EPOLLIN),
-                bool(raw[i].events & EPOLLOUT), bool(raw[i].events & (EPOLLERR|EPOLLHUP))};
-    }
-    return n;
-#else
-    thread_local std::vector<struct kevent> raw(1024);
-    struct timespec ts{timeout_ms/1000, (timeout_ms%1000)*1000000L};
-    struct timespec* tsp = (timeout_ms >= 0) ? &ts : nullptr;
-    int n = kevent(pfd, nullptr, 0, raw.data(), static_cast<int>(raw.size()), tsp);
-    if (n < 0) return n;
-    std::unordered_map<int, std::size_t> idx_map;
-    out.clear();
-    for (int i = 0; i < n; ++i) {
-      int fd = static_cast<int>(raw[i].ident);
-      auto it = idx_map.find(fd);
-      std::size_t idx;
-      if (it == idx_map.end()) { idx = out.size(); idx_map[fd] = idx; out.push_back({fd,false,false,false}); }
-      else idx = it->second;
-      if (raw[i].filter == EVFILT_READ)  out[idx].readable = true;
-      if (raw[i].filter == EVFILT_WRITE) out[idx].writable = true;
-      if (raw[i].flags & EV_ERROR) out[idx].error = true;
-      // EV_EOF on read means peer closed — mark readable so the read()
-      // returns 0 and the normal close path handles it gracefully.
-      if ((raw[i].flags & EV_EOF) && raw[i].filter == EVFILT_READ) out[idx].readable = true;
-    }
-    return static_cast<int>(out.size());
-#endif
-  }
-};
-
 // Offset-tracked write buffer to avoid O(n) erase on partial writes
 struct WriteBuf {
   std::string data;
@@ -158,8 +64,11 @@ struct WriteBuf {
   void append(const std::string& s) { data.append(s); }
   void advance(std::size_t n) { offset += n; }
   void compact() {
-    data.erase(0, offset);
-    offset = 0;
+    // Only compact when we've consumed more than half the buffer to avoid O(n) erase on every tick
+    if (offset > data.size() / 2) {
+      data.erase(0, offset);
+      offset = 0;
+    }
   }
 };
 
@@ -301,6 +210,7 @@ int run_server(const ServerConfig& config) {
   std::unordered_map<int, SessionState> sessions;
   std::int64_t last_active_expire_ms = DataStore::now_ms();
   int blocked_count = 0;
+  int wait_count = 0;
   int replica_count = 0;
 
   // Wire up the WAIT callback so it can count synced replicas
@@ -339,10 +249,19 @@ int run_server(const ServerConfig& config) {
     return out;
   };
 
+  // Mirror callbacks into the ServerContext struct for future callers.
+  server_ctx().callbacks.count_synced_replicas = g_count_synced_replicas;
+  server_ctx().callbacks.client_list = g_client_list_callback;
+
   // Helper: enqueue output data for a client and attempt immediate non-blocking flush.
+  // Hard output buffer limit: disconnect clients whose buffer exceeds 256 MB
+  constexpr std::size_t kOutputBufHardLimit = 256ULL * 1024 * 1024;
+
   auto enqueue_output = [&](int fd, const std::string& data) -> bool {
     if (data.empty()) return true;
     auto& wbuf = write_buffers[fd];
+    // Enforce output buffer hard limit before appending
+    if (wbuf.remaining() + data.size() > kOutputBufHardLimit) return false;
     const bool was_empty = wbuf.empty();
     wbuf.append(data);
     while (!wbuf.empty()) {
@@ -358,7 +277,7 @@ int run_server(const ServerConfig& config) {
     if (wbuf.empty()) {
       wbuf.data.clear();
       wbuf.offset = 0;
-    } else if (wbuf.offset > 65536) {
+    } else {
       wbuf.compact();
     }
     // Register write interest if data remains in the write buffer.
@@ -415,11 +334,11 @@ int run_server(const ServerConfig& config) {
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream) return true;
-    while (session.repl_index < replication_event_count()) {
+    const std::size_t current_total = replication_event_count();
+    if (session.repl_index < current_total) {
       const auto payload = replication_event_at(session.repl_index);
-      if (payload.empty()) break;
-      if (!enqueue_output(fd, payload)) return false;
-      ++session.repl_index;
+      if (!payload.empty() && !enqueue_output(fd, payload)) return false;
+      session.repl_index = current_total;
     }
     return true;
   };
@@ -453,8 +372,11 @@ int run_server(const ServerConfig& config) {
       store().active_expire_cycle();
       last_active_expire_ms = loop_now_ms;
     }
+    aof_fsync_if_needed(loop_now_ms);
+    reap_background_children();
 
     // ── Check blocked clients ──────────────────────────────────────────
+    if (has_pending_wakeups()) clear_pending_wakeups();
     if (blocked_count > 0) {
       std::vector<int> to_close;
       for (auto& [bfd, session] : sessions) {
@@ -465,6 +387,26 @@ int run_server(const ServerConfig& config) {
           if (!enqueue_output(bfd, reply)) {
             to_close.push_back(bfd);
           }
+        }
+      }
+      for (int cfd : to_close) close_client(cfd);
+    }
+
+    // ── Resolve deferred WAIT commands ────────────────────────────────
+    if (wait_count > 0) {
+      const auto wloop_now = DataStore::now_ms();
+      std::vector<int> to_close;
+      for (auto& [wfd, session] : sessions) {
+        if (!session.wait_state.has_value()) continue;
+        auto& ws = session.wait_state.value();
+        int synced = g_count_synced_replicas ? g_count_synced_replicas(ws.target_offset)
+                                             : g_connected_replicas.load();
+        const bool timed_out = ws.deadline_ms > 0 && wloop_now >= ws.deadline_ms;
+        if (synced >= ws.min_replicas || timed_out) {
+          session.wait_state.reset();
+          --wait_count;
+          const std::string reply = ":" + std::to_string(synced) + "\r\n";
+          if (!enqueue_output(wfd, reply)) to_close.push_back(wfd);
         }
       }
       for (int cfd : to_close) close_client(cfd);
@@ -615,6 +557,7 @@ int run_server(const ServerConfig& config) {
       bool should_close = false;
       auto& session = sessions[fd];
       const bool was_blocked = session.blocked.type != BlockType::None;
+      const bool was_waiting = session.wait_state.has_value();
       const bool was_replica = session.replica_stream;
 
       std::size_t consumed_total = 0;
@@ -631,8 +574,9 @@ int run_server(const ServerConfig& config) {
         if (should_close) break;
       }
 
-      // Track blocked/replica state changes
+      // Track blocked/replica/wait state changes
       if (!was_blocked && session.blocked.type != BlockType::None) ++blocked_count;
+      if (!was_waiting && session.wait_state.has_value()) ++wait_count;
       if (!was_replica && session.replica_stream) ++replica_count;
 
       if (consumed_total > 0) {

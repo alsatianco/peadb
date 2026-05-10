@@ -46,17 +46,21 @@ bool DataStore::expire_if_needed(DB& db, const std::string& key) {
   if (!it->second.expire_at_ms.has_value()) return false;
   if (*it->second.expire_at_ms > now_ms()) return false;
   db.erase(it);
+  record_expired();
   return true;
 }
 
 std::optional<std::string> DataStore::get(const std::string& key) {
   auto& db = dbs_[current_db_];
   auto it = db.find(key);
-  if (it == db.end()) return std::nullopt;
+  if (it == db.end()) { record_miss(); return std::nullopt; }
   if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now_ms()) {
     db.erase(it);
+    record_expired();
+    record_miss();
     return std::nullopt;
   }
+  record_hit();
   return it->second.value;
 }
 
@@ -77,6 +81,7 @@ bool DataStore::set(const std::string& key, const std::string& value, bool nx, b
       e.list_value.clear();
       e.set_value.clear();
       e.zset_value.clear();
+      e.zset_ordered.clear();
       e.stream_entries.clear();
       e.stream_groups.clear();
     }
@@ -271,21 +276,20 @@ std::vector<std::string> DataStore::keys(const std::string& pattern) {
 
 std::optional<std::string> DataStore::randomkey() {
   auto& db = dbs_[current_db_];
-  std::vector<std::string> ks;
-  ks.reserve(db.size());
-  for (auto it = db.begin(); it != db.end();) {
-    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now_ms()) {
-      ++it;
-      continue;
+  if (db.empty()) return std::nullopt;
+  static thread_local std::mt19937 rng{std::random_device{}()};
+  const auto now = now_ms();
+  const std::size_t num_buckets = db.bucket_count();
+  // Pick a random starting bucket and walk forward — O(1/load_factor) amortised
+  const std::size_t start = rng() % num_buckets;
+  for (std::size_t i = 0; i < num_buckets; ++i) {
+    const std::size_t bucket = (start + i) % num_buckets;
+    for (auto it = db.begin(bucket); it != db.end(bucket); ++it) {
+      if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
+      return it->first;
     }
-    ks.push_back(it->first);
-    ++it;
   }
-  if (ks.empty()) return std::nullopt;
-  static thread_local std::mt19937 rng{
-      static_cast<std::mt19937::result_type>(std::chrono::high_resolution_clock::now().time_since_epoch().count())};
-  std::uniform_int_distribution<std::size_t> dist(0, ks.size() - 1);
-  return ks[dist(rng)];
+  return std::nullopt;
 }
 
 bool DataStore::rename(const std::string& src, const std::string& dst, bool nx_only) {
@@ -955,8 +959,10 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   if (exists && gt && new_score <= mit->second) return r;
   if (exists && lt && new_score >= mit->second) return r;
 
+  auto& entry = it->second;
   if (!exists) {
-    it->second.zset_value[member] = new_score;
+    entry.zset_value[member] = new_score;
+    entry.zset_ordered[{new_score, member}] = true;
     r.added = true;
     r.changed = true;
     r.score = new_score;
@@ -964,7 +970,9 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   }
 
   if (mit->second != new_score) {
+    entry.zset_ordered.erase({mit->second, member}); // remove old position
     mit->second = new_score;
+    entry.zset_ordered[{new_score, member}] = true;  // insert at new position
     r.changed = true;
   }
   r.score = mit->second;
@@ -984,13 +992,9 @@ std::vector<std::pair<std::string, double>> DataStore::zrange(
     return out;
   }
 
-  std::vector<std::pair<std::string, double>> items(it->second.zset_value.begin(), it->second.zset_value.end());
-  std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-    if (a.second == b.second) return a.first < b.first;
-    return a.second < b.second;
-  });
-
-  const auto n = static_cast<std::int64_t>(items.size());
+  // Use the ordered index for O(log N) range iteration instead of O(N log N) sort.
+  auto& ordered = it->second.zset_ordered;
+  const auto n = static_cast<std::int64_t>(ordered.size());
   if (n == 0) return out;
   if (start < 0) start = n + start;
   if (stop < 0) stop = n + stop;
@@ -998,7 +1002,10 @@ std::vector<std::pair<std::string, double>> DataStore::zrange(
   if (stop >= n) stop = n - 1;
   if (start > stop || start >= n) return out;
 
-  for (std::int64_t i = start; i <= stop; ++i) out.push_back(items[static_cast<std::size_t>(i)]);
+  auto oit = ordered.begin();
+  std::advance(oit, start);
+  for (std::int64_t i = start; i <= stop; ++i, ++oit)
+    out.push_back({oit->first.second, oit->first.first}); // {member, score}
   (void)withscores;
   return out;
 }
@@ -1039,20 +1046,19 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(
     return out;
   }
 
-  std::vector<std::pair<std::string, double>> items(it->second.zset_value.begin(), it->second.zset_value.end());
-  std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) {
-    if (a.second == b.second) return a.first < b.first;
-    return a.second < b.second;
-  });
-  if (max) std::reverse(items.begin(), items.end());
-
-  const std::size_t take = std::min(count, items.size());
+  auto& entry = it->second;
+  auto& ordered = entry.zset_ordered;
+  const std::size_t take = std::min(count, ordered.size());
   out.reserve(take);
   for (std::size_t i = 0; i < take; ++i) {
-    out.push_back(items[i]);
-    it->second.zset_value.erase(items[i].first);
+    auto oit = max ? std::prev(ordered.end()) : ordered.begin();
+    const std::string& member = oit->first.second;
+    const double score = oit->first.first;
+    out.push_back({member, score});
+    entry.zset_value.erase(member);
+    ordered.erase(oit);
   }
-  if (it->second.zset_value.empty()) db.erase(it);
+  if (entry.zset_value.empty()) db.erase(it);
   return out;
 }
 
@@ -1536,6 +1542,39 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
 }
 
 std::uint64_t DataStore::mutation_epoch() const { return mutation_epoch_; }
+void DataStore::increment_mutation_epoch() { ++mutation_epoch_; }
+
+std::int64_t DataStore::estimate_used_memory() const {
+  std::int64_t total = sizeof(*this);
+  for (const auto& db : dbs_) {
+    for (const auto& [k, e] : db) {
+      total += static_cast<std::int64_t>(sizeof(k) + k.size() + sizeof(e));
+      total += static_cast<std::int64_t>(e.value.size());
+      for (const auto& [f, v] : e.hash_value) total += static_cast<std::int64_t>(f.size() + v.size());
+      for (const auto& v : e.list_value) total += static_cast<std::int64_t>(v.size());
+      for (const auto& m : e.set_value) total += static_cast<std::int64_t>(m.size());
+      for (const auto& [m, _] : e.zset_value) total += static_cast<std::int64_t>(m.size() + sizeof(double));
+    }
+  }
+  return total;
+}
+
+std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() const {
+  const auto& db = dbs_[current_db_];
+  const auto now = now_ms();
+  std::size_t total = 0, with_expiry = 0;
+  std::int64_t ttl_sum = 0;
+  for (const auto& [k, e] : db) {
+    ++total;
+    if (e.expire_at_ms.has_value()) {
+      ++with_expiry;
+      const auto ttl = *e.expire_at_ms - now;
+      if (ttl > 0) ttl_sum += ttl;
+    }
+  }
+  const std::int64_t avg_ttl = with_expiry > 0 ? ttl_sum / static_cast<std::int64_t>(with_expiry) : 0;
+  return {total, with_expiry, avg_ttl};
+}
 
 std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
   std::vector<std::vector<std::string>> out;
@@ -1691,16 +1730,27 @@ std::int64_t DataStore::zset_max_ziplist_entries() const {
 
 void DataStore::active_expire_cycle(std::size_t budget_per_db) {
   const auto now = now_ms();
+  static thread_local std::mt19937 rng{std::random_device{}()};
+
   for (auto& db : dbs_) {
+    if (db.empty()) continue;
+    const std::size_t num_buckets = db.bucket_count();
+    // Start from a random bucket to avoid always skipping tail entries
+    const std::size_t start_bucket = rng() % num_buckets;
     std::size_t scanned = 0;
-    for (auto it = db.begin(); it != db.end() && scanned < budget_per_db;) {
-      ++scanned;
-      if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
-        it = db.erase(it);
-      } else {
-        ++it;
+    std::size_t bucket = start_bucket;
+
+    do {
+      // Collect expired keys in this bucket, then erase by key (local_iterator can't be passed to erase)
+      std::vector<std::string> to_del;
+      for (auto it = db.begin(bucket); it != db.end(bucket) && scanned < budget_per_db; ++it, ++scanned) {
+        if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
+          to_del.push_back(it->first);
+        }
       }
-    }
+      for (const auto& k : to_del) { db.erase(k); record_expired(); }
+      bucket = (bucket + 1) % num_buckets;
+    } while (scanned < budget_per_db && bucket != start_bucket);
   }
 }
 
@@ -1716,35 +1766,70 @@ std::size_t DataStore::dbsize() {
   return dbs_[current_db_].size();
 }
 
+namespace {
+// Advance a cursor using reverse-binary-increment over `num_buckets` buckets.
+// The cursor encodes which bucket to visit next. Returning 0 signals completion.
+std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets) {
+  if (num_buckets == 0) return 0;
+  // Find highest power of 2 <= num_buckets to build a stable mask
+  std::uint64_t mask = 1;
+  while (mask < num_buckets) mask <<= 1;
+  mask -= 1; // e.g. 8 buckets -> mask = 7
+  // Reverse-bit-increment: fill upper bits, reverse, increment, reverse back
+  auto rev64 = [](std::uint64_t v) -> std::uint64_t {
+    v = ((v >> 1) & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
+    v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
+    v = ((v >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
+    v = ((v >> 8) & 0x00FF00FF00FF00FFULL) | ((v & 0x00FF00FF00FF00FFULL) << 8);
+    v = ((v >> 16) & 0x0000FFFF0000FFFFULL) | ((v & 0x0000FFFF0000FFFFULL) << 16);
+    v = (v >> 32) | (v << 32);
+    return v;
+  };
+  cursor |= ~mask;
+  cursor = rev64(cursor);
+  cursor++;
+  return rev64(cursor) & mask;
+}
+} // namespace
+
 std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
     std::uint64_t cursor, std::size_t count, const std::string& match, const std::string& type) {
   auto& db = dbs_[current_db_];
   std::vector<std::string> out;
-  std::size_t idx = 0, emitted = 0;
   const auto now = now_ms();
-  for (auto it = db.begin(); it != db.end(); ++it) {
-    // Skip expired keys
-    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
-    if (idx++ < cursor) continue;
-    // Match filter
-    if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
-    // Type filter
-    if (!type.empty()) {
-      std::string entry_type;
-      switch (it->second.type) {
-        case ValueType::String: entry_type = "string"; break;
-        case ValueType::Hash: entry_type = "hash"; break;
-        case ValueType::List: entry_type = "list"; break;
-        case ValueType::Set: entry_type = "set"; break;
-        case ValueType::ZSet: entry_type = "zset"; break;
-        case ValueType::Stream: entry_type = "stream"; break;
+  const std::uint64_t num_buckets = db.bucket_count();
+
+  if (num_buckets == 0 || db.empty()) return {0, out};
+
+  // Walk from the cursor bucket, emitting up to count keys, then return next cursor
+  std::uint64_t bucket = cursor % num_buckets;
+  std::size_t buckets_visited = 0;
+
+  while (buckets_visited < num_buckets) {
+    for (auto it = db.begin(bucket); it != db.end(bucket); ++it) {
+      if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
+      if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
+      if (!type.empty()) {
+        std::string entry_type;
+        switch (it->second.type) {
+          case ValueType::String: entry_type = "string"; break;
+          case ValueType::Hash: entry_type = "hash"; break;
+          case ValueType::List: entry_type = "list"; break;
+          case ValueType::Set: entry_type = "set"; break;
+          case ValueType::ZSet: entry_type = "zset"; break;
+          case ValueType::Stream: entry_type = "stream"; break;
+        }
+        if (entry_type != type) continue;
       }
-      if (entry_type != type) continue;
+      out.push_back(it->first);
     }
-    out.push_back(it->first);
-    if (++emitted >= count) break;
+    ++buckets_visited;
+    bucket = scan_next_cursor(bucket, num_buckets);
+    if (bucket == cursor % num_buckets) { bucket = 0; break; } // full cycle
+    if (out.size() >= count) break;
   }
-  const auto next = (idx >= db.size()) ? 0ULL : static_cast<std::uint64_t>(idx);
+
+  const std::uint64_t next = (buckets_visited >= num_buckets) ? 0 : bucket;
   return {next, out};
 }
 

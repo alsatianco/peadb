@@ -20,51 +20,31 @@ int main(int argc, char** argv) {
   std::signal(SIGTERM, signal_handler);
   std::signal(SIGINT, signal_handler);
 
-  peadb::ServerConfig config;
+  // First pass: find --config so we can load the file before applying CLI overrides
   std::string config_path;
-
   for (int i = 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--help" || arg == "-h") {
+    if (std::string(argv[i]) == "--config" && i + 1 < argc) {
+      config_path = argv[i + 1];
+      break;
+    }
+    if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
       std::cout << "Usage: peadb-server [--port <port>] [--bind <ip>] [--loglevel <error|warn|info|debug>] [--config <path>]\n";
       return 0;
     }
-    if (arg == "--config" && i + 1 < argc) {
-      config_path = argv[++i];
-      continue;
-    }
-    if (arg == "--port" && i + 1 < argc) {
-      config.port = std::stoi(argv[++i]);
-      continue;
-    }
-    if (arg == "--bind" && i + 1 < argc) {
-      config.bind = argv[++i];
-      continue;
-    }
-    if (arg == "--loglevel" && i + 1 < argc) {
-      config.log_level = argv[++i];
-      continue;
-    }
-    if (arg == "--dir" && i + 1 < argc) {
-      config.dir = argv[++i];
-      continue;
-    }
-    if (arg == "--dbfilename" && i + 1 < argc) {
-      config.dbfilename = argv[++i];
-      continue;
-    }
   }
 
-  if (!config_path.empty()) {
-    const peadb::ServerConfig file_cfg = peadb::load_config(config_path);
-    config.port = file_cfg.port;
-    config.maxclients = file_cfg.maxclients;
-    config.bind = file_cfg.bind;
-    config.log_level = file_cfg.log_level;
-    config.dir = file_cfg.dir;
-    config.dbfilename = file_cfg.dbfilename;
-    config.appendonly = file_cfg.appendonly;
-    config.appendfilename = file_cfg.appendfilename;
+  // Start from file config (if any), then let CLI args override
+  peadb::ServerConfig config = config_path.empty() ? peadb::ServerConfig{}
+                                                    : peadb::load_config(config_path);
+
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--config" && i + 1 < argc) { ++i; continue; } // already handled
+    if (arg == "--port" && i + 1 < argc) { config.port = std::stoi(argv[++i]); continue; }
+    if (arg == "--bind" && i + 1 < argc) { config.bind = argv[++i]; continue; }
+    if (arg == "--loglevel" && i + 1 < argc) { config.log_level = argv[++i]; continue; }
+    if (arg == "--dir" && i + 1 < argc) { config.dir = argv[++i]; continue; }
+    if (arg == "--dbfilename" && i + 1 < argc) { config.dbfilename = argv[++i]; continue; }
   }
 
   peadb::set_log_level(peadb::parse_log_level(config.log_level));

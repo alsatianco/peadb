@@ -32,6 +32,12 @@ struct BlockedState {
   std::vector<std::string> original_args; // original command args for context
 };
 
+struct WaitState {
+  std::int64_t target_offset = 0;   // master offset at WAIT issue time
+  std::int64_t deadline_ms = 0;     // absolute deadline; 0 = no timeout
+  std::int64_t min_replicas = 0;    // number of replicas to wait for
+};
+
 struct SessionState {
   RespVersion resp_version = RespVersion::Resp2;
   int db_index = 0;
@@ -46,6 +52,7 @@ struct SessionState {
   bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
   BlockedState blocked;
+  std::optional<WaitState> wait_state;
   // CLIENT command support
   std::uint64_t client_id = 0;
   std::string client_name;
@@ -55,9 +62,13 @@ struct SessionState {
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
+std::size_t command_count();
+std::vector<std::string> command_names();
 void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
                            const std::string& appendfilename);
 bool load_aof_file(const std::string& path, std::string& err);
+void aof_fsync_if_needed(std::int64_t now_ms);
+void reap_background_children();
 void configure_runtime_port(int port);
 void configure_max_clients(int max_clients);
 int configured_max_clients();
@@ -66,6 +77,10 @@ bool active_expire_enabled();
 std::size_t replication_event_count();
 std::string replication_event_at(std::size_t idx);
 void notify_key_written(const std::string& key, int db_index);
+void register_key_waiter(const std::string& key, int fd);
+void unregister_key_waiter(int fd);
+bool has_pending_wakeups();
+void clear_pending_wakeups();
 std::string try_unblock_client(SessionState& session);
 
 // ── Lua script context (set by lua_engine, read by blocking command handlers) ──

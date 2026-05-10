@@ -1,161 +1,53 @@
-# CLAUDE.md — Project Context for AI Assistants
+# CLAUDE.md
 
-## Project Overview
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-PeaDB is a high-performance, drop-in replacement for Redis 7.2.5, written in modern C++20. The goal is **behavioral indistinguishability** from Redis — same protocol, same commands, same edge-case semantics. Redis is the executable specification; for undocumented behavior, Redis source code defines truth.
-
-- **Language:** C++20 (GCC 11+ or Clang 14+), with C stubs for Lua libraries
-- **Target platform:** Linux (not Windows)
-- **License:** MIT
-- **Docker image:** `alsatianco/peadb-server` on Docker Hub
-
-## Repository Layout
-
-```
-include/           C++ headers (command, config, datastore, errors, logger, lua_engine, protocol, rdb, server)
-src/               C++ implementation (~11.5k lines) + main entry point
-tests/
-  unit/            C++ unit tests (CTest): config_parser_test, wrongtype_framework_test
-  integration/     Python integration tests (~95+ files, ~7k lines), organized by milestone (m0–m9) and polish stages (p0–p3)
-  fuzz/            RESP parser and command dispatcher fuzz tests
-  diff/            Differential tests (PeaDB vs a real Redis instance)
-scripts/
-  ci/              CI pipelines: run_integration_tests.sh, check_command_test_coverage.py, check_compat_delta.py
-  qa/              QA: run_fuzz_sanity.sh, run_stability_checks.sh, run_perf_baseline.sh, run_sentinel_validation.sh
-  dev/             Developer helpers: quick_start.sh, install_deps_ubuntu.sh, redis_vs_peadb_benchmark.sh
-  redis/           Upstream Redis TCL test runner + RDB import/export bridge scripts
-compat/            Compatibility delta tracker (delta.md — known gaps vs Redis 7.2.5)
-docs/decisions/    Architecture decision records (ADRs)
-artifacts/         Benchmark results and performance baselines (gitignored)
-```
-
-## Build Commands
+## Build
 
 ```bash
-# Install dependencies (Ubuntu/Debian)
-scripts/dev/install_deps_ubuntu.sh
-# or: sudo apt-get install build-essential cmake g++ liblua5.1-0-dev
-
-# Release build (default)
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -j$(nproc)
-
-# ASAN/UBSAN debug build
-cmake -S . -B build-asan \
-    -DCMAKE_BUILD_TYPE=Debug \
-    -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
-cmake --build build-asan -j$(nproc)
 ```
 
-The binary is `build/peadb-server`. Run with: `./build/peadb-server --port 6379 --bind 127.0.0.1`
+Requires: `cmake`, `g++` (C++20), `liblua5.1-0-dev` (Lua 5.1 headers + library).
 
-## Test Commands
+On macOS `-O2` is enforced for Release builds due to a Lua 5.1 miscompile issue with system Lua at `-O3`.
+
+## Tests
 
 ```bash
-# Run ALL test stages (9 stages, requires running peadb-server on port 6379)
-scripts/run_all_tests.sh
-
-# C++ unit tests only
+# Unit tests (fast, no server needed)
 cd build && ctest --output-on-failure
 
-# Integration tests only (requires running peadb-server)
-scripts/ci/run_integration_tests.sh
+# Integration tests (starts/stops peadb-server automatically)
+cd build && ../scripts/ci/run_integration_tests.sh
 
-# Fuzz / stability checks
-scripts/qa/run_fuzz_sanity.sh
-scripts/qa/run_stability_checks.sh
-
-# Differential tests (PeaDB vs Redis side-by-side)
-python3 tests/diff/run_diff_tests.py
-
-# Upstream Redis TCL test suite
-scripts/redis/run_redis_tests.sh
-
-# Check command test coverage
-python3 scripts/ci/check_command_test_coverage.py
-
-# Skip specific test stages (comma-separated):
-SKIP=perf,redis scripts/run_all_tests.sh
+# Single integration test
+python3 tests/integration/test_strings.py
 ```
 
-Integration tests use `pytest` with the `redis` Python package (`pip install redis>=5.0.0`). Dev tooling uses `ruff>=0.5.0` for linting/formatting (see `scripts/requirements-dev.txt`).
+## Architecture
 
-## Architecture Overview
+PeaDB is a Redis 7.2.5-compatible server written in C++20:
 
-- **Namespace:** All C++ code lives in the `peadb` namespace.
-- **Core components:**
-  - `Server` (`server.hpp/cpp`) — event loop, connection handling, entry point via `run_server()`
-  - `DataStore` (`datastore.hpp/cpp`) — in-memory key-value store with types: String, Hash, List, Set, ZSet, Stream
-  - `Command` (`command.hpp/cpp`) — command dispatcher and session state (RESP version, MULTI/EXEC, blocking, replication)
-  - `Protocol` (`protocol.hpp/cpp`) — RESP2/RESP3 parser and serializer
-  - `Config` (`config.hpp/cpp`) — Redis-compatible config parsing (CLI flags + config file)
-  - `LuaEngine` (`lua_engine.hpp/cpp`) — Lua 5.1 scripting (EVAL/EVALSHA, FUNCTION/FCALL)
-  - `RDB` (`rdb.hpp/cpp`) — RDB snapshot persistence
-  - `Logger` (`logger.hpp/cpp`) — logging subsystem
-- **Lua C stubs:** `lua_cjson_stub.c`, `lua_cmsgpack_stub.c`, `lua_bit_stub.c`, `lua_struct_stub.c` — provide Redis-compatible Lua libraries
-- **Entry point:** `src/main.cpp` → parses config → calls `peadb::run_server()`
+- **`src/command.cpp`** — All 207 Redis command handlers in one file (~7 000 LoC). The command table is built once in `command_table()` (a static local). `handle_command()` is the main dispatcher.
+- **`src/server.cpp`** — Single-threaded epoll/kqueue event loop. Manages client sessions (`SessionState`), write buffers (`WriteBuf`), blocked clients, and deferred WAIT replies. Calls into command.cpp for every client command.
+- **`src/datastore.cpp`** — In-memory key-value store (`DataStore`), 16 independent databases, all standard Redis data types (string, hash, list, set, zset, stream). Bucket-based SCAN cursor, random-start active expiry, O(1) RANDOMKEY.
+- **`src/rdb.cpp`** — RDB binary format reader/writer. Streams are not yet RDB-encoded (a warning is logged and they are skipped on save — data loss on restart).
+- **`src/lua_engine.cpp`** — Lua 5.1 scripting (EVAL/EVALSHA/FCALL), wired back to `handle_command` for Redis call dispatch.
+- **`include/command.hpp`** — `SessionState`, `BlockedState`, `WaitState` structs; all extern globals and callbacks shared between command.cpp and server.cpp.
+- **`include/datastore.hpp`** — `DataStore` class, `Entry` fat-struct (304 bytes, holds all 6 type payloads simultaneously).
 
-## Key Design Principles
+## Key Conventions
 
-1. **Redis compatibility is paramount.** Every command must match Redis behavior exactly — return types, error messages, error precedence, argument validation order, edge cases. When in doubt, match Redis.
-2. **Redis is the spec.** For undocumented behavior, consult Redis source code. If PeaDB diverges, it's a bug unless explicitly documented in `compat/delta.md`.
-3. **`OBJECT ENCODING` must return Redis-compatible encoding names** regardless of internal data structures.
-4. **Error messages must match Redis exactly** where clients/tests depend on them. Use `wrongtype_error_reply()` from `errors.hpp` for WRONGTYPE errors.
-5. **No new data types or commands** beyond what Redis provides (namespaced additive extensions allowed only if they don't break existing parsers).
+- Anonymous namespace in `command.cpp` contains all helpers and globals. Public functions are defined after `} // namespace` (before `} // namespace peadb`).
+- Globals in `command.cpp` anonymous namespace are accessible from public functions in the same file via the same-TU rule.
+- `SessionState::fd` must be set before BLPOP/BRPOP block — used by `register_key_waiter`.
+- Persistence: AOF uses a persistent fd (`g_aof_fd`) opened at startup. `fsync` policy controlled by `g_appendfsync` ("always"|"everysec"|"no"). BGSAVE/BGREWRITEAOF fork and are reaped by `reap_background_children()` in the event loop.
+- Config precedence: config file is loaded first, CLI flags override.
 
-## Coding Conventions
+## Compatibility
 
-- **C++20** standard, no extensions (`CMAKE_CXX_EXTENSIONS OFF`)
-- Headers in `include/`, implementations in `src/`
-- Single namespace: `peadb`
-- Header guards: `#pragma once`
-- Build system: CMake (min 3.16), library target `peadb_core` linked by `peadb-server` executable and test binaries
-- Integration tests: Python 3, pytest-style, one file per feature area, named `test_<milestone>_<feature>.py`
-- Milestone naming: m0 (smoke) → m9 (nightly/advanced), p0–p3 (polish stages)
+`compat/delta.md` is the canonical status registry for known gaps vs Redis 7.2.5. `compat/commands.generated.md` is auto-generated by `scripts/ci/generate_compat_scoreboard.py`.
 
-## Known Compatibility Deltas
-
-Current known gaps vs Redis 7.2.5 (see `compat/delta.md` for details):
-
-- **ACL:** Basic AUTH/default user only; full ACL engine deferred
-- **RDB:** Native reader/writer for common types; full parity (all opcodes/encodings) in progress
-- **AOF:** Core works; edge-case parity ongoing
-- **Modules:** Minimal `RedisModule_*` API; RedisJSON/RediSearch certification deferred
-
-## Supported Features (~147 commands)
-
-Strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions (MULTI/EXEC/WATCH), Lua scripting (EVAL/EVALSHA/FUNCTION/FCALL), RDB/AOF persistence, PSYNC2 replication, cluster (16384 hash slots, MOVED/ASK, gossip), partial Redis Modules API.
-
-## Docker
-
-```bash
-# Run published image
-docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest
-
-# Build locally
-docker compose up -d
-```
-
-Multi-stage Dockerfile (Ubuntu 24.04 base). Env vars: `PEADB_PORT`, `PEADB_LOGLEVEL`, `PEADB_NOFILE_SOFT`, `PEADB_NOFILE_HARD`.
-
-## Common Development Workflows
-
-```bash
-# Quick start (build + run)
-scripts/dev/quick_start.sh
-
-# Benchmark against Redis
-scripts/dev/redis_vs_peadb_benchmark.sh
-
-# Check compatibility delta
-python3 scripts/ci/check_compat_delta.py
-```
-
-## Important Notes for AI Assistants
-
-- When implementing or fixing commands, always verify behavior matches Redis 7.2.5 exactly.
-- Integration tests require a running peadb-server instance. Unit tests (CTest) do not.
-- The `peadb_core` library is the shared target for both the server and tests — add new source files there.
-- Python test files follow the pattern `tests/integration/test_<milestone>_<feature>.py`.
-- Performance baselines are in `artifacts/perf-baseline.csv`.
-- ADRs for major design decisions are in `docs/decisions/`.
+Feature status labels: `full` | `partial` | `surface` | `stub` | `experimental`.

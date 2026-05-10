@@ -72,17 +72,32 @@ elif command -v gtimeout >/dev/null 2>&1; then
   TIMEOUT_CMD="gtimeout"
 fi
 
-# Kill any stale peadb-server processes from previous runs to avoid port conflicts.
-pkill -9 -f "peadb-server" 2>/dev/null || true
-sleep 2
+# Terminate a peadb-server PID gracefully; SIGKILL after 5 s if it lingers.
+stop_server() {
+  local pid="$1"
+  [[ -z "$pid" ]] && return
+  kill -TERM "$pid" 2>/dev/null || return
+  local i
+  for i in $(seq 1 10); do
+    kill -0 "$pid" 2>/dev/null || return
+    sleep 0.5
+  done
+  kill -KILL "$pid" 2>/dev/null || true
+}
 
 passed=0
 failed=0
 fail_list=""
+_server_pid=""
+
+cleanup() {
+  stop_server "$_server_pid"
+  rm -f "${out_file:-}"
+}
+trap cleanup EXIT
 
 shopt -s nullglob
 out_file="$(mktemp -t peadb_test_out.XXXXXX)"
-trap 'rm -f "$out_file"' EXIT
 
 cd "$ROOT_DIR"
 
@@ -93,9 +108,9 @@ if [[ ${#tests[@]} -eq 0 ]]; then
 fi
 
 for t in "${tests[@]}"; do
-  # Ensure no stale peadb-server from the previous test still occupies a port.
-  pkill -9 -f "peadb-server" 2>/dev/null || true
-  sleep 1
+  # Stop any server left over from the previous test.
+  stop_server "$_server_pid"
+  _server_pid=""
   name=$(basename "$t" .py)
   if [[ -n "$TIMEOUT_CMD" ]]; then
     if "$TIMEOUT_CMD" "$TIMEOUT_SECS" python3 "$t" > "$out_file" 2>&1; then
