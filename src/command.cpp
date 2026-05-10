@@ -102,6 +102,12 @@ std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
 // by the event loop. All DataStore mutations stay on the event loop thread.
 std::mutex g_replica_cmd_queue_mu;
 std::vector<std::vector<std::string>> g_replica_cmd_queue;
+// Pending RDB load handed off from streaming thread to event loop. The streaming
+// thread sets g_replica_load_path + g_replica_load_pending=true and waits; the event
+// loop runs rdb_load() synchronously and signals completion via g_replica_load_pending=false.
+std::string g_replica_load_path; // protected by g_replica_cmd_queue_mu
+std::atomic<bool> g_replica_load_pending{false};
+std::atomic<bool> g_replica_load_ok{false};
 bool g_active_expire = true;
 std::int64_t g_last_save_time = 0;
 std::string g_replication_role = "master";
@@ -222,7 +228,6 @@ std::atomic<int> g_connected_clients{0};
 std::atomic<std::int64_t> g_total_connections_received{0};
 std::atomic<std::int64_t> g_total_commands_processed{0};
 std::atomic<std::int64_t> g_server_start_time{0};
-std::atomic<int> g_connected_replicas{0};
 std::atomic<int> g_runtime_max_clients{10000};
 std::function<int(std::int64_t)> g_count_synced_replicas;
 std::function<int()> g_count_connected_replicas;
@@ -748,12 +753,10 @@ bool rewrite_aof_file(std::string& err) {
   }
   ::fsync(tmp_fd);
   ::close(tmp_fd);
-  if (::rename(tmp_path.c_str(), g_aof_path.c_str()) != 0) {
-    ::unlink(tmp_path.c_str());
-    err = "AOF rewrite rename failed"; return false;
-  }
-  // Reopen persistent fd to point at the new file
-  open_aof_fd();
+  // Parent owns the rename + commit point: child writes temp.aof and exits;
+  // parent appends the diff buffer and only then atomically renames over the
+  // live AOF. This means any failure (cap overflow, diff append error, rename
+  // error, child crash) leaves the old AOF intact on disk.
   return true;
 }
 
@@ -1936,7 +1939,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (want("PERSISTENCE")) {
             out += "# Persistence\r\n"
-                   "loading:0\r\n"
+                   "loading:" + std::to_string(g_loading_replication.load() ? 1 : 0) + "\r\n"
                    "rdb_changes_since_last_save:" + std::to_string(store().mutation_epoch()) + "\r\n"
                    "rdb_bgsave_in_progress:" + std::to_string(g_bgsave_in_progress.load() ? 1 : 0) + "\r\n"
                    "rdb_last_save_time:" + std::to_string(g_last_save_time) + "\r\n"
@@ -2077,7 +2080,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (g_count_synced_replicas) {
               return encode_integer(g_count_synced_replicas(g_master_repl_offset));
             }
-            return encode_integer(g_connected_replicas.load());
+            return encode_integer(0);
           }
           // Check immediately — snapshot offset at call time (Redis semantics)
           const std::int64_t target = g_master_repl_offset;
@@ -6825,6 +6828,9 @@ std::string try_unblock_client(SessionState& session) {
         return wrongtype_error_reply();
       }
       if (val.has_value()) {
+        // Copy key before clearing the vector — `key` is a reference into
+        // session.blocked.keys, which clear() would invalidate.
+        const std::string captured_key = key;
         unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
@@ -6842,7 +6848,7 @@ std::string try_unblock_client(SessionState& session) {
         }
 
         session.blocked.original_args.clear();
-        return encode_array({encode_bulk(key), encode_bulk(*val)});
+        return encode_array({encode_bulk(captured_key), encode_bulk(*val)});
       }
     }
   } else if (session.blocked.type == BlockType::ZSet) {
@@ -6857,13 +6863,15 @@ std::string try_unblock_client(SessionState& session) {
         return wrongtype_error_reply();
       }
       if (!vals.empty()) {
+        // Copy key before clearing — same reasoning as the List branch above.
+        const std::string captured_key = key;
         unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
         session.blocked.original_args.clear();
         std::ostringstream oss;
         oss << vals[0].second;
-        return encode_array({encode_bulk(key), encode_bulk(vals[0].first), encode_bulk(oss.str())});
+        return encode_array({encode_bulk(captured_key), encode_bulk(vals[0].first), encode_bulk(oss.str())});
       }
     }
   }
@@ -6904,6 +6912,23 @@ void aof_fsync_if_needed(std::int64_t now) {
 }
 
 void drain_replica_cmd_queue() {
+  // Apply any pending replica RDB load on the event loop thread before processing
+  // queued commands. Running rdb_load() here serializes flushall+restore with all
+  // event-loop reads/writes, eliminating the race against the streaming thread.
+  if (g_replica_load_pending.load()) {
+    std::string path;
+    {
+      std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+      path = g_replica_load_path;
+      g_replica_load_path.clear();
+    }
+    std::string err;
+    const bool ok = rdb_load(path, err);
+    if (!ok) log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
+    g_replica_load_ok.store(ok);
+    g_replica_load_pending.store(false);  // signal streaming thread
+  }
+
   std::vector<std::vector<std::string>> cmds;
   {
     std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
@@ -7092,14 +7117,27 @@ bool replica_do_fullsync(const std::string& host, int port) {
     }
     // Note: keep fd open for command streaming after RDB load.
 
-    std::string err;
-    if (!rdb_load(tmp_path, err)) {
-        ::unlink(tmp_path.c_str());
+    // Hand the RDB load off to the event loop so flushall+restore happens on the same
+    // thread that serves client reads/writes — eliminating the DataStore race that the
+    // previous in-thread rdb_load() created (libstdc++ unordered_map mutations are not
+    // safe under concurrent access). The streaming thread waits here until completion.
+    {
+        std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+        g_replica_load_path = tmp_path;
+    }
+    g_loading_replication.store(true);  // visible via INFO persistence loading:1
+    g_replica_load_pending.store(true);
+    while (g_replica_load_pending.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    const bool load_ok = g_replica_load_ok.load();
+    g_loading_replication.store(false);
+    ::unlink(tmp_path.c_str());
+    if (!load_ok) {
         ::close(fd);
-        log(LogLevel::Error, "REPLICAOF: rdb_load failed: " + err);
+        log(LogLevel::Error, "REPLICAOF: rdb_load failed (event-loop)");
         return false;
     }
-    ::unlink(tmp_path.c_str());
     log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
 
     // Release loading gate; from here the event loop's READONLY guard rejects client writes.
@@ -7193,54 +7231,60 @@ void reap_background_children() {
     if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
       g_bgrewrite_child_pid.store(0);
       g_bgrewrite_in_progress.store(false);
-      // The child renamed the temp AOF into place. Append any commands that
-      // arrived during the rewrite window, then reopen the persistent fd.
+      // The child wrote temp.aof but did NOT rename. Parent owns the commit:
+      // append the diff buffer to temp.aof, then atomically rename. Any failure
+      // unlinks the temp and keeps the old AOF live.
+      const std::string tmp_path = g_aof_path.string() + ".tmp";
       if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_appendonly) {
         if (g_aof_rewrite_buf_capped) {
-          // The diff buffer hit the 256 MiB cap during rewrite; commands beyond
-          // the cap were dropped and are now missing from the rewritten AOF.
-          // Mark the rewrite as failed and discard the partial buffer so we don't
-          // produce a known-incomplete AOF. The next BGREWRITEAOF will rebuild
-          // from the in-memory dataset.
-          log(LogLevel::Error, "BGREWRITEAOF: marked failed because diff buffer hit 256 MiB cap; "
-              "dropping " + std::to_string(g_aof_rewrite_buf.size()) +
-              " bytes of partial diff. The rewritten AOF on disk is incomplete; "
-              "rerun BGREWRITEAOF after reducing write pressure.");
+          // Diff buffer overflowed during rewrite. Abandon: keep old AOF.
+          ::unlink(tmp_path.c_str());
+          log(LogLevel::Error, "BGREWRITEAOF: aborted because diff buffer hit 256 MiB cap; "
+              "old AOF retained intact (dropping " +
+              std::to_string(g_aof_rewrite_buf.size()) +
+              " bytes of partial diff). Reduce write rate and rerun BGREWRITEAOF.");
           g_aof_rewrite_buf.clear();
           g_aof_last_bgrewrite_status = "err";
-          open_aof_fd();
-        } else if (!g_aof_rewrite_buf.empty()) {
-          const int diff_fd = ::open(g_aof_path.c_str(),
-                                     O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
-          bool diff_ok = false;
-          if (diff_fd >= 0) {
-            const char* p = g_aof_rewrite_buf.data();
-            std::size_t remaining = g_aof_rewrite_buf.size();
-            diff_ok = true;
-            while (remaining > 0) {
-              const ssize_t rc = ::write(diff_fd, p, remaining);
-              if (rc <= 0) { diff_ok = false; break; }
-              p += static_cast<std::size_t>(rc);
-              remaining -= static_cast<std::size_t>(rc);
+          // g_aof_fd unchanged — still pointing at the live old AOF.
+        } else {
+          // Append diff buffer to temp.aof before committing via rename.
+          bool diff_ok = true;
+          if (!g_aof_rewrite_buf.empty()) {
+            const int diff_fd = ::open(tmp_path.c_str(),
+                                       O_WRONLY | O_APPEND | O_CLOEXEC, 0644);
+            if (diff_fd < 0) {
+              diff_ok = false;
+            } else {
+              const char* p = g_aof_rewrite_buf.data();
+              std::size_t remaining = g_aof_rewrite_buf.size();
+              while (remaining > 0) {
+                const ssize_t rc = ::write(diff_fd, p, remaining);
+                if (rc <= 0) { diff_ok = false; break; }
+                p += static_cast<std::size_t>(rc);
+                remaining -= static_cast<std::size_t>(rc);
+              }
+              if (diff_ok && ::fsync(diff_fd) != 0) diff_ok = false;
+              ::close(diff_fd);
             }
-            if (diff_ok && ::fsync(diff_fd) != 0) diff_ok = false;
-            ::close(diff_fd);
           }
-          if (diff_ok) {
+          if (diff_ok && ::rename(tmp_path.c_str(), g_aof_path.c_str()) == 0) {
             g_aof_rewrite_buf.clear();
             g_aof_last_bgrewrite_status = "ok";
+            open_aof_fd();  // reopen on the new inode
           } else {
-            log(LogLevel::Error, "BGREWRITEAOF: failed to append rewrite diff (" +
-                std::to_string(g_aof_rewrite_buf.size()) + " bytes); AOF may be incomplete");
+            ::unlink(tmp_path.c_str());
             g_aof_last_bgrewrite_status = "err";
-            // Buffer not cleared — next successful BGREWRITEAOF can retry.
+            log(LogLevel::Error, "BGREWRITEAOF: failed to commit (" +
+                std::string(diff_ok ? "rename" : "diff append") +
+                " failed); old AOF retained, " +
+                std::to_string(g_aof_rewrite_buf.size()) +
+                " buffered diff bytes preserved for retry.");
+            // Buffer not cleared — next rewrite can retry.
           }
-          if (g_aof_rewrite_buf.empty()) open_aof_fd();
-        } else {
-          g_aof_last_bgrewrite_status = "ok";
-          open_aof_fd();
         }
       } else {
+        // Child crashed/exited non-zero — clean any leftover temp; keep old AOF.
+        ::unlink(tmp_path.c_str());
         if (!g_aof_rewrite_buf.empty()) {
           log(LogLevel::Warn, "BGREWRITEAOF: child failed; discarding " +
               std::to_string(g_aof_rewrite_buf.size()) + " bytes of buffered diff");

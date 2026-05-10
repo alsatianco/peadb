@@ -448,8 +448,7 @@ int run_server(const ServerConfig& config) {
       for (auto& [wfd, session] : sessions) {
         if (!session.wait_state.has_value()) continue;
         auto& ws = session.wait_state.value();
-        int synced = g_count_synced_replicas ? g_count_synced_replicas(ws.target_offset)
-                                             : g_connected_replicas.load();
+        int synced = g_count_synced_replicas ? g_count_synced_replicas(ws.target_offset) : 0;
         const bool timed_out = ws.deadline_ms > 0 && wloop_now >= ws.deadline_ms;
         if (synced >= ws.min_replicas || timed_out) {
           session.wait_state.reset();
