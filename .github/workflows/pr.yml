@@ -1,0 +1,43 @@
+name: PR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y cmake g++ liblua5.1-0-dev redis-server clang-format
+
+      - name: clang-format check
+        run: |
+          find src include -name '*.cpp' -o -name '*.hpp' -o -name '*.c' -o -name '*.h' \
+            | xargs clang-format --dry-run --Werror
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Unit tests
+        run: cd build && ctest --output-on-failure
+
+      - name: Integration smoke
+        run: cd build && ../scripts/ci/run_integration_tests.sh
+
+      - name: Command coverage gate
+        run: python3 scripts/ci/check_command_test_coverage.py
+
+      - name: Compat delta check
+        run: |
+          if [ -f scripts/ci/check_compat_delta.py ]; then
+            python3 scripts/ci/check_compat_delta.py
+          fi

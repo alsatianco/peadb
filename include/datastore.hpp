@@ -7,6 +7,7 @@
 #include <map>
 #include <tuple>
 #include <string>
+#include <atomic>
 #include <filesystem>
 #include <unordered_map>
 #include <vector>
@@ -35,7 +36,8 @@ struct Entry {
   std::unordered_map<std::string, std::string> hash_value;
   std::deque<std::string> list_value;
   std::unordered_set<std::string> set_value;
-  std::unordered_map<std::string, double> zset_value;
+  std::unordered_map<std::string, double> zset_value;   // member → score (O(1) lookup)
+  std::map<std::pair<double, std::string>, bool> zset_ordered; // {score,member} sorted index
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> stream_entries;
   std::uint64_t stream_last_ms = 0;
   std::uint64_t stream_last_seq = 0;
@@ -155,6 +157,21 @@ class DataStore {
   void active_expire_cycle(std::size_t budget_per_db = 64);
   std::pair<std::uint64_t, std::vector<std::string>> scan(std::uint64_t cursor, std::size_t count, const std::string& match = "*", const std::string& type = "");
   std::uint64_t mutation_epoch() const;
+  void increment_mutation_epoch();
+  // Returns {total_keys, keys_with_expiry, avg_ttl_ms} for current db
+  std::tuple<std::size_t, std::size_t, std::int64_t> keyspace_stats() const;
+
+  // Observability counters
+  std::int64_t stat_expired_keys() const { return stat_expired_keys_.load(); }
+  std::int64_t stat_keyspace_hits() const { return stat_keyspace_hits_.load(); }
+  std::int64_t stat_keyspace_misses() const { return stat_keyspace_misses_.load(); }
+  std::int64_t stat_evicted_keys() const { return stat_evicted_keys_.load(); }
+  void record_hit() { stat_keyspace_hits_.fetch_add(1, std::memory_order_relaxed); }
+  void record_miss() { stat_keyspace_misses_.fetch_add(1, std::memory_order_relaxed); }
+  void record_expired() { stat_expired_keys_.fetch_add(1, std::memory_order_relaxed); }
+
+  // Memory accounting — walks all databases to compute an estimate
+  std::int64_t estimate_used_memory() const;
   bool save_snapshot_file(const std::filesystem::path& path, std::string& err);
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);
   std::vector<std::vector<std::string>> export_aof_commands() const;
@@ -175,6 +192,10 @@ class DataStore {
   std::vector<DB> dbs_;
   std::uint64_t mutation_epoch_ = 0;
   std::int64_t zset_max_ziplist_entries_ = 128;
+  std::atomic<std::int64_t> stat_expired_keys_{0};
+  std::atomic<std::int64_t> stat_keyspace_hits_{0};
+  std::atomic<std::int64_t> stat_keyspace_misses_{0};
+  std::atomic<std::int64_t> stat_evicted_keys_{0};
   static inline std::int64_t frozen_time_ms_ = 0;
   static inline bool time_frozen_ = false;
 };

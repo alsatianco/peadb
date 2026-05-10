@@ -1,7 +1,17 @@
 # Compatibility Delta
 
-Date: 2026-02-17
+Date: 2026-05-10
 Redis pin: 7.2.5 (`f60370ce28b946c1146dcea77c9c399d39601aaa`)
+
+This file is the **canonical status registry** for PeaDB compatibility gaps.
+README and FAQ links should reference this document rather than repeating status.
+
+Feature status labels:
+- `full` — passes integration + differential tests including error shape
+- `partial` — integration tests pass; differential or edge cases missing
+- `surface` — command is registered and returns plausible output; no test coverage
+- `stub` — command is registered but not implemented or returns hardcoded response
+- `experimental` — implemented but not validated against Redis test suite
 
 ## Known Deltas
 
@@ -46,3 +56,44 @@ Redis pin: 7.2.5 (`f60370ce28b946c1146dcea77c9c399d39601aaa`)
 - Missing: certification of popular external modules (RedisJSON, RediSearch,
   RedisTimeSeries, RedisBloom) without modification.
 - Tracking: post-M8 expansion of `RedisModule_*` API surface.
+
+5. Stream RDB encoding
+- Status: `surface` (data loss risk)
+- Owner: persistence-compat
+- Severity: high
+- Target milestone: P2
+- Implemented: XADD/XREAD/XREADGROUP in memory; stream keys are visible and queryable.
+- Missing: RDB save encodes stream keys — they are silently skipped during BGSAVE/SAVE.
+  A warning is logged to identify affected keys. Stream data does NOT survive restart.
+- Tracking: P2-1 in improvement plan.
+
+6. Cluster bus gossip protocol
+- Status: `stub`
+- Owner: cluster-compat
+- Severity: medium
+- Target milestone: P4
+- Implemented: CLUSTER MEET/INFO/NODES/SLOTS/KEYSLOT, MOVED/ASK redirection,
+  slot migration basics, PONG gossip reply on cluster bus port.
+- Missing: full binary gossip protocol (MEET/PING/PONG/FAIL messages); cluster bus
+  communication is PONG-only — nodes do not broadcast topology updates to each other.
+- Tracking: long-term cluster milestone.
+
+7. AUTH / ACL enforcement
+- Status: `surface`
+- Owner: security-compat
+- Severity: high
+- Target milestone: P3
+- Implemented: AUTH command accepted; ACL SETUSER/GETUSER/LIST/LOG/CAT registered.
+- Missing: real password enforcement and ACL rule evaluation. Any password is accepted.
+- Tracking: security hardening milestone.
+
+8. REPLICAOF in-process streaming
+- Status: `partial` (functional but fragile)
+- Owner: replication-compat
+- Severity: medium
+- Target milestone: P2
+- Implemented: REPLICAOF triggers sync via a Python helper script (system() call).
+  Full-resync only — PSYNC2 always triggers full resync, no partial resync.
+- Missing: in-process replication client (no Python dependency), partial resync,
+  bounded replication backlog.
+- Tracking: P2-2 and P3-1 in improvement plan.

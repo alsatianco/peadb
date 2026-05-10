@@ -1,4 +1,5 @@
 #include "command.hpp"
+#include "server_context.hpp"
 
 #include "datastore.hpp"
 #include "errors.hpp"
@@ -28,14 +29,27 @@
 #include <memory>
 #include <limits>
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
 #include <dlfcn.h>
 #include <fnmatch.h>
+#include <netdb.h>
+
+#include "logger.hpp"
 
 namespace peadb {
+
+// Forward declarations for functions defined after the anonymous namespace
+void register_key_waiter(const std::string& key, int fd);
+void unregister_key_waiter(int fd);
+void notify_key_written(const std::string& key, int db_index);
+bool replica_do_fullsync(const std::string& host, int port);
+
 namespace {
 
 enum CmdFlag : std::uint32_t {
@@ -62,12 +76,21 @@ struct CommandSpec {
   bool is_write() const { return flag_bits & kFlagWrite; }
 };
 
-std::atomic<std::uint64_t> g_mutation_epoch{0};
 std::unordered_map<std::string, std::string> g_script_cache;
 std::filesystem::path g_snapshot_path = "dump.rdb";
 std::filesystem::path g_aof_path = "appendonly.aof";
 bool g_appendonly = false;
 bool g_replaying_aof = false;
+int g_aof_fd = -1;
+std::string g_appendfsync = "everysec";
+bool g_aof_write_error = false;
+std::int64_t g_last_aof_fsync_ms = 0;
+std::atomic<pid_t> g_bgsave_child_pid{0};
+std::atomic<bool> g_bgsave_in_progress{false};
+std::int64_t g_bgsave_start_time = 0;
+std::string g_last_bgsave_status = "ok";
+std::atomic<pid_t> g_bgrewrite_child_pid{0};
+std::atomic<bool> g_bgrewrite_in_progress{false};
 bool g_active_expire = true;
 std::int64_t g_last_save_time = 0;
 std::string g_replication_role = "master";
@@ -78,9 +101,50 @@ std::string g_master_replid = "0000000000000000000000000000000000000001";
 std::int64_t g_master_repl_offset = 0;
 std::int64_t g_config_maxmemory = 0;
 std::int64_t g_config_min_replicas_to_write = 0;
-thread_local bool g_in_lua_script = false;
+bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
-std::vector<std::string> g_replication_events;
+// 1MB circular replication backlog (replaces unbounded g_replication_events vector)
+struct ReplBacklog {
+    static constexpr std::size_t kSize = 1 << 20; // 1MB
+    std::vector<char> buf;
+    std::int64_t total = 0; // total bytes ever appended
+
+    ReplBacklog() : buf(kSize, 0) {}
+
+    std::int64_t base() const {
+        return total > static_cast<std::int64_t>(kSize)
+               ? total - static_cast<std::int64_t>(kSize) : 0;
+    }
+
+    void append(const std::string& data) {
+        for (char c : data) {
+            buf[static_cast<std::size_t>(total++ % kSize)] = c;
+        }
+    }
+
+    // Fill out with bytes [from_byte, total). Returns false if from_byte < base().
+    bool get_slice(std::int64_t from_byte, std::string& out) const {
+        if (from_byte < base() || from_byte > total) return false;
+        const std::size_t len = static_cast<std::size_t>(total - from_byte);
+        out.resize(len);
+        if (len == 0) return true;
+        const std::size_t start = static_cast<std::size_t>(from_byte % kSize);
+        if (start + len <= kSize) {
+            std::memcpy(out.data(), buf.data() + start, len);
+        } else {
+            const std::size_t first = kSize - start;
+            std::memcpy(out.data(), buf.data() + start, first);
+            std::memcpy(out.data() + first, buf.data(), len - first);
+        }
+        return true;
+    }
+};
+ReplBacklog g_repl_backlog;
+// Append a RESP-encoded command to the replication backlog and advance the master offset
+inline void backlog_append(const std::string& data) {
+    g_repl_backlog.append(data);
+    g_master_repl_offset = g_repl_backlog.total;
+}
 std::vector<std::string> g_exec_replication_events;
 bool g_capture_exec_replication = false;
 int g_exec_last_repl_db = -1;
@@ -89,8 +153,8 @@ bool g_executing_exec = false;
 int g_last_repl_db = 0;
 bool g_replica_stale = false;
 std::atomic<bool> g_loading_replication{false};
-thread_local bool g_script_allow_oom = false;
-thread_local bool g_script_inner_error_seen = false;
+bool g_script_allow_oom = false;
+bool g_script_inner_error_seen = false;
 enum class SlotRoute { Owned, Moved, Ask };
 std::array<SlotRoute, 16384> g_slot_routes {};
 std::string g_cluster_redirect_addr = "127.0.0.1:7000";
@@ -108,7 +172,7 @@ struct ModuleKeyHandle {
   std::string key;
 };
 std::vector<std::unique_ptr<ModuleKeyHandle>> g_module_keys;
-thread_local std::string g_module_dma_buf;
+std::string g_module_dma_buf;
 struct ModuleCallCtx {
   std::string reply;
   bool replied = false;
@@ -126,9 +190,9 @@ struct CmdStats {
 bool parse_i64(const std::string& s, std::int64_t& out);
 std::unordered_map<std::string, FunctionDef> g_functions;
 std::unordered_map<std::string, std::vector<std::string>> g_function_libraries;
-thread_local bool g_script_readonly_context = false;
-thread_local RespVersion g_script_client_resp_version = RespVersion::Resp2;
-thread_local SessionState* g_script_current_session = nullptr;
+bool g_script_readonly_context = false;
+RespVersion g_script_client_resp_version = RespVersion::Resp2;
+SessionState* g_script_current_session = nullptr;
 std::uint64_t g_script_prng_state = 0x12345678ULL;
 std::unordered_map<std::string, CmdStats> g_cmdstats;
 std::unordered_map<std::string, std::int64_t> g_errorstats;
@@ -611,10 +675,10 @@ void append_replication_event(const std::vector<std::string>& args, const Sessio
     return;
   }
   if (session.db_index != g_last_repl_db) {
-    g_replication_events.push_back(encode_command_resp({"SELECT", std::to_string(session.db_index)}));
+    backlog_append(encode_command_resp({"SELECT", std::to_string(session.db_index)}));
     g_last_repl_db = session.db_index;
   }
-  g_replication_events.push_back(encode_command_resp(out));
+  backlog_append(encode_command_resp(out));
 }
 
 void append_lazy_expire_dels(const SessionState& session) {
@@ -624,26 +688,45 @@ void append_lazy_expire_dels(const SessionState& session) {
   }
 }
 
+void open_aof_fd() {
+  if (g_aof_fd >= 0) { ::close(g_aof_fd); g_aof_fd = -1; }
+  g_aof_fd = ::open(g_aof_path.c_str(), O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+}
+
 void append_aof(const std::vector<std::string>& args) {
   if (!g_appendonly || g_replaying_aof) return;
-  std::ofstream out(g_aof_path, std::ios::app | std::ios::binary);
-  if (!out.is_open()) return;
+  if (g_aof_fd < 0) open_aof_fd();
+  if (g_aof_fd < 0) { g_aof_write_error = true; return; }
   const auto payload = encode_command_resp(args);
-  out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+  const ssize_t written = ::write(g_aof_fd, payload.data(), payload.size());
+  if (written < 0 || static_cast<std::size_t>(written) != payload.size()) {
+    g_aof_write_error = true;
+    return;
+  }
+  if (g_appendfsync == "always") ::fsync(g_aof_fd);
 }
 
 bool rewrite_aof_file(std::string& err) {
   err.clear();
-  std::ofstream out(g_aof_path, std::ios::binary | std::ios::trunc);
-  if (!out.is_open()) {
-    err = "cannot open AOF for rewrite";
-    return false;
-  }
+  const std::string tmp_path = g_aof_path.string() + ".tmp";
+  const int tmp_fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (tmp_fd < 0) { err = "cannot open AOF tmp for rewrite"; return false; }
   const auto cmds = store().export_aof_commands();
   for (const auto& cmd : cmds) {
     const auto payload = encode_command_resp(cmd);
-    out.write(payload.data(), static_cast<std::streamsize>(payload.size()));
+    if (::write(tmp_fd, payload.data(), payload.size()) < 0) {
+      ::close(tmp_fd); ::unlink(tmp_path.c_str());
+      err = "AOF rewrite write error"; return false;
+    }
   }
+  ::fsync(tmp_fd);
+  ::close(tmp_fd);
+  if (::rename(tmp_path.c_str(), g_aof_path.c_str()) != 0) {
+    ::unlink(tmp_path.c_str());
+    err = "AOF rewrite rename failed"; return false;
+  }
+  // Reopen persistent fd to point at the new file
+  open_aof_fd();
   return true;
 }
 
@@ -1324,7 +1407,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
           session.replica_stream = true;
-          session.repl_index = g_replication_events.size();
+          session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           g_last_repl_db = -1; // Force re-emit SELECT on next write
           // Send empty RDB payload — replication stream carries all state.
           // RESP bulk string: $0\r\n followed by empty body (no trailing \r\n)
@@ -1369,15 +1452,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t offset = -1;
           parse_i64(args[2], offset);
 
-          // For now, always do full resync
           session.replica_stream = true;
-          session.repl_index = g_replication_events.size();
-          g_last_repl_db = -1; // Force re-emit SELECT on next write
+          g_last_repl_db = -1;
 
-          // Build RDB for full sync
+          // Attempt partial resync if replid matches and offset is within backlog
+          if (replid == g_master_replid && offset >= 0 &&
+              offset >= g_repl_backlog.base() && offset <= g_repl_backlog.total) {
+            std::string pending;
+            g_repl_backlog.get_slice(offset, pending);
+            session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
+            return "+CONTINUE\r\n" + pending;
+          }
+
+          // Full resync
+          session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           std::string rdb_data = rdb_save_to_string();
-
-          // FULLRESYNC <replid> <offset>
           std::string reply = "+FULLRESYNC " + g_master_replid + " " +
                               std::to_string(g_master_repl_offset) + "\r\n";
           reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data;
@@ -1407,7 +1496,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("WATCH", CommandSpec{"WATCH", -2, {"fast"}, 1, -1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           if (session.in_multi) return encode_error("WATCH inside MULTI is not allowed");
-          session.watched_epoch = g_mutation_epoch.load();
+          session.watched_epoch = store().mutation_epoch();
           for (std::size_t i = 1; i < args.size(); ++i) {
             session.watched_digests[args[i]] = store().debug_digest_value(args[i]);
           }
@@ -1513,16 +1602,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           g_executing_exec = false;
           g_capture_exec_replication = false;
           if (!has_replof && g_exec_write_event_count > 1) {
-            g_replication_events.push_back(encode_command_resp({"MULTI"}));
-            for (const auto& ev : g_exec_replication_events) g_replication_events.push_back(ev);
-            g_replication_events.push_back(encode_command_resp({"EXEC"}));
+            backlog_append(encode_command_resp({"MULTI"}));
+            for (const auto& ev : g_exec_replication_events) backlog_append(ev);
+            backlog_append(encode_command_resp({"EXEC"}));
             g_last_repl_db = g_exec_last_repl_db;
           } else if (!has_replof && g_exec_write_event_count == 1 && !g_exec_replication_events.empty()) {
             if (g_exec_last_repl_db != g_last_repl_db) {
-              // Emit SELECT if the captured events changed the db
-              g_replication_events.push_back(encode_command_resp({"SELECT", std::to_string(g_exec_last_repl_db)}));
+              backlog_append(encode_command_resp({"SELECT", std::to_string(g_exec_last_repl_db)}));
             }
-            g_replication_events.push_back(g_exec_replication_events.back());
+            backlog_append(g_exec_replication_events.back());
             g_last_repl_db = g_exec_last_repl_db;
           }
           g_exec_replication_events.clear();
@@ -1761,15 +1849,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           auto uptime_s = (now_ms() - g_server_start_time.load()) / 1000;
           if (uptime_s < 1) uptime_s = 1;
 
-          // Compute used_memory estimate: dbsize * ~200 bytes each (rough)
-          std::size_t total_keys = 0;
-          const int prev_db = store().current_db();
-          for (int d = 0; d < 16; ++d) {
-            store().select_db(d);
-            total_keys += store().dbsize();
-          }
-          store().select_db(prev_db);
-          std::size_t used_mem = total_keys * 200 + 1024 * 1024; // 1MB base + ~200 per key
+          const std::size_t used_mem = static_cast<std::size_t>(store().estimate_used_memory());
 
           auto format_mem = [](std::size_t bytes) -> std::string {
             if (bytes >= 1024ULL * 1024 * 1024) return std::to_string(bytes / (1024ULL * 1024 * 1024)) + "G";
@@ -1824,25 +1904,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "# Persistence\r\n"
                    "loading:0\r\n"
                    "rdb_changes_since_last_save:" + std::to_string(store().mutation_epoch()) + "\r\n"
-                   "rdb_bgsave_in_progress:0\r\n"
+                   "rdb_bgsave_in_progress:" + std::to_string(g_bgsave_in_progress.load() ? 1 : 0) + "\r\n"
                    "rdb_last_save_time:" + std::to_string(g_last_save_time) + "\r\n"
-                   "rdb_last_bgsave_status:ok\r\n"
+                   "rdb_last_bgsave_status:" + g_last_bgsave_status + "\r\n"
                    "aof_enabled:" + std::to_string(g_appendonly ? 1 : 0) + "\r\n"
-                   "aof_rewrite_in_progress:0\r\n"
-                   "aof_last_bgrewrite_status:ok\r\n\r\n";
+                   "aof_rewrite_in_progress:" + std::to_string(g_bgrewrite_in_progress.load() ? 1 : 0) + "\r\n"
+                   "aof_last_bgrewrite_status:ok\r\n"
+                   "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n\r\n";
           }
           if (want("STATS")) {
             out += "# Stats\r\n"
                    "total_connections_received:" + std::to_string(g_total_connections_received.load()) + "\r\n"
                    "total_commands_processed:" + std::to_string(g_total_commands_processed.load()) + "\r\n"
                    "total_error_replies:" + std::to_string(g_total_error_replies) + "\r\n"
-                   "keyspace_hits:0\r\n"
-                   "keyspace_misses:0\r\n\r\n";
+                   "keyspace_hits:" + std::to_string(store().stat_keyspace_hits()) + "\r\n"
+                   "keyspace_misses:" + std::to_string(store().stat_keyspace_misses()) + "\r\n"
+                   "expired_keys:" + std::to_string(store().stat_expired_keys()) + "\r\n"
+                   "evicted_keys:" + std::to_string(store().stat_evicted_keys()) + "\r\n\r\n";
           }
           if (want("REPLICATION")) {
             out += "# Replication\r\n"
                    "role:" + g_replication_role + "\r\n"
-                   "connected_slaves:0\r\n"
+                   "connected_slaves:" + std::to_string(g_connected_replicas.load()) + "\r\n"
                    "master_failover_state:no-failover\r\n"
                    "master_replid:" + g_master_replid + "\r\n"
                    "master_replid2:0000000000000000000000000000000000000000\r\n"
@@ -1886,9 +1969,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const int prev = store().current_db();
             for (int d = 0; d < 16; ++d) {
               store().select_db(d);
-              auto sz = store().dbsize();
-              if (sz > 0) {
-                out += "db" + std::to_string(d) + ":keys=" + std::to_string(sz) + ",expires=0,avg_ttl=0\r\n";
+              const auto [keys_count, expires_count, avg_ttl] = store().keyspace_stats();
+              if (keys_count > 0) {
+                out += "db" + std::to_string(d) + ":keys=" + std::to_string(keys_count) +
+                       ",expires=" + std::to_string(expires_count) +
+                       ",avg_ttl=" + std::to_string(avg_ttl) + "\r\n";
               }
             }
             store().select_db(prev);
@@ -1912,28 +1997,38 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("BGSAVE", CommandSpec{"BGSAVE", 1, {"admin", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
+          if (g_bgsave_in_progress.load()) return encode_error("Background save already in progress");
           pid_t pid = fork();
           if (pid < 0) return encode_error("Background save failed: fork error");
           if (pid == 0) {
-            // Child process — write RDB and exit
             std::string err;
             bool ok = rdb_save(g_snapshot_path, err);
             _exit(ok ? 0 : 1);
           }
-          // Parent continues
-          g_last_save_time = now_ms() / 1000;
+          g_bgsave_in_progress.store(true);
+          g_bgsave_child_pid.store(pid);
+          g_bgsave_start_time = now_ms();
           return encode_simple("Background saving started");
         }});
 
     t.emplace("BGREWRITEAOF", CommandSpec{"BGREWRITEAOF", 1, {"admin", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
-          std::string err;
-          if (!rewrite_aof_file(err)) return encode_error(err);
+          if (g_bgrewrite_in_progress.load())
+            return encode_error("Background append only file rewriting already in progress");
+          pid_t pid = fork();
+          if (pid < 0) return encode_error("BGREWRITEAOF failed: fork error");
+          if (pid == 0) {
+            std::string err;
+            bool ok = rewrite_aof_file(err);
+            _exit(ok ? 0 : 1);
+          }
+          g_bgrewrite_in_progress.store(true);
+          g_bgrewrite_child_pid.store(pid);
           return encode_simple("Background append only file rewriting started");
         }});
 
     t.emplace("WAIT", CommandSpec{"WAIT", 3, {"noscript"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::int64_t replicas = 0;
           std::int64_t timeout = 0;
           if (!parse_i64(args[1], replicas) || !parse_i64(args[2], timeout) || replicas < 0 || timeout < 0) {
@@ -1946,18 +2041,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             return encode_integer(g_connected_replicas.load());
           }
-          // Count replicas that have acked up to current offset
+          // Check immediately — snapshot offset at call time (Redis semantics)
+          const std::int64_t target = g_master_repl_offset;
           if (g_count_synced_replicas) {
-            auto deadline = (timeout > 0) ? (now_ms() + timeout) : std::numeric_limits<std::int64_t>::max();
-            while (true) {
-              int synced = g_count_synced_replicas(g_master_repl_offset);
-              if (synced >= replicas || now_ms() >= deadline) {
-                return encode_integer(synced);
-              }
-              std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
+            int synced = g_count_synced_replicas(target);
+            if (synced >= replicas) return encode_integer(synced);
+          } else {
+            return encode_integer(0);
           }
-          return encode_integer(g_connected_replicas.load());
+          if (replicas == 0) return encode_integer(0);
+          // Defer: event loop resolves when replicas ack or deadline passes
+          const auto deadline = (timeout > 0) ? (now_ms() + timeout) : std::int64_t{0};
+          session.wait_state = WaitState{target, deadline, replicas};
+          return std::string{};
         }});
 
     t.emplace("REPLICAOF", CommandSpec{"REPLICAOF", 3, {"admin"}, 0, 0, 0,
@@ -1981,18 +2077,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (p == 0) {
             return encode_simple("OK");
           }
-          const int target_port = g_server_port;
-          std::thread([host, p, target_port]() {
+          std::thread([host, p]() {
             // Small delay to ensure pending client commands see slave role first
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
             g_loading_replication.store(true);
-            std::string cmd = "python3 scripts/redis/sync_from_redis.py --source-host " + host +
-                              " --source-port " + std::to_string(p) +
-                              " --target-host 127.0.0.1 --target-port " + std::to_string(target_port) + " --flush-target";
-            const int rc = std::system(cmd.c_str());
-            (void)rc;
+            const bool ok = replica_do_fullsync(host, static_cast<int>(p));
             g_loading_replication.store(false);
-            g_replica_stale = false;
+            if (ok) g_replica_stale = false;
           }).detach();
           return encode_simple("OK");
         }});
@@ -3582,23 +3673,25 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("LPUSH", CommandSpec{"LPUSH", -3, {"write", "denyoom"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           return with_list_key(args[1], [&]() {
             std::vector<std::string> vals(args.begin() + 2, args.end());
             bool wrongtype = false;
             auto n = store().lpush(args[1], vals, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
+            notify_key_written(args[1], session.db_index);
             return encode_integer(n);
           });
         }});
 
     t.emplace("RPUSH", CommandSpec{"RPUSH", -3, {"write", "denyoom"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           return with_list_key(args[1], [&]() {
             std::vector<std::string> vals(args.begin() + 2, args.end());
             bool wrongtype = false;
             auto n = store().rpush(args[1], vals, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
+            notify_key_written(args[1], session.db_index);
             return encode_integer(n);
           });
         }});
@@ -3671,7 +3764,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.blocked.type = BlockType::List;
           session.blocked.pop_left = true;
           session.blocked.keys.clear();
-          for (std::size_t i = 1; i + 1 < args.size(); ++i) session.blocked.keys.push_back(args[i]);
+          for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+            session.blocked.keys.push_back(args[i]);
+            register_key_waiter(args[i], session.fd);
+          }
           session.blocked.original_args = args;
           if (timeout_sec > 0) {
             session.blocked.deadline_ms = now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L);
@@ -3700,7 +3796,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.blocked.type = BlockType::List;
           session.blocked.pop_left = false;
           session.blocked.keys.clear();
-          for (std::size_t i = 1; i + 1 < args.size(); ++i) session.blocked.keys.push_back(args[i]);
+          for (std::size_t i = 1; i + 1 < args.size(); ++i) {
+            session.blocked.keys.push_back(args[i]);
+            register_key_waiter(args[i], session.fd);
+          }
           session.blocked.original_args = args;
           if (timeout_sec > 0) {
             session.blocked.deadline_ms = now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L);
@@ -6536,7 +6635,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     }
   }
   if (spec_is_write && !is_error_reply(reply)) {
-    g_mutation_epoch.fetch_add(1);
+    store().increment_mutation_epoch();
     g_master_repl_offset += static_cast<std::int64_t>(encode_command_resp_size(args));
     append_replication_event(args, session, &reply);
     append_aof(args);
@@ -6549,6 +6648,7 @@ void configure_persistence(const std::string& dir, const std::string& dbfilename
   g_snapshot_path = std::filesystem::path(dir) / dbfilename;
   g_appendonly = appendonly;
   g_aof_path = std::filesystem::path(dir) / appendfilename;
+  if (g_appendonly) open_aof_fd();
 }
 
 bool load_aof_file(const std::string& path, std::string& err) {
@@ -6625,12 +6725,14 @@ int configured_max_clients() {
 }
 
 std::size_t replication_event_count() {
-  return g_replication_events.size();
+  return static_cast<std::size_t>(g_repl_backlog.total);
 }
 
-std::string replication_event_at(std::size_t idx) {
-  if (idx >= g_replication_events.size()) return {};
-  return g_replication_events[idx];
+// Returns all backlog bytes from byte-offset `from` to current total.
+std::string replication_event_at(std::size_t from) {
+  std::string out;
+  g_repl_backlog.get_slice(static_cast<std::int64_t>(from), out);
+  return out;
 }
 
 // ─── Blocking client support ──────────────────────────────────────────────
@@ -6642,6 +6744,7 @@ std::string try_unblock_client(SessionState& session) {
 
   // Check timeout
   if (session.blocked.deadline_ms > 0 && current >= session.blocked.deadline_ms) {
+    unregister_key_waiter(session.fd);
     session.blocked.type = BlockType::None;
     session.blocked.keys.clear();
     session.blocked.original_args.clear();
@@ -6662,12 +6765,14 @@ std::string try_unblock_client(SessionState& session) {
         val = store().rpop(key, wrongtype);
       }
       if (wrongtype) {
+        unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
         session.blocked.original_args.clear();
         return wrongtype_error_reply();
       }
       if (val.has_value()) {
+        unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
 
@@ -6692,12 +6797,14 @@ std::string try_unblock_client(SessionState& session) {
       bool wrongtype = false;
       auto vals = store().zpop(key, 1, session.blocked.zpop_max, wrongtype);
       if (wrongtype) {
+        unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
         session.blocked.original_args.clear();
         return wrongtype_error_reply();
       }
       if (!vals.empty()) {
+        unregister_key_waiter(session.fd);
         session.blocked.type = BlockType::None;
         session.blocked.keys.clear();
         session.blocked.original_args.clear();
@@ -6711,10 +6818,257 @@ std::string try_unblock_client(SessionState& session) {
   return {}; // still blocked
 }
 
-void notify_key_written(const std::string& /*key*/, int /*db_index*/) {
-  // Key write notification — the server loop uses this as a hint to
-  // re-check blocked clients. No-op for now; the server loop polls
-  // blocked clients on every iteration already.
+// Key → set of blocked client fds waiting for that key
+static std::unordered_map<std::string, std::vector<int>> g_key_waiters;
+static bool g_has_pending_wakeups = false;
+
+void register_key_waiter(const std::string& key, int fd) {
+  g_key_waiters[key].push_back(fd);
 }
+
+void unregister_key_waiter(int fd) {
+  for (auto it = g_key_waiters.begin(); it != g_key_waiters.end();) {
+    auto& fds = it->second;
+    fds.erase(std::remove(fds.begin(), fds.end(), fd), fds.end());
+    if (fds.empty()) it = g_key_waiters.erase(it);
+    else ++it;
+  }
+}
+
+bool has_pending_wakeups() { return g_has_pending_wakeups; }
+void clear_pending_wakeups() { g_has_pending_wakeups = false; }
+
+void notify_key_written(const std::string& key, int /*db_index*/) {
+  if (g_key_waiters.count(key)) g_has_pending_wakeups = true;
+}
+
+std::size_t command_count() { return command_table().size(); }
+
+std::vector<std::string> command_names() {
+  std::vector<std::string> names;
+  names.reserve(command_table().size());
+  for (const auto& [name, _] : command_table()) names.push_back(name);
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+void aof_fsync_if_needed(std::int64_t now) {
+  if (!g_appendonly || g_aof_fd < 0 || g_appendfsync != "everysec") return;
+  if (now - g_last_aof_fsync_ms >= 1000) {
+    ::fsync(g_aof_fd);
+    g_last_aof_fsync_ms = now;
+  }
+}
+
+// ── In-process replication client helpers ────────────────────────────────────
+
+static bool repl_readline(int fd, std::string& out) {
+    out.clear();
+    char c;
+    while (true) {
+        ssize_t n = ::read(fd, &c, 1);
+        if (n <= 0) return false;
+        if (c == '\n') {
+            if (!out.empty() && out.back() == '\r') out.pop_back();
+            return true;
+        }
+        out += c;
+        if (out.size() > 65536) return false;
+    }
+}
+
+static bool repl_read_exact(int fd, void* buf, std::size_t len) {
+    auto* p = static_cast<char*>(buf);
+    std::size_t done = 0;
+    while (done < len) {
+        ssize_t n = ::read(fd, p + done, len - done);
+        if (n <= 0) return false;
+        done += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+static bool repl_send(int fd, const std::string& data) {
+    std::size_t done = 0;
+    while (done < data.size()) {
+        ssize_t n = ::write(fd, data.c_str() + done, data.size() - done);
+        if (n <= 0) return false;
+        done += static_cast<std::size_t>(n);
+    }
+    return true;
+}
+
+static std::string repl_encode_cmd(const std::vector<std::string>& parts) {
+    std::string out = "*" + std::to_string(parts.size()) + "\r\n";
+    for (const auto& s : parts)
+        out += "$" + std::to_string(s.size()) + "\r\n" + s + "\r\n";
+    return out;
+}
+
+// Perform a full PSYNC handshake with master at host:port and load the RDB snapshot.
+bool replica_do_fullsync(const std::string& host, int port) {
+    struct addrinfo hints{}, *res = nullptr;
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    const std::string port_str = std::to_string(port);
+    if (::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0 || !res) {
+        log(LogLevel::Error, "REPLICAOF: cannot resolve " + host + ":" + port_str);
+        return false;
+    }
+
+    int fd = ::socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd < 0) {
+        ::freeaddrinfo(res);
+        log(LogLevel::Error, "REPLICAOF: socket() failed");
+        return false;
+    }
+    if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+        log(LogLevel::Error, "REPLICAOF: connect to " + host + ":" + port_str + " failed: " + strerror(errno));
+        ::freeaddrinfo(res);
+        ::close(fd);
+        return false;
+    }
+    ::freeaddrinfo(res);
+
+    std::string line;
+
+    // PING
+    if (!repl_send(fd, "*1\r\n$4\r\nPING\r\n") ||
+        !repl_readline(fd, line) ||
+        (line != "+PONG" && line.rfind("+PONG", 0) != 0)) {
+        log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
+        ::close(fd);
+        return false;
+    }
+
+    // REPLCONF listening-port
+    if (!repl_send(fd, repl_encode_cmd({"REPLCONF", "listening-port", std::to_string(g_server_port)})) ||
+        !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+        log(LogLevel::Error, "REPLICAOF: REPLCONF listening-port failed: " + line);
+        ::close(fd);
+        return false;
+    }
+
+    // REPLCONF capa psync2
+    if (!repl_send(fd, repl_encode_cmd({"REPLCONF", "capa", "psync2"})) ||
+        !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+        log(LogLevel::Error, "REPLICAOF: REPLCONF capa failed: " + line);
+        ::close(fd);
+        return false;
+    }
+
+    // PSYNC ? -1 (request full resync)
+    if (!repl_send(fd, repl_encode_cmd({"PSYNC", "?", "-1"})) ||
+        !repl_readline(fd, line)) {
+        ::close(fd);
+        return false;
+    }
+    if (line.rfind("+FULLRESYNC", 0) != 0) {
+        log(LogLevel::Error, "REPLICAOF: expected +FULLRESYNC, got: " + line);
+        ::close(fd);
+        return false;
+    }
+    // Parse replid and offset: "+FULLRESYNC <replid> <offset>"
+    {
+        auto sp1 = line.find(' ');
+        auto sp2 = line.find(' ', sp1 + 1);
+        if (sp1 != std::string::npos && sp2 != std::string::npos) {
+            g_master_replid = line.substr(sp1 + 1, sp2 - sp1 - 1);
+            std::int64_t off = 0;
+            parse_i64(line.substr(sp2 + 1), off);
+            g_master_repl_offset = off;
+        }
+    }
+
+    // Read $<N>\r\n  (may be preceded by a stray \n from some masters)
+    if (!repl_readline(fd, line)) { ::close(fd); return false; }
+    if (line.empty()) {
+        if (!repl_readline(fd, line)) { ::close(fd); return false; }
+    }
+    if (line.empty() || line[0] != '$') {
+        log(LogLevel::Error, "REPLICAOF: expected $<len>, got: " + line);
+        ::close(fd);
+        return false;
+    }
+    std::int64_t rdb_len = 0;
+    if (!parse_i64(line.substr(1), rdb_len) || rdb_len < 0) {
+        log(LogLevel::Error, "REPLICAOF: bad RDB length: " + line);
+        ::close(fd);
+        return false;
+    }
+
+    // Stream RDB into a temp file then load it
+    const std::string tmp_path = "/tmp/peadb_fullsync_" + std::to_string(::getpid()) + ".rdb.tmp";
+    {
+        int rfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (rfd < 0) {
+            log(LogLevel::Error, "REPLICAOF: cannot open temp file " + tmp_path + ": " + strerror(errno));
+            ::close(fd);
+            return false;
+        }
+        std::vector<char> chunk(65536);
+        std::int64_t remaining = rdb_len;
+        bool write_ok = true;
+        while (remaining > 0 && write_ok) {
+            std::size_t want = static_cast<std::size_t>(std::min(remaining, static_cast<std::int64_t>(chunk.size())));
+            if (!repl_read_exact(fd, chunk.data(), want)) {
+                write_ok = false;
+                break;
+            }
+            if (::write(rfd, chunk.data(), want) != static_cast<ssize_t>(want)) {
+                write_ok = false;
+                break;
+            }
+            remaining -= static_cast<std::int64_t>(want);
+        }
+        ::close(rfd);
+        if (!write_ok) {
+            ::unlink(tmp_path.c_str());
+            ::close(fd);
+            log(LogLevel::Error, "REPLICAOF: failed streaming RDB data");
+            return false;
+        }
+    }
+    ::close(fd);
+
+    std::string err;
+    if (!rdb_load(tmp_path, err)) {
+        ::unlink(tmp_path.c_str());
+        log(LogLevel::Error, "REPLICAOF: rdb_load failed: " + err);
+        return false;
+    }
+    ::unlink(tmp_path.c_str());
+    log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+void reap_background_children() {
+  if (g_bgsave_in_progress.load()) {
+    int status = 0;
+    pid_t pid = g_bgsave_child_pid.load();
+    if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
+      g_last_bgsave_status = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? "ok" : "err";
+      g_last_save_time = now_ms() / 1000;
+      g_bgsave_child_pid.store(0);
+      g_bgsave_in_progress.store(false);
+    }
+  }
+  if (g_bgrewrite_in_progress.load()) {
+    int status = 0;
+    pid_t pid = g_bgrewrite_child_pid.load();
+    if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
+      g_bgrewrite_child_pid.store(0);
+      g_bgrewrite_in_progress.store(false);
+    }
+  }
+}
+
+// ── ServerContext accessor ────────────────────────────────────────────────
+
+static ServerContext g_server_context;
+
+ServerContext& server_ctx() { return g_server_context; }
 
 } // namespace peadb

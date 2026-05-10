@@ -17,6 +17,16 @@ if(APPLE AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
 endif()
 
+set(PEADB_NUM_SHARDS 1 CACHE STRING "Number of event-loop shards (1 = single-threaded, legacy behavior)")
+
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND AND NOT APPLE)
+  pkg_check_modules(LIBURING QUIET liburing>=2.4)
+  if(LIBURING_FOUND)
+    message(STATUS "io_uring found (${LIBURING_VERSION}) — enabling PEADB_HAVE_IO_URING")
+  endif()
+endif()
+
 find_package(Lua 5.1)
 if(NOT LUA_LIBRARIES OR NOT LUA_INCLUDE_DIR)
   message(FATAL_ERROR
@@ -36,6 +46,7 @@ add_library(peadb_core
     src/logger.cpp
     src/protocol.cpp
     src/server.cpp
+    src/shard_loop.cpp
     src/lua_engine.cpp
     src/rdb.cpp
     src/lua_cjson_stub.c
@@ -45,6 +56,13 @@ add_library(peadb_core
 )
 target_include_directories(peadb_core PUBLIC include ${LUA_INCLUDE_DIR})
 target_link_libraries(peadb_core PUBLIC ${LUA_LIBRARIES} m)
+target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+target_compile_definitions(peadb_core PUBLIC PEADB_NUM_SHARDS=${PEADB_NUM_SHARDS})
+if(LIBURING_FOUND)
+  target_compile_definitions(peadb_core PUBLIC PEADB_HAVE_IO_URING)
+  target_include_directories(peadb_core PUBLIC ${LIBURING_INCLUDE_DIRS})
+  target_link_libraries(peadb_core PUBLIC ${LIBURING_LIBRARIES})
+endif()
 
 add_executable(peadb-server src/main.cpp)
 if(APPLE)
@@ -63,4 +81,12 @@ if(BUILD_TESTING)
   add_executable(wrongtype_framework_test tests/unit/wrongtype_framework_test.cpp)
   target_link_libraries(wrongtype_framework_test PRIVATE peadb_core)
   add_test(NAME wrongtype_framework_test COMMAND wrongtype_framework_test)
+
+  add_executable(command_contract_test tests/unit/command_contract_test.cpp)
+  target_link_libraries(command_contract_test PRIVATE peadb_core)
+  add_test(NAME command_contract_test COMMAND command_contract_test)
+
+  add_executable(mutation_epoch_test tests/unit/mutation_epoch_test.cpp)
+  target_link_libraries(mutation_epoch_test PRIVATE peadb_core)
+  add_test(NAME mutation_epoch_test COMMAND mutation_epoch_test)
 endif()

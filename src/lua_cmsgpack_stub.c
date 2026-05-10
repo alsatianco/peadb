@@ -186,8 +186,8 @@ static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
                     lua_pop(L, 1);
                 }
             } else {
-                /* Map: collect keys and sort them for deterministic output
-                   across Lua versions (5.1 vs 5.2+ have different hash orders). */
+                /* Map: count first, then emit in natural lua_next order.
+                   Redis cmsgpack uses natural iteration order (no sorting). */
                 int count = 0;
                 lua_pushnil(L);
                 while (lua_next(L, idx) != 0) { count++; lua_pop(L, 1); }
@@ -200,33 +200,13 @@ static void mp_pack_value(lua_State *L, mp_buf *b, int idx, int depth) {
                     mp_write_byte(b, 0xdf);
                     mp_write_u32be(b, (uint32_t)count);
                 }
-                /* Collect keys into an array at stack top, then sort. */
-                lua_newtable(L); /* temp array for keys */
-                int kidx = lua_gettop(L);
-                int ki = 0;
                 lua_pushnil(L);
                 while (lua_next(L, idx) != 0) {
-                    lua_pop(L, 1); /* pop value, keep key */
-                    lua_pushvalue(L, -1); /* dup key */
-                    lua_rawseti(L, kidx, ++ki); /* keys[ki] = key */
+                    /* key at -2, value at -1 */
+                    mp_pack_value(L, b, lua_gettop(L) - 1, depth + 1); /* key */
+                    mp_pack_value(L, b, lua_gettop(L),     depth + 1); /* value */
+                    lua_pop(L, 1); /* pop value, keep key for next iteration */
                 }
-                /* Sort keys table using table.sort for deterministic order */
-                lua_getglobal(L, "table");
-                lua_getfield(L, -1, "sort");
-                lua_remove(L, -2); /* remove 'table' */
-                lua_pushvalue(L, kidx);
-                if (lua_pcall(L, 1, 0, 0) != 0) lua_pop(L, 1); /* ignore sort errors */
-                /* Emit key-value pairs in sorted order */
-                for (int i = 1; i <= ki; i++) {
-                    lua_rawgeti(L, kidx, i); /* push key */
-                    int key_top = lua_gettop(L);
-                    mp_pack_value(L, b, key_top, depth + 1); /* pack key */
-                    lua_pushvalue(L, key_top); /* dup key for gettable */
-                    lua_gettable(L, idx); /* push value = t[key] */
-                    mp_pack_value(L, b, lua_gettop(L), depth + 1); /* pack value */
-                    lua_pop(L, 2); /* pop key and value */
-                }
-                lua_pop(L, 1); /* pop temp keys array */
             }
             break;
         }

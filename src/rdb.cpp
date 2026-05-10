@@ -12,6 +12,7 @@
 
 #include "rdb.hpp"
 #include "datastore.hpp"
+#include "logger.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,8 @@
 #include <cmath>
 #include <limits>
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 namespace peadb {
 namespace {
@@ -717,8 +720,9 @@ std::string rdb_build_string() {
         }
 
       } else if (type_str == "stream") {
-        // Skip streams in RDB for now — complex encoding
-        // Write as a string-encoded placeholder
+        // Stream RDB encoding not yet implemented — key will be lost on restart
+        log(LogLevel::Warn, "RDB save: skipping stream key '" + key +
+            "' — stream RDB encoding not implemented; data will be lost on restart");
         continue;
       }
     }
@@ -740,15 +744,23 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
   err.clear();
   std::string data = rdb_build_string();
 
-  // Write to file
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  if (!out.is_open()) {
-    err = "cannot open RDB file for writing";
-    return false;
+  // Write to a temp file on the same filesystem, then atomically rename
+  const std::string tmp_path = path.string() + ".tmp";
+  const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) { err = "cannot open RDB tmp file for writing"; return false; }
+
+  std::size_t written = 0;
+  while (written < data.size()) {
+    const ssize_t rc = ::write(fd, data.data() + written, data.size() - written);
+    if (rc <= 0) { ::close(fd); ::unlink(tmp_path.c_str()); err = "RDB write error"; return false; }
+    written += static_cast<std::size_t>(rc);
   }
-  out.write(data.data(), static_cast<std::streamsize>(data.size()));
-  if (!out.good()) {
-    err = "write error";
+  ::fsync(fd);
+  ::close(fd);
+
+  if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    ::unlink(tmp_path.c_str());
+    err = "RDB rename failed";
     return false;
   }
   return true;

@@ -9,7 +9,7 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 ## Highlights
 
 - **Full RESP2/RESP3 protocol** — works with every existing Redis client and tool, zero changes required.
-- **~147 commands** — strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, and more.
+- **207 commands** — strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, and more.
 - **Persistence** — RDB snapshots, AOF logging, and `SAVE`/`BGSAVE`/`BGREWRITEAOF`.
 - **Replication** — PSYNC2-based replication with multi-replica support and replica promotion.
 - **Cluster** — 16 384 hash-slot routing, `MOVED`/`ASK` redirection, slot migration, gossip protocol.
@@ -112,7 +112,7 @@ Runtime configuration is available via `CONFIG GET` / `CONFIG SET`.
 ## Supported Commands
 
 <details>
-<summary>Full command list (~147 commands)</summary>
+<summary>Full command list (207 commands)</summary>
 
 **Connection & Server** — `PING`, `ECHO`, `QUIT`, `HELLO`, `AUTH`, `ACL`, `INFO`, `COMMAND`, `CONFIG`, `DEBUG`, `SELECT`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `WAIT`, `TIME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`, `SHUTDOWN`
 
