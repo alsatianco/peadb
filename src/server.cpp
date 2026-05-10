@@ -572,6 +572,9 @@ int run_server(const ServerConfig& config) {
         consumed_total += parsed->consumed;
 
         if (should_close) break;
+        // Stop parsing when the session transitions into a blocking/waiting state.
+        // Subsequent pipelined commands must not overtake the deferred reply.
+        if (session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
 
       // Track blocked/replica/wait state changes

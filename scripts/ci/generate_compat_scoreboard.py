@@ -33,24 +33,41 @@ def extract_commands(cpp_path: Path) -> list[str]:
 
 def test_invocations(tests_dir: Path) -> dict[str, set[str]]:
     """
-    For each command, find which test files contain a redis client call
-    that invokes it (not just a mention in a string or comment).
+    For each command, find which test files contain a call that invokes it
+    (not just a mention in a string or comment).
+
+    Patterns matched (in order of prevalence in this repo):
+      send_cmd(s, "CMD", ...)          — raw RESP helper used by most tests
+      send_cmd(sock, "CMD", ...)
+      s.sendall(b"*N\\r\\n$M\\r\\nCMD\\r\\n") — raw RESP bytes for simple commands
+      r.CMD(...)                        — redis-py style (less common here)
+      execute_command("CMD", ...)      — redis-py execute_command
     """
     result: dict[str, set[str]] = {}
     if not tests_dir.exists():
         return result
     for test_file in sorted(tests_dir.glob("test_*.py")):
         text = test_file.read_text(errors="replace")
-        # Look for r.COMMAND(...) or r.execute_command("COMMAND", ...) patterns
+        # Unified pattern: any helper call whose first string argument is an
+        # all-caps Redis command name.  Covers:
+        #   send_cmd(s, "CMD", ...)   send_cmd(sock, 'CMD', ...)
+        #   cmd(s, "CMD", ...)        cmd(s, 'CMD', ...)
+        #   cmd(s,'CMD',...)          (no spaces, single-quoted — dominant style)
+        _cmd_call = re.compile(
+            r'(?:send_cmd|cmd)\s*\([^,]+,\s*["\']([A-Z][A-Z0-9_]*)["\']'
+        )
+        for m in _cmd_call.finditer(text):
+            result.setdefault(m.group(1), set()).add(test_file.name)
+        # Raw RESP bytes: sendall(b"...\r\nCMD\r\n")
+        for m in re.finditer(r'sendall\s*\(b["\'].*?\\r\\n([A-Z][A-Z0-9_]*)\\r\\n', text):
+            result.setdefault(m.group(1), set()).add(test_file.name)
+        # redis-py style: r.CMD(...) or r.execute_command("CMD") or r.execute("CMD")
         for m in re.finditer(r'r\.([A-Z][A-Z0-9_]*)\(', text):
-            cmd = m.group(1).upper()
-            result.setdefault(cmd, set()).add(test_file.name)
-        for m in re.finditer(r'execute_command\(["\']([A-Z][A-Z0-9_]+)', text, re.IGNORECASE):
-            cmd = m.group(1).upper()
-            result.setdefault(cmd, set()).add(test_file.name)
-        for m in re.finditer(r'r\.execute\(["\']([A-Z][A-Z0-9_]+)', text, re.IGNORECASE):
-            cmd = m.group(1).upper()
-            result.setdefault(cmd, set()).add(test_file.name)
+            result.setdefault(m.group(1).upper(), set()).add(test_file.name)
+        for m in re.finditer(r'execute_command\s*\(["\']([A-Z][A-Z0-9_]+)', text, re.IGNORECASE):
+            result.setdefault(m.group(1).upper(), set()).add(test_file.name)
+        for m in re.finditer(r'r\.execute\s*\(["\']([A-Z][A-Z0-9_]+)', text, re.IGNORECASE):
+            result.setdefault(m.group(1).upper(), set()).add(test_file.name)
     return result
 
 def coverage_level(cmd: str, invocations: dict[str, set[str]]) -> str:

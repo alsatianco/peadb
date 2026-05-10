@@ -65,6 +65,10 @@ if(LIBURING_FOUND)
 endif()
 
 add_executable(peadb-server src/main.cpp)
+# Place the binary at the repo root so integration tests can find it via
+# ROOT / "peadb-server" without relying on an untracked symlink.
+set_target_properties(peadb-server PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}")
 if(APPLE)
   target_link_libraries(peadb-server PRIVATE peadb_core)
 else()
@@ -89,4 +93,16 @@ if(BUILD_TESTING)
   add_executable(mutation_epoch_test tests/unit/mutation_epoch_test.cpp)
   target_link_libraries(mutation_epoch_test PRIVATE peadb_core)
   add_test(NAME mutation_epoch_test COMMAND mutation_epoch_test)
+
+  add_executable(expire_options_test tests/unit/expire_options_test.cpp)
+  target_link_libraries(expire_options_test PRIVATE peadb_core)
+  add_test(NAME expire_options_test COMMAND expire_options_test)
+
+  add_executable(zadd_flags_test tests/unit/zadd_flags_test.cpp)
+  target_link_libraries(zadd_flags_test PRIVATE peadb_core)
+  add_test(NAME zadd_flags_test COMMAND zadd_flags_test)
+
+  add_executable(multi_exec_test tests/unit/multi_exec_test.cpp)
+  target_link_libraries(multi_exec_test PRIVATE peadb_core)
+  add_test(NAME multi_exec_test COMMAND multi_exec_test)
 endif()

@@ -57,6 +57,8 @@ ServerConfig load_config(const std::string& path) {
       cfg.appendonly = (value == "yes" || value == "1" || value == "true");
     } else if (key == "appendfilename") {
       cfg.appendfilename = value;
+    } else if (key == "appendfsync") {
+      cfg.appendfsync = value;
     }
   }
 

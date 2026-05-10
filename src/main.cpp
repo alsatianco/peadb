@@ -52,7 +52,7 @@ int main(int argc, char** argv) {
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
-  peadb::configure_persistence(config.dir, config.dbfilename, config.appendonly, config.appendfilename);
+  peadb::configure_persistence(config.dir, config.dbfilename, config.appendonly, config.appendfilename, config.appendfsync);
 
   // Initialize the Lua scripting engine and wire the command dispatcher.
   peadb::lua_engine_init();

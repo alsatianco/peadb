@@ -1767,15 +1767,15 @@ std::size_t DataStore::dbsize() {
 }
 
 namespace {
-// Advance a cursor using reverse-binary-increment over `num_buckets` buckets.
-// The cursor encodes which bucket to visit next. Returning 0 signals completion.
+// Advance a cursor for SCAN iteration over `num_buckets` buckets.
+// Uses reverse-binary-increment when num_buckets is a power of 2 (gives better
+// resize resilience), otherwise falls back to linear increment.
+// RBI with non-power-of-2 sizes produces out-of-range bucket indices (UB).
 std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets) {
   if (num_buckets == 0) return 0;
-  // Find highest power of 2 <= num_buckets to build a stable mask
-  std::uint64_t mask = 1;
-  while (mask < num_buckets) mask <<= 1;
-  mask -= 1; // e.g. 8 buckets -> mask = 7
-  // Reverse-bit-increment: fill upper bits, reverse, increment, reverse back
+  const bool is_pow2 = (num_buckets & (num_buckets - 1)) == 0;
+  if (!is_pow2) return (cursor + 1) % num_buckets;
+  const std::uint64_t mask = num_buckets - 1;
   auto rev64 = [](std::uint64_t v) -> std::uint64_t {
     v = ((v >> 1) & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
     v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
