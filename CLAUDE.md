@@ -26,6 +26,20 @@ cd build && ../scripts/ci/run_integration_tests.sh
 python3 tests/integration/test_strings.py
 ```
 
+## MANDATORY pre-commit checks
+
+**After every set of changes that is ready to commit, you MUST run both of these and confirm they pass before considering the work done:**
+
+```bash
+# 1. Full test suite (unit + integration)
+bash scripts/run_all_tests.sh
+
+# 2. Performance regression check (must not get worse vs Redis baseline)
+bash scripts/dev/redis_vs_peadb_benchmark.sh
+```
+
+Do not skip either check. Do not commit if either fails.
+
 ## Architecture
 
 PeaDB is a Redis 7.2.5-compatible server written in C++20:
