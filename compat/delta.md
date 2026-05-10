@@ -91,6 +91,7 @@ Feature status labels:
 - Status: `partial` (functional, no reconnect/failover)
 - Owner: replication-compat
 - Severity: medium
+- Target milestone: P3-reconnect
 - Implemented: In-process TCP client (`replica_do_fullsync`). Does PING → REPLCONF →
   PSYNC ? -1 → RDB load → continuous command stream. Master supports +CONTINUE partial
   resync via 1 MiB ReplBacklog. Replica emits REPLCONF ACK every ~1 s.
@@ -100,7 +101,9 @@ Feature status labels:
 
 9. Sharding (shard_loop.cpp)
 - Status: `stub` (scaffolding only, not wired)
+- Owner: future-work
 - Severity: n/a (future work)
+- Target milestone: P5
 - Implemented: `crc16`, `key_hash_slot`, `ShardLoop`, `shard_init` defined.
   PEADB_NUM_SHARDS CMake option defaults to 1 (single-threaded, unchanged behaviour).
 - Missing: Actual multi-shard event loops, listener distribution, cross-shard routing.

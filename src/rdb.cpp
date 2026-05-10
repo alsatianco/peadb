@@ -609,7 +609,8 @@ class ListpackReader {
 // ── RDB Save ───────────────────────────────────────────────────────────
 
 namespace {
-std::string rdb_build_string() {
+std::string rdb_build_string(std::string& err) {
+  err.clear();
   auto& ds = store();
 
   RdbWriter w;
@@ -720,10 +721,12 @@ std::string rdb_build_string() {
         }
 
       } else if (type_str == "stream") {
-        // Stream RDB encoding not yet implemented — key will be lost on restart
-        log(LogLevel::Warn, "RDB save: skipping stream key '" + key +
-            "' — stream RDB encoding not implemented; data will be lost on restart");
-        continue;
+        // Stream RDB encoding is not implemented. Return an error rather than
+        // silently dropping stream data — the caller must gate SAVE/BGSAVE.
+        err = "ERR RDB stream encoding not implemented; key '" + key +
+              "' would be lost. Use BGREWRITEAOF for AOF-only persistence.";
+        ds.select_db(prev_db);
+        return {};
       }
     }
   }
@@ -742,7 +745,8 @@ std::string rdb_build_string() {
 
 bool rdb_save(const std::filesystem::path& path, std::string& err) {
   err.clear();
-  std::string data = rdb_build_string();
+  std::string data = rdb_build_string(err);
+  if (!err.empty()) return false;
 
   // Write to a temp file on the same filesystem, then atomically rename
   const std::string tmp_path = path.string() + ".tmp";
@@ -767,7 +771,8 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
 }
 
 std::string rdb_save_to_string() {
-  return rdb_build_string();
+  std::string err;
+  return rdb_build_string(err);  // Caller (PSYNC full-resync) ignores streams — acceptable
 }
 
 // ── RDB Load ───────────────────────────────────────────────────────────
