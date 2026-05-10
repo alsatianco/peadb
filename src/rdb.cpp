@@ -723,7 +723,7 @@ std::string rdb_build_string(std::string& err) {
       } else if (type_str == "stream") {
         // Stream RDB encoding is not implemented. Return an error rather than
         // silently dropping stream data — the caller must gate SAVE/BGSAVE.
-        err = "ERR RDB stream encoding not implemented; key '" + key +
+        err = "RDB stream encoding not implemented; key '" + key +
               "' would be lost. Use BGREWRITEAOF for AOF-only persistence.";
         ds.select_db(prev_db);
         return {};
@@ -803,7 +803,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err) {
     err = "invalid RDB version";
     return false;
   }
-  if (rdb_ver < 1 || rdb_ver > 12) {
+  if (rdb_ver < 1 || rdb_ver > 13) {
     err = "unsupported RDB version " + std::to_string(rdb_ver);
     return false;
   }

@@ -82,6 +82,8 @@ void unregister_key_waiter(int fd);
 bool has_pending_wakeups();
 void clear_pending_wakeups();
 std::string try_unblock_client(SessionState& session);
+// Apply replication commands queued by the streaming thread onto the event loop thread.
+void drain_replica_cmd_queue();
 
 // ── Lua script context (set by lua_engine, read by blocking command handlers) ──
 void set_lua_script_context(bool in_script);

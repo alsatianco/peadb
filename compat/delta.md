@@ -63,7 +63,9 @@ Feature status labels:
 - Severity: high
 - Target milestone: P2
 - Implemented: XADD/XREAD/XREADGROUP in memory; stream keys are visible and queryable.
-  SAVE/BGSAVE now return an explicit error when stream keys exist (no silent data loss).
+  SAVE returns an error immediately when stream keys exist (no silent data loss).
+  BGSAVE returns "Background saving started" and then reports failure asynchronously
+  via INFO persistence rdb_last_bgsave_status:err (no immediate error reply).
   PSYNC full-resync refuses to proceed for stream-containing datasets (returns -ERR).
   AOF-based persistence (BGREWRITEAOF) is safe; streams are AOF-encoded via XADD replays.
 - Missing: RDB binary stream encoding (RDB_TYPE_STREAM_LISTPACKS). Until implemented,
