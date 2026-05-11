@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, threading, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def enc(*a):
     d=f"*{len(a)}\r\n".encode()
@@ -41,7 +44,7 @@ def cmd(s,*a):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6497","--bind","127.0.0.1","--loglevel","error"])
     try:
-        time.sleep(0.2)
+        wait_until_ready(6497)
         with socket.create_connection(("127.0.0.1",6497),timeout=3) as a, \
              socket.create_connection(("127.0.0.1",6497),timeout=3) as b:
             assert cmd(a,"FLUSHALL")=="OK"

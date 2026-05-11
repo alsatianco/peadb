@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def enc(*a):
     d=f"*{len(a)}\r\n".encode()
@@ -44,7 +47,7 @@ def is_err(v,needle):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6516","--bind","127.0.0.1","--loglevel","error"])
     try:
-        time.sleep(0.25)
+        wait_until_ready(6516)
         with socket.create_connection(("127.0.0.1",6516),timeout=2) as s:
             assert cmd(s,"SET","x","some value")=="OK"
             assert cmd(s,"CONFIG","SET","min-replicas-to-write","1")=="OK"

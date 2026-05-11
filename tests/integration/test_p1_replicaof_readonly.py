@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import pathlib, socket, subprocess, time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def enc(*a):
     d=f"*{len(a)}\r\n".encode()
@@ -33,7 +36,7 @@ def cmd(s,*a): s.sendall(enc(*a)); return recv(s)
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6488","--bind","127.0.0.1","--loglevel","error"])
     try:
-        time.sleep(0.2)
+        wait_until_ready(6488)
         with socket.create_connection(("127.0.0.1",6488),timeout=2) as s:
             assert cmd(s,"SET","k","v")=="OK"
             assert cmd(s,"REPLICAOF","127.0.0.1","9999")=="OK"

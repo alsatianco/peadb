@@ -5,6 +5,9 @@ import subprocess
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def rx(s, n):
@@ -59,7 +62,7 @@ def cmd(s, *a):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6474", "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
-        time.sleep(0.2)
+        wait_until_ready(6474)
         with socket.create_connection(("127.0.0.1", 6474), timeout=2) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             assert cmd(s, "XADD", "x", "100", "a", "1") == "100-0"

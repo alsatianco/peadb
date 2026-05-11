@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def enc(*a):
     d=f"*{len(a)}\r\n".encode()
@@ -51,7 +54,7 @@ def repl_cmd(s):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6502","--bind","127.0.0.1","--loglevel","error"])
     try:
-        time.sleep(0.2)
+        wait_until_ready(6502)
         with socket.create_connection(("127.0.0.1",6502),timeout=2) as c, socket.create_connection(("127.0.0.1",6502),timeout=2) as r:
             assert cmd(c,"FLUSHALL")=="OK"
             assert isinstance(cmd(c,"XADD","mystream","*","f","1"),str)

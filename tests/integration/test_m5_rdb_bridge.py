@@ -2,6 +2,7 @@
 import pathlib, socket, subprocess, tempfile, time
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 from _redis_path import skip_if_no_redis_server, skip_if_no_redis_cli
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 REDIS_SERVER = skip_if_no_redis_server()
@@ -14,7 +15,7 @@ def cmd(host, port, *args):
 
 def start_peadb(port):
     p = subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','error'])
-    time.sleep(0.25)
+    wait_until_ready(port)
     return p
 
 

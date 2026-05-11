@@ -5,6 +5,9 @@ import subprocess
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def enc(*a):
@@ -77,7 +80,7 @@ def parse_repl_cmd(s):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6483", "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
-        time.sleep(0.2)
+        wait_until_ready(6483)
         with socket.create_connection(("127.0.0.1", 6483), timeout=2) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             assert cmd(s, "SET", "foo", "bar") == "OK"

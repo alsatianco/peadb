@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import pathlib,socket,subprocess,time,re
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def rx(s,n):
  b=b''
@@ -42,7 +45,7 @@ def isid(x): return isinstance(x,str) and re.match(r'^\d+-\d+$',x)
 def main():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6408','--bind','127.0.0.1','--loglevel','error'])
  try:
-  time.sleep(0.2)
+  wait_until_ready(6408)
   with socket.create_connection(('127.0.0.1',6408),timeout=2) as s:
    assert cmd(s,'FLUSHALL')=='OK'
    id1=cmd(s,'XADD','st','*','f','v1'); assert isid(id1)

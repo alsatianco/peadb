@@ -5,6 +5,9 @@ import subprocess
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def rx(s, n):
@@ -55,7 +58,7 @@ def main():
     p1 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6431", "--bind", "127.0.0.1", "--loglevel", "error"])
     p2 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6432", "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
-        time.sleep(0.3)
+        wait_until_ready(6431)
         with socket.create_connection(("127.0.0.1", 6431), timeout=2) as a, socket.create_connection(("127.0.0.1", 6432), timeout=2) as b:
             assert cmd(a, "FLUSHALL") == "OK"
             assert cmd(b, "FLUSHALL") == "OK"
