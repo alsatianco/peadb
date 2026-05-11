@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-import pathlib,socket,subprocess,tempfile,time
+import pathlib,socket,subprocess,sys,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def rx(s,n):
  b=b''
@@ -37,9 +39,9 @@ def cmd(s,*a):
   b=x.encode(); d+=f"${len(b)}\r\n".encode()+b+b"\r\n"
  s.sendall(d); return recv(s)
 
-def start(cfg):
+def start(cfg, port):
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--config',str(cfg)])
- time.sleep(0.25)
+ wait_until_ready(port)
  return p
 
 def main():
@@ -56,7 +58,7 @@ def main():
    'loglevel error',
   ])+'\n',encoding='utf-8')
 
-  p=start(cfg)
+  p=start(cfg, 6411)
   try:
    with socket.create_connection(('127.0.0.1',6411),timeout=2) as s:
     assert cmd(s,'FLUSHALL')=='OK'
@@ -70,7 +72,7 @@ def main():
   aof=tdp/'appendonly.aof'
   assert aof.exists() and aof.stat().st_size>0
 
-  p2=start(cfg)
+  p2=start(cfg, 6411)
   try:
    with socket.create_connection(('127.0.0.1',6411),timeout=2) as s2:
     assert cmd(s2,'GET','k')=='v'

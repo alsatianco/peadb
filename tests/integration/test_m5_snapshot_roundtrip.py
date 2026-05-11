@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-import pathlib, socket, subprocess, tempfile, time
+import pathlib, socket, subprocess, sys, tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def rx(s, n):
@@ -53,9 +55,9 @@ def cmd(s, *a):
     return recv(s)
 
 
-def start(cfg_path):
+def start(cfg_path, port):
     p = subprocess.Popen([str(ROOT / 'peadb-server'), '--config', str(cfg_path)])
-    time.sleep(0.25)
+    wait_until_ready(port)
     return p
 
 
@@ -71,7 +73,7 @@ def main():
             'loglevel error',
         ]) + '\n', encoding='utf-8')
 
-        p = start(cfg)
+        p = start(cfg, 6409)
         try:
             with socket.create_connection(('127.0.0.1', 6409), timeout=2) as s:
                 assert cmd(s, 'FLUSHALL') == 'OK'
@@ -88,7 +90,7 @@ def main():
 
         assert (tdp / 'dump.rdb').exists()
 
-        p2 = start(cfg)
+        p2 = start(cfg, 6409)
         try:
             with socket.create_connection(('127.0.0.1', 6409), timeout=2) as s2:
                 assert cmd(s2, 'GET', 'k') == 'v'
