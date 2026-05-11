@@ -35,8 +35,9 @@
 #
 # Prerequisites
 #   - `python3` in PATH.
-#   - A running `peadb-server` instance (most integration tests connect to
-#     one).  See `scripts/dev/quick_start.sh` for easy setup.
+#   - A built `peadb-server` binary at the repo root (created by `cmake --build`).
+#     Each integration test starts and stops its own `peadb-server` subprocess
+#     on its own port; this runner does not own a shared server instance.
 #   - (Optional) `timeout` or `gtimeout` for per-test timeout support.
 #
 # Configuration (env vars)
