@@ -7296,14 +7296,18 @@ void reap_background_children() {
           }
           if (diff_ok && ::rename(tmp_path.c_str(), g_aof_path.c_str()) == 0) {
             // Crash-durability: fsync the parent directory so the new AOF
-            // directory entry survives power loss. Without this, the rename
-            // is visible to the running process but may revert after a crash.
-            if (!fsync_parent_dir(g_aof_path)) {
-              log(LogLevel::Warn, "BGREWRITEAOF: parent directory fsync failed; "
-                  "rename may not be crash-durable until next sync");
+            // directory entry survives power loss. The rename is committed
+            // in-memory regardless, so we must keep the new fd live; but we
+            // surface dir-fsync failure as `aof_last_bgrewrite_status:err`
+            // so operators can retry (or migrate to a healthy disk).
+            const bool dir_durable = fsync_parent_dir(g_aof_path);
+            if (!dir_durable) {
+              log(LogLevel::Error, "BGREWRITEAOF: parent directory fsync failed; "
+                  "new AOF is live but the rename may revert across a crash. "
+                  "Reporting aof_last_bgrewrite_status:err — retry the rewrite.");
             }
             g_aof_rewrite_buf.clear();
-            g_aof_last_bgrewrite_status = "ok";
+            g_aof_last_bgrewrite_status = dir_durable ? "ok" : "err";
             open_aof_fd();  // reopen on the new inode
           } else {
             ::unlink(tmp_path.c_str());

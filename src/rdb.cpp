@@ -771,7 +771,13 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
     if (rc <= 0) { ::close(fd); ::unlink(tmp_path.c_str()); err = "RDB write error"; return false; }
     written += static_cast<std::size_t>(rc);
   }
-  ::fsync(fd);
+  // Fail fast on fsync error: a successful rename of an unfsynced temp file
+  // can leave the new RDB with stale or torn contents after a power loss.
+  if (::fsync(fd) != 0) {
+    ::close(fd); ::unlink(tmp_path.c_str());
+    err = "RDB fsync error";
+    return false;
+  }
   ::close(fd);
 
   if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
@@ -780,10 +786,13 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
     return false;
   }
   // Crash-durability: fsync the parent directory so the new RDB directory
-  // entry survives power loss. Best-effort: log but do not fail the save.
+  // entry survives power loss. If the dir fsync fails, the rename is visible
+  // to the running process but the new dirent may revert after a crash; this
+  // violates the durability contract of SAVE/BGSAVE so we report it as a
+  // failure. The file on disk is intact — operators can retry.
   if (!fsync_parent_dir(path)) {
-    log(LogLevel::Warn, "RDB save: parent directory fsync failed; "
-        "rename may not be crash-durable until next sync");
+    err = "RDB parent directory fsync failed (rename not crash-durable)";
+    return false;
   }
   return true;
 }
