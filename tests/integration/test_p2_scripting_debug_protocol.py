@@ -5,6 +5,9 @@ import subprocess
 import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def enc(*args: str) -> bytes:
@@ -115,7 +118,7 @@ def main() -> int:
         [str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"]
     )
     try:
-        time.sleep(0.25)
+        wait_until_ready(port)
         with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             assert cmd(s, "DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1")[1] == "OK"
 

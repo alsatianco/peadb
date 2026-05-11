@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def enc(*a):
@@ -60,7 +63,7 @@ def cmd(s, *a):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6507", "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
-        time.sleep(0.25)
+        wait_until_ready(6507)
         with socket.create_connection(("127.0.0.1", 6507), timeout=2) as s:
             script = "return redis.call('get',KEYS[1])"
             sha = cmd(s, "SCRIPT", "LOAD", script)

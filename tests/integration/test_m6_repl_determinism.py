@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import pathlib,socket,subprocess,time,re
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 CMDS=[('SET','a','1'),('HSET','h','f','x'),('LPUSH','l','a','b'),('SADD','s','m1','m2'),('ZADD','z','1','a')]
 
@@ -46,7 +49,7 @@ def off(info):
 def run(port):
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','error'])
  try:
-  time.sleep(0.2)
+  wait_until_ready(port)
   with socket.create_connection(('127.0.0.1',port),timeout=2) as s:
    cmd(s,'FLUSHALL')
    for c in CMDS: cmd(s,*c)

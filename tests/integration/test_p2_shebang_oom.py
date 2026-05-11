@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def enc(*a):
@@ -47,7 +50,7 @@ def is_err_with(v,needle):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6513","--bind","127.0.0.1","--loglevel","error"])
     try:
-        time.sleep(0.25)
+        wait_until_ready(6513)
         with socket.create_connection(("127.0.0.1",6513),timeout=2) as s:
             assert is_err_with(cmd(s,"EVAL","#!not-lua\nreturn 1","0"),"Unexpected engine in script shebang")
             assert cmd(s,"EVAL","#!lua\nreturn 1","0")==1

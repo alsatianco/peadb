@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 import pathlib,socket,subprocess,time
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def rx(s,n):
  b=b''
@@ -37,7 +40,7 @@ def main():
  p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6429','--bind','127.0.0.1','--loglevel','error'])
  p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6430','--bind','127.0.0.1','--loglevel','error'])
  try:
-  time.sleep(0.3)
+  wait_until_ready(6429)
   with socket.create_connection(('127.0.0.1',6429),timeout=2) as a, socket.create_connection(('127.0.0.1',6430),timeout=2) as b:
    assert cmd(a,'CLUSTER','MEET','127.0.0.1','6430')=='OK'
    deadline=time.time()+2

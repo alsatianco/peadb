@@ -2,6 +2,9 @@
 import pathlib, socket, subprocess, time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+import sys
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 
 def enc(*a):
@@ -58,7 +61,7 @@ def cmd(s, *a):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6508", "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
-        time.sleep(0.25)
+        wait_until_ready(6508)
         with socket.create_connection(("127.0.0.1", 6508), timeout=2) as s:
             assert cmd(s, "SCRIPT", "FLUSH") == "OK"
             for j in range(100):
