@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-import pathlib,socket,subprocess,tempfile,time
+import pathlib,socket,subprocess,sys,tempfile
 ROOT=pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def rx(s,n):
  b=b''
@@ -49,7 +51,7 @@ def main():
   ])+'\n',encoding='utf-8')
   p=subprocess.Popen([str(ROOT/'peadb-server'),'--config',str(cfg)])
   try:
-   time.sleep(0.2)
+   wait_until_ready(6410)
    with socket.create_connection(('127.0.0.1',6410),timeout=2) as s:
     assert cmd(s,'SET','a','1')=='OK'
     assert cmd(s,'SAVE')=='OK'

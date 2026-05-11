@@ -13,10 +13,12 @@ bit ops (BITCOUNT BITPOS BITOP BITFIELD),
 geo ops (GEODIST GEOPOS GEOHASH GEORADIUS GEORADIUSBYMEMBER GEOSEARCH GEOSEARCHSTORE),
 stream ops (XTRIM XAUTOCLAIM).
 """
-import pathlib, socket, subprocess, time, sys
+import pathlib, socket, subprocess, sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 PORT = 6490
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
 
 def enc(*a):
     d = f"*{len(a)}\r\n".encode()
@@ -70,7 +72,7 @@ def main():
     p = subprocess.Popen([str(binary), "--port", str(PORT), "--bind", "127.0.0.1", "--loglevel", "error"])
     passed = failed = 0
     try:
-        time.sleep(0.5)
+        wait_until_ready(PORT)
         s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
         cmd(s, "FLUSHALL")
 
