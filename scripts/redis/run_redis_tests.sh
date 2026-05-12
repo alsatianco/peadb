@@ -222,7 +222,7 @@ if [[ "$START_PEADB" == "1" ]]; then
 
   "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel error >"$OUT_DIR/peadb-start.log" 2>&1 &
   PEADB_PID="$!"
-  if ! python3 - "$HOST" "$PORT" "$PEADB_PID" <<'PY'
+  python3 - "$HOST" "$PORT" "$PEADB_PID" <<'PY'
 import os
 import socket
 import sys
@@ -250,8 +250,11 @@ while time.time() < deadline:
     time.sleep(0.05)
 sys.exit(2)  # timeout
 PY
-  then
-    rc=$?
+  rc=$?
+  # Capture rc AFTER the unnegated command — `if ! cmd; then rc=$?` always
+  # sees $? = 0 because the negation flips the exit status, which made the
+  # "process died" diagnostic branch unreachable.
+  if [[ "$rc" -ne 0 ]]; then
     if [[ "$rc" -eq 1 ]]; then
       echo "peadb-server exited before becoming ready (log: $OUT_DIR/peadb-start.log)" >&2
     else

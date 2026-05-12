@@ -58,7 +58,13 @@ jobs:
         # SUITES list in run_redis_tests.sh names only suites that must pass on
         # PeaDB. To explicitly waive a regression, remove or comment out the
         # offending suite there (and track it in compat/delta.md).
+        #
+        # `set -o pipefail` is required: the GitHub Actions default shell uses
+        # `bash -e {0}`, which does NOT enable pipefail. Without it, a failing
+        # `run_redis_tests.sh` on the left side of the `| tee` pipeline is
+        # masked by tee's exit-0, hiding compat failures from CI.
         run: |
+          set -o pipefail
           mkdir -p artifacts
           bash scripts/redis/run_redis_tests.sh 2>&1 | tee artifacts/redis-compat.log
 
