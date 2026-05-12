@@ -223,6 +223,7 @@ if [[ "$START_PEADB" == "1" ]]; then
   "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel error >"$OUT_DIR/peadb-start.log" 2>&1 &
   PEADB_PID="$!"
   if ! python3 - "$HOST" "$PORT" "$PEADB_PID" <<'PY'
+import os
 import socket
 import sys
 import time
@@ -231,6 +232,10 @@ host = sys.argv[1]
 port = int(sys.argv[2])
 pid = int(sys.argv[3])
 
+# Liveness check uses os.kill(pid, 0) which works on Linux and macOS.
+# (The earlier /proc/{pid}/stat check was Linux-only and immediately
+# failed on macOS, masking the real socket-not-ready vs. process-died
+# distinction.)
 deadline = time.time() + 5.0
 while time.time() < deadline:
     try:
@@ -239,12 +244,11 @@ while time.time() < deadline:
     except OSError:
         pass
     try:
-        with open(f"/proc/{pid}/stat", "r", encoding="utf-8"):
-            pass
+        os.kill(pid, 0)
     except OSError:
-        sys.exit(1)
+        sys.exit(1)  # process died
     time.sleep(0.05)
-sys.exit(2)
+sys.exit(2)  # timeout
 PY
   then
     rc=$?
