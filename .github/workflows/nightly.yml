@@ -54,10 +54,13 @@ jobs:
 
       - name: Redis upstream compatibility tests
         # Invokes scripts/redis/run_redis_tests.sh which runs the Redis Tcl suite
-        # (tests/test_helper.tcl) against PeaDB.  Logs go to artifacts/.
+        # (tests/test_helper.tcl) against PeaDB. Failure is blocking: the curated
+        # SUITES list in run_redis_tests.sh names only suites that must pass on
+        # PeaDB. To explicitly waive a regression, remove or comment out the
+        # offending suite there (and track it in compat/delta.md).
         run: |
           mkdir -p artifacts
-          bash scripts/redis/run_redis_tests.sh 2>&1 | tee artifacts/redis-compat.log || true
+          bash scripts/redis/run_redis_tests.sh 2>&1 | tee artifacts/redis-compat.log
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
