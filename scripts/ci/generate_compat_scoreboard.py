@@ -23,8 +23,28 @@ COMMAND_CPP = REPO_ROOT / "src" / "command.cpp"
 TESTS_DIR = REPO_ROOT / "tests" / "integration"
 OUT_FILE = REPO_ROOT / "compat" / "commands.generated.md"
 
-# Commands that have explicit differential/compat tests
-DIFFERENTIAL_COMMANDS: set[str] = set()
+# Commands that have explicit differential/compat tests — derived from the actual
+# tests/diff corpus so a command earns "full" by being differentially verified against
+# real Redis (not hand-maintained).
+def _load_differential_commands() -> set[str]:
+    import json
+    root = Path(__file__).resolve().parents[2]
+    cmds: set[str] = set()
+    diff_dir = root / "tests" / "diff"
+    if not diff_dir.exists():
+        return cmds
+    for f in diff_dir.rglob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        if isinstance(data, list):
+            for entry in data:
+                if isinstance(entry, list) and entry and isinstance(entry[0], str):
+                    cmds.add(entry[0].upper())
+    return cmds
+
+DIFFERENTIAL_COMMANDS: set[str] = _load_differential_commands()
 
 def extract_commands(cpp_path: Path) -> list[str]:
     """Extract command names from t.emplace("NAME", ...) calls."""

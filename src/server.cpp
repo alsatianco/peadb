@@ -17,6 +17,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <exception>
 #include <string>
 #include <string_view>
 #include <limits>
@@ -36,6 +37,21 @@ bool set_nonblocking(int fd) {
 void set_cloexec(int fd) {
   const int flags = fcntl(fd, F_GETFD, 0);
   if (flags >= 0) fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+}
+
+// Top-level exception boundary: a single bad command (bad_alloc, length_error, …)
+// must degrade to a RESP error for that client, never terminate the single event
+// loop and take down every connection.
+std::string safe_handle_command(const std::vector<std::string>& args,
+                                SessionState& session, bool& should_close) {
+  try {
+    return handle_command(args, session, should_close);
+  } catch (const std::exception& ex) {
+    log(LogLevel::Error, std::string("command handler exception: ") + ex.what());
+  } catch (...) {
+    log(LogLevel::Error, "command handler exception (unknown)");
+  }
+  return std::string("-ERR internal error\r\n");
 }
 
 bool set_tcp_nodelay(int fd) {
@@ -172,6 +188,20 @@ int run_server(const ServerConfig& config) {
 
   log(LogLevel::Info, "peadb-server listening on " + config.bind + ":" + std::to_string(config.port));
 
+  // Loud warning when reachable from the network without authentication. protected-mode
+  // (on by default) still refuses non-loopback clients in this state, but operators who
+  // disable it must know they are exposing an unauthenticated server.
+  if (!requirepass_is_set() && config.bind != "127.0.0.1" && config.bind != "::1") {
+    if (protected_mode_enabled()) {
+      log(LogLevel::Warn, "no requirepass set and bound to " + config.bind +
+          " — protected-mode is ON, so only loopback clients are accepted. Set 'requirepass' "
+          "to allow remote clients, or 'protected-mode no' to accept them unauthenticated.");
+    } else {
+      log(LogLevel::Warn, "SECURITY: protected-mode is OFF, no requirepass set, and bound to " +
+          config.bind + " — this server accepts UNAUTHENTICATED connections from the network.");
+    }
+  }
+
   // ── Cluster bus listener on port N+10000 ──
   const int cluster_bus_port = config.port + 10000;
   int cbus_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -231,11 +261,19 @@ int run_server(const ServerConfig& config) {
     return count;
   };
 
+  g_blocked_clients_cb = [&]() -> int { return blocked_count; };
+
   // Wire up the CLIENT LIST callback
   g_client_list_callback = [&]() -> std::string {
     std::string out;
+    const auto now = DataStore::now_ms();
     for (auto& [fd, sess] : sessions) {
+      const std::int64_t age = sess.created_ms ? (now - sess.created_ms) / 1000 : 0;
+      const std::int64_t idle = sess.last_interaction_ms ? (now - sess.last_interaction_ms) / 1000 : 0;
+      auto qit = buffers.find(fd);
+      const std::size_t qbuf = (qit != buffers.end()) ? qit->second.size() : 0;
       out += "id=" + std::to_string(sess.client_id);
+      out += " addr=" + sess.addr;
       out += " fd=" + std::to_string(fd);
       out += " name=" + sess.client_name;
       out += " lib-name=" + sess.lib_name;
@@ -244,14 +282,17 @@ int run_server(const ServerConfig& config) {
       out += " sub=0 psub=0 ssub=0";
       out += " multi=" + std::string(sess.in_multi ? std::to_string(static_cast<int>(sess.queued.size())) : "-1");
       out += " watch=" + std::to_string(sess.watched_digests.size());
-      out += " qbuf=0 qbuf-free=32768 argv-mem=0 multi-mem=0 tot-mem=20512";
-      out += " net-i=0 net-o=0 age=0 idle=0";
+      out += " qbuf=" + std::to_string(qbuf) + " qbuf-free=0 argv-mem=0 multi-mem=0 tot-mem=" + std::to_string(qbuf + 16384);
+      out += " net-i=0 net-o=0";
+      out += " age=" + std::to_string(age) + " idle=" + std::to_string(idle);
       std::string flags;
       if (sess.replica_stream) flags += "S";
+      if (sess.is_monitor) flags += "O";
       if (sess.blocked.type != BlockType::None) flags += "b";
       if (flags.empty()) flags = "N";
       out += " flags=" + flags;
-      out += " cmd=unknown user=default redir=-1";
+      out += " cmd=" + (sess.last_cmd.empty() ? std::string("NULL") : sess.last_cmd);
+      out += " user=" + sess.user + " redir=-1";
       out += " resp=" + std::to_string(static_cast<int>(sess.resp_version));
       out += "\n";
     }
@@ -333,12 +374,30 @@ int run_server(const ServerConfig& config) {
   // Helper: close a client connection and clean up all associated state.
   auto close_client = [&](int fd) {
     pubsub_unsubscribe_all(fd);
+    on_client_disconnect(fd);
     poller.remove(fd);
     ::close(fd);
     buffers.erase(fd);
     write_buffers.erase(fd);
     sessions.erase(fd);
     g_connected_clients.fetch_sub(1);
+  };
+
+  // CLIENT KILL: close clients matching a filter, except skip_fd (the caller, which
+  // closes itself via should_close). Safe to erase here — the event loop skips fds no
+  // longer in `sessions` at the top of each ready-fd iteration.
+  g_client_kill_cb = [&](const std::string& by, const std::string& val, int skip_fd) -> int {
+    std::vector<int> to_kill;
+    for (auto& [fd, sess] : sessions) {
+      if (fd == skip_fd) continue;
+      bool match = false;
+      if (by == "ID") match = (std::to_string(sess.client_id) == val);
+      else if (by == "ADDR") match = (sess.addr == val);
+      else if (by == "ANY") match = true;
+      if (match) to_kill.push_back(fd);
+    }
+    for (int fd : to_kill) close_client(fd);
+    return static_cast<int>(to_kill.size());
   };
 
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
@@ -360,7 +419,7 @@ int run_server(const ServerConfig& config) {
         auto parsed = parse_one_command(rem);
         if (!parsed.has_value()) break;
         g_total_commands_processed.fetch_add(1);
-        batch += handle_command(parsed->args, session, sc);
+        batch += safe_handle_command(parsed->args, session, sc);
         consumed += parsed->consumed;
         if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
@@ -412,10 +471,11 @@ int run_server(const ServerConfig& config) {
 
     const auto loop_now_ms = DataStore::now_ms();
     if (active_expire_enabled() && (loop_now_ms - last_active_expire_ms) >= 100) {
-      store().active_expire_cycle();
+      run_active_expire_cycle();  // master expires + propagates DEL; replica is a no-op
       last_active_expire_ms = loop_now_ms;
     }
     aof_fsync_if_needed(loop_now_ms);
+    background_save_cron();
     reap_background_children();
     drain_replica_cmd_queue();
 
@@ -522,6 +582,25 @@ int run_server(const ServerConfig& config) {
             continue;
           }
 
+          // ── protected-mode ── refuse non-loopback clients when no password is set,
+          // so an accidentally network-exposed server is not wide open. Loopback
+          // (127.0.0.0/8) is always allowed.
+          if (protected_mode_enabled() && !requirepass_is_set()) {
+            const bool is_loopback =
+                (ntohl(client_addr.sin_addr.s_addr) >> 24) == 127;
+            if (!is_loopback) {
+              static constexpr const char kDenied[] =
+                  "-DENIED PeaDB is running in protected mode because protected mode is enabled, "
+                  "no bind address was specified, and no authentication password is requested to "
+                  "clients. Connect from localhost, set a 'requirepass', or disable protected mode "
+                  "('protected-mode no').\r\n";
+              const ssize_t wn = ::write(client_fd, kDenied, sizeof(kDenied) - 1);
+              (void)wn;
+              ::close(client_fd);
+              continue;
+            }
+          }
+
           set_tcp_nodelay(client_fd);
 
           if (!poller.add_read(client_fd)) {
@@ -538,6 +617,12 @@ int run_server(const ServerConfig& config) {
             sess = SessionState{};
             sess.client_id = g_next_client_id.fetch_add(1);
             sess.fd = client_fd;
+            char ipbuf[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &client_addr.sin_addr, ipbuf, sizeof(ipbuf));
+            sess.addr = std::string(ipbuf) + ":" + std::to_string(ntohs(client_addr.sin_port));
+            const auto snow = DataStore::now_ms();
+            sess.created_ms = snow;
+            sess.last_interaction_ms = snow;
           }
           g_connected_clients.fetch_add(1);
           g_total_connections_received.fetch_add(1);
@@ -605,6 +690,17 @@ int run_server(const ServerConfig& config) {
       auto& input = buffers[fd];
       input.append(buf, static_cast<std::size_t>(n));
 
+      // Cap the per-client query buffer so a slow/never-completing command (or a
+      // flood that never forms a full frame) cannot grow input without bound and
+      // OOM the single-process server. 1 GB leaves headroom above proto-max-bulk-len.
+      constexpr std::size_t kInputBufHardLimit = 1ULL * 1024 * 1024 * 1024;
+      if (input.size() > kInputBufHardLimit) {
+        log(LogLevel::Warn, "client fd=" + std::to_string(fd) +
+            " exceeded query buffer limit (" + std::to_string(input.size()) + " bytes); closing");
+        close_client(fd);
+        continue;
+      }
+
       // Parse all complete commands, batching replies for a single write
       std::string batch_reply;
       bool should_close = false;
@@ -620,7 +716,7 @@ int run_server(const ServerConfig& config) {
         if (!parsed.has_value()) break;
 
         g_total_commands_processed.fetch_add(1);
-        const std::string reply = handle_command(parsed->args, session, should_close);
+        const std::string reply = safe_handle_command(parsed->args, session, should_close);
         batch_reply += reply;
         consumed_total += parsed->consumed;
 

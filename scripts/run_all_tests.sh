@@ -37,7 +37,7 @@
 # Environment variables
 #   SKIP   Comma-separated list of stage names to skip.  Valid names:
 #          unit, integration, coverage, compat, fuzz, stability, perf,
-#          sentinel, redis.
+#          sentinel, redis, diff.
 #
 # Exit codes
 #   0   All executed stages passed.
@@ -228,6 +228,10 @@ run_stage sentinel "Sentinel / replication validation" \
 # ── 9. Upstream Redis Tcl tests ─────────────────────────────────────────
 run_stage redis "Upstream Redis Tcl tests" \
     scripts/redis/run_redis_tests.sh
+
+# ── 10. Differential tests (PeaDB vs real Redis) ────────────────────────
+run_stage diff "Differential tests (PeaDB vs Redis)" \
+    python3 tests/diff/run_diff_tests.py
 
 # ── Summary ─────────────────────────────────────────────────────────────
 echo ""

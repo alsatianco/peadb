@@ -14,6 +14,16 @@
 
 namespace peadb {
 
+namespace {
+// Round-trip-safe double formatting for AOF rewrite (std::to_string gives only ~6
+// significant digits, silently corrupting non-round scores on every rewrite).
+std::string fmt_double(double d) {
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.17g", d);
+  return buf;
+}
+}  // namespace
+
 DataStore::DataStore() : current_db_(0), dbs_(16) {}
 
 bool DataStore::select_db(int db_index) {
@@ -1276,6 +1286,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
         rows.push_back(e);
         git->second.pending_to_consumer[e.first] = consumer;
         git->second.pending_per_consumer[consumer] += 1;
+        git->second.pending_delivery_ms[e.first] = now_ms();
+        git->second.pending_delivery_count[e.first] = 1;
         git->second.last_delivered_id = e.first;
         break;
       }
@@ -1313,6 +1325,8 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
         else grp.pending_per_consumer.erase(cit);
       }
       grp.pending_to_consumer.erase(pit);
+      grp.pending_delivery_ms.erase(id);
+      grp.pending_delivery_count.erase(id);
     }
   }
   return removed;
@@ -1341,6 +1355,8 @@ std::int64_t DataStore::xack(const std::string& key, const std::string& group, c
     if (pit == git->second.pending_to_consumer.end()) continue;
     const auto consumer = pit->second;
     git->second.pending_to_consumer.erase(pit);
+    git->second.pending_delivery_ms.erase(id);
+    git->second.pending_delivery_count.erase(id);
     auto cit = git->second.pending_per_consumer.find(consumer);
     if (cit != git->second.pending_per_consumer.end() && cit->second > 0) {
       cit->second -= 1;
@@ -1381,6 +1397,171 @@ std::vector<std::string> DataStore::xpending_summary(const std::string& key, con
     if (stream_id_gt(kv.first, max_id)) max_id = kv.first;
   }
   return {std::to_string(git->second.pending_to_consumer.size()), min_id, max_id, std::to_string(git->second.pending_per_consumer.size())};
+}
+
+bool DataStore::dump_stream(const std::string& key, StreamDump& out) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end() || it->second.type != ValueType::Stream) return false;
+  const auto& e = it->second;
+  out.entries = e.stream_entries;
+  out.last_ms = e.stream_last_ms;
+  out.last_seq = e.stream_last_seq;
+  out.groups.clear();
+  for (const auto& [gname, g] : e.stream_groups) {
+    StreamGroupDump gd;
+    gd.name = gname;
+    gd.last_delivered_id = g.last_delivered_id;
+    for (const auto& [id, consumer] : g.pending_to_consumer) {
+      StreamPel p;
+      p.id = id;
+      p.consumer = consumer;
+      auto dm = g.pending_delivery_ms.find(id);
+      p.delivery_ms = dm != g.pending_delivery_ms.end() ? dm->second : 0;
+      auto dc = g.pending_delivery_count.find(id);
+      p.delivery_count = dc != g.pending_delivery_count.end() ? dc->second : 1;
+      gd.pending.push_back(std::move(p));
+    }
+    out.groups.push_back(std::move(gd));
+  }
+  return true;
+}
+
+void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
+  auto& db = dbs_[current_db_];
+  auto& e = db[key];
+  e = Entry{};
+  e.type = ValueType::Stream;
+  e.stream_entries = d.entries;
+  e.stream_last_ms = d.last_ms;
+  e.stream_last_seq = d.last_seq;
+  for (const auto& gd : d.groups) {
+    Entry::StreamGroup g;
+    g.last_delivered_id = gd.last_delivered_id;
+    for (const auto& p : gd.pending) {
+      g.pending_to_consumer[p.id] = p.consumer;
+      g.pending_per_consumer[p.consumer] += 1;
+      g.pending_delivery_ms[p.id] = p.delivery_ms;
+      g.pending_delivery_count[p.id] = p.delivery_count;
+    }
+    e.stream_groups[gd.name] = std::move(g);
+  }
+}
+
+bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "ERR The XSETID command requires the key to exist."; return false; }
+  if (it->second.type != ValueType::Stream) { wrongtype = true; return false; }
+  std::uint64_t ms = 0, seq = 0;
+  if (!parse_stream_id_pair(id, ms, seq)) {
+    err = "ERR Invalid stream ID specified as stream command argument";
+    return false;
+  }
+  if (!it->second.stream_entries.empty() && stream_id_gt(it->second.stream_entries.back().first, id)) {
+    err = "ERR The ID specified in XSETID is smaller than the target stream top item";
+    return false;
+  }
+  it->second.stream_last_ms = ms;
+  it->second.stream_last_seq = seq;
+  return true;
+}
+
+std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xclaim(
+    const std::string& key, const std::string& group, const std::string& consumer,
+    std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
+    bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
+  if (it->second.type != ValueType::Stream) { wrongtype = true; return out; }
+  auto git = it->second.stream_groups.find(group);
+  if (git == it->second.stream_groups.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
+  auto& g = git->second;
+  const std::int64_t now = now_ms();
+  auto& entries = it->second.stream_entries;
+  for (const auto& id : ids) {
+    auto pit = g.pending_to_consumer.find(id);
+    const bool in_pel = pit != g.pending_to_consumer.end();
+    if (!in_pel && !force) continue;
+    auto eit = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+    if (eit == entries.end()) {  // entry was deleted from the stream — drop the dangling PEL entry
+      if (in_pel) {
+        auto cit = g.pending_per_consumer.find(pit->second);
+        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+        g.pending_to_consumer.erase(pit);
+        g.pending_delivery_ms.erase(id);
+        g.pending_delivery_count.erase(id);
+      }
+      continue;
+    }
+    if (in_pel) {
+      const auto dm = g.pending_delivery_ms.find(id);
+      const std::int64_t idle = now - (dm != g.pending_delivery_ms.end() ? dm->second : 0);
+      if (idle < min_idle_ms) continue;
+      if (pit->second != consumer) {
+        auto cit = g.pending_per_consumer.find(pit->second);
+        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+        pit->second = consumer;
+        g.pending_per_consumer[consumer] += 1;
+      }
+    } else {
+      g.pending_to_consumer[id] = consumer;
+      g.pending_per_consumer[consumer] += 1;
+      g.pending_delivery_count[id] = 0;
+    }
+    g.pending_delivery_ms[id] = now;
+    if (!justid) g.pending_delivery_count[id] += 1;
+    out.push_back(*eit);
+  }
+  return out;
+}
+
+DataStore::AutoClaimResult DataStore::xautoclaim(
+    const std::string& key, const std::string& group, const std::string& consumer,
+    std::int64_t min_idle_ms, const std::string& start, std::int64_t count, bool justid,
+    bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  AutoClaimResult res;
+  res.next_cursor = "0-0";
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
+  if (it->second.type != ValueType::Stream) { wrongtype = true; return res; }
+  auto git = it->second.stream_groups.find(group);
+  if (git == it->second.stream_groups.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
+  auto& g = git->second;
+  const std::int64_t now = now_ms();
+  if (count <= 0) count = 100;
+  auto& entries = it->second.stream_entries;
+  std::int64_t claimed = 0;
+  for (const auto& e : entries) {
+    if (stream_id_gt(start, e.first)) continue;          // skip ids before the cursor
+    auto pit = g.pending_to_consumer.find(e.first);
+    if (pit == g.pending_to_consumer.end()) continue;    // not pending
+    const auto dm = g.pending_delivery_ms.find(e.first);
+    const std::int64_t idle = now - (dm != g.pending_delivery_ms.end() ? dm->second : 0);
+    if (idle < min_idle_ms) continue;
+    if (claimed >= count) { res.next_cursor = e.first; break; }  // more remain → cursor here
+    if (pit->second != consumer) {
+      auto cit = g.pending_per_consumer.find(pit->second);
+      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+      pit->second = consumer;
+      g.pending_per_consumer[consumer] += 1;
+    }
+    g.pending_delivery_ms[e.first] = now;
+    if (!justid) g.pending_delivery_count[e.first] += 1;
+    res.claimed.push_back(e);
+    ++claimed;
+  }
+  return res;
 }
 
 bool DataStore::save_snapshot_file(const std::filesystem::path& path, std::string& err) {
@@ -1554,9 +1735,29 @@ std::int64_t DataStore::estimate_used_memory() const {
       for (const auto& v : e.list_value) total += static_cast<std::int64_t>(v.size());
       for (const auto& m : e.set_value) total += static_cast<std::int64_t>(m.size());
       for (const auto& [m, _] : e.zset_value) total += static_cast<std::int64_t>(m.size() + sizeof(double));
+      // Stream payloads (previously omitted — count entries + consumer-group PEL so
+      // stream-heavy datasets are not invisible to used_memory / maxmemory).
+      for (const auto& [id, fields] : e.stream_entries) {
+        total += static_cast<std::int64_t>(id.size());
+        for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
+      }
+      for (const auto& [gname, grp] : e.stream_groups) {
+        total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
+        for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
+      }
     }
   }
   return total;
+}
+
+std::int64_t DataStore::used_memory() const {
+  const std::int64_t now = now_ms();
+  constexpr std::int64_t kRecomputeIntervalMs = 100;
+  if (used_mem_cache_ < 0 || now - used_mem_cache_ms_ >= kRecomputeIntervalMs) {
+    used_mem_cache_ = estimate_used_memory();
+    used_mem_cache_ms_ = now;
+  }
+  return used_mem_cache_;
 }
 
 std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() const {
@@ -1606,7 +1807,7 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
         }
         case ValueType::ZSet: {
           std::vector<std::string> cmd{"ZADD", key};
-          for (const auto& [m, s] : e.zset_value) { cmd.push_back(std::to_string(s)); cmd.push_back(m); }
+          for (const auto& [m, s] : e.zset_value) { cmd.push_back(fmt_double(s)); cmd.push_back(m); }
           out.push_back(std::move(cmd));
           break;
         }
@@ -1728,11 +1929,13 @@ std::int64_t DataStore::zset_max_ziplist_entries() const {
 }
 
 
-void DataStore::active_expire_cycle(std::size_t budget_per_db) {
+std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::size_t budget_per_db) {
+  std::vector<std::pair<int, std::string>> expired;
   const auto now = now_ms();
   static thread_local std::mt19937 rng{std::random_device{}()};
 
-  for (auto& db : dbs_) {
+  for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
+    auto& db = dbs_[dbi];
     if (db.empty()) continue;
     const std::size_t num_buckets = db.bucket_count();
     // Start from a random bucket to avoid always skipping tail entries
@@ -1748,10 +1951,15 @@ void DataStore::active_expire_cycle(std::size_t budget_per_db) {
           to_del.push_back(it->first);
         }
       }
-      for (const auto& k : to_del) { db.erase(k); record_expired(); }
+      for (const auto& k : to_del) {
+        db.erase(k);
+        record_expired();
+        expired.emplace_back(static_cast<int>(dbi), k);
+      }
       bucket = (bucket + 1) % num_buckets;
     } while (scanned < budget_per_db && bucket != start_bucket);
   }
+  return expired;
 }
 
 void DataStore::flushall() {

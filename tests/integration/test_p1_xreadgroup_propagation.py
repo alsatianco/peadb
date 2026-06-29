@@ -63,7 +63,7 @@ def main():
             assert cmd(c,"XGROUP","CREATE","mystream","mygroup","0")=="OK"
 
             r.sendall(b"SYNC\r\n")
-            assert rx(r,1)==b'$'; assert rl(r)==b"0"
+            assert rx(r,1)==b'$'; _n=int(rl(r)); rx(r,_n)  # consume full-state RDB
 
             assert cmd(c,"MULTI")=="OK"
             assert cmd(c,"XREADGROUP","GROUP","mygroup","c1","COUNT","2","STREAMS","mystream",">")=="QUEUED"

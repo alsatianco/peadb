@@ -17,10 +17,18 @@ services:
     restart: unless-stopped
     init: true
     stop_grace_period: 5s
-    # Override CMD to pick up env-var driven log level
-    command: ["--port", "6379", "--bind", "0.0.0.0", "--dir", "/data", "--loglevel", "${PEADB_LOGLEVEL:-info}"]
+    # Override CMD to pick up env-var driven config.
+    # protected-mode defaults to `no` for this LOCAL-DEV compose so the host can connect
+    # over the published port. For production set PEADB_REQUIREPASS (and leave protected-mode
+    # on) — an unauthenticated server must not be exposed to an untrusted network.
+    command: ["--port", "6379", "--bind", "0.0.0.0", "--dir", "/data",
+              "--loglevel", "${PEADB_LOGLEVEL:-info}",
+              "--protected-mode", "${PEADB_PROTECTED_MODE:-no}",
+              "--requirepass", "${PEADB_REQUIREPASS:-}"]
     healthcheck:
-      test: ["CMD-SHELL", "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/6379'"]
+      # Verify the server actually answers RESP (PING → PONG), not just that the TCP port
+      # is open. Accept -NOAUTH too so the check still passes when a password is configured.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/6379 && printf 'PING\\r\\n' >&3 && head -c 32 <&3 | grep -Eq 'PONG|NOAUTH'"]
       interval: 10s
       timeout: 3s
       retries: 5

@@ -939,11 +939,14 @@ do
   _rawset(_G_ref, "setmetatable", safe_setmetatable)
   _rawset(_G_ref, "loadstring", safe_loadstring)
 
-  -- Remove unsafe globals
+  -- Remove unsafe globals. os/io grant filesystem and process access (os.execute,
+  -- io.popen) and must never be reachable from a script — Redis does not expose them.
   _rawset(_G_ref, "loadfile", nil)
   _rawset(_G_ref, "dofile", nil)
   _rawset(_G_ref, "print", nil)
   _rawset(_G_ref, "debug", nil)
+  _rawset(_G_ref, "os", nil)
+  _rawset(_G_ref, "io", nil)
 
   -- Set metatable on the real _G for protection:
   -- __readonly = true so safe_setmetatable blocks setmetatable(_G, ...)

@@ -37,6 +37,25 @@ ServerConfig load_config(const std::string& path) {
     std::string value;
     std::getline(iss, value);
     value = trim(value);
+
+    // rename-command takes two tokens (FROM TO) and an empty TO is meaningful
+    // (it disables the command), so it must be handled before the empty-value skip.
+    if (key == "rename-command") {
+      std::istringstream rargs(value);
+      std::string from, to;
+      rargs >> from;            // TO may be absent/empty (= disable)
+      rargs >> to;
+      if (!from.empty()) cfg.rename_commands.emplace_back(from, to);
+      continue;
+    }
+
+    // save thresholds accumulate across lines; `save ""` clears them.
+    if (key == "save") {
+      if (value == "\"\"" || value.empty()) { cfg.save.clear(); }
+      else { cfg.save += (cfg.save.empty() ? "" : " "); cfg.save += value; }
+      continue;
+    }
+
     if (value.empty()) continue;
 
     cfg.raw[key] = value;
@@ -59,6 +78,20 @@ ServerConfig load_config(const std::string& path) {
       cfg.appendfilename = value;
     } else if (key == "appendfsync") {
       cfg.appendfsync = value;
+    } else if (key == "requirepass") {
+      cfg.requirepass = value;
+    } else if (key == "masterauth") {
+      cfg.masterauth = value;
+    } else if (key == "protected-mode") {
+      cfg.protected_mode = (value == "yes" || value == "1" || value == "true");
+    } else if (key == "enable-module-command") {
+      cfg.enable_module_command = value;
+    } else if (key == "maxmemory") {
+      cfg.maxmemory = value;
+    } else if (key == "repl-backlog-size") {
+      cfg.repl_backlog_size = value;
+    } else if (key == "notify-keyspace-events") {
+      cfg.notify_keyspace_events = value;
     }
   }
 

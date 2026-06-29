@@ -40,7 +40,11 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- with tempfile.TemporaryDirectory(prefix='peadb-m5cmd-') as td:
+ # ignore_cleanup_errors: BGSAVE/BGREWRITEAOF fork children can briefly write
+ # dump.rdb(.tmp)/appendonly.aof into td after the parent is terminated, racing the
+ # temp-dir removal ("Directory not empty"). The product behaviour is correct; only
+ # the test teardown needs to tolerate the race.
+ with tempfile.TemporaryDirectory(prefix='peadb-m5cmd-', ignore_cleanup_errors=True) as td:
   cfg=pathlib.Path(td)/'p.conf'
   cfg.write_text('\n'.join([
    'bind 127.0.0.1',

@@ -8,6 +8,7 @@
 #include <unordered_map>
 #include <functional>
 #include <chrono>
+#include <utility>
 
 namespace peadb {
 
@@ -59,6 +60,18 @@ struct SessionState {
   std::string lib_name;
   std::string lib_ver;
   int fd = -1;  // file descriptor for this connection
+  // ── Authentication ──
+  // authenticated stays false until AUTH/HELLO succeeds; when no requirepass is
+  // configured the dispatch-time gate is skipped entirely, so the default is open
+  // exactly like Redis with no password set.
+  bool authenticated = false;
+  std::string user = "default";
+  // ── Introspection (CLIENT LIST / MONITOR / CLIENT KILL) ──
+  std::string addr;                       // peer "ip:port", set at accept
+  std::int64_t created_ms = 0;            // connection creation time
+  std::int64_t last_interaction_ms = 0;   // last command time (for idle)
+  std::string last_cmd;                   // last command name (lowercased)
+  bool is_monitor = false;                // client issued MONITOR
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
@@ -72,6 +85,18 @@ void reap_background_children();
 void configure_runtime_port(int port);
 void configure_max_clients(int max_clients);
 int configured_max_clients();
+// ── Security configuration (wired from main.cpp at startup) ──
+void configure_security(const std::string& requirepass, const std::string& masterauth,
+                        bool protected_mode, const std::string& enable_module_command,
+                        const std::vector<std::pair<std::string, std::string>>& rename_commands);
+bool protected_mode_enabled();   // read by the server accept loop
+bool requirepass_is_set();       // read by the server accept loop (protected-mode bypass)
+void configure_maxmemory(const std::string& spec);   // "100mb"/bytes; "" = unlimited
+void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
+void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb" (startup only)
+void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
+void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
+void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)
 void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
 std::size_t replication_event_count();
@@ -103,6 +128,13 @@ extern std::atomic<std::int64_t> g_server_start_time;
 extern std::function<int(std::int64_t)> g_count_synced_replicas;
 // Callback: returns the number of currently-connected replica sessions (replica_stream=true).
 extern std::function<int()> g_count_connected_replicas;
+// Callback: returns the number of currently-blocked clients (BLPOP/BRPOP/etc.).
+extern std::function<int()> g_blocked_clients_cb;
+// Callback: close clients matching (by="ID"|"ADDR"|"ANY", val), excluding skip_fd.
+// Returns the number closed. Wired by server.cpp (owns fd lifecycle).
+extern std::function<int(const std::string& by, const std::string& val, int skip_fd)> g_client_kill_cb;
+// Clear per-fd server-side registries (monitors, etc.) when a client disconnects.
+void on_client_disconnect(int fd);
 
 // ── Client registry (set from server.cpp, read by CLIENT LIST/INFO) ──
 extern std::atomic<std::uint64_t> g_next_client_id;

@@ -66,7 +66,7 @@ def main():
         with socket.create_connection(("127.0.0.1",6514),timeout=2) as c, socket.create_connection(("127.0.0.1",6514),timeout=2) as r:
             assert cmd(c,"FLUSHALL")=="OK"
             r.sendall(b"SYNC\r\n")
-            assert rx(r,1)==b'$'; assert rl(r)==b"0"
+            assert rx(r,1)==b'$'; _n=int(rl(r)); rx(r,_n)  # consume full-state RDB
 
             assert cmd(c,"MSET","a{t}","1","b{t}","2","c{t}","3","d{t}","4")=="OK"
             assert cmd(c,"EVAL","return redis.call('mget', 'a{t}', 'b{t}', 'c{t}', 'd{t}')","0")==["1","2","3","4"]

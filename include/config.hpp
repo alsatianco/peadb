@@ -2,6 +2,8 @@
 
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 namespace peadb {
 
@@ -15,6 +17,17 @@ struct ServerConfig {
   bool appendonly = false;
   std::string appendfilename = "appendonly.aof";
   std::string appendfsync = "everysec";
+  std::string maxmemory;                    // e.g. "100mb"; empty = unlimited
+  std::string save;                         // raw "sec changes [sec changes ...]"; empty = none
+  std::string repl_backlog_size;            // e.g. "256mb"; empty = default 1mb
+  std::string notify_keyspace_events;       // e.g. "KEA"; empty = disabled
+  // ── Security ──
+  std::string requirepass;                 // empty = no auth required (Redis default)
+  std::string masterauth;                  // password the replica sends to its master
+  bool protected_mode = true;              // refuse non-loopback clients when no auth set
+  std::string enable_module_command = "no"; // "yes" | "no" | "local" — gates MODULE LOAD
+  // rename-command FROM TO (TO empty disables FROM). Order-preserving, repeatable.
+  std::vector<std::pair<std::string, std::string>> rename_commands;
   std::unordered_map<std::string, std::string> raw;
 };
 
