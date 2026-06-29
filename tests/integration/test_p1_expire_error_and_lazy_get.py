@@ -97,7 +97,7 @@ def main():
             assert cmd(c, "SET", "foo", "bar", "PX", "1") == "OK"
             r.sendall(b"SYNC\r\n")
             assert rx(r, 1) == b"$"
-            _ = rl(r)
+            rx(r, int(rl(r)))  # consume full-state RDB
             time.sleep(0.12)
             assert cmd(c, "GET", "foo") is None
             assert cmd(c, "SET", "x", "1") == "OK"

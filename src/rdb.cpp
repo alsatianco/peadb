@@ -68,6 +68,10 @@ constexpr uint8_t RDB_TYPE_ZSET_LISTPACK   = 17;
 constexpr uint8_t RDB_TYPE_LIST_QUICKLIST_2= 18;
 constexpr uint8_t RDB_TYPE_SET_LISTPACK    = 20;
 constexpr uint8_t RDB_TYPE_STREAM_LISTPACKS   = 15; // overloaded opcode used for streams
+// PeaDB-specific stream encoding (NOT Redis byte-compatible — Redis can't load an RDB
+// containing this type; cross-engine stream migration still uses the AOF/bridge path).
+// Chosen outside Redis's type range so non-stream RDBs stay fully Redis-compatible.
+constexpr uint8_t RDB_TYPE_PEADB_STREAM       = 200;
 
 constexpr uint8_t RDB_ENC_INT8  = 0;
 constexpr uint8_t RDB_ENC_INT16 = 1;
@@ -733,12 +737,30 @@ std::string rdb_build_string(std::string& err) {
         }
 
       } else if (type_str == "stream") {
-        // Stream RDB encoding is not implemented. Return an error rather than
-        // silently dropping stream data — the caller must gate SAVE/BGSAVE.
-        err = "RDB stream encoding not implemented; key '" + key +
-              "' would be lost. Use BGREWRITEAOF for AOF-only persistence.";
-        ds.select_db(prev_db);
-        return {};
+        DataStore::StreamDump d;
+        if (!ds.dump_stream(key, d)) continue;
+        w.write_u8(RDB_TYPE_PEADB_STREAM);
+        w.write_string(key);
+        w.write_length(d.entries.size());
+        for (const auto& [id, fields] : d.entries) {
+          w.write_string(id);
+          w.write_length(fields.size());
+          for (const auto& [f, v] : fields) { w.write_string(f); w.write_string(v); }
+        }
+        w.write_length(d.last_ms);
+        w.write_length(d.last_seq);
+        w.write_length(d.groups.size());
+        for (const auto& gd : d.groups) {
+          w.write_string(gd.name);
+          w.write_string(gd.last_delivered_id);
+          w.write_length(gd.pending.size());
+          for (const auto& p : gd.pending) {
+            w.write_string(p.id);
+            w.write_string(p.consumer);
+            w.write_length(static_cast<uint64_t>(p.delivery_ms));
+            w.write_length(static_cast<uint64_t>(p.delivery_count));
+          }
+        }
       }
     }
   }
@@ -1101,6 +1123,47 @@ bool rdb_load(const std::filesystem::path& path, std::string& err) {
         try { score = std::stod(entries[i + 1]); } catch (...) {}
         ds.zadd_one(key, score, entries[i], false, false, false, false, false);
       }
+      if (expire_at) ds.expire(key, *expire_at);
+
+    } else if (type == RDB_TYPE_PEADB_STREAM) {
+      DataStore::StreamDump d;
+      uint64_t nentries = 0; bool enc = false;
+      if (!r.read_length(nentries, enc) || enc) { err = "malformed stream"; ds.select_db(prev_db); return false; }
+      for (uint64_t i = 0; i < nentries; ++i) {
+        std::string id; if (!r.read_string(id)) { err = "malformed stream entry id"; ds.select_db(prev_db); return false; }
+        uint64_t nf = 0; if (!r.read_length(nf, enc) || enc) { err = "malformed stream entry"; ds.select_db(prev_db); return false; }
+        std::vector<std::pair<std::string, std::string>> fields;
+        for (uint64_t j = 0; j < nf; ++j) {
+          std::string f, v;
+          if (!r.read_string(f) || !r.read_string(v)) { err = "malformed stream field"; ds.select_db(prev_db); return false; }
+          fields.emplace_back(std::move(f), std::move(v));
+        }
+        d.entries.emplace_back(std::move(id), std::move(fields));
+      }
+      uint64_t lms = 0, lseq = 0;
+      if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) { err = "malformed stream last-id"; ds.select_db(prev_db); return false; }
+      d.last_ms = lms; d.last_seq = lseq;
+      uint64_t ngroups = 0;
+      if (!r.read_length(ngroups, enc) || enc) { err = "malformed stream groups"; ds.select_db(prev_db); return false; }
+      for (uint64_t gi = 0; gi < ngroups; ++gi) {
+        DataStore::StreamGroupDump gd;
+        if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) { err = "malformed stream group"; ds.select_db(prev_db); return false; }
+        uint64_t npel = 0;
+        if (!r.read_length(npel, enc) || enc) { err = "malformed stream pel"; ds.select_db(prev_db); return false; }
+        for (uint64_t pi = 0; pi < npel; ++pi) {
+          DataStore::StreamPel p;
+          uint64_t dms = 0, dcnt = 0;
+          if (!r.read_string(p.id) || !r.read_string(p.consumer) ||
+              !r.read_length(dms, enc) || enc || !r.read_length(dcnt, enc) || enc) {
+            err = "malformed stream pel entry"; ds.select_db(prev_db); return false;
+          }
+          p.delivery_ms = static_cast<std::int64_t>(dms);
+          p.delivery_count = static_cast<std::int64_t>(dcnt);
+          gd.pending.push_back(std::move(p));
+        }
+        d.groups.push_back(std::move(gd));
+      }
+      ds.restore_stream(key, d);
       if (expire_at) ds.expire(key, *expire_at);
 
     } else {

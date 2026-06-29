@@ -8,6 +8,11 @@
 namespace peadb {
 namespace {
 
+// Protocol limits matching Redis defaults. Enforced *before* allocating, so a tiny
+// header (e.g. "*2000000000\r\n") cannot trigger a huge reservation / OOM crash.
+constexpr int kMaxMultibulk = 1024 * 1024;            // 1M elements
+constexpr int kMaxBulkLen   = 512 * 1024 * 1024;      // 512 MB (proto-max-bulk-len)
+
 bool parse_i32(std::string_view sv, int& out) {
   if (sv.empty()) return false;
   bool negative = false;
@@ -41,6 +46,7 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
   }
 
   if (count < 0) return ParsedCommand{{"__parse_error__"}, line_end + 2};
+  if (count > kMaxMultibulk) return ParsedCommand{{"__err_multibulk__"}, line_end + 2};
 
   std::size_t pos = line_end + 2;
   std::vector<std::string> args;
@@ -57,6 +63,7 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
     }
 
     if (len < 0) return ParsedCommand{{"__parse_error__"}, bulk_end + 2};
+    if (len > kMaxBulkLen) return ParsedCommand{{"__err_bulklen__"}, bulk_end + 2};
 
     const std::size_t data_start = bulk_end + 2;
     const std::size_t required = data_start + static_cast<std::size_t>(len) + 2;

@@ -58,7 +58,7 @@ def main():
         with socket.create_connection(("127.0.0.1",6501),timeout=2) as c, socket.create_connection(("127.0.0.1",6501),timeout=2) as r:
             assert cmd(c,"FLUSHALL")=="OK"
             r.sendall(b"SYNC\r\n")
-            assert rx(r,1)==b'$'; assert rl(r)==b"0"
+            assert rx(r,1)==b'$'; _n=int(rl(r)); rx(r,_n)  # consume full-state RDB
 
             assert cmd(c,"MULTI")=="OK"
             assert cmd(c,"SCRIPT","LOAD","redis.call('set', KEYS[1], 'foo')")=="QUEUED"

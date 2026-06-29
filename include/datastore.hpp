@@ -26,8 +26,10 @@ enum class ValueType {
 struct Entry {
   struct StreamGroup {
     std::string last_delivered_id = "0-0";
-    std::unordered_map<std::string, std::string> pending_to_consumer;
-    std::unordered_map<std::string, std::size_t> pending_per_consumer;
+    std::unordered_map<std::string, std::string> pending_to_consumer;     // id -> consumer
+    std::unordered_map<std::string, std::size_t> pending_per_consumer;    // consumer -> count
+    std::unordered_map<std::string, std::int64_t> pending_delivery_ms;    // id -> last delivery time (ms)
+    std::unordered_map<std::string, std::int64_t> pending_delivery_count; // id -> delivery count
   };
 
   ValueType type = ValueType::String;
@@ -149,12 +151,43 @@ class DataStore {
   std::vector<std::string> xpending_summary(const std::string& key, const std::string& group,
                                             bool& wrongtype, std::string& err);
 
+  // ── Stream serialization (for RDB persistence + replication of streams) ──
+  struct StreamPel { std::string id; std::string consumer; std::int64_t delivery_ms; std::int64_t delivery_count; };
+  struct StreamGroupDump { std::string name; std::string last_delivered_id; std::vector<StreamPel> pending; };
+  struct StreamDump {
+    std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> entries;
+    std::uint64_t last_ms = 0;
+    std::uint64_t last_seq = 0;
+    std::vector<StreamGroupDump> groups;
+  };
+  bool dump_stream(const std::string& key, StreamDump& out);      // false if absent / not a stream
+  void restore_stream(const std::string& key, const StreamDump& d);
+
+  // ── Stream ops (Batch 6) ──
+  bool xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err);
+  // XCLAIM: returns claimed entries (id, fields) for ids that were pending; updates PEL ownership.
+  std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> xclaim(
+      const std::string& key, const std::string& group, const std::string& consumer,
+      std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
+      bool& wrongtype, std::string& err);
+  // XAUTOCLAIM: from start cursor, claim up to count idle entries; returns {next_cursor, entries, deleted}.
+  struct AutoClaimResult {
+    std::string next_cursor;
+    std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> claimed;
+    std::vector<std::string> deleted;
+  };
+  AutoClaimResult xautoclaim(const std::string& key, const std::string& group, const std::string& consumer,
+                             std::int64_t min_idle_ms, const std::string& start, std::int64_t count,
+                             bool justid, bool& wrongtype, std::string& err);
+
   void flushall();
   void flushdb();
   std::size_t dbsize();
   std::vector<std::string> collect_expired_keys();
   bool lazy_expire_key(const std::string& key);
-  void active_expire_cycle(std::size_t budget_per_db = 64);
+  // Returns the (db_index, key) pairs physically removed this cycle so the caller
+  // (master) can propagate DEL to replicas/AOF and keep replicas in sync.
+  std::vector<std::pair<int, std::string>> active_expire_cycle(std::size_t budget_per_db = 64);
   std::pair<std::uint64_t, std::vector<std::string>> scan(std::uint64_t cursor, std::size_t count, const std::string& match = "*", const std::string& type = "");
   std::uint64_t mutation_epoch() const;
   void increment_mutation_epoch();
@@ -172,6 +205,12 @@ class DataStore {
 
   // Memory accounting — walks all databases to compute an estimate
   std::int64_t estimate_used_memory() const;
+  // Bounded-staleness cached view of estimate_used_memory(): recomputed at most
+  // once per ~100ms so INFO and per-write maxmemory checks are O(1) amortised
+  // instead of O(N+members) on every call. Drift-free (always the ground truth,
+  // just possibly up to ~100ms stale). True per-op O(1) accounting is deferred to
+  // the Entry tagged-union refactor (see compat/delta.md).
+  std::int64_t used_memory() const;
   bool save_snapshot_file(const std::filesystem::path& path, std::string& err);
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);
   std::vector<std::vector<std::string>> export_aof_commands() const;
@@ -191,6 +230,8 @@ class DataStore {
   int current_db_;
   std::vector<DB> dbs_;
   std::uint64_t mutation_epoch_ = 0;
+  mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
+  mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
   std::int64_t zset_max_ziplist_entries_ = 128;
   std::atomic<std::int64_t> stat_expired_keys_{0};
   std::atomic<std::int64_t> stat_keyspace_hits_{0};

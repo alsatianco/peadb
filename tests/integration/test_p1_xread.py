@@ -49,7 +49,8 @@ def main():
         wait_until_ready(6499)
         with socket.create_connection(("127.0.0.1",6499),timeout=2) as s:
             assert cmd(s,"FLUSHALL")=="OK"
-            assert cmd(s,"XREAD","BLOCK","0","STREAMS","s","$") is None
+            # BLOCK with a short timeout and no data → null after the timeout (XREAD now really blocks).
+            assert cmd(s,"XREAD","BLOCK","50","STREAMS","s","$") is None
             assert cmd(s,"SET","k","v")=="OK"
             e=cmd(s,"XREAD","BLOCK","0","STREAMS","k","$")
             assert isinstance(e,tuple) and e[0]=="ERR" and "WRONGTYPE" in e[1]

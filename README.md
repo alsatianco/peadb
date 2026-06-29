@@ -1,20 +1,21 @@
 # PeaDB
 
-A high-performance, drop-in replacement for Redis, written in modern C++20.
+A high-performance, Redis 7.2.5-compatible in-memory data store written in modern C++20.
 
 Docker image: `alsatianco/peadb-server` on [Docker Hub](https://hub.docker.com/repository/docker/alsatianco/peadb-server).
 
-PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same protocol, same commands, same edge-case semantics — while leveraging multi-core CPUs and cache-friendly data structures for superior throughput.
+PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same protocol, same commands, same edge-case semantics — built on cache-friendly data structures and a lean event loop. The command path is single-threaded today (like Redis); a sharded, multi-core architecture is the roadmap target (see [docs/architecture.md](docs/architecture.md)).
 
 ## Highlights
 
-- **Full RESP2/RESP3 protocol** — works with every existing Redis client and tool, zero changes required.
-- **207 commands** — strings, hashes, lists, sets, sorted sets, streams, pub/sub, transactions, Lua scripting, and more.
-- **Persistence** — RDB snapshots, AOF logging, and `SAVE`/`BGSAVE`/`BGREWRITEAOF`.
-- **Replication** — PSYNC2-based replication with multi-replica support and replica promotion.
-- **Cluster** — 16 384 hash-slot routing, `MOVED`/`ASK` redirection, slot migration, gossip protocol.
+- **Full RESP2 / partial RESP3 protocol** — works with existing Redis clients and tools, zero changes required.
+- **220+ commands** — strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo, bitmaps, pub/sub (incl. introspection + sharded aliases), transactions, Lua scripting, and more. (Authoritative per-command status: [`compat/commands.generated.md`](compat/commands.generated.md).)
+- **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`.
+- **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and correct replica expiry (the master propagates `DEL` so clocks can't diverge). Automatic failover/Sentinel is not yet implemented.
+- **Cluster** — 16 384 hash-slot routing, `CLUSTER KEYSLOT`/`INFO`/`NODES`/`SLOTS`, `MEET` peer discovery, and `MOVED`/`ASK` redirection (surface-level; full gossip and slot migration in progress).
 - **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries.
-- **Redis Modules API** — partial `RedisModule_*` C API; load `.so` modules at runtime via `MODULE LOAD`.
+- **Redis Modules API** — minimal `RedisModule_*` C API; load `.so` modules at runtime via `MODULE LOAD`.
+- **Observability** — populated `SLOWLOG` and `LATENCY` (real per-command timing), keyspace notifications (`notify-keyspace-events`, incl. `expired`), `MONITOR`, `CLIENT LIST`/`KILL`, runtime `CONFIG SET loglevel`, and Redis-compatible `INFO` (RSS, fragmentation ratio, fork timing, ops/sec) for `redis_exporter` and dashboards.
 - **Docker-ready** — published image at `alsatianco/peadb-server`, plus multi-stage Dockerfile and docker-compose for local builds.
 
 ## Quick Start
@@ -76,10 +77,7 @@ Run the published image directly:
 docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest
 ```
 
-Available public tags:
-
-- `alsatianco/peadb-server:latest`
-- `alsatianco/peadb-server:0.1`
+Available public tags: `alsatianco/peadb-server:latest`, `alsatianco/peadb-server:0.1`.
 
 Or build and run locally with Docker Compose:
 
@@ -87,14 +85,11 @@ Or build and run locally with Docker Compose:
 docker compose up -d
 ```
 
-The container exposes port `6379` (configurable via `PEADB_PORT`) and persists data to a named volume.
-For high-connection load tests, compose sets `ulimits.nofile` by default (`PEADB_NOFILE_SOFT` / `PEADB_NOFILE_HARD`, both default to `65536`).
-
-Docker Hub: https://hub.docker.com/repository/docker/alsatianco/peadb-server
+The container exposes port `6379` (configurable via `PEADB_PORT`) and persists data to a named volume. For high-connection load tests, compose sets `ulimits.nofile` by default (`PEADB_NOFILE_SOFT` / `PEADB_NOFILE_HARD`, both default to `65536`).
 
 ## Configuration
 
-PeaDB accepts Redis-style configuration via CLI flags or a config file.
+PeaDB accepts Redis-style configuration via CLI flags or a config file (`--config <path>`, using redis.conf `key value` syntax). CLI flags override config-file values.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -104,15 +99,25 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file.
 | `--dir` | `.` | Data directory for snapshots and AOF |
 | `--dbfilename` | `dump.rdb` | RDB snapshot filename |
 | `--config` | — | Path to a config file |
+| `maxclients` | — | Maximum concurrent client connections |
 | `appendonly` | `false` | Enable AOF persistence |
 | `appendfilename` | `appendonly.aof` | AOF filename |
+| `appendfsync` | `everysec` | AOF fsync policy (`always` / `everysec` / `no`) |
+| `--requirepass` | — | Require clients to `AUTH` with this password (empty = open, like Redis) |
+| `--masterauth` | — | Password a replica sends to its master during sync |
+| `--protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
+| `--enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
+| `--maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); denyoom writes rejected with `-OOM` above it (no eviction) |
+| `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` |
 
-Runtime configuration is available via `CONFIG GET` / `CONFIG SET`.
+`appendonly`, `appendfilename`, `appendfsync`, `masterauth`, and `repl-backlog-size` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys).
+
+Recognized redis.conf keys are a subset of Redis's; unknown directives are accepted but ignored. Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`).
 
 ## Supported Commands
 
 <details>
-<summary>Full command list (207 commands)</summary>
+<summary>Command list (see <a href="compat/commands.generated.md">commands.generated.md</a> for the authoritative, always-current list)</summary>
 
 **Connection & Server** — `PING`, `ECHO`, `QUIT`, `HELLO`, `AUTH`, `ACL`, `INFO`, `COMMAND`, `CONFIG`, `DEBUG`, `SELECT`, `SAVE`, `BGSAVE`, `BGREWRITEAOF`, `WAIT`, `TIME`, `DBSIZE`, `FLUSHALL`, `FLUSHDB`, `SHUTDOWN`
 
@@ -124,17 +129,19 @@ Runtime configuration is available via `CONFIG GET` / `CONFIG SET`.
 
 **Lists** — `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE`, `BLPOP`, `BRPOP`, `LMOVE`, `BLMOVE`, `BRPOPLPUSH`
 
-**Sets** — `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`, `SPOP`, `SSCAN`
+**Sets** — `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SCARD`, `SPOP`, `SMOVE`, `SINTERCARD`, `SSCAN`
+
+**HyperLogLog** — `PFADD`, `PFCOUNT`, `PFMERGE` (self-consistent dense form; see `compat/delta.md`)
 
 **Sorted Sets** — `ZADD` (NX/XX/GT/LT/INCR), `ZRANGE`, `ZSCAN`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`
 
-**Streams** — `XADD`, `XDEL`, `XLEN`, `XRANGE`, `XREVRANGE`, `XGROUP`, `XREADGROUP`, `XREAD`, `XACK`, `XPENDING`, `XINFO`
+**Streams** — `XADD`, `XDEL`, `XLEN`, `XRANGE`, `XREVRANGE`, `XGROUP`, `XREADGROUP`, `XREAD` (blocking), `XACK`, `XPENDING`, `XINFO`, `XSETID`, `XTRIM`, `XCLAIM`, `XAUTOCLAIM` — with a full PEL (delivery time/count) and **RDB persistence + replication** of streams
 
-**Pub/Sub** — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`
+**Pub/Sub** — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` (CHANNELS/NUMSUB/NUMPAT), `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH` (sharded aliases)
 
 **Transactions** — `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH`
 
-**Scripting** — `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (LOAD/EXISTS/FLUSH/KILL), `FUNCTION` (LOAD/LIST/DELETE/DUMP/RESTORE/FLUSH/STATS), `FCALL`, `FCALL_RO`
+**Scripting** — `EVAL`, `EVALSHA`, `EVAL_RO`, `EVALSHA_RO`, `SCRIPT` (LOAD/EXISTS/FLUSH/KILL), `FUNCTION` (LOAD/LIST/DELETE/FLUSH/STATS/KILL), `FCALL`, `FCALL_RO`
 
 **Replication** — `SYNC`, `PSYNC`, `REPLCONF`, `REPLICAOF`, `SLAVEOF`, `WAIT`
 
@@ -146,7 +153,7 @@ Runtime configuration is available via `CONFIG GET` / `CONFIG SET`.
 
 ## Testing
 
-PeaDB has a comprehensive test suite spanning unit, integration, fuzz, and differential testing.
+PeaDB has a comprehensive suite spanning unit, integration, fuzz, and differential testing.
 
 ```bash
 # Run all tests (unit + integration, 9 stages)
@@ -182,7 +189,7 @@ cmake --build build-asan -j$(nproc)
 
 ## Benchmarks
 
-Baseline numbers on a single connection (representative, not peak):
+Indicative single-connection throughput (representative, not peak):
 
 | Operation | ops/sec |
 |-----------|---------|
@@ -193,32 +200,24 @@ Baseline numbers on a single connection (representative, not peak):
 | INCR | 63,694 |
 | SADD | 63,694 |
 
-Full `redis-benchmark` and `memtier_benchmark` results are archived under `artifacts/`.
+Reproduce with `scripts/dev/redis_vs_peadb_benchmark.sh` (compares PeaDB against a Redis baseline). The command path is single-threaded, so throughput is competitive at low concurrency while tail latency rises under very high concurrency — the sharded, multi-core architecture on the [roadmap](docs/architecture.md#design-principles--roadmap) targets this.
 
-## RDB Import / Export
+## Compatibility, Persistence & Migration
 
-Bridge scripts are provided for migrating data to and from Redis:
+PeaDB is a drop-in replacement for core Redis workloads — standard clients connect unmodified, and you can migrate in via `REPLICAOF` (native PSYNC2 sync) or the RDB bridge scripts, and roll back the same way. Durability matches Redis (`appendfsync always`/`everysec`/`no`).
 
-```bash
-# Import an existing RDB file into PeaDB via a Redis intermediary
-python3 scripts/redis/import_rdb_via_redis.py <dump.rdb>
+Full detail — drop-in posture, tested clients, `redis.conf` support, migration & rollback steps, the feature-status table, persistence internals, and security/monitoring notes — lives in **[docs/compatibility.md](docs/compatibility.md)**. The authoritative, always-current gap registry is **[compat/delta.md](compat/delta.md)**.
 
-# Export PeaDB data to an RDB file via a Redis intermediary
-python3 scripts/redis/export_rdb_via_redis.py <output.rdb>
-```
+## Documentation
 
-## Known Compatibility Deltas
-
-PeaDB targets behavioral parity with Redis 7.2.5. Current known gaps:
-
-| Area | Severity | Notes |
-|------|----------|-------|
-| ACL completeness | High | Basic `AUTH` / default user only; full ACL engine deferred |
-| RDB binary compatibility | High | Import/export via bridge scripts; native RDB parser in progress |
-| AOF parity gaps | Medium | Core AOF works; full edge-case parity in progress |
-| Module ecosystem certification | High | Minimal `RedisModule_*` API; RedisJSON / RediSearch certification deferred |
-
-See [compat/delta.md](compat/delta.md) for the full delta tracker.
+| Document | What it covers |
+|----------|----------------|
+| [docs/compatibility.md](docs/compatibility.md) | Drop-in posture, migration & rollback, feature status, persistence & durability, ops notes |
+| [docs/architecture.md](docs/architecture.md) | How PeaDB works internally + design principles and roadmap (for contributors) |
+| [compat/delta.md](compat/delta.md) | **Canonical** registry of compatibility gaps vs Redis 7.2.5 |
+| [compat/commands.generated.md](compat/commands.generated.md) | Auto-generated per-command coverage scoreboard |
+| [scripts/README.md](scripts/README.md) | Guide to the helper, CI, QA, and dev scripts |
+| [CLAUDE.md](CLAUDE.md) | Build, test, and architecture notes for contributors and AI assistants |
 
 ## Project Structure
 
@@ -235,8 +234,8 @@ scripts/
   qa/             Fuzz, stability, perf, and sentinel validation
   dev/            Developer helpers (quick_start, install_deps)
   redis/          Upstream Redis test runner + RDB bridge scripts
-compat/           Compatibility delta tracker
-docs/decisions/   Architecture decision records
+compat/           Compatibility delta tracker + generated scoreboard
+docs/             Architecture, compatibility, and design-decision records
 artifacts/        Benchmark results and performance baselines
 ```
 

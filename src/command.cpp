@@ -40,6 +40,8 @@
 #include <dlfcn.h>
 #include <fnmatch.h>
 #include <netdb.h>
+#include <deque>
+#include <sys/resource.h>
 
 #include "logger.hpp"
 
@@ -49,7 +51,7 @@ namespace peadb {
 void register_key_waiter(const std::string& key, int fd);
 void unregister_key_waiter(int fd);
 void notify_key_written(const std::string& key, int db_index);
-bool replica_do_fullsync(const std::string& host, int port);
+bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen);
 
 namespace {
 
@@ -85,9 +87,13 @@ bool g_appendonly = false;
 // replay flag so setting it in one thread never silently suppresses AOF writes
 // or bypasses READONLY enforcement in the other.
 thread_local bool g_replaying_aof = false;
+// Set while re-dispatching a blocked XREAD/XREADGROUP from try_unblock_client so the
+// handler reads once instead of re-registering a block.
+thread_local bool g_block_disabled = false;
 int g_aof_fd = -1;
 std::string g_appendfsync = "everysec";
 bool g_aof_write_error = false;
+bool g_aof_load_truncated = true;   // tolerate an incomplete final command on load
 std::int64_t g_last_aof_fsync_ms = 0;
 std::atomic<pid_t> g_bgsave_child_pid{0};
 std::atomic<bool> g_bgsave_in_progress{false};
@@ -110,6 +116,11 @@ std::atomic<bool> g_replica_load_pending{false};
 std::atomic<bool> g_replica_load_ok{false};
 bool g_active_expire = true;
 std::int64_t g_last_save_time = 0;
+// ── Save points (BGSAVE thresholds) ──
+std::vector<std::pair<std::int64_t, std::int64_t>> g_save_params;  // (seconds, changes)
+std::string g_save_spec;                       // raw "sec changes ..." for CONFIG GET
+std::int64_t g_dirty_at_last_save = 0;         // mutation_epoch snapshot at last save start
+bool g_stop_writes_on_bgsave_error = true;
 std::string g_replication_role = "master";
 std::string g_replication_master_host = "";
 int g_replication_master_port = 0;
@@ -120,22 +131,48 @@ std::int64_t g_config_maxmemory = 0;
 std::int64_t g_config_min_replicas_to_write = 0;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
-// 1MB circular replication backlog (replaces unbounded g_replication_events vector)
+// ── Security ──
+std::string g_requirepass;                    // empty = no auth required (Redis default)
+std::string g_masterauth;                     // sent to master during replica handshake
+bool g_protected_mode = true;                 // refuse non-loopback clients when no auth set
+std::string g_enable_module_command = "no";   // "yes" | "no" | "local" — gates MODULE LOAD
+std::vector<std::pair<std::string, std::string>> g_rename_commands;
+// Length-checked, content-time-independent compare to avoid leaking the password
+// via per-byte timing. (Length is not secret enough to warrant masking here.)
+inline bool const_time_eq(const std::string& a, const std::string& b) {
+  if (a.size() != b.size()) return false;
+  unsigned char acc = 0;
+  for (std::size_t i = 0; i < a.size(); ++i)
+    acc |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
+  return acc == 0;
+}
+// Circular replication backlog (replaces unbounded g_replication_events vector).
+// Size is configurable via repl-backlog-size; a larger window lets a briefly
+// disconnected replica resume via +CONTINUE instead of forcing a full resync.
 struct ReplBacklog {
-    static constexpr std::size_t kSize = 1 << 20; // 1MB
+    std::size_t size_ = 1 << 20;  // default 1 MiB
     std::vector<char> buf;
     std::int64_t total = 0; // total bytes ever appended
 
-    ReplBacklog() : buf(kSize, 0) {}
+    ReplBacklog() : buf(size_, 0) {}
+
+    // Resize the backlog. Only valid before any data is appended (startup), since
+    // the modular indexing assumes a fixed size for the lifetime of the buffer.
+    void reset(std::size_t newsize) {
+        if (newsize == 0) return;
+        size_ = newsize;
+        buf.assign(size_, 0);
+        total = 0;
+    }
 
     std::int64_t base() const {
-        return total > static_cast<std::int64_t>(kSize)
-               ? total - static_cast<std::int64_t>(kSize) : 0;
+        return total > static_cast<std::int64_t>(size_)
+               ? total - static_cast<std::int64_t>(size_) : 0;
     }
 
     void append(const std::string& data) {
         for (char c : data) {
-            buf[static_cast<std::size_t>(total++ % kSize)] = c;
+            buf[static_cast<std::size_t>(total++ % size_)] = c;
         }
     }
 
@@ -145,11 +182,11 @@ struct ReplBacklog {
         const std::size_t len = static_cast<std::size_t>(total - from_byte);
         out.resize(len);
         if (len == 0) return true;
-        const std::size_t start = static_cast<std::size_t>(from_byte % kSize);
-        if (start + len <= kSize) {
+        const std::size_t start = static_cast<std::size_t>(from_byte % size_);
+        if (start + len <= size_) {
             std::memcpy(out.data(), buf.data() + start, len);
         } else {
-            const std::size_t first = kSize - start;
+            const std::size_t first = size_ - start;
             std::memcpy(out.data(), buf.data() + start, first);
             std::memcpy(out.data() + first, buf.data(), len - first);
         }
@@ -169,6 +206,10 @@ int g_exec_write_event_count = 0;
 bool g_executing_exec = false;
 int g_last_repl_db = 0;
 bool g_replica_stale = false;
+// Bumped on every REPLICAOF (including NO ONE). The reconnect supervisor and the
+// streaming loop compare against their captured generation and stop when it changes,
+// so a new REPLICAOF promptly supersedes an in-flight sync/stream.
+std::atomic<std::uint64_t> g_repl_generation{0};
 std::atomic<bool> g_loading_replication{false};
 bool g_script_allow_oom = false;
 bool g_script_inner_error_seen = false;
@@ -203,8 +244,315 @@ struct CmdStats {
   std::int64_t calls = 0;
   std::int64_t rejected_calls = 0;
   std::int64_t failed_calls = 0;
+  std::int64_t usec_total = 0;   // accumulated execution time for usec_per_call
 };
+
+// ── Observability state (SLOWLOG / LATENCY / keyspace notifications / INFO) ──
+struct SlowlogEntry {
+  std::int64_t id;
+  std::int64_t time_s;
+  std::int64_t usec;
+  std::vector<std::string> argv;   // truncated argv (<=32 args, each <=128 bytes)
+};
+std::deque<SlowlogEntry> g_slowlog;
+std::int64_t g_slowlog_next_id = 0;
+std::int64_t g_slowlog_threshold_us = 10000;   // slowlog-log-slower-than (<0 disables)
+std::size_t g_slowlog_max_len = 128;
+
+struct LatencyEvent { std::int64_t time_s; std::int64_t latest_ms; std::int64_t max_ms; };
+std::unordered_map<std::string, LatencyEvent> g_latency_events;
+std::int64_t g_latency_monitor_threshold_ms = 0;   // latency-monitor-threshold (0 disables)
+
+std::int64_t g_used_memory_peak = 0;
+std::int64_t g_latest_fork_usec = 0;
+std::int64_t g_total_forks = 0;
+std::string g_loglevel_name = "notice";
+std::int64_t g_ops_sample_ms = 0;     // for instantaneous_ops_per_sec (sampled per INFO)
+std::int64_t g_ops_sample_count = 0;
+std::unordered_set<int> g_monitor_fds;   // clients in MONITOR mode
+
+// Keyspace notifications: bitmask parsed from notify-keyspace-events.
+enum NotifyFlag : std::uint32_t {
+  NOTIFY_KEYSPACE = 1u << 0, NOTIFY_KEYEVENT = 1u << 1, NOTIFY_GENERIC = 1u << 2,
+  NOTIFY_STRING = 1u << 3, NOTIFY_LIST = 1u << 4, NOTIFY_SET = 1u << 5,
+  NOTIFY_HASH = 1u << 6, NOTIFY_ZSET = 1u << 7, NOTIFY_EXPIRED = 1u << 8,
+  NOTIFY_EVICTED = 1u << 9, NOTIFY_STREAM = 1u << 10, NOTIFY_KEY_MISS = 1u << 11,
+  NOTIFY_NEW = 1u << 12, NOTIFY_MODULE = 1u << 13,
+};
+constexpr std::uint32_t NOTIFY_ALL = NOTIFY_GENERIC | NOTIFY_STRING | NOTIFY_LIST |
+    NOTIFY_SET | NOTIFY_HASH | NOTIFY_ZSET | NOTIFY_EXPIRED | NOTIFY_EVICTED |
+    NOTIFY_STREAM | NOTIFY_MODULE;
+std::uint32_t g_notify_flags = 0;
 bool parse_i64(const std::string& s, std::int64_t& out);
+std::int64_t now_ms();
+// Parse a Redis-style memory size: raw bytes ("1048576") or with a unit suffix
+// (k=1000, kb=1024, m=1000^2, mb=1024^2, g=1000^3, gb=1024^3; b/none = bytes).
+inline bool parse_memory(const std::string& s, std::int64_t& out) {
+  if (s.empty()) return false;
+  std::size_t i = 0;
+  if (s[0] == '-' || s[0] == '+') ++i;
+  while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+  std::int64_t base = 0;
+  if (!parse_i64(s.substr(0, i), base)) return false;
+  std::string unit = s.substr(i);
+  for (auto& c : unit) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  std::int64_t mult = 1;
+  if (unit.empty() || unit == "b") mult = 1;
+  else if (unit == "k") mult = 1000LL;
+  else if (unit == "kb") mult = 1024LL;
+  else if (unit == "m") mult = 1000LL * 1000;
+  else if (unit == "mb") mult = 1024LL * 1024;
+  else if (unit == "g") mult = 1000LL * 1000 * 1000;
+  else if (unit == "gb") mult = 1024LL * 1024 * 1024;
+  else return false;
+  out = base * mult;
+  return out >= 0;
+}
+// noeviction maxmemory enforcement: reject denyoom writes once used memory exceeds
+// the configured limit. used_memory() is the bounded-staleness cached estimate.
+inline bool oom_should_reject() {
+  return g_config_maxmemory > 0 && store().used_memory() > g_config_maxmemory;
+}
+// min-replicas-to-write: reject writes only when FEWER than the required number of
+// replicas are actually connected (the previous code rejected whenever the knob was
+// set at all, blocking writes even with healthy replicas — a footgun).
+inline bool noreplicas_should_reject() {
+  if (g_config_min_replicas_to_write <= 0) return false;
+  const int connected = g_count_connected_replicas ? g_count_connected_replicas() : 0;
+  return connected < g_config_min_replicas_to_write;
+}
+// stop-writes-on-bgsave-error: refuse writes when persistence is failing, so the
+// server does not keep accepting data it cannot durably store.
+inline bool misconf_should_reject() {
+  if (g_appendonly && g_aof_write_error) return true;
+  if (g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err") return true;
+  return false;
+}
+// Fork a child to write the RDB. Shared by the BGSAVE command and the save-point
+// cron. Resets the dirty baseline at save start. Returns false on fork error.
+bool do_bgsave_fork() {
+  if (g_bgsave_in_progress.load()) return false;
+  const auto fork_t0 = std::chrono::steady_clock::now();
+  pid_t pid = fork();
+  if (pid < 0) return false;
+  if (pid == 0) {
+    std::string err;
+    bool ok = rdb_save(g_snapshot_path, err);
+    _exit(ok ? 0 : 1);
+  }
+  g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - fork_t0).count();
+  ++g_total_forks;
+  g_bgsave_in_progress.store(true);
+  g_bgsave_child_pid.store(pid);
+  g_bgsave_start_time = now_ms();
+  g_dirty_at_last_save = static_cast<std::int64_t>(store().mutation_epoch());
+  return true;
+}
+
+// ── SLOWLOG / LATENCY recording ──
+void slowlog_add(const std::vector<std::string>& args, std::int64_t usec) {
+  if (g_slowlog_threshold_us < 0 || usec < g_slowlog_threshold_us || args.empty()) return;
+  SlowlogEntry e;
+  e.id = g_slowlog_next_id++;
+  e.time_s = now_ms() / 1000;
+  e.usec = usec;
+  constexpr std::size_t kMaxArgs = 32;
+  for (std::size_t i = 0; i < args.size() && i < kMaxArgs; ++i) {
+    if (args[i].size() > 128)
+      e.argv.push_back(args[i].substr(0, 128) + "... (" + std::to_string(args[i].size()) + " bytes)");
+    else
+      e.argv.push_back(args[i]);
+  }
+  if (args.size() > kMaxArgs)
+    e.argv.push_back("... (" + std::to_string(args.size() - kMaxArgs) + " more arguments)");
+  g_slowlog.push_front(std::move(e));
+  while (g_slowlog.size() > g_slowlog_max_len) g_slowlog.pop_back();
+}
+
+void latency_add(const std::string& event, std::int64_t ms) {
+  if (g_latency_monitor_threshold_ms <= 0 || ms < g_latency_monitor_threshold_ms) return;
+  auto& ev = g_latency_events[event];
+  ev.time_s = now_ms() / 1000;
+  ev.latest_ms = ms;
+  if (ms > ev.max_ms) ev.max_ms = ms;
+}
+
+// ── Keyspace notifications ──
+std::uint32_t parse_notify_flags(const std::string& s) {
+  std::uint32_t f = 0;
+  for (char c : s) switch (c) {
+    case 'K': f |= NOTIFY_KEYSPACE; break;  case 'E': f |= NOTIFY_KEYEVENT; break;
+    case 'g': f |= NOTIFY_GENERIC; break;   case '$': f |= NOTIFY_STRING; break;
+    case 'l': f |= NOTIFY_LIST; break;      case 's': f |= NOTIFY_SET; break;
+    case 'h': f |= NOTIFY_HASH; break;      case 'z': f |= NOTIFY_ZSET; break;
+    case 'x': f |= NOTIFY_EXPIRED; break;   case 'e': f |= NOTIFY_EVICTED; break;
+    case 't': f |= NOTIFY_STREAM; break;    case 'm': f |= NOTIFY_KEY_MISS; break;
+    case 'n': f |= NOTIFY_NEW; break;       case 'd': f |= NOTIFY_MODULE; break;
+    case 'A': f |= NOTIFY_ALL; break;       default: break;
+  }
+  return f;
+}
+std::string notify_flags_to_str(std::uint32_t f) {
+  std::string s;
+  if ((f & NOTIFY_ALL) == NOTIFY_ALL) s += "A";
+  else {
+    if (f & NOTIFY_GENERIC) s += "g"; if (f & NOTIFY_STRING) s += "$";
+    if (f & NOTIFY_LIST) s += "l";    if (f & NOTIFY_SET) s += "s";
+    if (f & NOTIFY_HASH) s += "h";    if (f & NOTIFY_ZSET) s += "z";
+    if (f & NOTIFY_EXPIRED) s += "x"; if (f & NOTIFY_EVICTED) s += "e";
+    if (f & NOTIFY_STREAM) s += "t";  if (f & NOTIFY_MODULE) s += "d";
+  }
+  if (f & NOTIFY_KEY_MISS) s += "m";
+  if (f & NOTIFY_NEW) s += "n";
+  if (f & NOTIFY_KEYSPACE) s += "K";
+  if (f & NOTIFY_KEYEVENT) s += "E";
+  return s;
+}
+void notify_keyspace_event(std::uint32_t cls, const std::string& event, const std::string& key, int db) {
+  if (!(g_notify_flags & cls)) return;
+  if (g_notify_flags & NOTIFY_KEYSPACE)
+    pubsub_publish("__keyspace@" + std::to_string(db) + "__:" + key, event);
+  if (g_notify_flags & NOTIFY_KEYEVENT)
+    pubsub_publish("__keyevent@" + std::to_string(db) + "__:" + event, key);
+}
+// Centralised emission for write commands (avoids hand-instrumenting ~40 handlers).
+// Covers the most-subscribed events; class is per-command (mirrors the key's type).
+void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::string>& args,
+                                 int first_key, int db) {
+  if (g_notify_flags == 0) return;
+  if (cmd == "DEL" || cmd == "UNLINK") {
+    for (std::size_t i = 1; i < args.size(); ++i) notify_keyspace_event(NOTIFY_GENERIC, "del", args[i], db);
+    return;
+  }
+  if (cmd == "MSET" || cmd == "MSETNX") {
+    for (std::size_t i = 1; i + 1 < args.size(); i += 2) notify_keyspace_event(NOTIFY_STRING, "set", args[i], db);
+    return;
+  }
+  static const std::unordered_map<std::string, std::pair<std::uint32_t, std::string>> m = {
+    {"SET",{NOTIFY_STRING,"set"}},{"SETEX",{NOTIFY_STRING,"set"}},{"PSETEX",{NOTIFY_STRING,"set"}},
+    {"SETNX",{NOTIFY_STRING,"set"}},{"GETSET",{NOTIFY_STRING,"set"}},
+    {"APPEND",{NOTIFY_STRING,"append"}},{"SETRANGE",{NOTIFY_STRING,"setrange"}},{"SETBIT",{NOTIFY_STRING,"setbit"}},
+    {"INCR",{NOTIFY_STRING,"incrby"}},{"INCRBY",{NOTIFY_STRING,"incrby"}},{"DECR",{NOTIFY_STRING,"decrby"}},
+    {"DECRBY",{NOTIFY_STRING,"decrby"}},{"INCRBYFLOAT",{NOTIFY_STRING,"incrbyfloat"}},{"GETDEL",{NOTIFY_GENERIC,"del"}},
+    {"LPUSH",{NOTIFY_LIST,"lpush"}},{"RPUSH",{NOTIFY_LIST,"rpush"}},{"LPOP",{NOTIFY_LIST,"lpop"}},
+    {"RPOP",{NOTIFY_LIST,"rpop"}},{"LSET",{NOTIFY_LIST,"lset"}},{"LREM",{NOTIFY_LIST,"lrem"}},
+    {"LINSERT",{NOTIFY_LIST,"linsert"}},{"LTRIM",{NOTIFY_LIST,"ltrim"}},
+    {"SADD",{NOTIFY_SET,"sadd"}},{"SREM",{NOTIFY_SET,"srem"}},{"SPOP",{NOTIFY_SET,"spop"}},
+    {"HSET",{NOTIFY_HASH,"hset"}},{"HMSET",{NOTIFY_HASH,"hset"}},{"HSETNX",{NOTIFY_HASH,"hset"}},
+    {"HDEL",{NOTIFY_HASH,"hdel"}},{"HINCRBY",{NOTIFY_HASH,"hincrby"}},{"HINCRBYFLOAT",{NOTIFY_HASH,"hincrbyfloat"}},
+    {"ZADD",{NOTIFY_ZSET,"zadd"}},{"ZREM",{NOTIFY_ZSET,"zrem"}},{"ZINCRBY",{NOTIFY_ZSET,"zincr"}},
+    {"ZPOPMIN",{NOTIFY_ZSET,"zpopmin"}},{"ZPOPMAX",{NOTIFY_ZSET,"zpopmax"}},
+    {"XADD",{NOTIFY_STREAM,"xadd"}},{"XTRIM",{NOTIFY_STREAM,"xtrim"}},{"XDEL",{NOTIFY_STREAM,"xdel"}},
+    {"EXPIRE",{NOTIFY_GENERIC,"expire"}},{"PEXPIRE",{NOTIFY_GENERIC,"expire"}},
+    {"EXPIREAT",{NOTIFY_GENERIC,"expire"}},{"PEXPIREAT",{NOTIFY_GENERIC,"expire"}},
+    {"PERSIST",{NOTIFY_GENERIC,"persist"}},{"RENAME",{NOTIFY_GENERIC,"rename_from"}},
+    {"COPY",{NOTIFY_GENERIC,"copy_to"}},{"RESTORE",{NOTIFY_GENERIC,"restore"}},
+  };
+  auto it = m.find(cmd);
+  if (it == m.end()) return;
+  if (first_key > 0 && static_cast<std::size_t>(first_key) < args.size())
+    notify_keyspace_event(it->second.first, it->second.second, args[static_cast<std::size_t>(first_key)], db);
+  if (cmd == "RENAME" && args.size() >= 3)
+    notify_keyspace_event(NOTIFY_GENERIC, "rename_to", args[2], db);
+}
+
+// Feed the MONITOR stream: format the command Redis-style and push to every monitor.
+void feed_monitors(const std::string& cmd, const std::vector<std::string>& args, const SessionState& session) {
+  if (g_monitor_fds.empty() || g_replaying_aof || !g_pubsub_send) return;
+  if (cmd == "AUTH" || cmd == "MONITOR") return;  // Redis never echoes AUTH to monitors
+  const std::int64_t ms = now_ms();
+  char ts[40];
+  std::snprintf(ts, sizeof(ts), "%lld.%06lld", static_cast<long long>(ms / 1000),
+                static_cast<long long>((ms % 1000) * 1000));
+  std::string line = "+";
+  line += ts;
+  line += " [" + std::to_string(session.db_index) + " " + (session.addr.empty() ? "?:0" : session.addr) + "]";
+  for (const auto& a : args) {
+    line += " \"";
+    for (char c : a) {
+      switch (c) {
+        case '"': line += "\\\""; break;
+        case '\\': line += "\\\\"; break;
+        case '\n': line += "\\n"; break;
+        case '\r': line += "\\r"; break;
+        case '\t': line += "\\t"; break;
+        default:
+          if (static_cast<unsigned char>(c) < 32 || static_cast<unsigned char>(c) >= 127) {
+            char hex[8]; std::snprintf(hex, sizeof(hex), "\\x%02x", static_cast<unsigned char>(c)); line += hex;
+          } else line += c;
+      }
+    }
+    line += "\"";
+  }
+  line += "\r\n";
+  for (int mfd : g_monitor_fds) g_pubsub_send(mfd, line);
+}
+
+// ── HyperLogLog (self-consistent dense form) ──
+// Stored as a string value: 8-byte magic + 16384 one-byte registers. NOTE: this is
+// NOT byte-compatible with Redis's HYLL sparse/dense format (cross-migration of HLL
+// values is unsupported), but PFADD/PFCOUNT/PFMERGE are internally consistent and
+// give standard-accuracy estimates. Tracked in compat/delta.md.
+constexpr int kHllP = 14;
+constexpr int kHllRegs = 1 << kHllP;  // 16384
+constexpr std::size_t kHllHdr = 8;
+constexpr std::size_t kHllSize = kHllHdr + kHllRegs;
+inline const char* hll_magic() { return "PEAHLL01"; }
+
+std::uint64_t hll_hash(const std::string& s) {
+  std::uint64_t h = 1469598103934665603ULL;            // FNV-1a 64
+  for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+  h ^= h >> 30; h *= 0xbf58476d1ce4e5b9ULL;            // splitmix64 finalizer
+  h ^= h >> 27; h *= 0x94d049bb133111ebULL;
+  h ^= h >> 31;
+  return h;
+}
+bool hll_is_valid(const std::string& v) {
+  return v.size() == kHllSize && std::memcmp(v.data(), hll_magic(), kHllHdr) == 0;
+}
+std::string hll_new() {
+  std::string v(kHllSize, '\0');
+  std::memcpy(v.data(), hll_magic(), kHllHdr);
+  return v;
+}
+bool hll_add(std::string& v, const std::string& elem) {
+  const std::uint64_t h = hll_hash(elem);
+  const std::uint32_t idx = static_cast<std::uint32_t>(h & (kHllRegs - 1));
+  const std::uint64_t w = h >> kHllP;                  // 50 meaningful bits
+  int rank = 1;
+  std::uint64_t mask = 1ULL << (63 - kHllP);
+  while (rank <= (64 - kHllP) && (w & mask) == 0) { ++rank; mask >>= 1; }
+  auto* regs = reinterpret_cast<std::uint8_t*>(v.data()) + kHllHdr;
+  if (regs[idx] < rank) { regs[idx] = static_cast<std::uint8_t>(rank); return true; }
+  return false;
+}
+double hll_count(const std::string& v) {
+  const auto* regs = reinterpret_cast<const std::uint8_t*>(v.data()) + kHllHdr;
+  const double m = kHllRegs;
+  double sum = 0.0; int zeros = 0;
+  for (int i = 0; i < kHllRegs; ++i) { sum += std::ldexp(1.0, -static_cast<int>(regs[i])); if (regs[i] == 0) ++zeros; }
+  const double alpha = 0.7213 / (1.0 + 1.079 / m);
+  double E = alpha * m * m / sum;
+  if (E <= 2.5 * m && zeros != 0) E = m * std::log(m / static_cast<double>(zeros));  // linear counting
+  return E;
+}
+
+// Resident set size in bytes (0 if unavailable). Used for used_memory_rss / fragmentation.
+std::int64_t process_rss_bytes() {
+#if defined(__linux__)
+  FILE* f = std::fopen("/proc/self/statm", "r");
+  if (!f) return 0;
+  long pages = 0, resident = 0;
+  if (std::fscanf(f, "%ld %ld", &pages, &resident) != 2) { std::fclose(f); return 0; }
+  std::fclose(f);
+  return static_cast<std::int64_t>(resident) * static_cast<std::int64_t>(::sysconf(_SC_PAGESIZE));
+#else
+  struct rusage ru{};
+  if (getrusage(RUSAGE_SELF, &ru) != 0) return 0;
+  return static_cast<std::int64_t>(ru.ru_maxrss);  // macOS: bytes
+#endif
+}
 std::unordered_map<std::string, FunctionDef> g_functions;
 std::unordered_map<std::string, std::vector<std::string>> g_function_libraries;
 bool g_script_readonly_context = false;
@@ -231,6 +579,8 @@ std::atomic<std::int64_t> g_server_start_time{0};
 std::atomic<int> g_runtime_max_clients{10000};
 std::function<int(std::int64_t)> g_count_synced_replicas;
 std::function<int()> g_count_connected_replicas;
+std::function<int()> g_blocked_clients_cb;
+std::function<int(const std::string&, const std::string&, int)> g_client_kill_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
 std::function<std::string()> g_client_list_callback;
 std::function<bool(int fd, const std::string& data)> g_pubsub_send;
@@ -479,6 +829,31 @@ std::string format_score(double d) {
 std::string encode_null(RespVersion version) { return version == RespVersion::Resp3 ? "_\r\n" : "$-1\r\n"; }
 std::string encode_null_array() { return "*-1\r\n"; }
 
+// ── RESP3-aware type encoders (fall back to RESP2 shapes for RESP2 clients) ──
+std::string encode_double(double d, RespVersion v) {
+  std::string s;
+  if (std::isinf(d)) s = d > 0 ? "inf" : "-inf";
+  else if (std::isnan(d)) s = "nan";
+  else s = format_score(d);
+  return v == RespVersion::Resp3 ? ("," + s + "\r\n") : encode_bulk(s);
+}
+std::string encode_bool(bool b, RespVersion v) {
+  return v == RespVersion::Resp3 ? (b ? "#t\r\n" : "#f\r\n") : (b ? ":1\r\n" : ":0\r\n");
+}
+// kv holds already-encoded elements [k,v,k,v,...]; RESP3 emits a map (%N), RESP2 a flat array.
+std::string encode_map(const std::vector<std::string>& kv, RespVersion v) {
+  const std::size_t pairs = kv.size() / 2;
+  std::string out = (v == RespVersion::Resp3 ? "%" : "*") +
+                    std::to_string(v == RespVersion::Resp3 ? pairs : kv.size()) + "\r\n";
+  for (const auto& e : kv) out += e;
+  return out;
+}
+std::string encode_set_reply(const std::vector<std::string>& items, RespVersion v) {
+  std::string out = (v == RespVersion::Resp3 ? "~" : "*") + std::to_string(items.size()) + "\r\n";
+  for (const auto& e : items) out += e;
+  return out;
+}
+
 std::string encode_array(const std::vector<std::string>& encoded_items) {
   std::string out = "*" + std::to_string(encoded_items.size()) + "\r\n";
   for (const auto& item : encoded_items) out += item;
@@ -703,6 +1078,7 @@ void append_lazy_expire_dels(const SessionState& session) {
   const auto expired = store().collect_expired_keys();
   for (const auto& key : expired) {
     append_replication_event({"DEL", key}, session);
+    notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, session.db_index);
   }
 }
 
@@ -735,7 +1111,13 @@ void append_aof(const std::vector<std::string>& args) {
     g_aof_write_error = true;
     return;
   }
-  if (g_appendfsync == "always") ::fsync(g_aof_fd);
+  // In the strongest durability mode, a failed fsync means the just-written command
+  // is NOT durable — surface it (don't silently swallow, matching the strict
+  // fail-on-fsync posture used for RDB/AOF-rewrite).
+  if (g_appendfsync == "always" && ::fsync(g_aof_fd) != 0) {
+    g_aof_write_error = true;
+    log(LogLevel::Error, "AOF fsync (always) failed: " + std::string(std::strerror(errno)));
+  }
   // Buffer for BGREWRITEAOF diff: commands written while child is rewriting
   // are collected here and appended to the new AOF when the child finishes.
   if (g_bgrewrite_in_progress.load(std::memory_order_relaxed)) {
@@ -1448,14 +1830,30 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("ECHO", CommandSpec{"ECHO", 2, {"fast", "readonly"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) { return encode_bulk(args[1]); }});
 
-    t.emplace("QUIT", CommandSpec{"QUIT", 1, {"fast"}, 0, 0, 0,
+    t.emplace("QUIT", CommandSpec{"QUIT", 1, {"fast", "no_auth"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool& close) {
           close = true;
           return encode_simple("OK");
         }});
 
     t.emplace("SHUTDOWN", CommandSpec{"SHUTDOWN", -1, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState&, bool& close) {
+        [](const std::vector<std::string>& args, SessionState&, bool& close) {
+          // Default: save iff save points are configured (matches Redis).
+          bool do_save = !g_save_params.empty();
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            const auto o = upper(args[i]);
+            if (o == "NOSAVE") do_save = false;
+            else if (o == "SAVE") do_save = true;
+            else if (o == "NOW" || o == "FORCE" || o == "ABORT") { /* accepted, no-op */ }
+            else return encode_error("syntax error");
+          }
+          if (do_save) {
+            std::string err;
+            if (!rdb_save(g_snapshot_path, err))
+              return encode_error("Errors trying to SHUTDOWN. Check logs.");
+          }
+          // Flush the AOF so the everysec window is not lost on a clean shutdown.
+          if (g_appendonly && g_aof_fd >= 0) ::fsync(g_aof_fd);
           request_shutdown();
           close = true;
           return encode_simple("OK");
@@ -1466,8 +1864,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.replica_stream = true;
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           g_last_repl_db = -1; // Force re-emit SELECT on next write
-          // Send empty RDB payload — replication stream carries all state.
-          // RESP bulk string: $0\r\n followed by empty body (no trailing \r\n)
+          // Plain SYNC sends an empty RDB and relies on the command stream. PeaDB's own
+          // replica uses PSYNC (which serializes the full dataset, streams included).
+          // Full-state plain SYNC for external clients remains a deferred item — serializing
+          // the dataset here interacts with lazy expiry during RDB build and is low-value
+          // relative to PSYNC; see compat/delta.md.
           return std::string("$0\r\n");
         }});
 
@@ -1632,7 +2033,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it->second.is_write()) has_write = true;
             else has_read = true;
           }
-          if (has_write && g_config_min_replicas_to_write > 0) {
+          if (has_write && noreplicas_should_reject()) {
             g_executing_exec = false;
             g_capture_exec_replication = false;
             g_exec_replication_events.clear();
@@ -1641,7 +2042,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             session.watched_digests.clear();
             return std::string("-EXECABORT Transaction discarded because of previous errors: NOREPLICAS Not enough good replicas to write.\r\n");
           }
-          if (has_write && g_config_maxmemory == 1) {
+          if (has_write && oom_should_reject()) {
             g_executing_exec = false;
             g_capture_exec_replication = false;
             g_exec_replication_events.clear();
@@ -1686,23 +2087,71 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("HELLO", CommandSpec{"HELLO", -1, {"fast", "no_auth"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          RespVersion requested = session.resp_version;
+          std::size_t i = 1;
           if (args.size() >= 2) {
             int proto = 0;
             try {
               proto = std::stoi(args[1]);
             } catch (...) {
-              return encode_error("Protocol version is not an integer or out of range");
+              return encode_error("NOPROTO unsupported protocol version");
             }
             if (proto != 2 && proto != 3) return encode_error("NOPROTO unsupported protocol version");
-            session.resp_version = (proto == 3 ? RespVersion::Resp3 : RespVersion::Resp2);
+            requested = (proto == 3 ? RespVersion::Resp3 : RespVersion::Resp2);
+            i = 2;
           }
+          // Optional [AUTH user pass] and [SETNAME name] after the protocol version.
+          std::string set_name;
+          while (i < args.size()) {
+            const auto opt = upper(args[i]);
+            if (opt == "AUTH" && i + 2 < args.size()) {
+              const std::string& u = args[i + 1];
+              const std::string& p = args[i + 2];
+              if (g_requirepass.empty())
+                return encode_error("Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+              if (u != "default" || !const_time_eq(p, g_requirepass))
+                return std::string("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+              session.authenticated = true;
+              session.user = "default";
+              i += 3;
+            } else if (opt == "SETNAME" && i + 1 < args.size()) {
+              set_name = args[i + 1];
+              i += 2;
+            } else {
+              return encode_error("syntax error in HELLO");
+            }
+          }
+          // If a password is required and the client is still unauthenticated, refuse.
+          if (!g_requirepass.empty() && !session.authenticated) {
+            return std::string("-NOAUTH HELLO must be called with the client already "
+                               "authenticated, otherwise the HELLO <proto> AUTH <user> <pass> "
+                               "option can be used to authenticate the client and select the "
+                               "RESP protocol version at the same time\r\n");
+          }
+          session.resp_version = requested;
+          if (!set_name.empty()) session.client_name = set_name;
           return hello_reply(session);
         }});
 
     t.emplace("AUTH", CommandSpec{"AUTH", -2, {"fast", "no_auth"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          if (args.size() == 2 || args.size() == 3) return encode_simple("OK");
-          return encode_error("wrong number of arguments for 'auth' command");
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          if (args.size() != 2 && args.size() != 3)
+            return encode_error("wrong number of arguments for 'auth' command");
+          std::string user = "default";
+          std::string pass;
+          if (args.size() == 3) { user = args[1]; pass = args[2]; }
+          else { pass = args[1]; }
+          if (g_requirepass.empty()) {
+            // No password configured and only the default user exists → AUTH is an error,
+            // matching Redis ("Client sent AUTH, but no password is set").
+            return encode_error("Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+          }
+          if (user != "default" || !const_time_eq(pass, g_requirepass)) {
+            return std::string("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
+          }
+          session.authenticated = true;
+          session.user = "default";
+          return encode_simple("OK");
         }});
 
     t.emplace("ACL", CommandSpec{"ACL", -2, {"admin"}, 0, 0, 0,
@@ -1834,7 +2283,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::string script_body = she.has_shebang ? she.body : args[1];
           const bool allow_oom = she.allow_oom || she.no_writes;
           const bool write_intent = she.has_shebang ? !she.no_writes : script_has_write_intent(script_body);
-          if (g_config_maxmemory == 1) {
+          if (oom_should_reject()) {
             if (she.has_shebang && !she.explicit_flags && !allow_oom) {
               return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             }
@@ -1842,7 +2291,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             }
           }
-          if (write_intent && g_config_min_replicas_to_write > 0) {
+          if (write_intent && noreplicas_should_reject()) {
             return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
           }
 
@@ -1913,7 +2362,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           auto uptime_s = (now_ms() - g_server_start_time.load()) / 1000;
           if (uptime_s < 1) uptime_s = 1;
 
-          const std::size_t used_mem = static_cast<std::size_t>(store().estimate_used_memory());
+          const std::size_t used_mem = static_cast<std::size_t>(store().used_memory());
+          if (static_cast<std::int64_t>(used_mem) > g_used_memory_peak) g_used_memory_peak = static_cast<std::int64_t>(used_mem);
+          const std::int64_t rss_bytes = process_rss_bytes();
+          const double frag_ratio = (used_mem > 0 && rss_bytes > 0)
+              ? static_cast<double>(rss_bytes) / static_cast<double>(used_mem) : 1.0;
+          struct rusage ru{};
+          getrusage(RUSAGE_SELF, &ru);
+          const double cpu_user = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec / 1e6;
+          const double cpu_sys = ru.ru_stime.tv_sec + ru.ru_stime.tv_usec / 1e6;
+          const int blocked_now = g_blocked_clients_cb ? g_blocked_clients_cb() : 0;
+          // instantaneous_ops_per_sec: rate since the last INFO call.
+          const std::int64_t now_for_ops = now_ms();
+          const std::int64_t cur_ops = g_total_commands_processed.load();
+          std::int64_t inst_ops = 0;
+          if (g_ops_sample_ms > 0 && now_for_ops > g_ops_sample_ms)
+            inst_ops = (cur_ops - g_ops_sample_count) * 1000 / (now_for_ops - g_ops_sample_ms);
+          g_ops_sample_ms = now_for_ops;
+          g_ops_sample_count = cur_ops;
+
+          auto fmt2 = [](double d) -> std::string { char b[32]; std::snprintf(b, sizeof(b), "%.2f", d); return b; };
+          auto fmt6 = [](double d) -> std::string { char b[32]; std::snprintf(b, sizeof(b), "%.6f", d); return b; };
 
           auto format_mem = [](std::size_t bytes) -> std::string {
             if (bytes >= 1024ULL * 1024 * 1024) return std::to_string(bytes / (1024ULL * 1024 * 1024)) + "G";
@@ -1947,7 +2416,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (want("CLIENTS")) {
             out += "# Clients\r\n"
                    "connected_clients:" + std::to_string(g_connected_clients.load()) + "\r\n"
-                   "blocked_clients:0\r\n"
+                   "blocked_clients:" + std::to_string(blocked_now) + "\r\n"
                    "tracking_clients:0\r\n"
                    "maxclients:" + std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed)) + "\r\n\r\n";
           }
@@ -1955,10 +2424,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "# Memory\r\n"
                    "used_memory:" + std::to_string(used_mem) + "\r\n"
                    "used_memory_human:" + format_mem(used_mem) + "\r\n"
-                   "used_memory_peak:" + std::to_string(used_mem) + "\r\n"
-                   "used_memory_peak_human:" + format_mem(used_mem) + "\r\n"
-                   "used_memory_rss:" + std::to_string(used_mem) + "\r\n"
-                   "mem_fragmentation_ratio:1.00\r\n"
+                   "used_memory_peak:" + std::to_string(g_used_memory_peak) + "\r\n"
+                   "used_memory_peak_human:" + format_mem(static_cast<std::size_t>(g_used_memory_peak)) + "\r\n"
+                   "used_memory_rss:" + std::to_string(rss_bytes > 0 ? rss_bytes : static_cast<std::int64_t>(used_mem)) + "\r\n"
+                   "mem_fragmentation_ratio:" + fmt2(frag_ratio) + "\r\n"
+                   "mem_allocator:libc\r\n"
                    "maxmemory:" + std::to_string(g_config_maxmemory) + "\r\n"
                    "maxmemory_human:" + format_mem(static_cast<size_t>(g_config_maxmemory)) + "\r\n"
                    "maxmemory_policy:noeviction\r\n"
@@ -1981,7 +2451,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "# Stats\r\n"
                    "total_connections_received:" + std::to_string(g_total_connections_received.load()) + "\r\n"
                    "total_commands_processed:" + std::to_string(g_total_commands_processed.load()) + "\r\n"
+                   "instantaneous_ops_per_sec:" + std::to_string(inst_ops) + "\r\n"
                    "total_error_replies:" + std::to_string(g_total_error_replies) + "\r\n"
+                   "latest_fork_usec:" + std::to_string(g_latest_fork_usec) + "\r\n"
+                   "total_forks:" + std::to_string(g_total_forks) + "\r\n"
+                   "pubsub_channels:" + std::to_string(g_channel_subscribers.size()) + "\r\n"
+                   "pubsub_patterns:" + std::to_string(g_pattern_subscribers.size()) + "\r\n"
                    "keyspace_hits:" + std::to_string(store().stat_keyspace_hits()) + "\r\n"
                    "keyspace_misses:" + std::to_string(store().stat_keyspace_misses()) + "\r\n"
                    "expired_keys:" + std::to_string(store().stat_expired_keys()) + "\r\n"
@@ -1998,7 +2473,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "master_replid2:0000000000000000000000000000000000000000\r\n"
                    "master_repl_offset:" + std::to_string(g_master_repl_offset) + "\r\n"
                    "repl_backlog_active:0\r\n"
-                   "repl_backlog_size:1048576\r\n";
+                   "repl_backlog_size:" + std::to_string(g_repl_backlog.size_) + "\r\n";
             if (g_replication_role != "master") {
               out += "master_host:" + g_replication_master_host + "\r\n"
                      "master_port:" + std::to_string(g_replication_master_port) + "\r\n"
@@ -2008,8 +2483,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (want("CPU")) {
             out += "# CPU\r\n"
-                   "used_cpu_sys:0.000000\r\n"
-                   "used_cpu_user:0.000000\r\n\r\n";
+                   "used_cpu_sys:" + fmt6(cpu_sys) + "\r\n"
+                   "used_cpu_user:" + fmt6(cpu_user) + "\r\n\r\n";
           }
           if (want("MODULES")) {
             out += "# Modules\r\n\r\n";
@@ -2024,9 +2499,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (want("COMMANDSTATS")) {
             out += "# Commandstats\r\n";
             for (const auto& [k, st] : g_cmdstats) {
+              const double upc = st.calls > 0 ? static_cast<double>(st.usec_total) / static_cast<double>(st.calls) : 0.0;
               out += "cmdstat_" + lower(k) +
                      ":calls=" + std::to_string(st.calls) +
-                     ",usec=1,usec_per_call=1.00,rejected_calls=" + std::to_string(st.rejected_calls) +
+                     ",usec=" + std::to_string(st.usec_total) +
+                     ",usec_per_call=" + fmt2(upc) +
+                     ",rejected_calls=" + std::to_string(st.rejected_calls) +
                      ",failed_calls=" + std::to_string(st.failed_calls) + "\r\n";
             }
             out += "\r\n";
@@ -2059,22 +2537,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::string err;
           if (!rdb_save(g_snapshot_path, err)) return encode_error(err);
           g_last_save_time = now_ms() / 1000;
+          g_dirty_at_last_save = static_cast<std::int64_t>(store().mutation_epoch());
           return encode_simple("OK");
         }});
 
     t.emplace("BGSAVE", CommandSpec{"BGSAVE", 1, {"admin", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
           if (g_bgsave_in_progress.load()) return encode_error("Background save already in progress");
-          pid_t pid = fork();
-          if (pid < 0) return encode_error("Background save failed: fork error");
-          if (pid == 0) {
-            std::string err;
-            bool ok = rdb_save(g_snapshot_path, err);
-            _exit(ok ? 0 : 1);
-          }
-          g_bgsave_in_progress.store(true);
-          g_bgsave_child_pid.store(pid);
-          g_bgsave_start_time = now_ms();
+          if (!do_bgsave_fork()) return encode_error("Background save failed: fork error");
           return encode_simple("Background saving started");
         }});
 
@@ -2082,6 +2552,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>&, SessionState&, bool&) {
           if (g_bgrewrite_in_progress.load())
             return encode_error("Background append only file rewriting already in progress");
+          const auto fork_t0 = std::chrono::steady_clock::now();
           pid_t pid = fork();
           if (pid < 0) return encode_error("BGREWRITEAOF failed: fork error");
           if (pid == 0) {
@@ -2089,6 +2560,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             bool ok = rewrite_aof_file(err);
             _exit(ok ? 0 : 1);
           }
+          g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+              std::chrono::steady_clock::now() - fork_t0).count();
+          ++g_total_forks;
           g_bgrewrite_in_progress.store(true);
           g_bgrewrite_child_pid.store(pid);
           g_aof_rewrite_buf_capped = false; // reset per-rewrite overflow flag
@@ -2129,6 +2603,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::string host = args[1];
           const std::string port = args[2];
           if (upper(host) == "NO" && upper(port) == "ONE") {
+            g_repl_generation.fetch_add(1);  // signal any running reconnect supervisor to stop
             g_replication_role = "master";
             g_replication_master_host.clear();
             g_replication_master_port = 0;
@@ -2142,21 +2617,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           g_replication_master_port = static_cast<int>(p);
           g_replication_role = "slave";
           g_replica_stale = true;
+          const std::uint64_t gen = g_repl_generation.fetch_add(1) + 1;
           if (p == 0) {
             return encode_simple("OK");
           }
-          // Threading invariant: this thread accesses only atomics (g_loading_replication,
-          // g_replica_stale) and the DataStore under the implicit "event loop blocks client
-          // writes while g_loading_replication is true" guarantee (enforced at the top of
-          // handle_command). It must NOT call into Lua engine, script-context globals, or
-          // session state owned by the event loop.
-          std::thread([host, p]() {
-            // Small delay to ensure pending client commands see slave role first
+          // Supervised reconnect loop: connect → full sync → stream until disconnect,
+          // then retry with exponential backoff. Exits when a newer REPLICAOF bumps the
+          // generation. Threading invariant: this thread only touches atomics + enqueues
+          // commands for the event loop (see replica_do_fullsync); it never mutates the
+          // DataStore directly or calls into the Lua engine / session state.
+          std::thread([host, p, gen]() {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            g_loading_replication.store(true);
-            const bool ok = replica_do_fullsync(host, static_cast<int>(p));
-            g_loading_replication.store(false);
-            if (ok) g_replica_stale = false;
+            int backoff_ms = 500;
+            while (g_repl_generation.load() == gen) {
+              g_loading_replication.store(true);
+              const bool ok = replica_do_fullsync(host, static_cast<int>(p), gen);
+              g_loading_replication.store(false);
+              if (g_repl_generation.load() != gen) break;  // superseded mid-sync
+              // Link dropped (or connect failed): mark stale and reconnect after backoff.
+              g_replica_stale = true;
+              backoff_ms = ok ? 500 : std::min(backoff_ms * 2, 30000);
+              std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+            }
           }).detach();
           return encode_simple("OK");
         }});
@@ -2283,30 +2765,54 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("COMMAND", CommandSpec{"COMMAND", -1, {"loading", "stale"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           const auto& table = command_table();
-          if (args.size() == 1) return encode_array({});
+          auto info = [](const CommandSpec& s) -> std::string {
+            std::vector<std::string> flags;
+            for (const auto& f : s.flags) flags.push_back(encode_bulk(f));
+            // Redis COMMAND INFO shape: name, arity, flags, first/last/step key,
+            // acl-categories, tips, key-specs, subcommands (last four left empty).
+            return encode_array({
+                encode_bulk(lower(s.name)), encode_integer(s.arity), encode_array(flags),
+                encode_integer(s.first_key), encode_integer(s.last_key), encode_integer(s.key_step),
+                encode_array({}), encode_array({}), encode_array({}), encode_array({})});
+          };
+          if (args.size() == 1) {
+            std::vector<std::string> out;
+            out.reserve(table.size());
+            for (const auto& [k, s] : table) { (void)k; out.push_back(info(s)); }
+            return encode_array(out);
+          }
           const std::string sub = upper(args[1]);
           if (sub == "COUNT") return encode_integer(static_cast<long long>(table.size()));
           if (sub == "INFO") {
             if (args.size() == 2) return encode_array({});
             std::vector<std::string> out;
             for (std::size_t i = 2; i < args.size(); ++i) {
-              const std::string k = upper(args[i]);
-              auto it = table.find(k);
-              if (it == table.end()) {
-                out.push_back(encode_null(session.resp_version));
-                continue;
-              }
-              const auto& s = it->second;
-              std::vector<std::string> flags;
-              for (const auto& f : s.flags) flags.push_back(encode_bulk(f));
-              out.push_back(encode_array({
-                  encode_bulk(s.name), encode_integer(s.arity), encode_array(flags),
-                  encode_integer(s.first_key), encode_integer(s.last_key), encode_integer(s.key_step),
-              }));
+              auto it = table.find(upper(args[i]));
+              out.push_back(it == table.end() ? encode_null(session.resp_version) : info(it->second));
             }
             return encode_array(out);
+          }
+          if (sub == "GETKEYS" || sub == "GETKEYSANDFLAGS") {
+            if (args.size() < 3) return encode_error("Unknown subcommand or wrong number of arguments for 'getkeys'");
+            auto it = table.find(upper(args[2]));
+            if (it == table.end()) return encode_error("Invalid command specified");
+            const auto& s = it->second;
+            const std::vector<std::string> cmdline(args.begin() + 2, args.end());
+            if (s.first_key <= 0) return encode_error("The command has no key arguments");
+            int last = s.last_key;
+            if (last < 0) last = static_cast<int>(cmdline.size()) + last;
+            const int step = s.key_step > 0 ? s.key_step : 1;
+            std::vector<std::string> keys;
+            for (int k = s.first_key; k <= last && k < static_cast<int>(cmdline.size()); k += step) {
+              if (sub == "GETKEYSANDFLAGS")
+                keys.push_back(encode_array({encode_bulk(cmdline[static_cast<std::size_t>(k)]), encode_array({})}));
+              else
+                keys.push_back(encode_bulk(cmdline[static_cast<std::size_t>(k)]));
+            }
+            if (keys.empty()) return encode_error("The command has no key arguments");
+            return encode_array(keys);
           }
           if (sub == "DOCS") return session.resp_version == RespVersion::Resp3 ? std::string("%0\r\n") : std::string("*0\r\n");
           return encode_error("unknown subcommand for COMMAND");
@@ -2318,7 +2824,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const auto& pattern = args[2];
             // Build config parameter table
             std::vector<std::pair<std::string, std::string>> config_params = {
-              {"save", ""},
+              {"save", g_save_spec},
+              {"stop-writes-on-bgsave-error", g_stop_writes_on_bgsave_error ? "yes" : "no"},
+              {"aof-load-truncated", g_aof_load_truncated ? "yes" : "no"},
+              {"repl-backlog-size", std::to_string(g_repl_backlog.size_)},
               {"appendonly", g_appendonly ? "yes" : "no"},
               {"maxmemory", std::to_string(g_config_maxmemory)},
               {"min-replicas-to-write", std::to_string(g_config_min_replicas_to_write)},
@@ -2335,11 +2844,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"lfu-decay-time", "1"},
               {"slave-serve-stale-data", g_config_replica_serve_stale_data ? "yes" : "no"},
               {"min-slaves-to-write", std::to_string(g_config_min_replicas_to_write)},
-              {"slowlog-log-slower-than", "10000"},
-              {"slowlog-max-len", "128"},
+              {"slowlog-log-slower-than", std::to_string(g_slowlog_threshold_us)},
+              {"slowlog-max-len", std::to_string(g_slowlog_max_len)},
+              {"notify-keyspace-events", notify_flags_to_str(g_notify_flags)},
+              {"latency-monitor-threshold", std::to_string(g_latency_monitor_threshold_ms)},
               {"databases", "16"},
               {"activedefrag", "no"},
-              {"loglevel", "notice"},
+              {"loglevel", g_loglevel_name},
               {"maxmemory-policy", "noeviction"},
               {"timeout", "0"},
               {"tcp-keepalive", "300"},
@@ -2348,6 +2859,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"maxclients", std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed))},
               {"appendfsync", g_appendfsync},
               {"appendfilename", g_aof_path.filename().string()},
+              {"requirepass", g_requirepass},
+              {"masterauth", g_masterauth},
+              {"protected-mode", g_protected_mode ? "yes" : "no"},
+              {"enable-module-command", g_enable_module_command},
             };
             std::vector<std::string> out;
             for (const auto& [key, value] : config_params) {
@@ -2362,7 +2877,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const auto k = lower(args[2]);
             if (k == "maxmemory") {
               std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) {
+              if (!parse_memory(args[3], v) || v < 0) {
                 return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] + "') - argument couldn't be parsed into an integer");
               }
               g_config_maxmemory = v;
@@ -2399,6 +2914,60 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (v != "always" && v != "everysec" && v != "no")
                 return encode_error("Invalid argument '" + args[3] + "' for CONFIG SET 'appendfsync'");
               g_appendfsync = v;
+            }
+            if (k == "requirepass") {
+              // Setting to "" disables auth. Already-connected clients keep their state.
+              g_requirepass = args[3];
+            }
+            if (k == "masterauth") {
+              g_masterauth = args[3];
+            }
+            if (k == "protected-mode") {
+              const auto v = lower(args[3]);
+              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
+              g_protected_mode = (v == "yes");
+            }
+            if (k == "save") {
+              configure_save(args[3]);
+            }
+            if (k == "stop-writes-on-bgsave-error") {
+              const auto v = lower(args[3]);
+              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
+              g_stop_writes_on_bgsave_error = (v == "yes");
+            }
+            if (k == "aof-load-truncated") {
+              const auto v = lower(args[3]);
+              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
+              g_aof_load_truncated = (v == "yes");
+            }
+            if (k == "notify-keyspace-events") {
+              g_notify_flags = parse_notify_flags(args[3]);
+            }
+            if (k == "slowlog-log-slower-than") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v)) return encode_error("value is not an integer or out of range");
+              g_slowlog_threshold_us = v;
+            }
+            if (k == "slowlog-max-len") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
+              g_slowlog_max_len = static_cast<std::size_t>(v);
+              while (g_slowlog.size() > g_slowlog_max_len) g_slowlog.pop_back();
+            }
+            if (k == "latency-monitor-threshold") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
+              g_latency_monitor_threshold_ms = v;
+            }
+            if (k == "loglevel") {
+              const auto v = lower(args[3]);
+              g_loglevel_name = v;
+              // Map redis-style levels onto PeaDB's logger levels.
+              if (v == "debug") set_log_level(LogLevel::Debug);
+              else if (v == "verbose") set_log_level(LogLevel::Info);
+              else if (v == "notice") set_log_level(LogLevel::Info);
+              else if (v == "warning") set_log_level(LogLevel::Warn);
+              else set_log_level(parse_log_level(v));
             }
             return encode_simple("OK");
           }
@@ -2478,7 +3047,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           const auto sub = upper(args[1]);
           if (sub == "LOAD" && args.size() >= 3) {
+            // MODULE LOAD dlopen()s arbitrary code; gate it behind explicit opt-in
+            // (default off) so an authenticated-but-untrusted or misconfigured server
+            // is not a trivial RCE primitive.
+            if (g_enable_module_command != "yes" && g_enable_module_command != "local") {
+              return encode_error("MODULE command not allowed. If you really want to use it, "
+                                  "please set the 'enable-module-command' config to 'yes'.");
+            }
             const std::string path = args[2];
+            // Reject path traversal to limit the loadable surface.
+            if (path.find("..") != std::string::npos) {
+              return encode_error("Error loading the extension. Please check the server logs.");
+            }
             const std::string name = module_name_from_path(path);
             if (g_loaded_modules.find(name) != g_loaded_modules.end()) {
               return encode_error("Module already loaded");
@@ -3708,7 +4288,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("HGETALL", CommandSpec{"HGETALL", 2, {"readonly"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          const auto resp = session.resp_version;
           return with_hash_key(args[1], [&]() {
             bool wrongtype = false;
             const auto fields = store().hgetall(args[1], wrongtype);
@@ -3719,7 +4300,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               out.push_back(encode_bulk(f));
               out.push_back(encode_bulk(v));
             }
-            return encode_array(out);
+            // RESP3 clients receive a proper map; RESP2 a flat array.
+            return encode_map(out, resp);
           });
         }});
 
@@ -4346,7 +4928,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("XADD", CommandSpec{"XADD", -5, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           // Parse optional flags: [NOMKSTREAM] [MAXLEN|MINID [=|~] threshold [LIMIT count]] id field value ...
           std::size_t idx = 2;
           bool nomkstream = false;
@@ -4420,6 +5002,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               }
             }
 
+            notify_key_written(args[1], session.db_index);  // wake blocked XREAD/XREADGROUP
             return encode_bulk(*id);
           });
         }});
@@ -4523,6 +5106,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::string group = args[2];
           const std::string consumer = args[3];
           std::size_t req_count = 1;
+          std::int64_t block_ms = -1;
           std::size_t i = 4;
           for (;;) {
             if (i >= args.size()) return encode_error("syntax error");
@@ -4538,6 +5122,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!parse_i64(args[i + 1], block) || block < 0) return encode_error("value is not an integer or out of range");
               if (in_lua_script_context())
                 return encode_error("xreadgroup command is not allowed with BLOCK option from scripts");
+              block_ms = block;
               i += 2;
               continue;
             }
@@ -4572,7 +5157,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               dst.insert(dst.end(), entries.begin(), entries.end());
             }
           }
-          if (merged_rows.empty()) return encode_null(RespVersion::Resp2);
+          if (merged_rows.empty()) {
+            // Block only when reading new messages (all ids are ">"), like Redis.
+            bool all_new = !streams.empty();
+            for (const auto& s : streams) if (s.second != ">") { all_new = false; break; }
+            if (block_ms >= 0 && all_new && !g_block_disabled && !in_lua_script_context() && !g_executing_exec) {
+              session.blocked.type = BlockType::Stream;
+              session.blocked.keys.clear();
+              for (const auto& s : streams) { session.blocked.keys.push_back(s.first); register_key_waiter(s.first, session.fd); }
+              session.blocked.original_args = args;
+              session.blocked.deadline_ms = block_ms > 0 ? now_ms() + block_ms : 0;
+              return std::string{};  // deferred
+            }
+            return encode_null(RespVersion::Resp2);
+          }
 
           std::vector<std::string> out;
           for (const auto& [key, entries] : merged_rows) {
@@ -4592,9 +5190,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("XREAD", CommandSpec{"XREAD", -4, {"readonly", "blocking"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::size_t i = 1;
           std::int64_t count = -1;
+          std::int64_t block_ms = -1;
           while (i < args.size()) {
             const auto opt = upper(args[i]);
             if (opt == "COUNT") {
@@ -4611,7 +5210,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!parse_i64(args[i + 1], v) || v < 0) return encode_error("value is not an integer or out of range");
               if (in_lua_script_context())
                 return encode_error("xread command is not allowed with BLOCK option from scripts");
-              // Non-blocking for now: BLOCK timeout parsed but not waited on
+              block_ms = v;
               i += 2;
               continue;
             }
@@ -4681,6 +5280,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               entry_items.push_back(encode_array({encode_bulk(fe.first), encode_array(field_vals)}));
             }
             results.push_back(encode_array({encode_bulk(stream_key), encode_array(entry_items)}));
+          }
+          if (!any_data && block_ms >= 0 && !g_block_disabled && !in_lua_script_context() && !g_executing_exec) {
+            // Block: resolve "$" to each stream's current last id so a re-read after
+            // wakeup returns only entries added while we were blocked.
+            std::vector<std::string> resolved = args;
+            for (std::size_t k = 0; k < n; ++k) {
+              if (resolved[i + n + k] == "$") {
+                bool wt = false;
+                auto es = store().xrange(args[i + k], "-", "+", false, wt);
+                resolved[i + n + k] = es.empty() ? "0-0" : es.back().first;
+              }
+            }
+            session.blocked.type = BlockType::Stream;
+            session.blocked.keys.clear();
+            for (std::size_t k = 0; k < n; ++k) { session.blocked.keys.push_back(args[i + k]); register_key_waiter(args[i + k], session.fd); }
+            session.blocked.original_args = std::move(resolved);
+            session.blocked.deadline_ms = block_ms > 0 ? now_ms() + block_ms : 0;
+            return std::string{};  // deferred until data arrives or timeout
           }
           if (!any_data) return encode_null(RespVersion::Resp2);
           // Filter out null entries for streams with no data
@@ -4808,7 +5425,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── CLIENT ────────────────────────────────────────────────────────
     t.emplace("CLIENT", CommandSpec{"CLIENT", -2, {"admin", "loading", "stale"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+        [](const std::vector<std::string>& args, SessionState& session, bool& should_close) -> std::string {
           const auto sub = upper(args[1]);
           if (sub == "SETNAME") {
             if (args.size() != 3) return encode_error("wrong number of arguments for 'client|setname' command");
@@ -4864,6 +5481,30 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "\n";
             return encode_bulk(out);
           }
+          if (sub == "KILL") {
+            // Old form: CLIENT KILL <ip:port>.  New form: CLIENT KILL [ID id] [ADDR a] [SKIPME y/n] ...
+            if (args.size() == 3) {
+              const bool self = (session.addr == args[2]);
+              int killed = g_client_kill_cb ? g_client_kill_cb("ADDR", args[2], session.fd) : 0;
+              if (self) { should_close = true; ++killed; }
+              return killed > 0 ? encode_simple("OK") : encode_error("No such client");
+            }
+            std::string by, val; bool skipme = true;
+            for (std::size_t i = 2; i + 1 < args.size(); i += 2) {
+              const auto o = upper(args[i]);
+              if (o == "ID") { by = "ID"; val = args[i + 1]; }
+              else if (o == "ADDR") { by = "ADDR"; val = args[i + 1]; }
+              else if (o == "SKIPME") { skipme = (lower(args[i + 1]) != "no"); }
+              else if (o == "TYPE" || o == "LADDR" || o == "USER" || o == "MAXAGE") { /* accepted; unsupported filter */ }
+              else return encode_error("syntax error");
+            }
+            if (by.empty()) return encode_error("syntax error");
+            const bool self = (by == "ID" && std::to_string(session.client_id) == val) ||
+                              (by == "ADDR" && session.addr == val);
+            int killed = g_client_kill_cb ? g_client_kill_cb(by, val, session.fd) : 0;
+            if (self && !skipme) { should_close = true; ++killed; }
+            return encode_integer(killed);
+          }
           if (sub == "NO-EVICT" || sub == "NO-TOUCH") {
             return encode_simple("OK");
           }
@@ -4874,6 +5515,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_simple("OK");
           }
           return encode_error("unknown subcommand or wrong number of arguments for 'client|" + lower(args[1]) + "' command");
+        }});
+
+    t.emplace("MONITOR", CommandSpec{"MONITOR", 1, {"admin", "loading", "stale"}, 0, 0, 0,
+        [](const std::vector<std::string>&, SessionState& session, bool&) {
+          g_monitor_fds.insert(session.fd);
+          session.is_monitor = true;
+          return encode_simple("OK");
         }});
 
     // ─── MEMORY ──────────────────────────────────────────────────────────
@@ -4944,12 +5592,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           const auto sub = upper(args[1]);
           if (sub == "GET") {
-            return encode_array({}); // empty slow log
+            std::int64_t count = 10;
+            if (args.size() >= 3) { if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range"); }
+            std::vector<std::string> entries;
+            std::size_t n = 0;
+            for (const auto& e : g_slowlog) {
+              if (count >= 0 && n >= static_cast<std::size_t>(count)) break;
+              std::vector<std::string> argv;
+              for (const auto& a : e.argv) argv.push_back(encode_bulk(a));
+              // Each entry: [id, timestamp, usec, [argv...], client-addr, client-name]
+              entries.push_back(encode_array({
+                  encode_integer(e.id), encode_integer(e.time_s), encode_integer(e.usec),
+                  encode_array(argv), encode_bulk(""), encode_bulk("")}));
+              ++n;
+            }
+            return encode_array(entries);
           }
           if (sub == "LEN") {
-            return encode_integer(0);
+            return encode_integer(static_cast<long long>(g_slowlog.size()));
           }
           if (sub == "RESET") {
+            g_slowlog.clear();
             return encode_simple("OK");
           }
           if (sub == "HELP") {
@@ -4967,14 +5630,41 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("LATENCY", CommandSpec{"LATENCY", -2, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           const auto sub = upper(args[1]);
-          if (sub == "LATEST" || sub == "HISTORY" || sub == "GRAPH" || sub == "HISTOGRAM") {
+          if (sub == "LATEST") {
+            // Each: [event, timestamp, latest-ms, max-ms]
+            std::vector<std::string> out;
+            for (const auto& [name, ev] : g_latency_events) {
+              out.push_back(encode_array({encode_bulk(name), encode_integer(ev.time_s),
+                                          encode_integer(ev.latest_ms), encode_integer(ev.max_ms)}));
+            }
+            return encode_array(out);
+          }
+          if (sub == "HISTORY" && args.size() >= 3) {
+            auto it = g_latency_events.find(args[2]);
+            if (it == g_latency_events.end()) return encode_array({});
+            return encode_array({encode_array({encode_integer(it->second.time_s),
+                                               encode_integer(it->second.latest_ms)})});
+          }
+          if (sub == "HISTORY" || sub == "GRAPH" || sub == "HISTOGRAM") {
             return encode_array({});
           }
           if (sub == "RESET") {
-            return encode_integer(0);
+            std::int64_t n = static_cast<std::int64_t>(g_latency_events.size());
+            if (args.size() >= 3) {
+              n = 0;
+              for (std::size_t i = 2; i < args.size(); ++i) n += g_latency_events.erase(args[i]);
+            } else {
+              g_latency_events.clear();
+            }
+            return encode_integer(n);
           }
           if (sub == "DOCTOR") {
-            return encode_bulk("I have no latency reports to show you at this time.");
+            if (g_latency_events.empty())
+              return encode_bulk("Dave, I have observed the system, no worrying latency spikes. Everything seems fine.");
+            std::string rep = "Dave, I detected latency events:\n";
+            for (const auto& [name, ev] : g_latency_events)
+              rep += "- " + name + ": max " + std::to_string(ev.max_ms) + " ms (last " + std::to_string(ev.latest_ms) + " ms)\n";
+            return encode_bulk(rep);
           }
           if (sub == "HELP") {
             std::vector<std::string> items;
@@ -5027,6 +5717,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.watched_digests.clear();
           session.client_name.clear();
           session.resp_version = RespVersion::Resp2;
+          // Per Redis, RESET returns the client to the unauthenticated state when a
+          // password is configured (no-op when auth is open).
+          session.authenticated = false;
+          session.user = "default";
           return "+RESET\r\n";
         }});
 
@@ -6533,11 +7227,239 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     // ─── XAUTOCLAIM ──────────────────────────────────────────────────────
+    // Encode a claimed stream entry as [id, [f,v,...]] (or just the id for JUSTID).
+    auto encode_stream_entry = [](const std::string& id,
+                                  const std::vector<std::pair<std::string, std::string>>& fields,
+                                  bool justid) -> std::string {
+      if (justid) return encode_bulk(id);
+      std::vector<std::string> fv;
+      for (const auto& [f, v] : fields) { fv.push_back(encode_bulk(f)); fv.push_back(encode_bulk(v)); }
+      return encode_array({encode_bulk(id), encode_array(fv)});
+    };
+
     t.emplace("XAUTOCLAIM", CommandSpec{"XAUTOCLAIM", -6, {"write"}, 1, 1, 1,
+        [encode_stream_entry](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
+          std::int64_t min_idle = 0;
+          if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XAUTOCLAIM");
+          std::int64_t count = 100; bool justid = false;
+          for (std::size_t i = 6; i < args.size(); ++i) {
+            const auto o = upper(args[i]);
+            if (o == "COUNT" && i + 1 < args.size()) { if (!parse_i64(args[++i], count) || count <= 0) return encode_error("COUNT must be > 0"); }
+            else if (o == "JUSTID") justid = true;
+            else return encode_error("syntax error");
+          }
+          bool wt = false; std::string err;
+          auto res = store().xautoclaim(args[1], args[2], args[3], min_idle, args[5], count, justid, wt, err);
+          if (wt) return wrongtype_error_reply();
+          if (!err.empty()) return "-" + err + "\r\n";
+          std::vector<std::string> ents;
+          for (const auto& [id, fields] : res.claimed) ents.push_back(encode_stream_entry(id, fields, justid));
+          std::vector<std::string> del;
+          for (const auto& d : res.deleted) del.push_back(encode_bulk(d));
+          return encode_array({encode_bulk(res.next_cursor), encode_array(ents), encode_array(del)});
+        }});
+
+    t.emplace("XCLAIM", CommandSpec{"XCLAIM", -6, {"write", "fast"}, 1, 1, 1,
+        [encode_stream_entry](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // XCLAIM key group consumer min-idle-time id [id...] [IDLE ms][TIME ms][RETRYCOUNT n][FORCE][JUSTID][LASTID id]
+          std::int64_t min_idle = 0;
+          if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XCLAIM");
+          std::vector<std::string> ids; bool justid = false, force = false;
+          for (std::size_t i = 5; i < args.size(); ++i) {
+            const auto o = upper(args[i]);
+            if ((o == "IDLE" || o == "TIME" || o == "RETRYCOUNT" || o == "LASTID") && i + 1 < args.size()) { ++i; }
+            else if (o == "FORCE") force = true;
+            else if (o == "JUSTID") justid = true;
+            else ids.push_back(args[i]);
+          }
+          if (ids.empty()) return encode_error("wrong number of arguments for 'xclaim' command");
+          bool wt = false; std::string err;
+          auto claimed = store().xclaim(args[1], args[2], args[3], min_idle, ids, justid, force, wt, err);
+          if (wt) return wrongtype_error_reply();
+          if (!err.empty()) return "-" + err + "\r\n";
+          std::vector<std::string> out;
+          for (const auto& [id, fields] : claimed) out.push_back(encode_stream_entry(id, fields, justid));
+          return encode_array(out);
+        }});
+
+    t.emplace("XSETID", CommandSpec{"XSETID", -3, {"write", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_stream(args[1])) return wrongtype_error_reply();
-          // Stub: return empty results (next-cursor, claimed-entries, deleted-ids)
-          return encode_array({encode_bulk("0-0"), encode_array({}), encode_array({})});
+          bool wt = false; std::string err;
+          if (!store().xsetid(args[1], args[2], wt, err)) {
+            if (wt) return wrongtype_error_reply();
+            return "-" + err + "\r\n";
+          }
+          return encode_simple("OK");
+        }});
+
+    // (XTRIM MAXLEN is already registered earlier in this table.)
+
+    // ─── HyperLogLog ─────────────────────────────────────────────────────
+    t.emplace("PFADD", CommandSpec{"PFADD", -2, {"write", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const std::string& key = args[1];
+          if (store().is_wrongtype_for_string(key)) return wrongtype_error_reply();
+          auto cur = store().get(key);
+          if (cur.has_value() && !hll_is_valid(*cur))
+            return encode_error("WRONGTYPE Key is not a valid HyperLogLog string value.");
+          std::string hll = cur.has_value() ? *cur : hll_new();
+          bool changed = !cur.has_value();
+          for (std::size_t i = 2; i < args.size(); ++i) if (hll_add(hll, args[i])) changed = true;
+          if (changed) store().set(key, hll, false, false, std::nullopt, true);
+          return encode_integer(changed ? 1 : 0);
+        }});
+
+    t.emplace("PFCOUNT", CommandSpec{"PFCOUNT", -2, {"readonly"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::string merged = hll_new();
+          auto* mregs = reinterpret_cast<std::uint8_t*>(merged.data()) + kHllHdr;
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_string(args[i])) return wrongtype_error_reply();
+            auto cur = store().get(args[i]);
+            if (!cur.has_value()) continue;
+            if (!hll_is_valid(*cur)) return encode_error("WRONGTYPE Key is not a valid HyperLogLog string value.");
+            const auto* r = reinterpret_cast<const std::uint8_t*>(cur->data()) + kHllHdr;
+            for (int j = 0; j < kHllRegs; ++j) if (r[j] > mregs[j]) mregs[j] = r[j];
+          }
+          return encode_integer(static_cast<long long>(hll_count(merged) + 0.5));
+        }});
+
+    t.emplace("PFMERGE", CommandSpec{"PFMERGE", -2, {"write"}, 1, -1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const std::string& dest = args[1];
+          if (store().is_wrongtype_for_string(dest)) return wrongtype_error_reply();
+          auto dcur = store().get(dest);
+          if (dcur.has_value() && !hll_is_valid(*dcur))
+            return encode_error("WRONGTYPE Key is not a valid HyperLogLog string value.");
+          std::string merged = dcur.has_value() ? *dcur : hll_new();
+          auto* mregs = reinterpret_cast<std::uint8_t*>(merged.data()) + kHllHdr;
+          for (std::size_t i = 2; i < args.size(); ++i) {
+            if (store().is_wrongtype_for_string(args[i])) return wrongtype_error_reply();
+            auto cur = store().get(args[i]);
+            if (!cur.has_value()) continue;
+            if (!hll_is_valid(*cur)) return encode_error("WRONGTYPE Key is not a valid HyperLogLog string value.");
+            const auto* r = reinterpret_cast<const std::uint8_t*>(cur->data()) + kHllHdr;
+            for (int j = 0; j < kHllRegs; ++j) if (r[j] > mregs[j]) mregs[j] = r[j];
+          }
+          store().set(dest, merged, false, false, std::nullopt, true);
+          return encode_simple("OK");
+        }});
+
+    // ─── SMOVE ───────────────────────────────────────────────────────────
+    t.emplace("SMOVE", CommandSpec{"SMOVE", 4, {"write", "fast"}, 1, 2, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const std::string& src = args[1]; const std::string& dst = args[2]; const std::string& m = args[3];
+          if (store().is_wrongtype_for_set(src) || store().is_wrongtype_for_set(dst)) return wrongtype_error_reply();
+          bool wt = false;
+          if (!store().sismember(src, m, wt)) return encode_integer(0);
+          if (wt) return wrongtype_error_reply();
+          store().srem(src, {m}, wt);
+          store().sadd(dst, {m}, wt);
+          return encode_integer(1);
+        }});
+
+    // ─── ZRANGESTORE (index form, optional REV) ──────────────────────────
+    t.emplace("ZRANGESTORE", CommandSpec{"ZRANGESTORE", -5, {"write"}, 1, 2, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const std::string& dst = args[1]; const std::string& src = args[2];
+          for (std::size_t i = 5; i < args.size(); ++i) {
+            const auto o = upper(args[i]);
+            if (o == "BYSCORE" || o == "BYLEX")
+              return encode_error("ZRANGESTORE BYSCORE/BYLEX is not yet supported (index form only)");
+          }
+          bool rev = false;
+          for (std::size_t i = 5; i < args.size(); ++i) if (upper(args[i]) == "REV") rev = true;
+          std::int64_t start = 0, stop = 0;
+          if (!parse_i64(args[3], start) || !parse_i64(args[4], stop))
+            return encode_error("value is not an integer or out of range");
+          if (store().is_wrongtype_for_zset(src) || store().is_wrongtype_for_zset(dst)) return wrongtype_error_reply();
+          bool wt = false;
+          std::vector<std::pair<std::string, double>> items;
+          if (rev) {
+            auto all = store().zrange(src, 0, -1, true, wt);
+            std::reverse(all.begin(), all.end());
+            const std::int64_t n = static_cast<std::int64_t>(all.size());
+            std::int64_t s = start < 0 ? n + start : start, e = stop < 0 ? n + stop : stop;
+            if (s < 0) s = 0; if (e >= n) e = n - 1;
+            for (std::int64_t i = s; i <= e && i < n; ++i) items.push_back(all[i]);
+          } else {
+            items = store().zrange(src, start, stop, true, wt);
+          }
+          if (wt) return wrongtype_error_reply();
+          store().del(dst);
+          for (const auto& [mem, sc] : items) store().zadd_one(dst, sc, mem, false, false, false, false, false);
+          return encode_integer(static_cast<long long>(items.size()));
+        }});
+
+    // ─── PUBSUB introspection (+ sharded aliases) ────────────────────────
+    t.emplace("PUBSUB", CommandSpec{"PUBSUB", -2, {"pubsub", "fast", "loading", "stale"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          if (sub == "CHANNELS" || sub == "SHARDCHANNELS") {
+            const std::string pat = args.size() >= 3 ? args[2] : "*";
+            std::vector<std::string> out;
+            for (const auto& [ch, subs] : g_channel_subscribers) {
+              if (!subs.empty() && fnmatch(pat.c_str(), ch.c_str(), 0) == 0) out.push_back(encode_bulk(ch));
+            }
+            return encode_array(out);
+          }
+          if (sub == "NUMSUB" || sub == "SHARDNUMSUB") {
+            std::vector<std::string> out;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+              auto it = g_channel_subscribers.find(args[i]);
+              out.push_back(encode_bulk(args[i]));
+              out.push_back(encode_integer(it == g_channel_subscribers.end() ? 0 : static_cast<long long>(it->second.size())));
+            }
+            return encode_array(out);
+          }
+          if (sub == "NUMPAT") {
+            std::size_t n = 0;
+            for (const auto& [p, subs] : g_pattern_subscribers) if (!subs.empty()) ++n;
+            return encode_integer(static_cast<long long>(n));
+          }
+          return encode_error("Unknown PUBSUB subcommand or wrong number of arguments for '" + lower(args[1]) + "'");
+        }});
+
+    // Sharded pub/sub — in standalone mode this is equivalent to regular pub/sub.
+    auto delegate = [](const char* base, const std::vector<std::string>& args,
+                       SessionState& session, bool& close) -> std::string {
+      std::vector<std::string> proxy = args; proxy[0] = base;
+      const auto& tbl = command_table();
+      auto it = tbl.find(base);
+      return it == tbl.end() ? encode_error("unknown command") : it->second.handler(proxy, session, close);
+    };
+    t.emplace("SSUBSCRIBE", CommandSpec{"SSUBSCRIBE", -2, {"pubsub"}, 0, 0, 0,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("SUBSCRIBE", a, s, c); }});
+    t.emplace("SUNSUBSCRIBE", CommandSpec{"SUNSUBSCRIBE", -1, {"pubsub"}, 0, 0, 0,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("UNSUBSCRIBE", a, s, c); }});
+    t.emplace("SPUBLISH", CommandSpec{"SPUBLISH", 3, {"pubsub", "fast"}, 0, 0, 0,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("PUBLISH", a, s, c); }});
+
+    // ─── Read-only command variants (reject the write/STORE options) ─────
+    t.emplace("SORT_RO", CommandSpec{"SORT_RO", -2, {"readonly"}, 1, 1, 1,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
+          for (const auto& x : a) if (upper(x) == "STORE") return encode_error("SORT_RO does not support STORE");
+          return delegate("SORT", a, s, c);
+        }});
+    t.emplace("BITFIELD_RO", CommandSpec{"BITFIELD_RO", -2, {"readonly", "fast"}, 1, 1, 1,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
+          for (std::size_t i = 2; i < a.size(); ++i) {
+            const auto o = upper(a[i]);
+            if (o == "SET" || o == "INCRBY" || o == "OVERFLOW")
+              return encode_error("BITFIELD_RO only supports the GET subcommand");
+          }
+          return delegate("BITFIELD", a, s, c);
+        }});
+    t.emplace("GEORADIUS_RO", CommandSpec{"GEORADIUS_RO", -6, {"readonly"}, 1, 1, 1,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
+          for (const auto& x : a) { const auto o = upper(x); if (o == "STORE" || o == "STOREDIST") return encode_error("GEORADIUS_RO does not support STORE"); }
+          return delegate("GEORADIUS", a, s, c);
+        }});
+    t.emplace("GEORADIUSBYMEMBER_RO", CommandSpec{"GEORADIUSBYMEMBER_RO", -5, {"readonly"}, 1, 1, 1,
+        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
+          for (const auto& x : a) { const auto o = upper(x); if (o == "STORE" || o == "STOREDIST") return encode_error("GEORADIUSBYMEMBER_RO does not support STORE"); }
+          return delegate("GEORADIUSBYMEMBER", a, s, c);
         }});
 
     // Pre-compute flag bitmasks for fast checking
@@ -6556,6 +7478,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
       }
     }
 
+    // Apply rename-command directives (config-file only). Renaming to an empty
+    // target disables the command. Done after flag computation so the moved spec
+    // keeps its flags. Command names are matched case-insensitively (table keys
+    // are upper-case, and handle_command upper-cases incoming command names).
+    for (const auto& [from, to] : g_rename_commands) {
+      const std::string f = upper(from);
+      auto fit = t.find(f);
+      if (fit == t.end()) continue;
+      if (to.empty()) { t.erase(fit); continue; }
+      const std::string tname = upper(to);
+      CommandSpec spec = fit->second;
+      spec.name = tname;
+      t.erase(fit);
+      t[tname] = std::move(spec);
+    }
+
     return t;
   }();
 
@@ -6565,8 +7503,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 } // namespace
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close) {
-  if (args.empty() || args[0] == "__empty__" || args[0] == "__parse_error__") {
+  if (args.empty() || args[0] == "__empty__") {
     return encode_error("Protocol error");
+  }
+  // Real protocol errors desync the byte stream — reply, then close the connection
+  // (matching Redis) so a malformed frame cannot corrupt subsequent commands.
+  if (args[0] == "__parse_error__") {
+    should_close = true;
+    return encode_error("Protocol error");
+  }
+  if (args[0] == "__err_multibulk__") {
+    should_close = true;
+    return encode_error("Protocol error: invalid multibulk length");
+  }
+  if (args[0] == "__err_bulklen__") {
+    should_close = true;
+    return encode_error("Protocol error: invalid bulk length");
   }
 
   auto& ds = store();
@@ -6626,7 +7578,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       return encode_error("wrong number of arguments for '" + lower(cmd) + "' command");
     }
     bool q_is_write = qit->second.is_write();
-    if (q_is_write && g_config_maxmemory == 1 && !g_script_allow_oom &&
+    if (q_is_write && oom_should_reject() && !g_script_allow_oom &&
         cmd != "EVAL" && cmd != "EVALSHA" && cmd != "FLUSHALL" && cmd != "FLUSHDB") {
       session.multi_dirty = true;
       return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
@@ -6636,6 +7588,18 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
 
   const auto it = table.find(cmd);
+  // ── Authentication gate (default user / requirepass) ──
+  // Skipped when no password is configured (open, like Redis with no requirepass) and
+  // for internally replayed/replicated commands (g_replaying_aof). Commands flagged
+  // no_auth (AUTH/HELLO/QUIT/RESET) are always allowed so a client can authenticate.
+  if (!g_requirepass.empty() && !session.authenticated && !g_replaying_aof) {
+    const bool no_auth = (it != table.end()) && (it->second.flag_bits & kFlagNoAuth);
+    if (!no_auth) {
+      record_error_stat("NOAUTH");
+      if (in_lua_script_context()) g_script_inner_error_seen = true;
+      return std::string("-NOAUTH Authentication required.\r\n");
+    }
+  }
   if (it == table.end()) {
     auto mit = g_module_commands.find(cmd);
     if (mit == g_module_commands.end()) return encode_error("unknown command");
@@ -6653,7 +7617,15 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   auto& top_stat = g_cmdstats[lower(cmd)];
   const bool spec_is_write = spec.is_write();
-  if (spec_is_write && g_config_maxmemory == 1 && !g_script_allow_oom &&
+  if (spec_is_write && misconf_should_reject() && !g_replaying_aof &&
+      cmd != "CONFIG" && cmd != "EVAL" && cmd != "EVALSHA") {
+    ++top_stat.rejected_calls;
+    record_error_stat("MISCONF");
+    if (in_lua_script_context()) g_script_inner_error_seen = true;
+    return std::string("-MISCONF Errors writing to the persistence layer (RDB/AOF). "
+                       "Writes are disabled (stop-writes-on-bgsave-error). Check the server logs.\r\n");
+  }
+  if (spec_is_write && oom_should_reject() && !g_script_allow_oom &&
       cmd != "CONFIG" && cmd != "EVAL" && cmd != "EVALSHA" &&
       cmd != "FLUSHALL" && cmd != "FLUSHDB") {
     ++top_stat.rejected_calls;
@@ -6661,7 +7633,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
   }
-  if (spec_is_write && g_config_min_replicas_to_write > 0 &&
+  if (spec_is_write && noreplicas_should_reject() &&
       cmd != "EVAL" && cmd != "EVALSHA" &&
       cmd != "CONFIG" && cmd != "REPLICAOF" && cmd != "SLAVEOF") {
     ++top_stat.rejected_calls;
@@ -6704,7 +7676,20 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     session.asking = false;
   }
 
+  session.last_cmd = lower(cmd);
+  session.last_interaction_ms = now_ms();
+  feed_monitors(cmd, args, session);
+
+  const auto t_start = std::chrono::steady_clock::now();
   const std::string reply = spec.handler(args, session, should_close);
+  const std::int64_t exec_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - t_start).count();
+  // Single instrumentation chokepoint: per-command time → cmdstat usec, SLOWLOG, LATENCY.
+  top_stat.usec_total += exec_usec;
+  if (!in_lua_script_context()) {
+    slowlog_add(args, exec_usec);
+    latency_add("command", exec_usec / 1000);
+  }
   if (is_error_reply(reply)) {
     ++top_stat.failed_calls;
     if (in_lua_script_context() && !is_script_cmd) {
@@ -6715,14 +7700,97 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       record_error_stat(error_code_from_reply(reply));
     }
   }
-  if (spec_is_write && !is_error_reply(reply)) {
+  // Skip write side-effects when the command DEFERRED (a blocking command that just
+  // registered a block produced no mutation yet). Without this guard a blocked
+  // BLPOP/XREADGROUP would be wrongly written to the AOF / dirtied / notified.
+  if (spec_is_write && !is_error_reply(reply) && session.blocked.type == BlockType::None) {
     store().increment_mutation_epoch();
     // g_master_repl_offset is updated inside append_replication_event → backlog_append
     // via g_master_repl_offset = g_repl_backlog.total (absolute set, not increment).
     append_replication_event(args, session, &reply);
     append_aof(args);
+    emit_keyspace_notifications(cmd, args, spec.first_key, session.db_index);
   }
   return reply;
+}
+
+void configure_security(const std::string& requirepass, const std::string& masterauth,
+                        bool protected_mode, const std::string& enable_module_command,
+                        const std::vector<std::pair<std::string, std::string>>& rename_commands) {
+  g_requirepass = requirepass;
+  g_masterauth = masterauth;
+  g_protected_mode = protected_mode;
+  g_enable_module_command = enable_module_command;
+  g_rename_commands = rename_commands;
+}
+
+bool protected_mode_enabled() { return g_protected_mode; }
+bool requirepass_is_set() { return !g_requirepass.empty(); }
+
+void configure_maxmemory(const std::string& spec) {
+  if (spec.empty()) { g_config_maxmemory = 0; return; }
+  std::int64_t v = 0;
+  if (parse_memory(spec, v) && v >= 0) g_config_maxmemory = v;
+  else log(LogLevel::Warn, "ignoring invalid maxmemory value: " + spec);
+}
+
+void configure_notify_keyspace_events(const std::string& spec) {
+  g_notify_flags = parse_notify_flags(spec);
+}
+
+void configure_repl_backlog_size(const std::string& spec) {
+  if (spec.empty()) return;
+  std::int64_t v = 0;
+  if (parse_memory(spec, v) && v > 0) g_repl_backlog.reset(static_cast<std::size_t>(v));
+  else log(LogLevel::Warn, "ignoring invalid repl-backlog-size: " + spec);
+}
+
+void configure_save(const std::string& spec) {
+  g_save_params.clear();
+  g_save_spec = spec;
+  std::istringstream iss(spec);
+  std::int64_t sec = 0, changes = 0;
+  while (iss >> sec >> changes) {
+    if (sec > 0 && changes > 0) g_save_params.emplace_back(sec, changes);
+  }
+}
+
+// Active expiry driver (called from the event loop). On a master, physically
+// expires keys and propagates a DEL to replicas so they stay in sync. On a
+// replica, does nothing — a replica deletes a key only when the master's DEL
+// arrives, which prevents master/replica divergence from independent expiry clocks.
+void on_client_disconnect(int fd) {
+  g_monitor_fds.erase(fd);
+}
+
+void run_active_expire_cycle() {
+  if (g_replication_role == "slave") return;
+  auto expired = store().active_expire_cycle();
+  if (expired.empty()) return;
+  for (const auto& [dbidx, key] : expired) {
+    if (dbidx != g_last_repl_db) {
+      backlog_append(encode_command_resp({"SELECT", std::to_string(dbidx)}));
+      g_last_repl_db = dbidx;
+    }
+    backlog_append(encode_command_resp({"DEL", key}));
+    notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, dbidx);
+  }
+}
+
+// Save-point cron: triggered from the event loop. Fires BGSAVE when any configured
+// (seconds, changes) threshold is met. Cheap O(1) check using mutation_epoch as the
+// dirty counter.
+void background_save_cron() {
+  if (g_save_params.empty() || g_bgsave_in_progress.load()) return;
+  const std::int64_t now_s = now_ms() / 1000;
+  const std::int64_t dirty = static_cast<std::int64_t>(store().mutation_epoch()) - g_dirty_at_last_save;
+  if (dirty <= 0) return;
+  for (const auto& [sec, changes] : g_save_params) {
+    if (dirty >= changes && (now_s - g_last_save_time) >= sec) {
+      do_bgsave_fork();
+      break;
+    }
+  }
 }
 
 void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
@@ -6744,15 +7812,32 @@ bool load_aof_file(const std::string& path, std::string& err) {
   std::string buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
   std::size_t pos = 0;
   SessionState session {};
+  session.authenticated = true;  // internal replay must not be gated by requirepass
   g_replaying_aof = true;
   while (pos < buffer.size()) {
     auto parsed = parse_one_command(std::string_view(buffer).substr(pos));
-    if (!parsed.has_value()) break;
+    if (!parsed.has_value()) {
+      // Incomplete frame remains. If it plausibly looks like a partial command at
+      // EOF, treat it as a truncated tail (Redis: aof-load-truncated, default yes)
+      // and warn with the byte offset; otherwise refuse to start on corruption
+      // rather than silently discarding the remainder.
+      const std::size_t dropped = buffer.size() - pos;
+      const unsigned char first = static_cast<unsigned char>(buffer[pos]);
+      const bool looks_partial = (first == '*' || std::isprint(first));
+      if (looks_partial && g_aof_load_truncated) {
+        log(LogLevel::Warn, "AOF: ignoring truncated tail — " + std::to_string(dropped) +
+            " bytes dropped at offset " + std::to_string(pos));
+        break;
+      }
+      g_replaying_aof = false;
+      err = "AOF corrupted at offset " + std::to_string(pos);
+      return false;
+    }
     bool close = false;
     const auto reply = handle_command(parsed->args, session, close);
     if (is_error_reply(reply)) {
       g_replaying_aof = false;
-      err = "AOF replay command failed";
+      err = "AOF replay command failed at offset " + std::to_string(pos);
       return false;
     }
     pos += parsed->consumed;
@@ -6901,6 +7986,28 @@ std::string try_unblock_client(SessionState& session) {
         return encode_array({encode_bulk(captured_key), encode_bulk(vals[0].first), encode_bulk(oss.str())});
       }
     }
+  } else if (session.blocked.type == BlockType::Stream) {
+    // Re-run the original XREAD/XREADGROUP once (g_block_disabled prevents re-blocking).
+    // Like the BLPOP/BZPOPMIN paths, the on-wakeup read is applied directly (the
+    // blocking-replication limitation is shared with those commands).
+    const std::vector<std::string> orig = session.blocked.original_args;
+    const std::string cmd0 = orig.empty() ? std::string() : upper(orig[0]);
+    const auto& tbl = command_table();
+    auto it = tbl.find(cmd0);
+    std::string reply;
+    if (it != tbl.end()) {
+      g_block_disabled = true;
+      bool close = false;
+      reply = it->second.handler(orig, session, close);
+      g_block_disabled = false;
+    }
+    if (!reply.empty() && reply != encode_null(RespVersion::Resp2)) {
+      unregister_key_waiter(session.fd);
+      session.blocked.type = BlockType::None;
+      session.blocked.keys.clear();
+      session.blocked.original_args.clear();
+      return reply;
+    }
   }
 
   return {}; // still blocked
@@ -6933,7 +8040,10 @@ std::vector<std::string> command_names() {
 void aof_fsync_if_needed(std::int64_t now) {
   if (!g_appendonly || g_aof_fd < 0 || g_appendfsync != "everysec") return;
   if (now - g_last_aof_fsync_ms >= 1000) {
-    ::fsync(g_aof_fd);
+    if (::fsync(g_aof_fd) != 0) {
+      g_aof_write_error = true;
+      log(LogLevel::Error, "AOF fsync (everysec) failed: " + std::string(std::strerror(errno)));
+    }
     g_last_aof_fsync_ms = now;
   }
 }
@@ -7019,7 +8129,7 @@ static std::string repl_encode_cmd(const std::vector<std::string>& parts) {
 }
 
 // Perform a full PSYNC handshake with master at host:port and load the RDB snapshot.
-bool replica_do_fullsync(const std::string& host, int port) {
+bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -7052,6 +8162,16 @@ bool replica_do_fullsync(const std::string& host, int port) {
         log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
         ::close(fd);
         return false;
+    }
+
+    // AUTH masterauth (if the master requires a password)
+    if (!g_masterauth.empty()) {
+        if (!repl_send(fd, repl_encode_cmd({"AUTH", g_masterauth})) ||
+            !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+            log(LogLevel::Error, "REPLICAOF: AUTH to master failed: " + line);
+            ::close(fd);
+            return false;
+        }
     }
 
     // REPLCONF listening-port
@@ -7194,6 +8314,12 @@ bool replica_do_fullsync(const std::string& host, int port) {
 
     auto last_ack_ms = now_ms();
     while (true) {
+        // Stop promptly if a newer REPLICAOF (including NO ONE) superseded us. The 1s
+        // recv timeout below bounds how long this takes.
+        if (g_repl_generation.load() != gen) {
+            log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF, stopping stream");
+            break;
+        }
         // Non-blocking check: send REPLCONF ACK every ~1s
         const auto now = now_ms();
         if (now - last_ack_ms >= 1000) {

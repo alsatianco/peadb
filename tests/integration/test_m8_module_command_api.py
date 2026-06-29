@@ -81,7 +81,7 @@ def main():
         extra = ["-undefined", "dynamic_lookup"] if platform.system() == "Darwin" else []
         subprocess.check_call(["g++", "-shared", "-fPIC", "-O2"] + extra + [str(mod_cpp), "-o", str(mod_so)])
 
-        p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6435", "--bind", "127.0.0.1", "--loglevel", "error"])
+        p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6435", "--bind", "127.0.0.1", "--loglevel", "error", "--enable-module-command", "yes"])
         try:
             wait_until_ready(6435)
             with socket.create_connection(("127.0.0.1", 6435), timeout=2) as s:

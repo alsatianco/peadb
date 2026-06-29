@@ -75,7 +75,7 @@ def main():
 
             r.sendall(b"SYNC\r\n")
             assert rx(r, 1) == b"$"
-            assert read_line(r) == b"0"
+            rx(r, int(read_line(r)))  # consume full-state RDB
 
             send_cmd(c, "SET", "foo", "bar")
             assert rx(c, 1) == b"+"
