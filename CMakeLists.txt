@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(peadb LANGUAGES C CXX)
+project(peadb VERSION 0.1.0 LANGUAGES C CXX)
 
 # Default to Release if no build type specified (Debug builds are much slower)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
