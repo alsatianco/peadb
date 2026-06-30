@@ -448,6 +448,51 @@ int run_server(const ServerConfig& config) {
     }
   };
 
+  // Recheck blocked clients (BLPOP/BRPOP/BLMOVE/BZPOPMIN/XREAD…): deliver to any whose
+  // key now has data, or whose block timed out. Extracted so it can run both at loop top
+  // and again right after processing readable fds — the latter removes the ~100ms latency
+  // floor (a write and the unblock land in the same iteration instead of the next poll).
+  auto recheck_blocked = [&]() {
+    if (blocked_count <= 0) return;
+    std::vector<int> to_close, to_drain;
+    for (auto& [bfd, session] : sessions) {
+      if (session.blocked.type == BlockType::None) continue;
+      const std::string reply = try_unblock_client(session);
+      if (!reply.empty()) {
+        --blocked_count;
+        if (!enqueue_output(bfd, reply)) to_close.push_back(bfd);
+        else to_drain.push_back(bfd);
+      }
+    }
+    for (int cfd : to_close) close_client(cfd);
+    std::vector<int> drain_close;
+    drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
+    for (int cfd : drain_close) close_client(cfd);
+  };
+
+  auto recheck_wait = [&]() {
+    if (wait_count <= 0) return;
+    const auto wloop_now = DataStore::now_ms();
+    std::vector<int> to_close, to_drain;
+    for (auto& [wfd, session] : sessions) {
+      if (!session.wait_state.has_value()) continue;
+      auto& ws = session.wait_state.value();
+      int synced = g_count_synced_replicas ? g_count_synced_replicas(ws.target_offset) : 0;
+      const bool timed_out = ws.deadline_ms > 0 && wloop_now >= ws.deadline_ms;
+      if (synced >= ws.min_replicas || timed_out) {
+        session.wait_state.reset();
+        --wait_count;
+        const std::string reply = ":" + std::to_string(synced) + "\r\n";
+        if (!enqueue_output(wfd, reply)) to_close.push_back(wfd);
+        else to_drain.push_back(wfd);
+      }
+    }
+    for (int cfd : to_close) close_client(cfd);
+    std::vector<int> drain_close;
+    drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
+    for (int cfd : drain_close) close_client(cfd);
+  };
+
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream) return true;
     const std::size_t current_total = replication_event_count();
@@ -515,49 +560,8 @@ int run_server(const ServerConfig& config) {
 
     // ── Check blocked clients ──────────────────────────────────────────
     if (has_pending_wakeups()) clear_pending_wakeups();
-    if (blocked_count > 0) {
-      std::vector<int> to_close;
-      std::vector<int> to_drain;
-      for (auto& [bfd, session] : sessions) {
-        if (session.blocked.type == BlockType::None) continue;
-        const std::string reply = try_unblock_client(session);
-        if (!reply.empty()) {
-          --blocked_count;
-          if (!enqueue_output(bfd, reply)) to_close.push_back(bfd);
-          else to_drain.push_back(bfd);
-        }
-      }
-      for (int cfd : to_close) close_client(cfd);
-
-      std::vector<int> drain_close;
-      drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
-      for (int cfd : drain_close) close_client(cfd);
-    }
-
-    // ── Resolve deferred WAIT commands ────────────────────────────────
-    if (wait_count > 0) {
-      const auto wloop_now = DataStore::now_ms();
-      std::vector<int> to_close;
-      std::vector<int> to_drain;
-      for (auto& [wfd, session] : sessions) {
-        if (!session.wait_state.has_value()) continue;
-        auto& ws = session.wait_state.value();
-        int synced = g_count_synced_replicas ? g_count_synced_replicas(ws.target_offset) : 0;
-        const bool timed_out = ws.deadline_ms > 0 && wloop_now >= ws.deadline_ms;
-        if (synced >= ws.min_replicas || timed_out) {
-          session.wait_state.reset();
-          --wait_count;
-          const std::string reply = ":" + std::to_string(synced) + "\r\n";
-          if (!enqueue_output(wfd, reply)) to_close.push_back(wfd);
-          else to_drain.push_back(wfd);
-        }
-      }
-      for (int cfd : to_close) close_client(cfd);
-
-      std::vector<int> drain_close;
-      drain_pipelined(to_drain, blocked_count, wait_count, drain_close);
-      for (int cfd : drain_close) close_client(cfd);
-    }
+    recheck_blocked();
+    recheck_wait();
 
     for (int i = 0; i < nready; ++i) {
       const int fd = ep_events[i].fd;
@@ -802,6 +806,15 @@ int run_server(const ServerConfig& config) {
         }
       }
       for (int cfd : to_close) close_client(cfd);
+    }
+
+    // Same-iteration unblock: writes processed above set the pending-wakeup flag; deliver
+    // to blocked/WAITing clients now rather than waiting for the next ~100ms poll. This is
+    // what removes the blocking-command latency floor.
+    if (has_pending_wakeups()) {
+      clear_pending_wakeups();
+      recheck_blocked();
+      recheck_wait();
     }
   }
 

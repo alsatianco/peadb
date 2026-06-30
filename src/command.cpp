@@ -7912,6 +7912,12 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     append_replication_event(args, session, &reply);
     append_aof(args);
     emit_keyspace_notifications(cmd, args, spec.first_key, session.db_index);
+    // Any write may satisfy a blocked client (BLPOP/BZPOPMIN/BLMOVE/XREAD…). Flag a
+    // wakeup so the event loop rechecks blocked clients in THIS iteration instead of on
+    // the next ~100ms poll. Cheap: the recheck early-returns when nothing is blocked.
+    notify_key_written(spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()
+                           ? args[static_cast<std::size_t>(spec.first_key)] : std::string(),
+                       session.db_index);
   }
   // Eviction access tracking: refresh the command's primary key's LRU/LFU metadata so
   // recently-used keys survive eviction. Done after the handler so a key the command just
