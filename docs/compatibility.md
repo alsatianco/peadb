@@ -43,7 +43,7 @@ See [`../compat/delta.md`](../compat/delta.md) for authoritative, per-feature de
 
 PeaDB's durability matches Redis's options.
 
-- **RDB snapshots** — `SAVE` (blocking) and `BGSAVE` (forked) write a native Redis-compatible RDB to `--dir`/`--dbfilename`. The writer fsyncs the file and its parent directory and fails the save on any fsync error rather than leaving a corrupt snapshot.
+- **RDB snapshots** — `SAVE` (blocking) and `BGSAVE` (forked) write a native Redis-compatible RDB to `--dir`/`--dbfilename`. The writer fsyncs the file and its parent directory and fails the save on any fsync error rather than leaving a corrupt snapshot. On startup the trailing **CRC64 is verified**: a corrupt native RDB (`REDIS` magic, bad checksum) is fatal — the server refuses to start rather than silently falling back to an empty/legacy load. (Replication-stream RDBs skip CRC, since a foreign master's CRC variant differs; that path is integrity-checked by TCP + length framing.)
 - **AOF** — enable with `--appendonly yes`; commands append to a persistent fd. The `appendfsync` policy governs durability:
 
   | `appendfsync` | Behavior | Worst-case loss on crash |

@@ -14,7 +14,9 @@ bool rdb_save(const std::filesystem::path& path, std::string& err);
 std::string rdb_save_to_string(std::string& err);
 
 // Load a Redis-compatible RDB file into the datastore.
-bool rdb_load(const std::filesystem::path& path, std::string& err);
+// verify_crc: check the trailing CRC64 (on-disk startup loads). Pass false for the
+// replication path, which may receive an RDB from a foreign master (different CRC variant).
+bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_crc = true);
 
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);
