@@ -20,6 +20,7 @@ struct ServerConfig {
   std::string maxmemory;                    // e.g. "100mb"; empty = unlimited
   std::string maxmemory_policy;             // e.g. "allkeys-lru"; empty = noeviction
   std::string maxmemory_samples;            // eviction sample size; empty = 5
+  std::string timeout;                       // idle-client timeout (seconds); empty = 0 (off)
   std::string save;                         // raw "sec changes [sec changes ...]"; empty = none
   std::string repl_backlog_size;            // e.g. "256mb"; empty = default 1mb
   std::string notify_keyspace_events;       // e.g. "KEA"; empty = disabled

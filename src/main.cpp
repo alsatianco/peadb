@@ -94,6 +94,7 @@ int main(int argc, char** argv) {
     if (arg == "--maxmemory" && i + 1 < argc) { config.maxmemory = argv[++i]; continue; }
     if (arg == "--maxmemory-policy" && i + 1 < argc) { config.maxmemory_policy = argv[++i]; continue; }
     if (arg == "--maxmemory-samples" && i + 1 < argc) { config.maxmemory_samples = argv[++i]; continue; }
+    if (arg == "--timeout" && i + 1 < argc) { config.timeout = argv[++i]; continue; }
     if (arg == "--save" && i + 1 < argc) { config.save = argv[++i]; continue; }
     if (arg == "--appendonly" && i + 1 < argc) { const std::string v = argv[++i]; config.appendonly = (v == "yes" || v == "1" || v == "true"); continue; }
     if (arg == "--appendfilename" && i + 1 < argc) { config.appendfilename = argv[++i]; continue; }
@@ -115,6 +116,7 @@ int main(int argc, char** argv) {
   peadb::configure_maxmemory(config.maxmemory);
   peadb::configure_maxmemory_policy(config.maxmemory_policy);
   peadb::configure_maxmemory_samples(config.maxmemory_samples);
+  peadb::configure_timeout(config.timeout);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);

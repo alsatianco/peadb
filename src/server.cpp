@@ -59,6 +59,19 @@ bool set_tcp_nodelay(int fd) {
   return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == 0;
 }
 
+// Enable TCP keepalive so half-open connections (peer vanished without FIN) are detected
+// and reaped by the kernel instead of lingering forever against maxclients.
+void set_tcp_keepalive(int fd) {
+  int yes = 1;
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+#ifdef __linux__
+  int idle = 300, intvl = 30, cnt = 3;  // first probe after 5 min, then every 30s, 3 times
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#endif
+}
+
 int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
 #ifdef __linux__
   return accept4(listen_fd, addr, addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
@@ -239,6 +252,7 @@ int run_server(const ServerConfig& config) {
   std::unordered_map<int, WriteBuf> write_buffers;
   std::unordered_map<int, SessionState> sessions;
   std::int64_t last_active_expire_ms = DataStore::now_ms();
+  std::int64_t last_idle_reap_ms = DataStore::now_ms();
   int blocked_count = 0;
   int wait_count = 0;
   int replica_count = 0;
@@ -479,6 +493,26 @@ int run_server(const ServerConfig& config) {
     reap_background_children();
     drain_replica_cmd_queue();
 
+    // ── Idle-client timeout reaping ──────────────────────────────────────
+    // Close normal clients idle longer than `timeout` seconds. Replicas, blocked/waiting
+    // clients, in-MULTI clients, and pub/sub subscribers are exempt (they legitimately sit
+    // quiet). Swept at most ~once/sec to keep it cheap. timeout=0 disables it.
+    if (const int idle_to = client_timeout_seconds(); idle_to > 0 &&
+        loop_now_ms - last_idle_reap_ms >= 1000) {
+      last_idle_reap_ms = loop_now_ms;
+      const std::int64_t cutoff = static_cast<std::int64_t>(idle_to) * 1000;
+      std::vector<int> idle_fds;
+      for (auto& [cfd, session] : sessions) {
+        if (session.replica_stream || session.blocked.type != BlockType::None ||
+            session.wait_state.has_value() || session.in_multi) continue;
+        if (session.last_interaction_ms == 0) continue;  // never issued a command yet
+        if (loop_now_ms - session.last_interaction_ms < cutoff) continue;
+        if (client_has_subscriptions(cfd)) continue;
+        idle_fds.push_back(cfd);
+      }
+      for (int cfd : idle_fds) close_client(cfd);
+    }
+
     // ── Check blocked clients ──────────────────────────────────────────
     if (has_pending_wakeups()) clear_pending_wakeups();
     if (blocked_count > 0) {
@@ -602,6 +636,7 @@ int run_server(const ServerConfig& config) {
           }
 
           set_tcp_nodelay(client_fd);
+          set_tcp_keepalive(client_fd);
 
           if (!poller.add_read(client_fd)) {
             log(LogLevel::Warn, "poller add failed for client fd=" + std::to_string(client_fd) +
