@@ -8,6 +8,7 @@
 
 #include <iostream>
 #include <string>
+#include <fstream>
 #include <filesystem>
 #include <csignal>
 #include <cstdio>
@@ -128,8 +129,23 @@ int main(int argc, char** argv) {
   const auto snap = std::filesystem::path(config.dir) / config.dbfilename;
   if (std::filesystem::exists(snap)) {
     std::string err;
-    // Try native RDB format first, fall back to legacy PEADB-SNAPSHOT format
+    // A file with the "REDIS" magic is a native RDB: if it fails to load (e.g. CRC
+    // mismatch) that is corruption — refuse to start rather than silently falling back to
+    // the legacy plaintext snapshot and serving partial/empty data. Only non-native files
+    // fall back to the legacy PEADB-SNAPSHOT format.
+    bool is_native_rdb = false;
+    {
+      std::ifstream probe(snap, std::ios::binary);
+      char magic[5] = {0};
+      if (probe.read(magic, 5)) is_native_rdb = std::string(magic, 5) == "REDIS";
+    }
     if (!peadb::rdb_load(snap, err)) {
+      if (is_native_rdb) {
+        peadb::log(peadb::LogLevel::Error,
+                   "FATAL: RDB load failed: " + err +
+                   " — refusing to start. Restore from backup or repair the dump.");
+        return 1;
+      }
       peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");
       if (!peadb::store().load_snapshot_file(snap, err)) {
         peadb::log(peadb::LogLevel::Warn, "failed to load snapshot: " + err);

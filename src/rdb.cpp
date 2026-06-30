@@ -825,7 +825,7 @@ std::string rdb_save_to_string(std::string& err) {
 
 // ── RDB Load ───────────────────────────────────────────────────────────
 
-bool rdb_load(const std::filesystem::path& path, std::string& err) {
+bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_crc) {
   err.clear();
 
   std::ifstream in(path, std::ios::binary);
@@ -855,6 +855,27 @@ bool rdb_load(const std::filesystem::path& path, std::string& err) {
   if (rdb_ver < 1 || rdb_ver > 13) {
     err = "unsupported RDB version " + std::to_string(rdb_ver);
     return false;
+  }
+
+  // Verify the trailing 8-byte CRC64 over all preceding bytes (matches the writer at
+  // rdb_build_string). A stored checksum of 0 means checksumming was disabled — skip then,
+  // like Redis. A mismatch means the file is corrupt: refuse to load it (the caller treats
+  // a corrupt REDIS-magic file as fatal rather than silently falling back to legacy).
+  // Only enforced for on-disk startup loads: the replication path may receive an RDB from a
+  // foreign master (real Redis), whose CRC-64 variant differs from PeaDB's and whose stream
+  // integrity is already covered by TCP + length framing + the parser.
+  if (verify_crc && filedata.size() >= 8) {
+    uint64_t stored = 0;
+    const auto* tail = reinterpret_cast<const unsigned char*>(filedata.data() + filedata.size() - 8);
+    for (int i = 0; i < 8; ++i) stored |= static_cast<uint64_t>(tail[i]) << (8 * i);
+    if (stored != 0) {
+      const uint64_t computed =
+          crc64(0, reinterpret_cast<const uint8_t*>(filedata.data()), filedata.size() - 8);
+      if (computed != stored) {
+        err = "RDB CRC64 checksum mismatch (file is corrupt)";
+        return false;
+      }
+    }
   }
 
   RdbReader r(filedata.data() + 9, filedata.size() - 9);

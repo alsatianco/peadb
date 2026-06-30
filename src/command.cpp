@@ -8215,7 +8215,10 @@ void drain_replica_cmd_queue() {
       g_replica_load_path.clear();
     }
     std::string err;
-    const bool ok = rdb_load(path, err);
+    // Skip CRC verification: the RDB came from the master (possibly real Redis, whose
+    // CRC-64 variant differs from PeaDB's); the TCP stream + length framing + parser already
+    // guard integrity. CRC verification is for on-disk startup loads of PeaDB's own dumps.
+    const bool ok = rdb_load(path, err, /*verify_crc=*/false);
     if (!ok) log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
     g_replica_load_ok.store(ok);
     g_replica_load_pending.store(false);  // signal streaming thread
