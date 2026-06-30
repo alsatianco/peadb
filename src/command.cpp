@@ -128,6 +128,8 @@ int g_server_port = 6379;
 std::string g_master_replid = "0000000000000000000000000000000000000001";
 std::int64_t g_master_repl_offset = 0;
 std::int64_t g_config_maxmemory = 0;
+MaxmemoryPolicy g_maxmemory_policy = MaxmemoryPolicy::NoEviction;
+int g_maxmemory_samples = 5;        // candidate keys sampled per eviction (Redis default 5)
 std::int64_t g_config_min_replicas_to_write = 0;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
@@ -308,10 +310,56 @@ inline bool parse_memory(const std::string& s, std::int64_t& out) {
   out = base * mult;
   return out >= 0;
 }
-// noeviction maxmemory enforcement: reject denyoom writes once used memory exceeds
-// the configured limit. used_memory() is the bounded-staleness cached estimate.
+std::string lower(std::string s);  // defined below; needed by parse_maxmemory_policy
+
+// Maxmemory-policy string ↔ enum. Returns nullopt for an unrecognised name.
+inline std::optional<MaxmemoryPolicy> parse_maxmemory_policy(const std::string& s) {
+  const std::string p = lower(s);
+  if (p == "noeviction")      return MaxmemoryPolicy::NoEviction;
+  if (p == "allkeys-lru")     return MaxmemoryPolicy::AllkeysLru;
+  if (p == "allkeys-lfu")     return MaxmemoryPolicy::AllkeysLfu;
+  if (p == "allkeys-random")  return MaxmemoryPolicy::AllkeysRandom;
+  if (p == "volatile-lru")    return MaxmemoryPolicy::VolatileLru;
+  if (p == "volatile-lfu")    return MaxmemoryPolicy::VolatileLfu;
+  if (p == "volatile-random") return MaxmemoryPolicy::VolatileRandom;
+  if (p == "volatile-ttl")    return MaxmemoryPolicy::VolatileTtl;
+  return std::nullopt;
+}
+inline const char* maxmemory_policy_to_str(MaxmemoryPolicy p) {
+  switch (p) {
+    case MaxmemoryPolicy::NoEviction:      return "noeviction";
+    case MaxmemoryPolicy::AllkeysLru:      return "allkeys-lru";
+    case MaxmemoryPolicy::AllkeysLfu:      return "allkeys-lfu";
+    case MaxmemoryPolicy::AllkeysRandom:   return "allkeys-random";
+    case MaxmemoryPolicy::VolatileLru:     return "volatile-lru";
+    case MaxmemoryPolicy::VolatileLfu:     return "volatile-lfu";
+    case MaxmemoryPolicy::VolatileRandom:  return "volatile-random";
+    case MaxmemoryPolicy::VolatileTtl:     return "volatile-ttl";
+  }
+  return "noeviction";
+}
+
+inline void apply_maxmemory_policy(MaxmemoryPolicy p) {
+  g_maxmemory_policy = p;
+  store().set_eviction_lfu(p == MaxmemoryPolicy::AllkeysLfu || p == MaxmemoryPolicy::VolatileLfu);
+}
+
+// Defined later (needs the AOF/backlog/notify propagation helpers). When over the
+// maxmemory budget and a policy is set, evict keys until back under budget or nothing
+// is evictable, propagating each eviction to replicas/AOF/keyspace-notifications.
+void evict_to_fit();
+
+// maxmemory enforcement: when used memory exceeds the limit, first try to evict per
+// maxmemory-policy; reject denyoom writes with -OOM only if still over budget (true
+// noeviction, or nothing left to evict). used_memory() is the bounded-staleness cache.
 inline bool oom_should_reject() {
-  return g_config_maxmemory > 0 && store().used_memory() > g_config_maxmemory;
+  if (g_config_maxmemory <= 0) return false;
+  if (store().used_memory() <= g_config_maxmemory) return false;
+  if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction &&
+      g_replication_role != "slave" && !g_replaying_aof) {
+    evict_to_fit();
+  }
+  return store().used_memory() > g_config_maxmemory;
 }
 // min-replicas-to-write: reject writes only when FEWER than the required number of
 // replicas are actually connected (the previous code rejected whenever the knob was
@@ -1131,6 +1179,29 @@ void append_aof(const std::vector<std::string>& args) {
           "writes beyond this point will not appear in the rewritten AOF. "
           "Consider reducing write rate or increasing available memory.");
     }
+  }
+}
+
+// Eviction loop (maxmemory-policy). Evicts sampled keys until used memory is back under
+// the limit or nothing is evictable. Each evicted key is propagated like a server-issued
+// deletion: a DEL to the replication backlog (with SELECT on db change, so replicas stay
+// in sync) and to the AOF (bare DEL — the live AOF is db-agnostic, and DEL of an absent
+// key is a harmless no-op on replay), plus an "evicted" keyspace notification.
+void evict_to_fit() {
+  // Bound the loop so a pathological config can never spin forever; in practice it exits
+  // as soon as used_memory drops under the limit (evict_one keeps the cache live).
+  int guard = 0;
+  while (store().used_memory() > g_config_maxmemory) {
+    if (++guard > 10'000'000) break;
+    auto victim = store().evict_one(g_maxmemory_policy, g_maxmemory_samples);
+    if (!victim) break;  // nothing evictable (e.g. volatile-* with no TTL keys)
+    if (victim->db != g_last_repl_db) {
+      backlog_append(encode_command_resp({"SELECT", std::to_string(victim->db)}));
+      g_last_repl_db = victim->db;
+    }
+    backlog_append(encode_command_resp({"DEL", victim->key}));
+    append_aof({"DEL", victim->key});
+    notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key, victim->db);
   }
 }
 
@@ -2431,7 +2502,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "mem_allocator:libc\r\n"
                    "maxmemory:" + std::to_string(g_config_maxmemory) + "\r\n"
                    "maxmemory_human:" + format_mem(static_cast<size_t>(g_config_maxmemory)) + "\r\n"
-                   "maxmemory_policy:noeviction\r\n"
+                   "maxmemory_policy:" + std::string(maxmemory_policy_to_str(g_maxmemory_policy)) + "\r\n"
                    "number_of_cached_scripts:" + std::to_string(g_script_cache.size()) + "\r\n\r\n";
           }
           if (want("PERSISTENCE")) {
@@ -2851,7 +2922,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"databases", "16"},
               {"activedefrag", "no"},
               {"loglevel", g_loglevel_name},
-              {"maxmemory-policy", "noeviction"},
+              {"maxmemory-policy", maxmemory_policy_to_str(g_maxmemory_policy)},
+              {"maxmemory-samples", std::to_string(g_maxmemory_samples)},
               {"timeout", "0"},
               {"tcp-keepalive", "300"},
               {"list-max-ziplist-size", "-2"},
@@ -2881,6 +2953,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] + "') - argument couldn't be parsed into an integer");
               }
               g_config_maxmemory = v;
+            }
+            if (k == "maxmemory-policy") {
+              const auto p = parse_maxmemory_policy(args[3]);
+              if (!p) return encode_error("argument(s) must be one of the following: "
+                                          "noeviction, allkeys-lru, allkeys-lfu, allkeys-random, "
+                                          "volatile-lru, volatile-lfu, volatile-random, volatile-ttl");
+              apply_maxmemory_policy(*p);
+            }
+            if (k == "maxmemory-samples") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 1 || v > 1000) return encode_error("value is not an integer or out of range");
+              g_maxmemory_samples = static_cast<int>(v);
             }
             if (k == "maxclients") {
               std::int64_t v = 0;
@@ -7711,6 +7795,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     append_aof(args);
     emit_keyspace_notifications(cmd, args, spec.first_key, session.db_index);
   }
+  // Eviction access tracking: refresh the command's primary key's LRU/LFU metadata so
+  // recently-used keys survive eviction. Done after the handler so a key the command just
+  // created is stamped (not left at lru=0). Single-key/first-key approximation; zero cost
+  // when no eviction policy is configured. (See AI-temp/autonomous-decisions.md.)
+  if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction && !is_error_reply(reply) &&
+      spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
+    store().touch_key_for_eviction(args[static_cast<std::size_t>(spec.first_key)]);
+  }
   return reply;
 }
 
@@ -7732,6 +7824,19 @@ void configure_maxmemory(const std::string& spec) {
   std::int64_t v = 0;
   if (parse_memory(spec, v) && v >= 0) g_config_maxmemory = v;
   else log(LogLevel::Warn, "ignoring invalid maxmemory value: " + spec);
+}
+
+void configure_maxmemory_policy(const std::string& spec) {
+  if (spec.empty()) return;  // keep default (noeviction)
+  if (auto p = parse_maxmemory_policy(spec)) apply_maxmemory_policy(*p);
+  else log(LogLevel::Warn, "ignoring invalid maxmemory-policy: " + spec);
+}
+
+void configure_maxmemory_samples(const std::string& spec) {
+  if (spec.empty()) return;
+  std::int64_t v = 0;
+  if (parse_i64(spec, v) && v >= 1 && v <= 1000) g_maxmemory_samples = static_cast<int>(v);
+  else log(LogLevel::Warn, "ignoring invalid maxmemory-samples: " + spec);
 }
 
 void configure_notify_keyspace_events(const std::string& spec) {

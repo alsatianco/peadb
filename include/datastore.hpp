@@ -26,6 +26,20 @@ enum class ValueType {
   Stream,
 };
 
+// maxmemory-policy. `allkeys-*` sample the whole keyspace; `volatile-*` only keys
+// with a TTL. The victim is chosen by approximate LRU (oldest access), LFU (lowest
+// access frequency), TTL (soonest to expire), or at random.
+enum class MaxmemoryPolicy {
+  NoEviction,
+  AllkeysLru,
+  AllkeysLfu,
+  AllkeysRandom,
+  VolatileLru,
+  VolatileLfu,
+  VolatileRandom,
+  VolatileTtl,
+};
+
 // Per-key value. Only the ACTIVE type's payload is allocated: the `payload` variant
 // holds the inline string (String type) or a unique_ptr to the active collection, so a
 // small string key no longer pays for six empty containers. `expire_at_ms`, `lru`, and
@@ -284,6 +298,21 @@ class DataStore {
   void record_hit() { stat_keyspace_hits_.fetch_add(1, std::memory_order_relaxed); }
   void record_miss() { stat_keyspace_misses_.fetch_add(1, std::memory_order_relaxed); }
   void record_expired() { stat_expired_keys_.fetch_add(1, std::memory_order_relaxed); }
+  void record_evicted() { stat_evicted_keys_.fetch_add(1, std::memory_order_relaxed); }
+
+  // ── Eviction (maxmemory-policy) ──
+  // Update a key's access metadata (LRU clock / LFU counter) used by eviction. Called
+  // on the hot read/write paths. lfu=false → LRU (store coarse access time); lfu=true →
+  // LFU (probabilistic log-increment counter). Touch is O(1).
+  void touch_lru(Entry& e, bool lfu);
+  void set_eviction_lfu(bool v) { eviction_lfu_ = v; }  // pick LRU vs LFU touch semantics
+  void touch_key_for_eviction(const std::string& key);  // current db; no-op if absent
+  struct EvictVictim { int db; std::string key; std::int64_t freed_bytes; };
+  // Sample `samples` candidate keys across all DBs (allkeys-*) or only volatile keys
+  // (volatile-*), pick the victim per policy, erase it, record the eviction, and decrement
+  // the cached used_memory so a tight eviction loop sees memory fall in real time (instead
+  // of over-evicting against the ~100ms-stale cache). nullopt = nothing evictable.
+  std::optional<EvictVictim> evict_one(MaxmemoryPolicy policy, int samples);
 
   // Memory accounting — walks all databases to compute an estimate
   std::int64_t estimate_used_memory() const;
@@ -308,6 +337,9 @@ class DataStore {
   using DB = std::unordered_map<std::string, Entry>;
 
   bool expire_if_needed(DB& db, const std::string& key);
+  // Approximate bytes attributable to one key (map node key + Entry + active payload).
+  // Shared by estimate_used_memory() and evict_one() so accounting and eviction agree.
+  std::int64_t entry_cost(const std::string& key, const Entry& e) const;
 
   int current_db_;
   std::vector<DB> dbs_;
@@ -315,6 +347,7 @@ class DataStore {
   mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
   std::int64_t zset_max_ziplist_entries_ = 128;
+  bool eviction_lfu_ = false;   // touch_key_for_eviction uses LFU semantics when true
   std::atomic<std::int64_t> stat_expired_keys_{0};
   std::atomic<std::int64_t> stat_keyspace_hits_{0};
   std::atomic<std::int64_t> stat_keyspace_misses_{0};

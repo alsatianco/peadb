@@ -18,6 +18,8 @@ struct ServerConfig {
   std::string appendfilename = "appendonly.aof";
   std::string appendfsync = "everysec";
   std::string maxmemory;                    // e.g. "100mb"; empty = unlimited
+  std::string maxmemory_policy;             // e.g. "allkeys-lru"; empty = noeviction
+  std::string maxmemory_samples;            // eviction sample size; empty = 5
   std::string save;                         // raw "sec changes [sec changes ...]"; empty = none
   std::string repl_backlog_size;            // e.g. "256mb"; empty = default 1mb
   std::string notify_keyspace_events;       // e.g. "KEA"; empty = disabled
