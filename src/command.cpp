@@ -139,6 +139,7 @@ std::atomic<std::int64_t> g_sync_partial_err{0};  // partial resync requests we 
 std::int64_t g_config_maxmemory = 0;
 MaxmemoryPolicy g_maxmemory_policy = MaxmemoryPolicy::NoEviction;
 int g_maxmemory_samples = 5;        // candidate keys sampled per eviction (Redis default 5)
+int g_config_timeout = 0;           // idle-client timeout in seconds; 0 = never reap
 std::int64_t g_config_min_replicas_to_write = 0;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
@@ -2970,7 +2971,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"loglevel", g_loglevel_name},
               {"maxmemory-policy", maxmemory_policy_to_str(g_maxmemory_policy)},
               {"maxmemory-samples", std::to_string(g_maxmemory_samples)},
-              {"timeout", "0"},
+              {"timeout", std::to_string(g_config_timeout)},
               {"tcp-keepalive", "300"},
               {"list-max-ziplist-size", "-2"},
               {"set-max-intset-entries", "512"},
@@ -3011,6 +3012,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               std::int64_t v = 0;
               if (!parse_i64(args[3], v) || v < 1 || v > 1000) return encode_error("value is not an integer or out of range");
               g_maxmemory_samples = static_cast<int>(v);
+            }
+            if (k == "timeout") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
+              g_config_timeout = static_cast<int>(v);
             }
             if (k == "maxclients") {
               std::int64_t v = 0;
@@ -7953,6 +7959,23 @@ void configure_maxmemory_samples(const std::string& spec) {
 
 void init_replication_id() {
   g_master_replid = gen_run_id();
+}
+
+void configure_timeout(const std::string& spec) {
+  if (spec.empty()) return;
+  std::int64_t v = 0;
+  if (parse_i64(spec, v) && v >= 0) g_config_timeout = static_cast<int>(v);
+  else log(LogLevel::Warn, "ignoring invalid timeout: " + spec);
+}
+
+int client_timeout_seconds() { return g_config_timeout; }
+
+// Whether an fd has any active pub/sub subscription — such clients are exempt from the
+// idle timeout (they legitimately sit quiet waiting for messages, like Redis).
+bool client_has_subscriptions(int fd) {
+  for (const auto& [ch, subs] : g_channel_subscribers) if (subs.count(fd)) return true;
+  for (const auto& [pat, subs] : g_pattern_subscribers) if (subs.count(fd)) return true;
+  return false;
 }
 
 void configure_notify_keyspace_events(const std::string& spec) {

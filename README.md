@@ -110,6 +110,7 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file (`--confi
 | `--maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `--maxmemory-policy`, else denyoom writes get `-OOM` |
 | `--maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
 | `--maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
+| `--timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
 | `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` |
 
 `appendonly`, `appendfilename`, `appendfsync`, `masterauth`, and `repl-backlog-size` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys).

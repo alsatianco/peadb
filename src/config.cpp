@@ -92,6 +92,8 @@ ServerConfig load_config(const std::string& path) {
       cfg.maxmemory_policy = value;
     } else if (key == "maxmemory-samples") {
       cfg.maxmemory_samples = value;
+    } else if (key == "timeout") {
+      cfg.timeout = value;
     } else if (key == "repl-backlog-size") {
       cfg.repl_backlog_size = value;
     } else if (key == "notify-keyspace-events") {
