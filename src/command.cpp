@@ -7489,34 +7489,100 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_integer(1);
         }});
 
-    // ─── ZRANGESTORE (index form, optional REV) ──────────────────────────
+    // ─── ZRANGESTORE — index (default), BYSCORE, or BYLEX; optional REV + LIMIT ───
     t.emplace("ZRANGESTORE", CommandSpec{"ZRANGESTORE", -5, {"write"}, 1, 2, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           const std::string& dst = args[1]; const std::string& src = args[2];
+          enum class Mode { Index, ByScore, ByLex };
+          Mode mode = Mode::Index;
+          bool rev = false;
+          bool has_limit = false;
+          std::int64_t lim_off = 0, lim_cnt = -1;
           for (std::size_t i = 5; i < args.size(); ++i) {
             const auto o = upper(args[i]);
-            if (o == "BYSCORE" || o == "BYLEX")
-              return encode_error("ZRANGESTORE BYSCORE/BYLEX is not yet supported (index form only)");
+            if (o == "BYSCORE") mode = Mode::ByScore;
+            else if (o == "BYLEX") mode = Mode::ByLex;
+            else if (o == "REV") rev = true;
+            else if (o == "LIMIT" && i + 2 < args.size()) {
+              if (!parse_i64(args[i + 1], lim_off) || !parse_i64(args[i + 2], lim_cnt))
+                return encode_error("value is not an integer or out of range");
+              has_limit = true; i += 2;
+            } else {
+              return encode_error("syntax error");
+            }
           }
-          bool rev = false;
-          for (std::size_t i = 5; i < args.size(); ++i) if (upper(args[i]) == "REV") rev = true;
-          std::int64_t start = 0, stop = 0;
-          if (!parse_i64(args[3], start) || !parse_i64(args[4], stop))
-            return encode_error("value is not an integer or out of range");
+          if (has_limit && mode == Mode::Index)
+            return encode_error("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
           if (store().is_wrongtype_for_zset(src) || store().is_wrongtype_for_zset(dst)) return wrongtype_error_reply();
           bool wt = false;
+          auto all = store().zrange(src, 0, -1, true, wt);  // ascending {member,score}
+          if (wt) return wrongtype_error_reply();
           std::vector<std::pair<std::string, double>> items;
-          if (rev) {
-            auto all = store().zrange(src, 0, -1, true, wt);
-            std::reverse(all.begin(), all.end());
+
+          if (mode == Mode::Index) {
+            if (rev) std::reverse(all.begin(), all.end());
+            std::int64_t start = 0, stop = 0;
+            if (!parse_i64(args[3], start) || !parse_i64(args[4], stop))
+              return encode_error("value is not an integer or out of range");
             const std::int64_t n = static_cast<std::int64_t>(all.size());
             std::int64_t s = start < 0 ? n + start : start, e = stop < 0 ? n + stop : stop;
             if (s < 0) s = 0; if (e >= n) e = n - 1;
             for (std::int64_t i = s; i <= e && i < n; ++i) items.push_back(all[i]);
-          } else {
-            items = store().zrange(src, start, stop, true, wt);
+          } else if (mode == Mode::ByScore) {
+            // REV swaps bound order: ZRANGESTORE d s max min BYSCORE REV.
+            const std::string& lo_s = rev ? args[4] : args[3];
+            const std::string& hi_s = rev ? args[3] : args[4];
+            auto parse_bound = [](const std::string& s, double& val, bool& ex) -> bool {
+              ex = false;
+              if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
+              if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
+              std::string v = s; if (!v.empty() && v[0] == '(') { ex = true; v = v.substr(1); }
+              try { val = std::stod(v); return true; } catch (...) { return false; }
+            };
+            double lo, hi; bool lo_ex, hi_ex;
+            if (!parse_bound(lo_s, lo, lo_ex) || !parse_bound(hi_s, hi, hi_ex))
+              return encode_error("min or max is not a float");
+            for (const auto& [m, sc] : all) {
+              bool above = lo_ex ? (sc > lo) : (sc >= lo);
+              bool below = hi_ex ? (sc < hi) : (sc <= hi);
+              if (above && below) items.push_back({m, sc});
+            }
+            if (rev) std::reverse(items.begin(), items.end());
+          } else {  // ByLex — all members assumed same score; compare lexicographically.
+            const std::string& lo_s = rev ? args[4] : args[3];
+            const std::string& hi_s = rev ? args[3] : args[4];
+            // Bound forms: "-" (min), "+" (max), "[member" (inclusive), "(member" (exclusive).
+            auto lex_ge_lo = [&](const std::string& m) -> bool {
+              if (lo_s == "-") return true;
+              if (lo_s == "+") return false;
+              if (lo_s.empty()) return false;
+              const std::string b = lo_s.substr(1);
+              return lo_s[0] == '(' ? (m > b) : (m >= b);
+            };
+            auto lex_le_hi = [&](const std::string& m) -> bool {
+              if (hi_s == "+") return true;
+              if (hi_s == "-") return false;
+              if (hi_s.empty()) return false;
+              const std::string b = hi_s.substr(1);
+              return hi_s[0] == '(' ? (m < b) : (m <= b);
+            };
+            if ((!lo_s.empty() && lo_s[0] != '[' && lo_s[0] != '(' && lo_s != "-" && lo_s != "+") ||
+                (!hi_s.empty() && hi_s[0] != '[' && hi_s[0] != '(' && hi_s != "-" && hi_s != "+"))
+              return encode_error("min or max not valid string range item");
+            for (const auto& [m, sc] : all) if (lex_ge_lo(m) && lex_le_hi(m)) items.push_back({m, sc});
+            if (rev) std::reverse(items.begin(), items.end());
           }
-          if (wt) return wrongtype_error_reply();
+
+          // LIMIT applies to BYSCORE/BYLEX, on the (possibly reversed) output order.
+          if (has_limit) {
+            if (lim_off > 0) {
+              if (static_cast<std::size_t>(lim_off) >= items.size()) items.clear();
+              else items.erase(items.begin(), items.begin() + lim_off);
+            }
+            if (lim_cnt >= 0 && static_cast<std::size_t>(lim_cnt) < items.size())
+              items.resize(static_cast<std::size_t>(lim_cnt));
+          }
+
           store().del(dst);
           for (const auto& [mem, sc] : items) store().zadd_one(dst, sc, mem, false, false, false, false, false);
           return encode_integer(static_cast<long long>(items.size()));
