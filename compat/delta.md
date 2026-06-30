@@ -227,4 +227,4 @@ Feature status labels:
   incremental-rehash keyspace map (avoids the stop-the-world rehash on multi-million-key
   maps), a skiplist zset with O(log N) rank, and a jemalloc + `activedefrag` allocator.
   These are L/XL and architecturally invasive; deferred to protect the green baseline.
-- Tracking: `AI-temp/autonomous-decisions.md` (deferral rationale).
+- Tracking: see the "Deferred" section of `CHANGELOG.md`.
