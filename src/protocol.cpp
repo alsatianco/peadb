@@ -79,16 +79,77 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
   return ParsedCommand{std::move(args), pos};
 }
 
+// Split an inline command line honoring quotes and escapes, matching Redis's
+// sdssplitargs: double quotes allow \xHH and C-style escapes (\n,\r,\t,\b,\a),
+// single quotes are literal except \', and unbalanced quotes are a protocol error.
+// Returns false on a malformed (unbalanced-quote) line.
+bool split_inline_args(const std::string& line, std::vector<std::string>& out) {
+  std::size_t i = 0;
+  const std::size_t n = line.size();
+  auto hexdigit = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  while (true) {
+    while (i < n && std::isspace(static_cast<unsigned char>(line[i]))) ++i;  // skip blanks
+    if (i >= n) break;
+    std::string cur;
+    bool done = false;
+    while (!done) {
+      if (line[i] == '"') {
+        ++i;
+        while (i < n && line[i] != '"') {
+          if (line[i] == '\\' && i + 1 < n) {
+            char e = line[i + 1];
+            if (e == 'x' && i + 3 < n && hexdigit(line[i + 2]) >= 0 && hexdigit(line[i + 3]) >= 0) {
+              cur.push_back(static_cast<char>(hexdigit(line[i + 2]) * 16 + hexdigit(line[i + 3])));
+              i += 4;
+            } else {
+              switch (e) {
+                case 'n': cur.push_back('\n'); break;
+                case 'r': cur.push_back('\r'); break;
+                case 't': cur.push_back('\t'); break;
+                case 'b': cur.push_back('\b'); break;
+                case 'a': cur.push_back('\a'); break;
+                default:  cur.push_back(e); break;
+              }
+              i += 2;
+            }
+          } else {
+            cur.push_back(line[i++]);
+          }
+        }
+        if (i >= n) return false;  // unterminated quote
+        ++i;  // closing quote — must be followed by space or EOL
+      } else if (line[i] == '\'') {
+        ++i;
+        while (i < n && line[i] != '\'') {
+          if (line[i] == '\\' && i + 1 < n && line[i + 1] == '\'') { cur.push_back('\''); i += 2; }
+          else cur.push_back(line[i++]);
+        }
+        if (i >= n) return false;  // unterminated quote
+        ++i;
+      } else {
+        cur.push_back(line[i++]);
+      }
+      if (i >= n || std::isspace(static_cast<unsigned char>(line[i]))) done = true;
+    }
+    out.push_back(std::move(cur));
+  }
+  return true;
+}
+
 std::optional<ParsedCommand> parse_inline(std::string_view buffer) {
   const auto line_end = buffer.find("\r\n");
   if (line_end == std::string::npos) return std::nullopt;
 
   const std::string line(buffer.substr(0, line_end));
-  std::istringstream iss(line);
   std::vector<std::string> args;
-  std::string token;
-  while (iss >> token) {
-    args.push_back(token);
+  if (!split_inline_args(line, args)) {
+    // Unbalanced quotes — Redis returns a protocol error and closes the connection.
+    return ParsedCommand{{"__parse_error__"}, line_end + 2};
   }
 
   if (args.empty()) {
