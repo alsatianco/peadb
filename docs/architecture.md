@@ -56,7 +56,7 @@ The main-keyspace `SCAN` is bucket-based and advances the cursor with **reverse-
 
 ## Request/response handling
 
-The parser slices the per-client input buffer as `string_view`. All replies for the commands parsed in one read are **batched into a single `WriteBuf`** and flushed with one `enqueue_output()`; partial writes register `EPOLLOUT` interest for backpressure. Blocking commands (`BLPOP`/`BRPOP`/`BLMOVE`) use poll-based wakeup — a write sets a pending-wakeup flag and blocked clients are rechecked on the next loop iteration (up to ~100 ms latency), rather than being signalled synchronously.
+The parser slices the per-client input buffer as `string_view`. All replies for the commands parsed in one read are **batched into a single `WriteBuf`** and flushed with one `enqueue_output()`; partial writes register `EPOLLOUT` interest for backpressure. Blocking commands (`BLPOP`/`BRPOP`/`BLMOVE`/`BZPOPMIN`/`XREAD`) are served promptly: every successful write sets a pending-wakeup flag, and the loop rechecks blocked (and `WAIT`ing) clients **again after processing readable fds in the same iteration** — so a write and the unblock it triggers land together (sub-millisecond), instead of slipping to the next ~100 ms poll. (Cross-thread/eventfd wakeup for replica-applied writes and a per-key waiter index are possible refinements, deferred as diminishing-return.)
 
 ## Design principles & roadmap
 
