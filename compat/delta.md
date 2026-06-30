@@ -133,9 +133,12 @@ Feature status labels:
   clocks can't diverge. **min-replicas-to-write** now compares against the actual connected
   replica count (was: rejected whenever the knob was > 0). Backlog size is configurable via
   `repl-backlog-size` (default 1 MiB). Master supports +CONTINUE partial resync; replica
-  emits REPLCONF ACK every ~1 s.
-  Note: full-resync fails if master dataset contains stream keys (RDB stream encoding
-  not yet implemented; PSYNC returns -ERR and replica does not sync).
+  emits REPLCONF ACK every ~1 s. **Randomized replid** per process (`init_replication_id`)
+  so unrelated instances never share an id and can't be wrongly +CONTINUE'd; on promotion
+  (`REPLICAOF NO ONE`) the old id rotates into `replid2`/`second_repl_offset` and PSYNC
+  accepts a partial resync against that history. `INFO` reports `sync_full`/
+  `sync_partial_ok`/`sync_partial_err`. **WAIT** injects `REPLCONF GETACK *` so replicas
+  ACK within ~1 RTT instead of on the ~1 s heartbeat.
   Operator-visible behaviour during full-sync RDB load: client writes on the replica
   return -READONLY and reads return MASTERDOWN if `replica-serve-stale-data no` is set.
   `INFO persistence loading:1` indicates that the event-loop is currently applying the
@@ -144,12 +147,13 @@ Feature status labels:
   thread), so DataStore mutations are never concurrent with client command processing.
 - Missing: real full-state plain `SYNC` (still sends an empty RDB; PSYNC serializes the
   full dataset incl. streams, so PeaDB's own replicas are unaffected — plain SYNC for
-  external clients is deferred as low-value); per-replica `slaveN:` INFO lines and
-  RTT-granularity WAIT via master-initiated `REPLCONF GETACK` (deferred refinements);
-  automatic failover/Sentinel (deferred XL track). (Stream replication bootstrap now works —
-  PSYNC resyncs stream datasets via the stream RDB encoding, item 5.)
+  external clients is deferred as low-value); per-replica `slaveN:` INFO lines; diskless
+  fork-based RDB streaming for full resync (today the snapshot serializes on the event-loop
+  thread); automatic failover/Sentinel (deferred XL track). (Stream replication bootstrap
+  works — PSYNC resyncs stream datasets via the stream RDB encoding, item 5.)
 - Tracking: P2-2 done; P3-1 done (backlog, now configurable); auto-reconnect + masterauth +
-  replica-expiry propagation + min-replicas-correctness done; failover deferred.
+  replica-expiry propagation + min-replicas-correctness + randomized replid/replid2 +
+  WAIT GETACK done; failover + diskless sync deferred.
 
 9. Sharding (shard_loop.cpp)
 - Status: `stub` (scaffolding only, not wired)

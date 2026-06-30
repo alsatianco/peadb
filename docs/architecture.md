@@ -52,7 +52,7 @@ The main-keyspace `SCAN` is bucket-based and advances the cursor with **reverse-
 
 ## Replication
 
-`REPLICAOF` runs a **native in-process PSYNC2 client** (`replica_do_fullsync`): TCP connect → `PING` → `REPLCONF` → `PSYNC` → RDB load → continuous command stream, with `+CONTINUE` partial resync served from a **1 MiB circular backlog** (`g_repl_backlog`, tracked by `g_master_repl_offset`). Replicas emit `REPLCONF ACK` ~once per second. `WAIT` is resolved once per loop iteration (so ~100 ms granularity), and `min-replicas-to-write` can reject writes. Automatic reconnect/failover is not yet implemented.
+`REPLICAOF` runs a **native in-process PSYNC2 client** (`replica_do_fullsync`): TCP connect → `PING` → `REPLCONF` → `PSYNC` → RDB load → continuous command stream, with `+CONTINUE` partial resync served from a **configurable circular backlog** (`g_repl_backlog`, tracked by `g_master_repl_offset`). The **replication id is randomized per process** (`init_replication_id`), so unrelated instances never share a replid and can't be wrongly partial-resynced against a foreign stream; on promotion (`REPLICAOF NO ONE`) the old id rotates into `replid2`/`second_repl_offset` so a former sibling can still partial-resync against history. `INFO` reports `sync_full`/`sync_partial_ok`/`sync_partial_err`. Replicas emit `REPLCONF ACK` ~once per second, and a client `WAIT` injects `REPLCONF GETACK *` into the stream so replicas ACK within ~1 RTT instead of waiting for the next heartbeat. `min-replicas-to-write` can reject writes. A generation-tagged supervisor **auto-reconnects** with backoff; automatic failover (Sentinel/Raft) is not yet implemented.
 
 ## Request/response handling
 

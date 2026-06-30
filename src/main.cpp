@@ -110,6 +110,7 @@ int main(int argc, char** argv) {
   // rename-command directives take effect on the live table.
   peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
                             config.enable_module_command, config.rename_commands);
+  peadb::init_replication_id();   // unique per-process replid (PSYNC2 safety)
   peadb::configure_maxmemory(config.maxmemory);
   peadb::configure_maxmemory_policy(config.maxmemory_policy);
   peadb::configure_maxmemory_samples(config.maxmemory_samples);
