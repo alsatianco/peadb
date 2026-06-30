@@ -140,6 +140,13 @@ std::int64_t g_config_maxmemory = 0;
 MaxmemoryPolicy g_maxmemory_policy = MaxmemoryPolicy::NoEviction;
 int g_maxmemory_samples = 5;        // candidate keys sampled per eviction (Redis default 5)
 int g_config_timeout = 0;           // idle-client timeout in seconds; 0 = never reap
+// client-output-buffer-limit per class [normal, replica, pubsub]. Redis defaults: normal
+// unlimited; replica 256mb hard / 64mb soft / 60s; pubsub 32mb / 8mb / 60s.
+CoblLimit g_cobl[3] = {
+  {0, 0, 0},
+  {256LL * 1024 * 1024, 64LL * 1024 * 1024, 60},
+  {32LL * 1024 * 1024, 8LL * 1024 * 1024, 60},
+};
 std::int64_t g_config_min_replicas_to_write = 0;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
@@ -2971,6 +2978,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"loglevel", g_loglevel_name},
               {"maxmemory-policy", maxmemory_policy_to_str(g_maxmemory_policy)},
               {"maxmemory-samples", std::to_string(g_maxmemory_samples)},
+              {"client-output-buffer-limit", client_output_buffer_limit_str()},
               {"timeout", std::to_string(g_config_timeout)},
               {"tcp-keepalive", "300"},
               {"list-max-ziplist-size", "-2"},
@@ -3017,6 +3025,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               std::int64_t v = 0;
               if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
               g_config_timeout = static_cast<int>(v);
+            }
+            if (k == "client-output-buffer-limit") {
+              configure_client_output_buffer_limit(args[3]);
             }
             if (k == "maxclients") {
               std::int64_t v = 0;
@@ -7975,6 +7986,43 @@ void configure_timeout(const std::string& spec) {
 }
 
 int client_timeout_seconds() { return g_config_timeout; }
+
+void configure_client_output_buffer_limit(const std::string& spec) {
+  if (spec.empty()) return;
+  // Flat token stream of (class hard soft soft-seconds) groups, e.g.
+  //   "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60"
+  std::istringstream iss(spec);
+  std::string cls;
+  while (iss >> cls) {
+    std::string h, s, sec;
+    if (!(iss >> h >> s >> sec)) { log(LogLevel::Warn, "ignoring malformed client-output-buffer-limit"); return; }
+    int idx = -1;
+    const std::string c = lower(cls);
+    if (c == "normal") idx = kCoblNormal;
+    else if (c == "slave" || c == "replica") idx = kCoblReplica;
+    else if (c == "pubsub") idx = kCoblPubsub;
+    else { log(LogLevel::Warn, "unknown client-output-buffer-limit class: " + cls); continue; }
+    std::int64_t hv = 0, sv = 0, secv = 0;
+    if (!parse_memory(h, hv) || !parse_memory(s, sv) || !parse_i64(sec, secv) || hv < 0 || sv < 0 || secv < 0) {
+      log(LogLevel::Warn, "ignoring invalid client-output-buffer-limit values for " + cls);
+      continue;
+    }
+    g_cobl[idx] = {hv, sv, static_cast<int>(secv)};
+  }
+}
+
+CoblLimit cobl_for(int cls) {
+  if (cls < 0 || cls > 2) return {0, 0, 0};
+  return g_cobl[cls];
+}
+
+std::string client_output_buffer_limit_str() {
+  auto one = [](const char* name, const CoblLimit& l) {
+    return std::string(name) + " " + std::to_string(l.hard) + " " + std::to_string(l.soft) +
+           " " + std::to_string(l.soft_seconds);
+  };
+  return one("normal", g_cobl[0]) + " " + one("slave", g_cobl[1]) + " " + one("pubsub", g_cobl[2]);
+}
 
 // Whether an fd has any active pub/sub subscription — such clients are exempt from the
 // idle timeout (they legitimately sit quiet waiting for messages, like Redis).

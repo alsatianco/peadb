@@ -49,6 +49,16 @@ ServerConfig load_config(const std::string& path) {
       continue;
     }
 
+    // client-output-buffer-limit is one class per line in the config file; accumulate
+    // all lines into a single flat spec for configure_client_output_buffer_limit.
+    if (key == "client-output-buffer-limit") {
+      if (!value.empty()) {
+        cfg.client_output_buffer_limit += (cfg.client_output_buffer_limit.empty() ? "" : " ");
+        cfg.client_output_buffer_limit += value;
+      }
+      continue;
+    }
+
     // save thresholds accumulate across lines; `save ""` clears them.
     if (key == "save") {
       if (value == "\"\"" || value.empty()) { cfg.save.clear(); }

@@ -86,6 +86,7 @@ int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
 struct WriteBuf {
   std::string data;
   std::size_t offset = 0;
+  std::int64_t soft_since_ms = 0;  // when this buffer first exceeded its class soft limit (0 = not over)
 
   bool empty() const { return offset >= data.size(); }
   std::size_t remaining() const { return data.size() - offset; }
@@ -317,15 +318,23 @@ int run_server(const ServerConfig& config) {
   server_ctx().callbacks.count_synced_replicas = g_count_synced_replicas;
   server_ctx().callbacks.client_list = g_client_list_callback;
 
-  // Helper: enqueue output data for a client and attempt immediate non-blocking flush.
-  // Hard output buffer limit: disconnect clients whose buffer exceeds 256 MB
-  constexpr std::size_t kOutputBufHardLimit = 256ULL * 1024 * 1024;
+  // Per-class client-output-buffer-limit (normal/replica/pubsub). A slow consumer or a
+  // lagging replica can no longer buffer unbounded and OOM the single process. Returning
+  // false from enqueue_output makes the caller close the offending client.
+  auto cobl_class_of = [&](int fd) -> int {
+    auto it = sessions.find(fd);
+    if (it != sessions.end() && it->second.replica_stream) return kCoblReplica;
+    if (client_has_subscriptions(fd)) return kCoblPubsub;
+    return kCoblNormal;
+  };
+
+  // Clients whose output buffer overflowed its class limit during an async send (pub/sub)
+  // are recorded here and closed by the event loop, since those senders ignore the return.
+  std::vector<int> obuf_overflow_fds;
 
   auto enqueue_output = [&](int fd, const std::string& data) -> bool {
     if (data.empty()) return true;
     auto& wbuf = write_buffers[fd];
-    // Enforce output buffer hard limit before appending
-    if (wbuf.remaining() + data.size() > kOutputBufHardLimit) return false;
     const bool was_empty = wbuf.empty();
     wbuf.append(data);
     while (!wbuf.empty()) {
@@ -338,6 +347,23 @@ int run_server(const ServerConfig& config) {
       if (n == 0) break;
       wbuf.advance(static_cast<std::size_t>(n));
     }
+    // Enforce the class output-buffer limit on what remains BUFFERED after the write
+    // attempt (Redis semantics — a large message the socket fully absorbs is fine; a
+    // persistent backlog from a slow consumer / lagging replica trips it). Async senders
+    // (pub/sub) ignore the return value, so record the fd for the loop to close.
+    const std::size_t remaining = wbuf.remaining();
+    const CoblLimit lim = cobl_for(cobl_class_of(fd));
+    bool overflow = false;
+    if (lim.hard > 0 && remaining > static_cast<std::size_t>(lim.hard)) {
+      overflow = true;
+    } else if (lim.soft > 0 && lim.soft_seconds > 0 && remaining > static_cast<std::size_t>(lim.soft)) {
+      const std::int64_t now = DataStore::now_ms();
+      if (wbuf.soft_since_ms == 0) wbuf.soft_since_ms = now;
+      else if (now - wbuf.soft_since_ms >= static_cast<std::int64_t>(lim.soft_seconds) * 1000) overflow = true;
+    } else {
+      wbuf.soft_since_ms = 0;  // back under the soft limit — reset the timer
+    }
+    if (overflow) { obuf_overflow_fds.push_back(fd); return false; }
     if (wbuf.empty()) {
       wbuf.data.clear();
       wbuf.offset = 0;
@@ -385,8 +411,11 @@ int run_server(const ServerConfig& config) {
     return enqueue_output(fd, data);
   };
 
-  // Helper: close a client connection and clean up all associated state.
+  // Helper: close a client connection and clean up all associated state. Idempotent —
+  // safe to call twice (e.g. a synchronous caller closed on a false enqueue_output and the
+  // deferred output-buffer-overflow drain also targets the same fd).
   auto close_client = [&](int fd) {
+    if (!sessions.count(fd) && !write_buffers.count(fd)) return;
     pubsub_unsubscribe_all(fd);
     on_client_disconnect(fd);
     poller.remove(fd);
@@ -815,6 +844,16 @@ int run_server(const ServerConfig& config) {
       clear_pending_wakeups();
       recheck_blocked();
       recheck_wait();
+    }
+
+    // Close clients whose output buffer overflowed its class limit during an async send.
+    if (!obuf_overflow_fds.empty()) {
+      for (int cfd : obuf_overflow_fds) {
+        log(LogLevel::Warn, "closing client fd=" + std::to_string(cfd) +
+                            " (client-output-buffer-limit exceeded)");
+        close_client(cfd);
+      }
+      obuf_overflow_fds.clear();
     }
   }
 
