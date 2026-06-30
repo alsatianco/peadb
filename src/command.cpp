@@ -28,6 +28,7 @@
 #include <array>
 #include <set>
 #include <memory>
+#include <random>
 #include <limits>
 #include <arpa/inet.h>
 #include <fcntl.h>
@@ -126,7 +127,15 @@ std::string g_replication_master_host = "";
 int g_replication_master_port = 0;
 int g_server_port = 6379;
 std::string g_master_replid = "0000000000000000000000000000000000000001";
+// replid2/second_replid_offset: after a replica is promoted (REPLICAOF NO ONE) the old
+// master's replid is remembered here so siblings that were replicating the same stream can
+// still partial-resync against history instead of forcing a full resync. (Redis PSYNC2.)
+std::string g_master_replid2 = "0000000000000000000000000000000000000000";
+std::int64_t g_second_replid_offset = -1;
 std::int64_t g_master_repl_offset = 0;
+std::atomic<std::int64_t> g_sync_full{0};     // count of full resyncs served (INFO sync_full)
+std::atomic<std::int64_t> g_sync_partial_ok{0};   // partial resyncs served (sync_partial_ok)
+std::atomic<std::int64_t> g_sync_partial_err{0};  // partial resync requests we couldn't serve
 std::int64_t g_config_maxmemory = 0;
 MaxmemoryPolicy g_maxmemory_policy = MaxmemoryPolicy::NoEviction;
 int g_maxmemory_samples = 5;        // candidate keys sampled per eviction (Redis default 5)
@@ -342,6 +351,17 @@ inline const char* maxmemory_policy_to_str(MaxmemoryPolicy p) {
 inline void apply_maxmemory_policy(MaxmemoryPolicy p) {
   g_maxmemory_policy = p;
   store().set_eviction_lfu(p == MaxmemoryPolicy::AllkeysLfu || p == MaxmemoryPolicy::VolatileLfu);
+}
+
+// A Redis-style 40-char lowercase-hex run id, used as the replication id. Randomizing it
+// per process means two unrelated PeaDB instances never share a replid, so a re-pointed
+// replica can't be wrongly served a +CONTINUE partial resync against a different stream.
+inline std::string gen_run_id() {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hex = "0123456789abcdef";
+  std::string id(40, '0');
+  for (char& c : id) c = hex[rng() & 0xF];
+  return id;
 }
 
 // Defined later (needs the AOF/backlog/notify propagation helpers). When over the
@@ -1984,14 +2004,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.replica_stream = true;
           g_last_repl_db = -1;
 
-          // Attempt partial resync if replid matches and offset is within backlog
-          if (replid == g_master_replid && offset >= 0 &&
+          // Attempt partial resync if the requested replid matches our current id (or our
+          // pre-promotion replid2 history, up to second_replid_offset) and the offset is
+          // still within the backlog window.
+          const bool id_ok = (replid == g_master_replid) ||
+                             (replid == g_master_replid2 && g_second_replid_offset >= 0 &&
+                              offset <= g_second_replid_offset);
+          if (id_ok && offset >= 0 &&
               offset >= g_repl_backlog.base() && offset <= g_repl_backlog.total) {
             std::string pending;
             g_repl_backlog.get_slice(offset, pending);
             session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
+            g_sync_partial_ok.fetch_add(1, std::memory_order_relaxed);
             return "+CONTINUE\r\n" + pending;
           }
+          // A partial resync was requested (replid given) but we can't serve it.
+          if (replid != "?") g_sync_partial_err.fetch_add(1, std::memory_order_relaxed);
 
           // Full resync
           std::string rdb_err;
@@ -2003,6 +2031,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return "-ERR Full sync failed: " + rdb_err + "\r\n";
           }
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
+          g_sync_full.fetch_add(1, std::memory_order_relaxed);
           std::string reply = "+FULLRESYNC " + g_master_replid + " " +
                               std::to_string(g_master_repl_offset) + "\r\n";
           reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data;
@@ -2531,7 +2560,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "keyspace_hits:" + std::to_string(store().stat_keyspace_hits()) + "\r\n"
                    "keyspace_misses:" + std::to_string(store().stat_keyspace_misses()) + "\r\n"
                    "expired_keys:" + std::to_string(store().stat_expired_keys()) + "\r\n"
-                   "evicted_keys:" + std::to_string(store().stat_evicted_keys()) + "\r\n\r\n";
+                   "evicted_keys:" + std::to_string(store().stat_evicted_keys()) + "\r\n"
+                   "sync_full:" + std::to_string(g_sync_full.load()) + "\r\n"
+                   "sync_partial_ok:" + std::to_string(g_sync_partial_ok.load()) + "\r\n"
+                   "sync_partial_err:" + std::to_string(g_sync_partial_err.load()) + "\r\n\r\n";
           }
           if (want("REPLICATION")) {
             const int connected_replicas =
@@ -2541,8 +2573,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "connected_slaves:" + std::to_string(connected_replicas) + "\r\n"
                    "master_failover_state:no-failover\r\n"
                    "master_replid:" + g_master_replid + "\r\n"
-                   "master_replid2:0000000000000000000000000000000000000000\r\n"
+                   "master_replid2:" + g_master_replid2 + "\r\n"
                    "master_repl_offset:" + std::to_string(g_master_repl_offset) + "\r\n"
+                   "second_repl_offset:" + std::to_string(g_second_replid_offset) + "\r\n"
                    "repl_backlog_active:0\r\n"
                    "repl_backlog_size:" + std::to_string(g_repl_backlog.size_) + "\r\n";
             if (g_replication_role != "master") {
@@ -2663,6 +2696,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_integer(0);
           }
           if (replicas == 0) return encode_integer(0);
+          // Ask replicas to ACK now instead of waiting for their ~1 Hz heartbeat, so WAIT
+          // resolves in ~1 RTT rather than up to a second. The GETACK rides the backlog the
+          // same way write commands do; replicas reply REPLCONF ACK out-of-band.
+          backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
           // Defer: event loop resolves when replicas ack or deadline passes
           const auto deadline = (timeout > 0) ? (now_ms() + timeout) : std::int64_t{0};
           session.wait_state = WaitState{target, deadline, replicas};
@@ -2675,11 +2712,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::string port = args[2];
           if (upper(host) == "NO" && upper(port) == "ONE") {
             g_repl_generation.fetch_add(1);  // signal any running reconnect supervisor to stop
+            const bool was_replica = g_replication_role == "slave";
             g_replication_role = "master";
             g_replication_master_host.clear();
             g_replication_master_port = 0;
             g_replica_stale = false;
             g_loading_replication.store(false);
+            // On promotion, remember the old replication id in replid2 so siblings that
+            // shared the previous master's stream can partial-resync against history, then
+            // adopt a fresh replid for the new lineage (Redis PSYNC2 promotion semantics).
+            if (was_replica) {
+              g_master_replid2 = g_master_replid;
+              g_second_replid_offset = g_master_repl_offset;
+              g_master_replid = gen_run_id();
+            }
             return encode_simple("OK");
           }
           std::int64_t p = 0;
@@ -7839,6 +7885,10 @@ void configure_maxmemory_samples(const std::string& spec) {
   else log(LogLevel::Warn, "ignoring invalid maxmemory-samples: " + spec);
 }
 
+void init_replication_id() {
+  g_master_replid = gen_run_id();
+}
+
 void configure_notify_keyspace_events(const std::string& spec) {
   g_notify_flags = parse_notify_flags(spec);
 }
@@ -8449,13 +8499,21 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         // This keeps all DataStore mutations on the event loop thread, eliminating
         // the data race between the streaming thread and concurrent client reads.
         std::size_t consumed = 0;
+        bool getack_seen = false;
         {
             std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
             while (true) {
                 const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
                 auto parsed = parse_one_command(view);
                 if (!parsed.has_value()) break;
-                g_replica_cmd_queue.push_back(parsed->args);
+                // The master sends REPLCONF GETACK * to demand an immediate ACK (e.g. behind
+                // a client's WAIT). Note it so we reply right after counting its bytes.
+                const auto& a = parsed->args;
+                if (a.size() >= 2 && upper(a[0]) == "REPLCONF" && upper(a[1]) == "GETACK") {
+                    getack_seen = true;
+                } else {
+                    g_replica_cmd_queue.push_back(a);
+                }
                 consumed += parsed->consumed;
                 replica_rx_bytes += static_cast<std::int64_t>(parsed->consumed);
             }
@@ -8464,6 +8522,11 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         if (consumed > 0) {
             if (consumed == stream_buf.size()) stream_buf.clear();
             else stream_buf.erase(0, consumed);
+        }
+        // Respond to GETACK immediately (the offset now includes the GETACK bytes).
+        if (getack_seen) {
+            repl_send(fd, repl_encode_cmd({"REPLCONF", "ACK", std::to_string(replica_rx_bytes)}));
+            last_ack_ms = now_ms();
         }
     }
     ::close(fd);

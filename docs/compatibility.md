@@ -36,7 +36,7 @@ See [`../compat/delta.md`](../compat/delta.md) for authoritative, per-feature de
 | Transactions — `MULTI`/`EXEC`/`WATCH` (optimistic locking) | RESP3 — `HELLO` negotiates; `HGETALL` returns maps and the map/set/double/bool encoders exist, but many replies are still RESP2-shaped | Multi-user ACL rules; TLS |
 | Pub/Sub — messages delivered; `PUBLISH` returns the receiver count | Cluster — routing, `KEYSLOT`, `MEET`; gossip + full slot migration in progress | Compact listpack/intset encodings (`OBJECT ENCODING` cosmetic); jemalloc/`activedefrag` |
 | Key eviction — all 8 `maxmemory-policy` modes (approximate LRU/LFU/random/TTL sampling) | | |
-| Lua — `EVAL`/`EVALSHA`, `FUNCTION`, `FCALL` (no `FUNCTION DUMP`/`RESTORE`) | Replication — PSYNC2 + `WAIT` + auto-reconnect; no automatic failover | Client-side caching (`CLIENT TRACKING`) |
+| Lua — `EVAL`/`EVALSHA`, `FUNCTION`, `FCALL` (no `FUNCTION DUMP`/`RESTORE`) | Replication — PSYNC2 (randomized replid + replid2 on promotion) + fast `WAIT` (GETACK) + auto-reconnect; no automatic failover or diskless sync | Client-side caching (`CLIENT TRACKING`) |
 | RDB + AOF persistence | Modules — `MODULE LOAD`/`LIST`/`UNLOAD` + a minimal `RedisModule_*` subset | Sentinel; client-side caching (`CLIENT TRACKING`) |
 
 ## Persistence & durability
