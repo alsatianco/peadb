@@ -91,6 +91,8 @@ int main(int argc, char** argv) {
     if (arg == "--protected-mode" && i + 1 < argc) { const std::string v = argv[++i]; config.protected_mode = (v == "yes" || v == "1" || v == "true"); continue; }
     if (arg == "--enable-module-command" && i + 1 < argc) { config.enable_module_command = argv[++i]; continue; }
     if (arg == "--maxmemory" && i + 1 < argc) { config.maxmemory = argv[++i]; continue; }
+    if (arg == "--maxmemory-policy" && i + 1 < argc) { config.maxmemory_policy = argv[++i]; continue; }
+    if (arg == "--maxmemory-samples" && i + 1 < argc) { config.maxmemory_samples = argv[++i]; continue; }
     if (arg == "--save" && i + 1 < argc) { config.save = argv[++i]; continue; }
     if (arg == "--appendonly" && i + 1 < argc) { const std::string v = argv[++i]; config.appendonly = (v == "yes" || v == "1" || v == "true"); continue; }
     if (arg == "--appendfilename" && i + 1 < argc) { config.appendfilename = argv[++i]; continue; }
@@ -109,6 +111,8 @@ int main(int argc, char** argv) {
   peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
                             config.enable_module_command, config.rename_commands);
   peadb::configure_maxmemory(config.maxmemory);
+  peadb::configure_maxmemory_policy(config.maxmemory_policy);
+  peadb::configure_maxmemory_samples(config.maxmemory_samples);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);

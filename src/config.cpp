@@ -88,6 +88,10 @@ ServerConfig load_config(const std::string& path) {
       cfg.enable_module_command = value;
     } else if (key == "maxmemory") {
       cfg.maxmemory = value;
+    } else if (key == "maxmemory-policy") {
+      cfg.maxmemory_policy = value;
+    } else if (key == "maxmemory-samples") {
+      cfg.maxmemory_samples = value;
     } else if (key == "repl-backlog-size") {
       cfg.repl_backlog_size = value;
     } else if (key == "notify-keyspace-events") {

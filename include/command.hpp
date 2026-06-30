@@ -92,6 +92,8 @@ void configure_security(const std::string& requirepass, const std::string& maste
 bool protected_mode_enabled();   // read by the server accept loop
 bool requirepass_is_set();       // read by the server accept loop (protected-mode bypass)
 void configure_maxmemory(const std::string& spec);   // "100mb"/bytes; "" = unlimited
+void configure_maxmemory_policy(const std::string& spec);   // e.g. "allkeys-lru"; "" = noeviction
+void configure_maxmemory_samples(const std::string& spec);  // eviction sample size; "" = 5
 void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
 void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb" (startup only)
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"

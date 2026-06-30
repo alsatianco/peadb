@@ -36,6 +36,10 @@ Internal representations differ from Redis but preserve observable semantics:
 
 Hybrid **lazy + active**. Lazy: expired keys are dropped on access. Active: `active_expire_cycle()` runs at most every ~100 ms, scanning up to 64 keys per database starting from a **randomly chosen bucket** (no front-bias / tail starvation).
 
+## Eviction (maxmemory-policy)
+
+When `used_memory()` exceeds `maxmemory` and a policy other than `noeviction` is set, the write gate (`oom_should_reject`) runs `evict_to_fit()` before rejecting: it repeatedly calls `DataStore::evict_one(policy, samples)` until memory is back under budget or nothing is evictable. `evict_one` samples up to `maxmemory-samples` (default 5) candidate keys via the same random-bucket walk `RANDOMKEY` uses — across **all** DBs for `allkeys-*`, restricted to TTL-bearing keys for `volatile-*` — and picks the victim by the policy: oldest access clock (LRU), lowest frequency counter (LFU), soonest TTL (`volatile-ttl`), or random. Per-key LRU/LFU metadata rides in the inline `Entry::lru` word (a coarse ms clock, or an 8-bit log-increment counter), touched on `DataStore::get()` and at the dispatch chokepoint for the command's primary key — an O(1), first-key approximation. Each eviction is propagated like a server-issued deletion (a `DEL` to the replication backlog and AOF, plus an `evicted` keyspace notification) and counted in `evicted_keys`. `evict_one` decrements the cached `used_memory` as it frees so the loop sees memory fall in real time instead of over-evicting against the ~100 ms-stale cache; eviction runs only on a master and never during AOF replay.
+
 ## SCAN
 
 The main-keyspace `SCAN` is bucket-based and advances the cursor with **reverse-binary-increment**, making it resilient to rehashing across calls (a monotonic non-wrapping path covers non-power-of-two bucket counts). Per-collection `HSCAN`/`SSCAN`/`ZSCAN` use simpler ordinal cursors.

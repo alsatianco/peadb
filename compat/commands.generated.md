@@ -26,7 +26,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `CLIENT` | partial | test_b4_observability.py, test_p3_ecosystem_commands.py |
 | `CLUSTER` | partial | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py |
 | `COMMAND` | partial | test_b5_commands.py, test_m1_commands.py |
-| `CONFIG` | partial | test_b4_observability.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py |
+| `CONFIG` | partial | test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py |
 | `COPY` | partial | test_p1_copy_spop_time.py, test_p1_xinfo_stream_full.py |
 | `DBSIZE` | full | test_p1_dbsize_flushdb.py, test_p1_expire_lazy_scan.py |
 | `DEBUG` | partial | test_p1_expire_error_and_lazy_get.py, test_p1_expire_lazy_scan.py, test_p1_expiretime_debug_digest.py, test_p1_msetnx_debug_loadaof.py, test_p1_setnx_debug.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py |
@@ -40,7 +40,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `EVALSHA` | partial | test_m4_lua.py, test_m4_lua2_atomic.py, test_p2_evalsha_sha1.py |
 | `EVALSHA_RO` | partial | test_p3_sort_zmpop.py |
 | `EVAL_RO` | partial | test_p2_shebang_oom.py |
-| `EXEC` | partial | test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py |
+| `EXEC` | partial | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py |
 | `EXISTS` | partial | test_m2_strings_expire.py, test_p1_move.py, test_p1_set_get_option.py, test_p1_string_range_ops.py, test_p2_scripting_time_freeze.py |
 | `EXPIRE` | partial | test_m2_strings_expire.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py |
 | `EXPIREAT` | partial | test_command_coverage_extras.py |
@@ -60,7 +60,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `GEORADIUS_RO` | partial | test_b5_commands.py |
 | `GEOSEARCH` | partial | test_p3_ecosystem_commands.py |
 | `GEOSEARCHSTORE` | partial | test_p3_ecosystem_commands.py |
-| `GET` | full | test_m2_dump_restore.py, test_m2_strings_expire.py, test_m4_lua2_atomic.py, test_m4_tx.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_m7_migrate.py, test_m7_redirection.py, test_m8_module_key_api.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_copy_spop_time.py, test_p1_expire_error_and_lazy_get.py, test_p1_getset.py, test_p1_move.py, test_p1_msetnx_debug_loadaof.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_set_get_option.py, test_p1_setnx_debug.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p2_script_rewrite_ops.py |
+| `GET` | full | test_b7_eviction.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m4_lua2_atomic.py, test_m4_tx.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_m7_migrate.py, test_m7_redirection.py, test_m8_module_key_api.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_copy_spop_time.py, test_p1_expire_error_and_lazy_get.py, test_p1_getset.py, test_p1_move.py, test_p1_msetnx_debug_loadaof.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_set_get_option.py, test_p1_setnx_debug.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p2_script_rewrite_ops.py |
 | `GETBIT` | partial | test_p1_bitmap_xreadgroup.py |
 | `GETDEL` | partial | test_command_coverage_extras.py |
 | `GETEX` | partial | test_command_coverage_extras.py, test_p1_expire_replication_canonical.py |
@@ -85,7 +85,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `INCR` | partial | test_m2_strings_expire.py, test_m4_tx.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py |
 | `INCRBY` | partial | test_m2_strings_expire.py |
 | `INCRBYFLOAT` | partial | test_m2_strings_expire.py |
-| `INFO` | partial | test_b4_observability.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py |
+| `INFO` | partial | test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py |
 | `KEYS` | full | test_p1_keys_pattern.py |
 | `LATENCY` | partial | test_p3_ecosystem_commands.py |
 | `LCS` | partial | test_p1_lcs.py |
@@ -110,7 +110,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `MOVE` | partial | test_p1_move.py |
 | `MSET` | partial | test_m2_strings_expire.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py |
 | `MSETNX` | partial | test_p1_msetnx_debug_loadaof.py |
-| `MULTI` | partial | test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py |
+| `MULTI` | partial | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py |
 | `OBJECT` | partial | test_m3_object_encoding.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py |
 | `PERSIST` | partial | test_m2_strings_expire.py |
 | `PEXPIRE` | partial | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py |
@@ -119,9 +119,9 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `PFADD` | partial | test_b5_commands.py |
 | `PFCOUNT` | partial | test_b5_commands.py |
 | `PFMERGE` | partial | test_b5_commands.py |
-| `PING` | full | test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py |
+| `PING` | full | test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py |
 | `PSETEX` | full | test_p1_expire_lazy_scan.py, test_p1_setex_psetex.py |
-| `PSUBSCRIBE` | partial | test_b4_observability.py, test_p3_pubsub_surface.py |
+| `PSUBSCRIBE` | partial | test_b4_observability.py, test_b7_eviction.py, test_p3_pubsub_surface.py |
 | `PSYNC` | stub | — |
 | `PTTL` | partial | test_m2_strings_expire.py, test_m7_migrate.py, test_p1_setex_psetex.py |
 | `PUBLISH` | partial | test_p1_publish.py |
@@ -148,7 +148,7 @@ Total: **223** commands — full: 11, partial: 210, stub: 2
 | `SDIFF` | partial | test_p3_ecosystem_commands.py |
 | `SDIFFSTORE` | partial | test_p3_ecosystem_commands.py |
 | `SELECT` | partial | test_m2_strings_expire.py, test_p1_dbsize_flushdb.py, test_p1_move.py, test_p1_object_swapdb_sync.py |
-| `SET` | full | test_b4_observability.py, test_b5_commands.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py |
+| `SET` | full | test_b4_observability.py, test_b5_commands.py, test_b7_eviction.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py |
 | `SETBIT` | partial | test_p1_bitmap_xreadgroup.py |
 | `SETEX` | full | test_p1_setex_psetex.py |
 | `SETNX` | partial | test_p1_setnx_debug.py |

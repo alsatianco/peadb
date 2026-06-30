@@ -188,3 +188,39 @@ Feature status labels:
   (`CONFIG GET`, `XPENDING`, `XINFO`, `CLIENT INFO`, `ZSCORE`/`ZADD INCR`, etc.) and
   RESP3 push frames for client-side caching invalidation.
 - Tracking: incremental protocol hardening.
+
+12. Key eviction (maxmemory-policy)
+- Status: `full` (approximate, like Redis — sampling-based, not exact LRU/LFU)
+- Owner: memory-eviction
+- Severity: n/a (implemented)
+- Target milestone: P4
+- Implemented: all eight `maxmemory-policy` modes — `noeviction`, `allkeys-lru`/`-lfu`/
+  `-random`, `volatile-lru`/`-lfu`/`-random`/`-ttl` — via `DataStore::evict_one()` +
+  `evict_to_fit()` at the OOM write gate. Approximate sampling (`maxmemory-samples`,
+  default 5) over the `randomkey()` bucket walk across all DBs (or TTL-only for
+  `volatile-*`). Per-key LRU/LFU metadata in the inline `Entry::lru` word, touched on
+  `get()` + the dispatch chokepoint (first key). Each eviction propagates `DEL` to the
+  backlog + AOF, emits an `evicted` keyspace notification, and increments `evicted_keys`.
+  Eviction runs on the master only, never during AOF replay; the loop keeps the cached
+  `used_memory` live so it bounds memory rather than over-evicting. Config via
+  `maxmemory-policy`/`maxmemory-samples` (config file, `CONFIG SET`/`GET`, CLI), reported
+  in `INFO memory`.
+- Missing: exact (non-sampled) LRU/LFU, LFU decay-over-time (`lfu-decay-time`), and
+  per-read touch for every read command (currently the command's first key only — a
+  documented approximation). Compact listpack/intset encodings and a jemalloc/activedefrag
+  allocator (which would shrink RSS further after churn) remain deferred — see item 13.
+- Tracking: keystone "Memory + eviction" track; builds on the `Entry` tagged-union (item 9).
+
+13. Memory model — compact encodings & allocator (deferred)
+- Status: `partial` (tagged-union Entry done; compact backends + allocator pending)
+- Owner: memory-eviction
+- Severity: medium
+- Target milestone: P5
+- Implemented: the `Entry` tagged union (only the active payload allocates; `sizeof(Entry)`
+  ~328 B → ~56 B, accounted bytes/key ~3.9×, RSS ~32% on the small-key workload — item 9).
+- Missing: real listpack/intset/ziplist backends (storage is hashtable-grade today;
+  `OBJECT ENCODING` reports Redis-style names cosmetically), an open-addressing /
+  incremental-rehash keyspace map (avoids the stop-the-world rehash on multi-million-key
+  maps), a skiplist zset with O(log N) rank, and a jemalloc + `activedefrag` allocator.
+  These are L/XL and architecturally invasive; deferred to protect the green baseline.
+- Tracking: `AI-temp/autonomous-decisions.md` (deferral rationale).

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <iomanip>
 #include <random>
+#include <limits>
 #include <fnmatch.h>
 
 namespace peadb {
@@ -1708,50 +1709,52 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
 std::uint64_t DataStore::mutation_epoch() const { return mutation_epoch_; }
 void DataStore::increment_mutation_epoch() { ++mutation_epoch_; }
 
+std::int64_t DataStore::entry_cost(const std::string& k, const Entry& e) const {
+  // Per-key fixed overhead: the map node's key string + the (now small) Entry.
+  std::int64_t total = static_cast<std::int64_t>(sizeof(k) + k.size() + sizeof(e));
+  // Only the active payload is allocated now (tagged union), so account per type —
+  // and add the heap container's own sizeof, which no longer rides inside Entry.
+  switch (e.type()) {
+    case ValueType::String:
+      total += static_cast<std::int64_t>(e.str().size());
+      break;
+    case ValueType::Hash:
+      total += static_cast<std::int64_t>(sizeof(Entry::HashT));
+      for (const auto& [f, v] : e.hash()) total += static_cast<std::int64_t>(f.size() + v.size());
+      break;
+    case ValueType::List:
+      total += static_cast<std::int64_t>(sizeof(Entry::ListT));
+      for (const auto& v : e.list()) total += static_cast<std::int64_t>(v.size());
+      break;
+    case ValueType::Set:
+      total += static_cast<std::int64_t>(sizeof(Entry::SetT));
+      for (const auto& m : e.set()) total += static_cast<std::int64_t>(m.size());
+      break;
+    case ValueType::ZSet:
+      total += static_cast<std::int64_t>(sizeof(Entry::ZSetT));
+      for (const auto& [m, _] : e.zset()) total += static_cast<std::int64_t>(m.size() + sizeof(double));
+      break;
+    case ValueType::Stream:
+      // Count entries + consumer-group PEL so stream-heavy datasets are not invisible
+      // to used_memory / maxmemory.
+      total += static_cast<std::int64_t>(sizeof(Entry::StreamT));
+      for (const auto& [id, fields] : e.stream_entries()) {
+        total += static_cast<std::int64_t>(id.size());
+        for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
+      }
+      for (const auto& [gname, grp] : e.stream_groups()) {
+        total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
+        for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
+      }
+      break;
+  }
+  return total;
+}
+
 std::int64_t DataStore::estimate_used_memory() const {
   std::int64_t total = sizeof(*this);
-  for (const auto& db : dbs_) {
-    for (const auto& [k, e] : db) {
-      // Per-key fixed overhead: the map node's key string + the (now small) Entry.
-      total += static_cast<std::int64_t>(sizeof(k) + k.size() + sizeof(e));
-      // Only the active payload is allocated now (tagged union), so account per type —
-      // and add the heap container's own sizeof, which no longer rides inside Entry.
-      switch (e.type()) {
-        case ValueType::String:
-          total += static_cast<std::int64_t>(e.str().size());
-          break;
-        case ValueType::Hash:
-          total += static_cast<std::int64_t>(sizeof(Entry::HashT));
-          for (const auto& [f, v] : e.hash()) total += static_cast<std::int64_t>(f.size() + v.size());
-          break;
-        case ValueType::List:
-          total += static_cast<std::int64_t>(sizeof(Entry::ListT));
-          for (const auto& v : e.list()) total += static_cast<std::int64_t>(v.size());
-          break;
-        case ValueType::Set:
-          total += static_cast<std::int64_t>(sizeof(Entry::SetT));
-          for (const auto& m : e.set()) total += static_cast<std::int64_t>(m.size());
-          break;
-        case ValueType::ZSet:
-          total += static_cast<std::int64_t>(sizeof(Entry::ZSetT));
-          for (const auto& [m, _] : e.zset()) total += static_cast<std::int64_t>(m.size() + sizeof(double));
-          break;
-        case ValueType::Stream:
-          // Count entries + consumer-group PEL so stream-heavy datasets are not invisible
-          // to used_memory / maxmemory.
-          total += static_cast<std::int64_t>(sizeof(Entry::StreamT));
-          for (const auto& [id, fields] : e.stream_entries()) {
-            total += static_cast<std::int64_t>(id.size());
-            for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
-          }
-          for (const auto& [gname, grp] : e.stream_groups()) {
-            total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
-            for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
-          }
-          break;
-      }
-    }
-  }
+  for (const auto& db : dbs_)
+    for (const auto& [k, e] : db) total += entry_cost(k, e);
   return total;
 }
 
@@ -1763,6 +1766,104 @@ std::int64_t DataStore::used_memory() const {
     used_mem_cache_ms_ = now;
   }
   return used_mem_cache_;
+}
+
+// ── Eviction (maxmemory-policy) ──
+
+void DataStore::touch_lru(Entry& e, bool lfu) {
+  if (lfu) {
+    // Approximate LFU: the low 8 bits of `lru` are a logarithmic access counter (Redis
+    // LFU_INIT_VAL=5). Increment probabilistically so the counter saturates slowly — the
+    // higher the count, the lower the increment probability. (No decay-over-time yet; a
+    // documented approximation. The high bits are unused in LFU mode.)
+    std::uint32_t counter = e.lru & 0xFF;
+    if (counter < 255) {
+      static thread_local std::mt19937 rng{std::random_device{}()};
+      const double r = static_cast<double>(rng()) / static_cast<double>(rng.max());
+      const double base = counter > 5 ? counter - 5 : 0;
+      const double p = 1.0 / (base * /*lfu-log-factor*/ 10.0 + 1.0);
+      if (r < p) ++counter;
+    }
+    e.lru = counter;
+  } else {
+    // LRU: store a coarse millisecond access clock (truncated to 32 bits — wraps ~49
+    // days, which only risks treating a 49-day-idle key as recent; acceptable for a cache).
+    e.lru = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
+  }
+}
+
+void DataStore::touch_key_for_eviction(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  auto it = db.find(key);
+  if (it != db.end()) touch_lru(it->second, eviction_lfu_);
+}
+
+std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy policy, int samples) {
+  if (policy == MaxmemoryPolicy::NoEviction) return std::nullopt;
+  const bool volatile_only = policy == MaxmemoryPolicy::VolatileLru ||
+                             policy == MaxmemoryPolicy::VolatileLfu ||
+                             policy == MaxmemoryPolicy::VolatileRandom ||
+                             policy == MaxmemoryPolicy::VolatileTtl;
+  const bool lfu = policy == MaxmemoryPolicy::AllkeysLfu || policy == MaxmemoryPolicy::VolatileLfu;
+  const bool lru = policy == MaxmemoryPolicy::AllkeysLru || policy == MaxmemoryPolicy::VolatileLru;
+  const bool ttl = policy == MaxmemoryPolicy::VolatileTtl;
+  if (samples < 1) samples = 1;
+
+  static thread_local std::mt19937 rng{std::random_device{}()};
+  const std::int64_t now = now_ms();
+
+  // Sample up to `samples` eligible keys across all DBs and keep the best victim.
+  // Eligible = has a TTL for volatile-*, any key otherwise. We sample by walking from a
+  // random (db,bucket) start until we've gathered `samples` candidates or exhausted the
+  // keyspace — the same bucket-walk RANDOMKEY uses, generalized across databases.
+  struct Cand { int db; std::string key; std::uint32_t lru; std::int64_t expire; };
+  std::optional<Cand> best;
+  auto better = [&](const Cand& c) -> bool {
+    if (!best) return true;
+    if (ttl)  return c.expire < best->expire;          // soonest to expire
+    if (lfu)  return (c.lru & 0xFF) < (best->lru & 0xFF); // lowest frequency
+    if (lru)  return c.lru < best->lru;                // oldest access clock
+    return (rng() & 1) != 0;                            // random: keep flipping
+  };
+
+  int collected = 0;
+  const std::size_t ndb = dbs_.size();
+  const std::size_t db_start = rng() % (ndb ? ndb : 1);
+  for (std::size_t di = 0; di < ndb && collected < samples; ++di) {
+    auto& db = dbs_[(db_start + di) % ndb];
+    if (db.empty()) continue;
+    const std::size_t nb = db.bucket_count();
+    if (nb == 0) continue;
+    const std::size_t bstart = rng() % nb;
+    for (std::size_t bi = 0; bi < nb && collected < samples; ++bi) {
+      const std::size_t bucket = (bstart + bi) % nb;
+      for (auto it = db.begin(bucket); it != db.end(bucket) && collected < samples; ++it) {
+        const Entry& e = it->second;
+        const bool has_ttl = e.expire_at_ms.has_value();
+        if (has_ttl && *e.expire_at_ms <= now) continue;  // already logically expired
+        if (volatile_only && !has_ttl) continue;
+        Cand c{static_cast<int>((db_start + di) % ndb), it->first, e.lru,
+               has_ttl ? *e.expire_at_ms : std::numeric_limits<std::int64_t>::max()};
+        if (better(c)) best = c;
+        ++collected;
+      }
+    }
+  }
+  if (!best) return std::nullopt;  // nothing evictable (e.g. volatile-* with no TTL keys)
+
+  auto& vdb = dbs_[static_cast<std::size_t>(best->db)];
+  auto vit = vdb.find(best->key);
+  if (vit == vdb.end()) return std::nullopt;
+  const std::int64_t freed = entry_cost(best->key, vit->second);
+  vdb.erase(vit);
+  record_evicted();
+  // Keep the cached used_memory live so the caller's eviction loop sees memory fall
+  // immediately rather than over-evicting against the ~100ms-stale cache.
+  if (used_mem_cache_ >= 0) {
+    used_mem_cache_ -= freed;
+    if (used_mem_cache_ < 0) used_mem_cache_ = 0;
+  }
+  return EvictVictim{best->db, best->key, freed};
 }
 
 std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() const {
