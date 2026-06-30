@@ -71,7 +71,7 @@ std::optional<std::string> DataStore::get(const std::string& key) {
     return std::nullopt;
   }
   record_hit();
-  return it->second.value;
+  return it->second.str();
 }
 
 bool DataStore::set(const std::string& key, const std::string& value, bool nx, bool xx,
@@ -83,29 +83,12 @@ bool DataStore::set(const std::string& key, const std::string& value, bool nx, b
   if (nx && exists_now) return false;
   if (xx && !exists_now) return false;
 
-  if (exists_now) {
-    auto& e = it->second;
-    // Reuse existing entry, clear non-string fields only if type changed
-    if (e.type != ValueType::String) {
-      e.hash_value.clear();
-      e.list_value.clear();
-      e.set_value.clear();
-      e.zset_value.clear();
-      e.zset_ordered.clear();
-      e.stream_entries.clear();
-      e.stream_groups.clear();
-    }
-    e.type = ValueType::String;
-    e.value = value;
-    e.string_force_raw = false;
-    if (!keep_ttl) {
-      e.expire_at_ms = expire_at_ms;
-    }
-  } else {
-    auto& e = db[key];
-    e.type = ValueType::String;
-    e.value = value;
-    e.string_force_raw = false;
+  auto& e = exists_now ? it->second : db[key];
+  // str() materializes the String payload, destroying any prior collection (replaces the
+  // old per-field clear + type reset).
+  e.str() = value;
+  e.string_force_raw = false;
+  if (!exists_now || !keep_ttl) {
     e.expire_at_ms = expire_at_ms;
   }
   return true;
@@ -116,7 +99,7 @@ std::optional<std::string> DataStore::getdel(const std::string& key) {
   expire_if_needed(db, key);
   const auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  const auto out = it->second.value;
+  const auto out = it->second.str();
   db.erase(it);
   return out;
 }
@@ -132,7 +115,7 @@ std::optional<std::string> DataStore::getex(const std::string& key, std::optiona
   } else if (expire_at_ms.has_value()) {
     it->second.expire_at_ms = expire_at_ms;
   }
-  return it->second.value;
+  return it->second.str();
 }
 
 bool DataStore::del(const std::string& key) {
@@ -156,12 +139,12 @@ std::string DataStore::type_of(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return "none";
-  if (it->second.type == ValueType::String) return "string";
-  if (it->second.type == ValueType::Hash) return "hash";
-  if (it->second.type == ValueType::List) return "list";
-  if (it->second.type == ValueType::Set) return "set";
-  if (it->second.type == ValueType::ZSet) return "zset";
-  if (it->second.type == ValueType::Stream) return "stream";
+  if (it->second.type() == ValueType::String) return "string";
+  if (it->second.type() == ValueType::Hash) return "hash";
+  if (it->second.type() == ValueType::List) return "list";
+  if (it->second.type() == ValueType::Set) return "set";
+  if (it->second.type() == ValueType::ZSet) return "zset";
+  if (it->second.type() == ValueType::Stream) return "stream";
   return "none";
 }
 
@@ -170,14 +153,14 @@ bool DataStore::is_wrongtype_for_string(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::String;
+  return it->second.type() != ValueType::String;
 }
 
 bool DataStore::is_wrongtype_for_string_noexpire(const std::string& key) {
   auto& db = dbs_[current_db_];
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::String;
+  return it->second.type() != ValueType::String;
 }
 
 bool DataStore::is_wrongtype_for_hash(const std::string& key) {
@@ -185,7 +168,7 @@ bool DataStore::is_wrongtype_for_hash(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::Hash;
+  return it->second.type() != ValueType::Hash;
 }
 
 bool DataStore::is_wrongtype_for_list(const std::string& key) {
@@ -193,7 +176,7 @@ bool DataStore::is_wrongtype_for_list(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::List;
+  return it->second.type() != ValueType::List;
 }
 
 bool DataStore::is_wrongtype_for_set(const std::string& key) {
@@ -201,7 +184,7 @@ bool DataStore::is_wrongtype_for_set(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::Set;
+  return it->second.type() != ValueType::Set;
 }
 
 bool DataStore::is_wrongtype_for_zset(const std::string& key) {
@@ -209,7 +192,7 @@ bool DataStore::is_wrongtype_for_zset(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::ZSet;
+  return it->second.type() != ValueType::ZSet;
 }
 
 bool DataStore::is_wrongtype_for_stream(const std::string& key) {
@@ -217,7 +200,7 @@ bool DataStore::is_wrongtype_for_stream(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  return it->second.type != ValueType::Stream;
+  return it->second.type() != ValueType::Stream;
 }
 
 std::int64_t DataStore::pttl(const std::string& key) {
@@ -415,16 +398,16 @@ std::size_t DataStore::append(const std::string& key, const std::string& value) 
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::String;
-    e.value = value;
+    e.str();
+    e.str() = value;
     e.string_force_raw = true;
     db[key] = std::move(e);
     return value.size();
   }
-  if (it->second.type != ValueType::String) return 0;
-  it->second.value += value;
+  if (it->second.type() != ValueType::String) return 0;
+  it->second.str() += value;
   it->second.string_force_raw = true;
-  return it->second.value.size();
+  return it->second.str().size();
 }
 
 std::size_t DataStore::strlen(const std::string& key) {
@@ -449,17 +432,17 @@ int DataStore::setbit(const std::string& key, std::uint64_t bit_offset, int bit,
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::String;
+    e.str();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::String) {
+  } else if (it->second.type() != ValueType::String) {
     err = "WRONGTYPE";
     return 0;
   }
 
   const std::size_t byte_index = static_cast<std::size_t>(bit_offset / 8ULL);
   const unsigned bit_index = static_cast<unsigned>(bit_offset % 8ULL);
-  auto& s = it->second.value;
+  auto& s = it->second.str();
   if (s.size() <= byte_index) s.resize(byte_index + 1, '\0');
 
   unsigned char c = static_cast<unsigned char>(s[byte_index]);
@@ -488,14 +471,14 @@ int DataStore::getbit(const std::string& key, std::uint64_t bit_offset, bool& ok
     ok = true;
     return 0;
   }
-  if (it->second.type != ValueType::String) {
+  if (it->second.type() != ValueType::String) {
     err = "WRONGTYPE";
     return 0;
   }
 
   const std::size_t byte_index = static_cast<std::size_t>(bit_offset / 8ULL);
   const unsigned bit_index = static_cast<unsigned>(bit_offset % 8ULL);
-  const auto& s = it->second.value;
+  const auto& s = it->second.str();
   if (byte_index >= s.size()) {
     ok = true;
     return 0;
@@ -519,13 +502,13 @@ std::size_t DataStore::setrange(const std::string& key, std::size_t offset, cons
     ok = true;
     return 0;
   }
-  if (it != db.end() && it->second.type != ValueType::String) {
+  if (it != db.end() && it->second.type() != ValueType::String) {
     err = "WRONGTYPE";
     return 0;
   }
 
   std::size_t base_len = 0;
-  if (it != db.end()) base_len = it->second.value.size();
+  if (it != db.end()) base_len = it->second.str().size();
   if (value.empty()) {
     ok = true;
     return base_len;
@@ -542,11 +525,11 @@ std::size_t DataStore::setrange(const std::string& key, std::size_t offset, cons
 
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::String;
+    e.str();
     db[key] = std::move(e);
     it = db.find(key);
   }
-  auto& s = it->second.value;
+  auto& s = it->second.str();
   if (s.size() < offset) s.resize(offset, '\0');
   if (s.size() < end_len) s.resize(end_len, '\0');
   s.replace(offset, value.size(), value);
@@ -566,12 +549,12 @@ std::string DataStore::getrange(const std::string& key, std::int64_t start, std:
     ok = true;
     return "";
   }
-  if (it->second.type != ValueType::String) {
+  if (it->second.type() != ValueType::String) {
     err = "WRONGTYPE";
     return "";
   }
 
-  const auto& s = it->second.value;
+  const auto& s = it->second.str();
   const std::int64_t len = static_cast<std::int64_t>(s.size());
   if (len == 0) {
     ok = true;
@@ -603,18 +586,18 @@ std::int64_t DataStore::hset(const std::string& key, const std::vector<std::pair
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::Hash;
+    e.hash();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::Hash) {
+  } else if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return 0;
   }
 
   std::int64_t added = 0;
   for (const auto& [f, v] : fields) {
-    if (it->second.hash_value.find(f) == it->second.hash_value.end()) ++added;
-    it->second.hash_value[f] = v;
+    if (it->second.hash().find(f) == it->second.hash().end()) ++added;
+    it->second.hash()[f] = v;
   }
   return added;
 }
@@ -625,12 +608,12 @@ std::optional<std::string> DataStore::hget(const std::string& key, const std::st
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return std::nullopt;
   }
-  auto fit = it->second.hash_value.find(field);
-  if (fit == it->second.hash_value.end()) return std::nullopt;
+  auto fit = it->second.hash().find(field);
+  if (fit == it->second.hash().end()) return std::nullopt;
   return fit->second;
 }
 
@@ -640,13 +623,13 @@ std::int64_t DataStore::hdel(const std::string& key, const std::vector<std::stri
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return 0;
   }
   std::int64_t removed = 0;
-  for (const auto& f : fields) removed += it->second.hash_value.erase(f) ? 1 : 0;
-  if (it->second.hash_value.empty()) db.erase(it);
+  for (const auto& f : fields) removed += it->second.hash().erase(f) ? 1 : 0;
+  if (it->second.hash().empty()) db.erase(it);
   return removed;
 }
 
@@ -656,11 +639,11 @@ std::int64_t DataStore::hlen(const std::string& key, bool& wrongtype) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return 0;
   }
-  return static_cast<std::int64_t>(it->second.hash_value.size());
+  return static_cast<std::int64_t>(it->second.hash().size());
 }
 
 bool DataStore::hexists(const std::string& key, const std::string& field, bool& wrongtype) {
@@ -669,11 +652,11 @@ bool DataStore::hexists(const std::string& key, const std::string& field, bool& 
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return false;
   }
-  return it->second.hash_value.find(field) != it->second.hash_value.end();
+  return it->second.hash().find(field) != it->second.hash().end();
 }
 
 std::vector<std::pair<std::string, std::string>> DataStore::hgetall(const std::string& key, bool& wrongtype) {
@@ -683,12 +666,12 @@ std::vector<std::pair<std::string, std::string>> DataStore::hgetall(const std::s
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return out;
   }
-  out.reserve(it->second.hash_value.size());
-  for (const auto& kv : it->second.hash_value) out.push_back(kv);
+  out.reserve(it->second.hash().size());
+  for (const auto& kv : it->second.hash()) out.push_back(kv);
   return out;
 }
 
@@ -700,20 +683,20 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataS
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return {0, out};
-  if (it->second.type != ValueType::Hash) {
+  if (it->second.type() != ValueType::Hash) {
     wrongtype = true;
     return {0, out};
   }
 
   std::size_t idx = 0;
   std::size_t emitted = 0;
-  for (const auto& kv : it->second.hash_value) {
+  for (const auto& kv : it->second.hash()) {
     if (idx++ < cursor) continue;
     out.push_back(kv);
     if (++emitted >= count) break;
   }
 
-  const std::uint64_t next = (cursor + emitted) >= it->second.hash_value.size() ? 0 : (cursor + emitted);
+  const std::uint64_t next = (cursor + emitted) >= it->second.hash().size() ? 0 : (cursor + emitted);
   return {next, out};
 }
 
@@ -724,15 +707,15 @@ std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::str
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::List;
+    e.list();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::List) {
+  } else if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return 0;
   }
-  for (const auto& v : values) it->second.list_value.push_front(v);
-  return static_cast<std::int64_t>(it->second.list_value.size());
+  for (const auto& v : values) it->second.list().push_front(v);
+  return static_cast<std::int64_t>(it->second.list().size());
 }
 
 std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype) {
@@ -742,15 +725,15 @@ std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::str
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::List;
+    e.list();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::List) {
+  } else if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return 0;
   }
-  for (const auto& v : values) it->second.list_value.push_back(v);
-  return static_cast<std::int64_t>(it->second.list_value.size());
+  for (const auto& v : values) it->second.list().push_back(v);
+  return static_cast<std::int64_t>(it->second.list().size());
 }
 
 std::optional<std::string> DataStore::lpop(const std::string& key, bool& wrongtype) {
@@ -759,14 +742,14 @@ std::optional<std::string> DataStore::lpop(const std::string& key, bool& wrongty
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  if (it->second.type != ValueType::List) {
+  if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return std::nullopt;
   }
-  if (it->second.list_value.empty()) return std::nullopt;
-  auto v = it->second.list_value.front();
-  it->second.list_value.pop_front();
-  if (it->second.list_value.empty()) db.erase(it);
+  if (it->second.list().empty()) return std::nullopt;
+  auto v = it->second.list().front();
+  it->second.list().pop_front();
+  if (it->second.list().empty()) db.erase(it);
   return v;
 }
 
@@ -776,14 +759,14 @@ std::optional<std::string> DataStore::rpop(const std::string& key, bool& wrongty
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  if (it->second.type != ValueType::List) {
+  if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return std::nullopt;
   }
-  if (it->second.list_value.empty()) return std::nullopt;
-  auto v = it->second.list_value.back();
-  it->second.list_value.pop_back();
-  if (it->second.list_value.empty()) db.erase(it);
+  if (it->second.list().empty()) return std::nullopt;
+  auto v = it->second.list().back();
+  it->second.list().pop_back();
+  if (it->second.list().empty()) db.erase(it);
   return v;
 }
 
@@ -793,11 +776,11 @@ std::int64_t DataStore::llen(const std::string& key, bool& wrongtype) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::List) {
+  if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return 0;
   }
-  return static_cast<std::int64_t>(it->second.list_value.size());
+  return static_cast<std::int64_t>(it->second.list().size());
 }
 
 std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t start, std::int64_t stop, bool& wrongtype) {
@@ -807,12 +790,12 @@ std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t 
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::List) {
+  if (it->second.type() != ValueType::List) {
     wrongtype = true;
     return out;
   }
 
-  const auto n = static_cast<std::int64_t>(it->second.list_value.size());
+  const auto n = static_cast<std::int64_t>(it->second.list().size());
   if (n == 0) return out;
 
   if (start < 0) start = n + start;
@@ -821,7 +804,7 @@ std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t 
   if (stop >= n) stop = n - 1;
   if (start > stop || start >= n) return out;
 
-  for (std::int64_t i = start; i <= stop; ++i) out.push_back(it->second.list_value[static_cast<std::size_t>(i)]);
+  for (std::int64_t i = start; i <= stop; ++i) out.push_back(it->second.list()[static_cast<std::size_t>(i)]);
   return out;
 }
 
@@ -832,15 +815,15 @@ std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::stri
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::Set;
+    e.set();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::Set) {
+  } else if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return 0;
   }
   std::int64_t added = 0;
-  for (const auto& m : members) added += it->second.set_value.insert(m).second ? 1 : 0;
+  for (const auto& m : members) added += it->second.set().insert(m).second ? 1 : 0;
   return added;
 }
 
@@ -850,13 +833,13 @@ std::int64_t DataStore::srem(const std::string& key, const std::vector<std::stri
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return 0;
   }
   std::int64_t removed = 0;
-  for (const auto& m : members) removed += it->second.set_value.erase(m) ? 1 : 0;
-  if (it->second.set_value.empty()) db.erase(it);
+  for (const auto& m : members) removed += it->second.set().erase(m) ? 1 : 0;
+  if (it->second.set().empty()) db.erase(it);
   return removed;
 }
 
@@ -866,11 +849,11 @@ bool DataStore::sismember(const std::string& key, const std::string& member, boo
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return false;
   }
-  return it->second.set_value.find(member) != it->second.set_value.end();
+  return it->second.set().find(member) != it->second.set().end();
 }
 
 std::vector<std::string> DataStore::smembers(const std::string& key, bool& wrongtype) {
@@ -880,12 +863,12 @@ std::vector<std::string> DataStore::smembers(const std::string& key, bool& wrong
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return out;
   }
-  out.reserve(it->second.set_value.size());
-  for (const auto& m : it->second.set_value) out.push_back(m);
+  out.reserve(it->second.set().size());
+  for (const auto& m : it->second.set()) out.push_back(m);
   return out;
 }
 
@@ -895,11 +878,11 @@ std::int64_t DataStore::scard(const std::string& key, bool& wrongtype) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return 0;
   }
-  return static_cast<std::int64_t>(it->second.set_value.size());
+  return static_cast<std::int64_t>(it->second.set().size());
 }
 
 std::optional<std::string> DataStore::spop(const std::string& key, bool& wrongtype) {
@@ -908,15 +891,15 @@ std::optional<std::string> DataStore::spop(const std::string& key, bool& wrongty
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return std::nullopt;
   }
-  if (it->second.set_value.empty()) return std::nullopt;
-  const auto pick = it->second.set_value.begin();
+  if (it->second.set().empty()) return std::nullopt;
+  const auto pick = it->second.set().begin();
   const std::string value = *pick;
-  it->second.set_value.erase(pick);
-  if (it->second.set_value.empty()) db.erase(it);
+  it->second.set().erase(pick);
+  if (it->second.set().empty()) db.erase(it);
   return value;
 }
 
@@ -928,18 +911,18 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return {0, out};
-  if (it->second.type != ValueType::Set) {
+  if (it->second.type() != ValueType::Set) {
     wrongtype = true;
     return {0, out};
   }
 
   std::size_t idx = 0, emitted = 0;
-  for (const auto& m : it->second.set_value) {
+  for (const auto& m : it->second.set()) {
     if (idx++ < cursor) continue;
     out.push_back(m);
     if (++emitted >= count) break;
   }
-  const auto next = (cursor + emitted) >= it->second.set_value.size() ? 0 : (cursor + emitted);
+  const auto next = (cursor + emitted) >= it->second.set().size() ? 0 : (cursor + emitted);
   return {next, out};
 }
 
@@ -951,16 +934,16 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::ZSet;
+    e.zset_payload();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::ZSet) {
+  } else if (it->second.type() != ValueType::ZSet) {
     r.wrongtype = true;
     return r;
   }
 
-  auto mit = it->second.zset_value.find(member);
-  const bool exists = mit != it->second.zset_value.end();
+  auto mit = it->second.zset().find(member);
+  const bool exists = mit != it->second.zset().end();
   if (nx && exists) return r;
   if (xx && !exists) return r;
 
@@ -971,8 +954,8 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
 
   auto& entry = it->second;
   if (!exists) {
-    entry.zset_value[member] = new_score;
-    entry.zset_ordered[{new_score, member}] = true;
+    entry.zset()[member] = new_score;
+    entry.zord()[{new_score, member}] = true;
     r.added = true;
     r.changed = true;
     r.score = new_score;
@@ -980,9 +963,9 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   }
 
   if (mit->second != new_score) {
-    entry.zset_ordered.erase({mit->second, member}); // remove old position
+    entry.zord().erase({mit->second, member}); // remove old position
     mit->second = new_score;
-    entry.zset_ordered[{new_score, member}] = true;  // insert at new position
+    entry.zord()[{new_score, member}] = true;  // insert at new position
     r.changed = true;
   }
   r.score = mit->second;
@@ -997,13 +980,13 @@ std::vector<std::pair<std::string, double>> DataStore::zrange(
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::ZSet) {
+  if (it->second.type() != ValueType::ZSet) {
     wrongtype = true;
     return out;
   }
 
   // Use the ordered index for O(log N) range iteration instead of O(N log N) sort.
-  auto& ordered = it->second.zset_ordered;
+  auto& ordered = it->second.zord();
   const auto n = static_cast<std::int64_t>(ordered.size());
   if (n == 0) return out;
   if (start < 0) start = n + start;
@@ -1028,18 +1011,18 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return {0, out};
-  if (it->second.type != ValueType::ZSet) {
+  if (it->second.type() != ValueType::ZSet) {
     wrongtype = true;
     return {0, out};
   }
 
   std::size_t idx = 0, emitted = 0;
-  for (const auto& kv : it->second.zset_value) {
+  for (const auto& kv : it->second.zset()) {
     if (idx++ < cursor) continue;
     out.push_back(kv);
     if (++emitted >= count) break;
   }
-  const auto next = (cursor + emitted) >= it->second.zset_value.size() ? 0 : (cursor + emitted);
+  const auto next = (cursor + emitted) >= it->second.zset().size() ? 0 : (cursor + emitted);
   return {next, out};
 }
 
@@ -1051,13 +1034,13 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::ZSet) {
+  if (it->second.type() != ValueType::ZSet) {
     wrongtype = true;
     return out;
   }
 
   auto& entry = it->second;
-  auto& ordered = entry.zset_ordered;
+  auto& ordered = entry.zord();
   const std::size_t take = std::min(count, ordered.size());
   out.reserve(take);
   for (std::size_t i = 0; i < take; ++i) {
@@ -1065,10 +1048,10 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(
     const std::string& member = oit->first.second;
     const double score = oit->first.first;
     out.push_back({member, score});
-    entry.zset_value.erase(member);
+    entry.zset().erase(member);
     ordered.erase(oit);
   }
-  if (entry.zset_value.empty()) db.erase(it);
+  if (entry.zset().empty()) db.erase(it);
   return out;
 }
 
@@ -1083,10 +1066,10 @@ std::optional<std::string> DataStore::xadd(
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
-    e.type = ValueType::Stream;
+    e.stream();
     db[key] = std::move(e);
     it = db.find(key);
-  } else if (it->second.type != ValueType::Stream) {
+  } else if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return std::nullopt;
   }
@@ -1094,12 +1077,12 @@ std::optional<std::string> DataStore::xadd(
   std::uint64_t ms = 0, seq = 0;
   if (id == "*") {
     const auto now = static_cast<std::uint64_t>(now_ms());
-    if (now > it->second.stream_last_ms) {
+    if (now > it->second.stream_last_ms()) {
       ms = now;
       seq = 0;
     } else {
-      ms = it->second.stream_last_ms;
-      seq = it->second.stream_last_seq + 1;
+      ms = it->second.stream_last_ms();
+      seq = it->second.stream_last_seq() + 1;
     }
   } else {
     const auto pos = id.find('-');
@@ -1115,16 +1098,16 @@ std::optional<std::string> DataStore::xadd(
       err = "Invalid stream ID specified as stream command argument";
       return std::nullopt;
     }
-    if (ms < it->second.stream_last_ms || (ms == it->second.stream_last_ms && seq <= it->second.stream_last_seq)) {
+    if (ms < it->second.stream_last_ms() || (ms == it->second.stream_last_ms() && seq <= it->second.stream_last_seq())) {
       err = "The ID specified in XADD is equal or smaller than the target stream top item";
       return std::nullopt;
     }
   }
 
-  it->second.stream_last_ms = ms;
-  it->second.stream_last_seq = seq;
+  it->second.stream_last_ms() = ms;
+  it->second.stream_last_seq() = seq;
   const std::string out_id = std::to_string(ms) + "-" + std::to_string(seq);
-  it->second.stream_entries.push_back({out_id, fields});
+  it->second.stream_entries().push_back({out_id, fields});
   return out_id;
 }
 
@@ -1134,11 +1117,11 @@ std::int64_t DataStore::xlen(const std::string& key, bool& wrongtype) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return 0;
   }
-  return static_cast<std::int64_t>(it->second.stream_entries.size());
+  return static_cast<std::int64_t>(it->second.stream_entries().size());
 }
 
 std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xrange(
@@ -1149,7 +1132,7 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return out;
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return out;
   }
@@ -1161,9 +1144,9 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   };
 
   if (!rev) {
-    for (const auto& e : it->second.stream_entries) if (in_range(e.first)) out.push_back(e);
+    for (const auto& e : it->second.stream_entries()) if (in_range(e.first)) out.push_back(e);
   } else {
-    for (auto rit = it->second.stream_entries.rbegin(); rit != it->second.stream_entries.rend(); ++rit) {
+    for (auto rit = it->second.stream_entries().rbegin(); rit != it->second.stream_entries().rend(); ++rit) {
       if (in_range(rit->first)) out.push_back(*rit);
     }
   }
@@ -1204,21 +1187,21 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group, 
       return false;
     }
     Entry e;
-    e.type = ValueType::Stream;
+    e.stream();
     db[key] = std::move(e);
     it = db.find(key);
   }
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return false;
   }
-  if (it->second.stream_groups.find(group) != it->second.stream_groups.end()) {
+  if (it->second.stream_groups().find(group) != it->second.stream_groups().end()) {
     err = "BUSYGROUP Consumer Group name already exists";
     return false;
   }
   Entry::StreamGroup g;
   g.last_delivered_id = start_id;
-  it->second.stream_groups[group] = std::move(g);
+  it->second.stream_groups()[group] = std::move(g);
   return true;
 }
 
@@ -1233,19 +1216,19 @@ bool DataStore::xgroup_setid(const std::string& key, const std::string& group, c
     err = "NOGROUP No such key or consumer group";
     return false;
   }
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return false;
   }
-  auto git = it->second.stream_groups.find(group);
-  if (git == it->second.stream_groups.end()) {
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
     err = "NOGROUP No such key or consumer group";
     return false;
   }
 
   std::string next_id = id;
   if (id == "$") {
-    next_id = it->second.stream_entries.empty() ? "0-0" : it->second.stream_entries.back().first;
+    next_id = it->second.stream_entries().empty() ? "0-0" : it->second.stream_entries().back().first;
   } else {
     std::uint64_t ms = 0, seq = 0;
     if (!parse_stream_id_pair(id, ms, seq)) {
@@ -1269,19 +1252,19 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
     expire_if_needed(db, key);
     auto it = db.find(key);
     if (it == db.end()) continue;
-    if (it->second.type != ValueType::Stream) {
+    if (it->second.type() != ValueType::Stream) {
       wrongtype = true;
       return {};
     }
-    auto git = it->second.stream_groups.find(group);
-    if (git == it->second.stream_groups.end()) {
+    auto git = it->second.stream_groups().find(group);
+    if (git == it->second.stream_groups().end()) {
       err = "NOGROUP No such key or consumer group";
       return {};
     }
 
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> rows;
     if (idreq == ">") {
-      for (const auto& e : it->second.stream_entries) {
+      for (const auto& e : it->second.stream_entries()) {
         if (!stream_id_gt(e.first, git->second.last_delivered_id)) continue;
         rows.push_back(e);
         git->second.pending_to_consumer[e.first] = consumer;
@@ -1303,20 +1286,20 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return 0;
   }
 
   std::int64_t removed = 0;
   for (const auto& id : ids) {
-    auto vit = std::find_if(it->second.stream_entries.begin(), it->second.stream_entries.end(),
+    auto vit = std::find_if(it->second.stream_entries().begin(), it->second.stream_entries().end(),
                             [&](const auto& e) { return e.first == id; });
-    if (vit == it->second.stream_entries.end()) continue;
-    it->second.stream_entries.erase(vit);
+    if (vit == it->second.stream_entries().end()) continue;
+    it->second.stream_entries().erase(vit);
     ++removed;
 
-    for (auto& [_, grp] : it->second.stream_groups) {
+    for (auto& [_, grp] : it->second.stream_groups()) {
       auto pit = grp.pending_to_consumer.find(id);
       if (pit == grp.pending_to_consumer.end()) continue;
       auto cit = grp.pending_per_consumer.find(pit->second);
@@ -1340,12 +1323,12 @@ std::int64_t DataStore::xack(const std::string& key, const std::string& group, c
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return 0;
   }
-  auto git = it->second.stream_groups.find(group);
-  if (git == it->second.stream_groups.end()) {
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
     err = "NOGROUP No such key or consumer group";
     return 0;
   }
@@ -1375,12 +1358,12 @@ std::vector<std::string> DataStore::xpending_summary(const std::string& key, con
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return {"0", "", "", ""};
-  if (it->second.type != ValueType::Stream) {
+  if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return {};
   }
-  auto git = it->second.stream_groups.find(group);
-  if (git == it->second.stream_groups.end()) {
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
     err = "NOGROUP No such key or consumer group";
     return {};
   }
@@ -1403,13 +1386,13 @@ bool DataStore::dump_stream(const std::string& key, StreamDump& out) {
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end() || it->second.type != ValueType::Stream) return false;
+  if (it == db.end() || it->second.type() != ValueType::Stream) return false;
   const auto& e = it->second;
-  out.entries = e.stream_entries;
-  out.last_ms = e.stream_last_ms;
-  out.last_seq = e.stream_last_seq;
+  out.entries = e.stream_entries();
+  out.last_ms = e.stream_last_ms();
+  out.last_seq = e.stream_last_seq();
   out.groups.clear();
-  for (const auto& [gname, g] : e.stream_groups) {
+  for (const auto& [gname, g] : e.stream_groups()) {
     StreamGroupDump gd;
     gd.name = gname;
     gd.last_delivered_id = g.last_delivered_id;
@@ -1432,10 +1415,10 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   auto& db = dbs_[current_db_];
   auto& e = db[key];
   e = Entry{};
-  e.type = ValueType::Stream;
-  e.stream_entries = d.entries;
-  e.stream_last_ms = d.last_ms;
-  e.stream_last_seq = d.last_seq;
+  e.stream();
+  e.stream_entries() = d.entries;
+  e.stream_last_ms() = d.last_ms;
+  e.stream_last_seq() = d.last_seq;
   for (const auto& gd : d.groups) {
     Entry::StreamGroup g;
     g.last_delivered_id = gd.last_delivered_id;
@@ -1445,7 +1428,7 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
       g.pending_delivery_ms[p.id] = p.delivery_ms;
       g.pending_delivery_count[p.id] = p.delivery_count;
     }
-    e.stream_groups[gd.name] = std::move(g);
+    e.stream_groups()[gd.name] = std::move(g);
   }
 }
 
@@ -1455,18 +1438,18 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) { err = "ERR The XSETID command requires the key to exist."; return false; }
-  if (it->second.type != ValueType::Stream) { wrongtype = true; return false; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
   std::uint64_t ms = 0, seq = 0;
   if (!parse_stream_id_pair(id, ms, seq)) {
     err = "ERR Invalid stream ID specified as stream command argument";
     return false;
   }
-  if (!it->second.stream_entries.empty() && stream_id_gt(it->second.stream_entries.back().first, id)) {
+  if (!it->second.stream_entries().empty() && stream_id_gt(it->second.stream_entries().back().first, id)) {
     err = "ERR The ID specified in XSETID is smaller than the target stream top item";
     return false;
   }
-  it->second.stream_last_ms = ms;
-  it->second.stream_last_seq = seq;
+  it->second.stream_last_ms() = ms;
+  it->second.stream_last_seq() = seq;
   return true;
 }
 
@@ -1480,12 +1463,12 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
-  if (it->second.type != ValueType::Stream) { wrongtype = true; return out; }
-  auto git = it->second.stream_groups.find(group);
-  if (git == it->second.stream_groups.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
   auto& g = git->second;
   const std::int64_t now = now_ms();
-  auto& entries = it->second.stream_entries;
+  auto& entries = it->second.stream_entries();
   for (const auto& id : ids) {
     auto pit = g.pending_to_consumer.find(id);
     const bool in_pel = pit != g.pending_to_consumer.end();
@@ -1534,13 +1517,13 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
-  if (it->second.type != ValueType::Stream) { wrongtype = true; return res; }
-  auto git = it->second.stream_groups.find(group);
-  if (git == it->second.stream_groups.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return res; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
   auto& g = git->second;
   const std::int64_t now = now_ms();
   if (count <= 0) count = 100;
-  auto& entries = it->second.stream_entries;
+  auto& entries = it->second.stream_entries();
   std::int64_t claimed = 0;
   for (const auto& e : entries) {
     if (stream_id_gt(start, e.first)) continue;          // skip ids before the cursor
@@ -1575,34 +1558,34 @@ bool DataStore::save_snapshot_file(const std::filesystem::path& path, std::strin
   for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
     for (const auto& [key, e] : dbs_[dbi]) {
       const auto ttl = e.expire_at_ms.has_value() ? std::to_string(*e.expire_at_ms) : std::string("-1");
-      switch (e.type) {
+      switch (e.type()) {
         case ValueType::String:
-          out << "S " << dbi << " " << ttl << " " << std::quoted(key) << " " << std::quoted(e.value) << "\n";
+          out << "S " << dbi << " " << ttl << " " << std::quoted(key) << " " << std::quoted(e.str()) << "\n";
           break;
         case ValueType::Hash:
-          out << "H " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.hash_value.size();
-          for (const auto& [f, v] : e.hash_value) out << " " << std::quoted(f) << " " << std::quoted(v);
+          out << "H " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.hash().size();
+          for (const auto& [f, v] : e.hash()) out << " " << std::quoted(f) << " " << std::quoted(v);
           out << "\n";
           break;
         case ValueType::List:
-          out << "L " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.list_value.size();
-          for (const auto& v : e.list_value) out << " " << std::quoted(v);
+          out << "L " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.list().size();
+          for (const auto& v : e.list()) out << " " << std::quoted(v);
           out << "\n";
           break;
         case ValueType::Set:
-          out << "T " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.set_value.size();
-          for (const auto& m : e.set_value) out << " " << std::quoted(m);
+          out << "T " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.set().size();
+          for (const auto& m : e.set()) out << " " << std::quoted(m);
           out << "\n";
           break;
         case ValueType::ZSet:
-          out << "Z " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.zset_value.size();
-          for (const auto& [m, s] : e.zset_value) out << " " << std::quoted(m) << " " << s;
+          out << "Z " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.zset().size();
+          for (const auto& [m, s] : e.zset()) out << " " << std::quoted(m) << " " << s;
           out << "\n";
           break;
         case ValueType::Stream:
-          out << "X " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.stream_entries.size() << " "
-              << e.stream_last_ms << " " << e.stream_last_seq;
-          for (const auto& [id, fields] : e.stream_entries) {
+          out << "X " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.stream_entries().size() << " "
+              << e.stream_last_ms() << " " << e.stream_last_seq();
+          for (const auto& [id, fields] : e.stream_entries()) {
             out << " " << std::quoted(id) << " " << fields.size();
             for (const auto& [f, v] : fields) out << " " << std::quoted(f) << " " << std::quoted(v);
           }
@@ -1729,21 +1712,43 @@ std::int64_t DataStore::estimate_used_memory() const {
   std::int64_t total = sizeof(*this);
   for (const auto& db : dbs_) {
     for (const auto& [k, e] : db) {
+      // Per-key fixed overhead: the map node's key string + the (now small) Entry.
       total += static_cast<std::int64_t>(sizeof(k) + k.size() + sizeof(e));
-      total += static_cast<std::int64_t>(e.value.size());
-      for (const auto& [f, v] : e.hash_value) total += static_cast<std::int64_t>(f.size() + v.size());
-      for (const auto& v : e.list_value) total += static_cast<std::int64_t>(v.size());
-      for (const auto& m : e.set_value) total += static_cast<std::int64_t>(m.size());
-      for (const auto& [m, _] : e.zset_value) total += static_cast<std::int64_t>(m.size() + sizeof(double));
-      // Stream payloads (previously omitted — count entries + consumer-group PEL so
-      // stream-heavy datasets are not invisible to used_memory / maxmemory).
-      for (const auto& [id, fields] : e.stream_entries) {
-        total += static_cast<std::int64_t>(id.size());
-        for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
-      }
-      for (const auto& [gname, grp] : e.stream_groups) {
-        total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
-        for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
+      // Only the active payload is allocated now (tagged union), so account per type —
+      // and add the heap container's own sizeof, which no longer rides inside Entry.
+      switch (e.type()) {
+        case ValueType::String:
+          total += static_cast<std::int64_t>(e.str().size());
+          break;
+        case ValueType::Hash:
+          total += static_cast<std::int64_t>(sizeof(Entry::HashT));
+          for (const auto& [f, v] : e.hash()) total += static_cast<std::int64_t>(f.size() + v.size());
+          break;
+        case ValueType::List:
+          total += static_cast<std::int64_t>(sizeof(Entry::ListT));
+          for (const auto& v : e.list()) total += static_cast<std::int64_t>(v.size());
+          break;
+        case ValueType::Set:
+          total += static_cast<std::int64_t>(sizeof(Entry::SetT));
+          for (const auto& m : e.set()) total += static_cast<std::int64_t>(m.size());
+          break;
+        case ValueType::ZSet:
+          total += static_cast<std::int64_t>(sizeof(Entry::ZSetT));
+          for (const auto& [m, _] : e.zset()) total += static_cast<std::int64_t>(m.size() + sizeof(double));
+          break;
+        case ValueType::Stream:
+          // Count entries + consumer-group PEL so stream-heavy datasets are not invisible
+          // to used_memory / maxmemory.
+          total += static_cast<std::int64_t>(sizeof(Entry::StreamT));
+          for (const auto& [id, fields] : e.stream_entries()) {
+            total += static_cast<std::int64_t>(id.size());
+            for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
+          }
+          for (const auto& [gname, grp] : e.stream_groups()) {
+            total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
+            for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
+          }
+          break;
       }
     }
   }
@@ -1783,36 +1788,36 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
     if (dbs_[dbi].empty()) continue;
     out.push_back({"SELECT", std::to_string(dbi)});
     for (const auto& [key, e] : dbs_[dbi]) {
-      switch (e.type) {
+      switch (e.type()) {
         case ValueType::String:
-          out.push_back({"SET", key, e.value});
+          out.push_back({"SET", key, e.str()});
           break;
         case ValueType::Hash: {
           std::vector<std::string> cmd{"HSET", key};
-          for (const auto& [f, v] : e.hash_value) { cmd.push_back(f); cmd.push_back(v); }
+          for (const auto& [f, v] : e.hash()) { cmd.push_back(f); cmd.push_back(v); }
           out.push_back(std::move(cmd));
           break;
         }
         case ValueType::List: {
           std::vector<std::string> cmd{"RPUSH", key};
-          for (const auto& v : e.list_value) cmd.push_back(v);
+          for (const auto& v : e.list()) cmd.push_back(v);
           out.push_back(std::move(cmd));
           break;
         }
         case ValueType::Set: {
           std::vector<std::string> cmd{"SADD", key};
-          for (const auto& m : e.set_value) cmd.push_back(m);
+          for (const auto& m : e.set()) cmd.push_back(m);
           out.push_back(std::move(cmd));
           break;
         }
         case ValueType::ZSet: {
           std::vector<std::string> cmd{"ZADD", key};
-          for (const auto& [m, s] : e.zset_value) { cmd.push_back(fmt_double(s)); cmd.push_back(m); }
+          for (const auto& [m, s] : e.zset()) { cmd.push_back(fmt_double(s)); cmd.push_back(m); }
           out.push_back(std::move(cmd));
           break;
         }
         case ValueType::Stream: {
-          for (const auto& [id, fields] : e.stream_entries) {
+          for (const auto& [id, fields] : e.stream_entries()) {
             std::vector<std::string> cmd{"XADD", key, id};
             for (const auto& [f, v] : fields) { cmd.push_back(f); cmd.push_back(v); }
             out.push_back(std::move(cmd));
@@ -1847,36 +1852,36 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
       return false;
     }
   };
-  if (e.type == ValueType::String) {
+  if (e.type() == ValueType::String) {
     if (e.string_force_raw) return "raw";
-    if (is_int(e.value)) return "int";
-    return e.value.size() <= 39 ? "embstr" : "raw";
+    if (is_int(e.str())) return "int";
+    return e.str().size() <= 39 ? "embstr" : "raw";
   }
-  if (e.type == ValueType::List) {
-    bool small = e.list_value.size() <= 128;
-    for (const auto& v : e.list_value) if (v.size() > 64) { small = false; break; }
+  if (e.type() == ValueType::List) {
+    bool small = e.list().size() <= 128;
+    for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
     return small ? "listpack" : "quicklist";
   }
-  if (e.type == ValueType::Set) {
+  if (e.type() == ValueType::Set) {
     bool all_int = true;
-    for (const auto& v : e.set_value) if (!is_int(v)) { all_int = false; break; }
-    if (all_int && e.set_value.size() <= 512) return "intset";
-    bool small = e.set_value.size() <= 128;
-    for (const auto& v : e.set_value) if (v.size() > 64) { small = false; break; }
+    for (const auto& v : e.set()) if (!is_int(v)) { all_int = false; break; }
+    if (all_int && e.set().size() <= 512) return "intset";
+    bool small = e.set().size() <= 128;
+    for (const auto& v : e.set()) if (v.size() > 64) { small = false; break; }
     return small ? "listpack" : "hashtable";
   }
-  if (e.type == ValueType::Hash) {
-    bool small = e.hash_value.size() <= 128;
-    for (const auto& [f, v] : e.hash_value) if (f.size() > 64 || v.size() > 64) { small = false; break; }
+  if (e.type() == ValueType::Hash) {
+    bool small = e.hash().size() <= 128;
+    for (const auto& [f, v] : e.hash()) if (f.size() > 64 || v.size() > 64) { small = false; break; }
     return small ? "listpack" : "hashtable";
   }
-  if (e.type == ValueType::ZSet) {
+  if (e.type() == ValueType::ZSet) {
     bool small = zset_max_ziplist_entries_ >= 0 &&
-                 e.zset_value.size() <= static_cast<std::size_t>(zset_max_ziplist_entries_);
-    for (const auto& [m, _] : e.zset_value) if (m.size() > 64) { small = false; break; }
+                 e.zset().size() <= static_cast<std::size_t>(zset_max_ziplist_entries_);
+    for (const auto& [m, _] : e.zset()) if (m.size() > 64) { small = false; break; }
     return small ? "listpack" : "skiplist";
   }
-  if (e.type == ValueType::Stream) return "stream";
+  if (e.type() == ValueType::Stream) return "stream";
   return "raw";
 }
 
@@ -1887,27 +1892,27 @@ std::optional<std::string> DataStore::debug_digest_value(const std::string& key)
   if (it == db.end()) return std::nullopt;
   const auto& e = it->second;
   std::ostringstream oss;
-  oss << static_cast<int>(e.type) << "|";
+  oss << static_cast<int>(e.type()) << "|";
   if (e.expire_at_ms.has_value()) oss << "ttl=" << *e.expire_at_ms << "|";
   else oss << "ttl=-1|";
-  if (e.type == ValueType::String) {
-    oss << e.value;
-  } else if (e.type == ValueType::Hash) {
-    std::vector<std::pair<std::string, std::string>> items(e.hash_value.begin(), e.hash_value.end());
+  if (e.type() == ValueType::String) {
+    oss << e.str();
+  } else if (e.type() == ValueType::Hash) {
+    std::vector<std::pair<std::string, std::string>> items(e.hash().begin(), e.hash().end());
     std::sort(items.begin(), items.end());
     for (const auto& [f, v] : items) oss << f << "=" << v << ";";
-  } else if (e.type == ValueType::List) {
-    for (const auto& v : e.list_value) oss << v << ";";
-  } else if (e.type == ValueType::Set) {
-    std::vector<std::string> items(e.set_value.begin(), e.set_value.end());
+  } else if (e.type() == ValueType::List) {
+    for (const auto& v : e.list()) oss << v << ";";
+  } else if (e.type() == ValueType::Set) {
+    std::vector<std::string> items(e.set().begin(), e.set().end());
     std::sort(items.begin(), items.end());
     for (const auto& v : items) oss << v << ";";
-  } else if (e.type == ValueType::ZSet) {
-    std::vector<std::pair<std::string, double>> items(e.zset_value.begin(), e.zset_value.end());
+  } else if (e.type() == ValueType::ZSet) {
+    std::vector<std::pair<std::string, double>> items(e.zset().begin(), e.zset().end());
     std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& [m, s] : items) oss << m << "=" << s << ";";
-  } else if (e.type == ValueType::Stream) {
-    for (const auto& [id, fields] : e.stream_entries) {
+  } else if (e.type() == ValueType::Stream) {
+    for (const auto& [id, fields] : e.stream_entries()) {
       oss << id << "{";
       for (const auto& [f, v] : fields) oss << f << "=" << v << ";";
       oss << "}";
@@ -2017,7 +2022,7 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
       if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
       if (!type.empty()) {
         std::string entry_type;
-        switch (it->second.type) {
+        switch (it->second.type()) {
           case ValueType::String: entry_type = "string"; break;
           case ValueType::Hash: entry_type = "hash"; break;
           case ValueType::List: entry_type = "list"; break;

@@ -62,7 +62,7 @@ PeaDB is a Redis 7.2.5-compatible server written in C++20. For a fuller contribu
 - **`src/rdb.cpp`** — RDB binary format reader/writer. Non-stream types use real Redis type bytes (Redis-loadable). Streams are encoded under a **PeaDB-specific type byte (200)** via `DataStore::dump_stream`/`restore_stream` (entries + last-id + consumer groups + full PEL), so `SAVE`/`BGSAVE`/PSYNC handle stream datasets — but a PeaDB RDB containing streams is NOT loadable by real Redis (cross-engine stream migration uses AOF/bridge). See `compat/delta.md` items 2 & 5.
 - **`src/lua_engine.cpp`** — Lua 5.1 scripting (EVAL/EVALSHA/FCALL), wired back to `handle_command` for Redis call dispatch.
 - **`include/command.hpp`** — `SessionState`, `BlockedState`, `WaitState` structs; all extern globals and callbacks shared between command.cpp and server.cpp.
-- **`include/datastore.hpp`** — `DataStore` class, `Entry` fat-struct (304 bytes, holds all 6 type payloads simultaneously).
+- **`include/datastore.hpp`** — `DataStore` class and `Entry`. `Entry` is a **tagged union** (`std::variant` over the inline string + five heap-held collection payloads), so only the active type allocates: ~56 bytes + the active payload, down from the old fat struct that carried all six payloads at once (~328 B libc++ / ~456 B libstdc++). `expire_at_ms`, `lru`, and `string_force_raw` stay inline; typed accessors (`str()`/`hash()`/`list()`/`set()`/`zset()`+`zord()`/`stream_*()`) lazily materialize the active alternative, and a hand-written deep-copy ctor clones it (the `unique_ptr` members make the default copy ill-formed). `type()` is `payload.index()`. All payload access is confined to `src/datastore.cpp`.
 
 ## Key Conventions
 

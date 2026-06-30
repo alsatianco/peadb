@@ -105,4 +105,8 @@ if(BUILD_TESTING)
   add_executable(multi_exec_test tests/unit/multi_exec_test.cpp)
   target_link_libraries(multi_exec_test PRIVATE peadb_core)
   add_test(NAME multi_exec_test COMMAND multi_exec_test)
+
+  add_executable(entry_size_test tests/unit/entry_size_test.cpp)
+  target_link_libraries(entry_size_test PRIVATE peadb_core)
+  add_test(NAME entry_size_test COMMAND entry_size_test)
 endif()

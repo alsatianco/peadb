@@ -159,7 +159,8 @@ Feature status labels:
 - Implemented: `crc16`, `key_hash_slot`, `ShardLoop`, `shard_init` defined.
   PEADB_NUM_SHARDS CMake option defaults to 1 (single-threaded, unchanged behaviour).
 - Missing: Actual multi-shard event loops, listener distribution, cross-shard routing.
-  Prerequisites: full P3-3 ServerContext migration + P4-1 Entry variant.
+  Prerequisites: full P3-3 ServerContext migration. (P4-1 `Entry` tagged-union variant is
+  **done** — `Entry` now allocates only the active payload; see `docs/architecture.md`.)
 - Tracking: P4-7 in improvement plan.
 
 10. HyperLogLog byte-format compatibility
