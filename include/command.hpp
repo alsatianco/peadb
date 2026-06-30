@@ -98,6 +98,13 @@ void init_replication_id();   // randomize the replication id at startup (call o
 void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
 int client_timeout_seconds();                       // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping
+
+// client-output-buffer-limit: per-class output buffer caps. hard=0 / soft=0 means no limit.
+enum CoblClass { kCoblNormal = 0, kCoblReplica = 1, kCoblPubsub = 2 };
+struct CoblLimit { std::int64_t hard; std::int64_t soft; int soft_seconds; };
+void configure_client_output_buffer_limit(const std::string& spec);  // "normal H S Sec slave ... pubsub ..."
+CoblLimit cobl_for(int cls);                          // limits for a CoblClass
+std::string client_output_buffer_limit_str();         // current config as a CONFIG GET string
 void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
 void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb" (startup only)
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
