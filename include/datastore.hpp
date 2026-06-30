@@ -11,6 +11,9 @@
 #include <filesystem>
 #include <unordered_map>
 #include <vector>
+#include <variant>
+#include <memory>
+#include <utility>
 
 namespace peadb {
 
@@ -23,6 +26,16 @@ enum class ValueType {
   Stream,
 };
 
+// Per-key value. Only the ACTIVE type's payload is allocated: the `payload` variant
+// holds the inline string (String type) or a unique_ptr to the active collection, so a
+// small string key no longer pays for six empty containers. `expire_at_ms`, `lru`, and
+// `string_force_raw` stay inline (read regardless of type). The variant alternatives are
+// ordered to match ValueType, so `type()` == `payload.index()`.
+//
+// Accessors mirror the old field names (`.hash()`, `.list()`, `.set()`, `.zset()`,
+// `.zord()`, `.str()`, `.stream_*()`) and are the *only* way the rest of the code touches
+// payloads. The mutable accessors materialize the active payload (get-or-create), which
+// also replaces the old manual type-reset logic.
 struct Entry {
   struct StreamGroup {
     std::string last_delivered_id = "0-0";
@@ -32,19 +45,88 @@ struct Entry {
     std::unordered_map<std::string, std::int64_t> pending_delivery_count; // id -> delivery count
   };
 
-  ValueType type = ValueType::String;
-  std::string value;
-  bool string_force_raw = false;
-  std::unordered_map<std::string, std::string> hash_value;
-  std::deque<std::string> list_value;
-  std::unordered_set<std::string> set_value;
-  std::unordered_map<std::string, double> zset_value;   // member → score (O(1) lookup)
-  std::map<std::pair<double, std::string>, bool> zset_ordered; // {score,member} sorted index
-  std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> stream_entries;
-  std::uint64_t stream_last_ms = 0;
-  std::uint64_t stream_last_seq = 0;
-  std::unordered_map<std::string, StreamGroup> stream_groups;
+  using HashT = std::unordered_map<std::string, std::string>;
+  using ListT = std::deque<std::string>;
+  using SetT  = std::unordered_set<std::string>;
+  struct ZSetT {
+    std::unordered_map<std::string, double> by_member;            // member → score (O(1) lookup)
+    std::map<std::pair<double, std::string>, bool> ordered;       // {score,member} sorted index
+  };
+  struct StreamT {
+    std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> entries;
+    std::uint64_t last_ms = 0;
+    std::uint64_t last_seq = 0;
+    std::unordered_map<std::string, StreamGroup> groups;
+  };
+  using Payload = std::variant<std::string,
+                               std::unique_ptr<HashT>,
+                               std::unique_ptr<ListT>,
+                               std::unique_ptr<SetT>,
+                               std::unique_ptr<ZSetT>,
+                               std::unique_ptr<StreamT>>;
+
   std::optional<std::int64_t> expire_at_ms;
+  std::uint32_t lru = 0;             // eviction metadata (LRU clock / LFU counter), Phase B
+  bool string_force_raw = false;
+  Payload payload{std::string{}};
+
+  ValueType type() const { return static_cast<ValueType>(payload.index()); }
+
+  // ── Mutable accessors (materialize the active payload, destroying any prior one) ──
+  std::string& str() {
+    if (payload.index() != 0) payload.emplace<std::string>();
+    return std::get<std::string>(payload);
+  }
+  HashT& hash()   { if (payload.index() != 1) payload = std::make_unique<HashT>();   return *std::get<std::unique_ptr<HashT>>(payload); }
+  ListT& list()   { if (payload.index() != 2) payload = std::make_unique<ListT>();   return *std::get<std::unique_ptr<ListT>>(payload); }
+  SetT&  set()    { if (payload.index() != 3) payload = std::make_unique<SetT>();    return *std::get<std::unique_ptr<SetT>>(payload); }
+  ZSetT& zset_payload() { if (payload.index() != 4) payload = std::make_unique<ZSetT>(); return *std::get<std::unique_ptr<ZSetT>>(payload); }
+  StreamT& stream() { if (payload.index() != 5) payload = std::make_unique<StreamT>(); return *std::get<std::unique_ptr<StreamT>>(payload); }
+  std::unordered_map<std::string, double>& zset() { return zset_payload().by_member; }
+  std::map<std::pair<double, std::string>, bool>& zord() { return zset_payload().ordered; }
+  auto& stream_entries()  { return stream().entries; }
+  std::uint64_t& stream_last_ms()  { return stream().last_ms; }
+  std::uint64_t& stream_last_seq() { return stream().last_seq; }
+  auto& stream_groups()   { return stream().groups; }
+
+  // ── Const accessors (assume the variant already holds the matching type; callers
+  //    switch on type() first). std::get throws on a type bug rather than UB. ──
+  const std::string& str() const { return std::get<std::string>(payload); }
+  const HashT& hash() const { return *std::get<std::unique_ptr<HashT>>(payload); }
+  const ListT& list() const { return *std::get<std::unique_ptr<ListT>>(payload); }
+  const SetT&  set()  const { return *std::get<std::unique_ptr<SetT>>(payload); }
+  const ZSetT& zset_payload() const { return *std::get<std::unique_ptr<ZSetT>>(payload); }
+  const StreamT& stream() const { return *std::get<std::unique_ptr<StreamT>>(payload); }
+  const std::unordered_map<std::string, double>& zset() const { return zset_payload().by_member; }
+  const std::map<std::pair<double, std::string>, bool>& zord() const { return zset_payload().ordered; }
+  const auto& stream_entries()  const { return stream().entries; }
+  std::uint64_t stream_last_ms()  const { return stream().last_ms; }
+  std::uint64_t stream_last_seq() const { return stream().last_seq; }
+  const auto& stream_groups()   const { return stream().groups; }
+
+  // Default move; deep-copy so rename/move_key/copy_key/swapdb keep value semantics.
+  Entry() = default;
+  Entry(Entry&&) = default;
+  Entry& operator=(Entry&&) = default;
+  Entry(const Entry& o)
+      : expire_at_ms(o.expire_at_ms), lru(o.lru), string_force_raw(o.string_force_raw),
+        payload(clone_payload(o.payload)) {}
+  Entry& operator=(const Entry& o) {
+    if (this != &o) {
+      expire_at_ms = o.expire_at_ms; lru = o.lru; string_force_raw = o.string_force_raw;
+      payload = clone_payload(o.payload);
+    }
+    return *this;
+  }
+
+ private:
+  static Payload clone_payload(const Payload& p) {
+    return std::visit([](const auto& v) -> Payload {
+      using T = std::decay_t<decltype(v)>;
+      if constexpr (std::is_same_v<T, std::string>) return v;
+      else return std::make_unique<typename T::element_type>(*v);
+    }, p);
+  }
 };
 
 class DataStore {
