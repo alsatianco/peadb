@@ -14,6 +14,9 @@
 #include <variant>
 #include <memory>
 #include <utility>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 
 namespace peadb {
 
@@ -278,6 +281,12 @@ class DataStore {
 
   void flushall();
   void flushdb();
+  // Lazyfree variants: detach the data on the caller (event-loop) thread and destruct it on
+  // a background thread, so deleting/flushing a huge dataset doesn't stall the loop. Safe
+  // under the single-writer model — ownership is moved out of the live map before handoff.
+  bool unlink(const std::string& key);   // like del, but big values are freed in background
+  void flushall_async();
+  void flushdb_async();
   std::size_t dbsize();
   std::vector<std::string> collect_expired_keys();
   bool lazy_expire_key(const std::string& key);
@@ -333,10 +342,16 @@ class DataStore {
   static void unfreeze_time();
   static std::int64_t now_ms();
 
+  ~DataStore();
+
  private:
   using DB = std::unordered_map<std::string, Entry>;
 
   bool expire_if_needed(DB& db, const std::string& key);
+  // Background lazyfree: a worker thread destructs detached maps off the event loop.
+  void ensure_lazyfree_thread();
+  void lazyfree_enqueue(DB&& db);
+  static bool entry_is_big(const Entry& e);  // worth offloading (large collection)?
   // Approximate bytes attributable to one key (map node key + Entry + active payload).
   // Shared by estimate_used_memory() and evict_one() so accounting and eviction agree.
   std::int64_t entry_cost(const std::string& key, const Entry& e) const;
@@ -348,6 +363,13 @@ class DataStore {
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
   std::int64_t zset_max_ziplist_entries_ = 128;
   bool eviction_lfu_ = false;   // touch_key_for_eviction uses LFU semantics when true
+  // Lazyfree worker state.
+  std::thread lazyfree_thread_;
+  std::mutex lazyfree_mu_;
+  std::condition_variable lazyfree_cv_;
+  std::deque<DB> lazyfree_queue_;
+  bool lazyfree_stop_ = false;
+  bool lazyfree_started_ = false;
   std::atomic<std::int64_t> stat_expired_keys_{0};
   std::atomic<std::int64_t> stat_keyspace_hits_{0};
   std::atomic<std::int64_t> stat_keyspace_misses_{0};

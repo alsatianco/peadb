@@ -6,7 +6,7 @@ How PeaDB works internally and how to develop it. For build/test commands and co
 
 PeaDB runs a **single-threaded event loop** (like Redis). One thread accepts connections, reads and parses requests, dispatches commands, and writes replies. The loop is built on an abstracted `Poller` (`include/poller.hpp`) backed by **epoll** on Linux and **kqueue** on macOS, with an optional **io_uring** backend compiled in when `PEADB_HAVE_IO_URING` is defined. The poller waits with a 100 ms timeout, which also bounds background housekeeping (active expiry, child reaping, blocked-client rechecks, deferred `WAIT`).
 
-The only other thread is a short-lived detached helper used during `REPLICAOF` full-sync; command processing and `DataStore` mutation always happen on the one event-loop thread, so there is no fine-grained locking on the hot path.
+Besides the event-loop thread there are two helper threads: a short-lived detached helper used during `REPLICAOF` full-sync, and a **lazyfree** worker that destructs large detached objects (`UNLINK`, `FLUSHALL`/`FLUSHDB ASYNC`) off the loop. Both preserve the single-writer invariant: command processing and `DataStore` mutation happen only on the event-loop thread, and the lazyfree worker only ever touches data that was first *moved out* of the live keyspace (exclusive ownership transferred under a mutex-guarded queue), so there is no fine-grained locking on the hot path and no race with live data.
 
 ## Source layout
 

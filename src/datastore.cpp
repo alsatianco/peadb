@@ -2076,6 +2076,91 @@ void DataStore::flushdb() {
   dbs_[current_db_].clear();
 }
 
+// ── Lazyfree (background destruction of detached data) ──
+
+DataStore::~DataStore() {
+  {
+    std::lock_guard<std::mutex> lk(lazyfree_mu_);
+    lazyfree_stop_ = true;
+  }
+  lazyfree_cv_.notify_all();
+  if (lazyfree_thread_.joinable()) lazyfree_thread_.join();
+}
+
+void DataStore::ensure_lazyfree_thread() {
+  if (lazyfree_started_) return;
+  lazyfree_started_ = true;
+  lazyfree_thread_ = std::thread([this] {
+    for (;;) {
+      std::deque<DB> batch;
+      {
+        std::unique_lock<std::mutex> lk(lazyfree_mu_);
+        lazyfree_cv_.wait(lk, [this] { return lazyfree_stop_ || !lazyfree_queue_.empty(); });
+        if (lazyfree_queue_.empty() && lazyfree_stop_) return;
+        batch.swap(lazyfree_queue_);
+      }
+      // Destruct the detached maps (and every Entry/payload they own) here, off the
+      // event-loop thread. These maps are exclusively owned by `batch` — moved out of the
+      // live keyspace before handoff — so there is no race with command processing.
+      batch.clear();
+    }
+  });
+}
+
+void DataStore::lazyfree_enqueue(DB&& db) {
+  if (db.empty()) return;
+  ensure_lazyfree_thread();
+  {
+    std::lock_guard<std::mutex> lk(lazyfree_mu_);
+    lazyfree_queue_.push_back(std::move(db));
+  }
+  lazyfree_cv_.notify_one();
+}
+
+bool DataStore::entry_is_big(const Entry& e) {
+  // Threshold mirrors Redis's lazyfree heuristic (~64 elements): below it, inline free is
+  // cheaper than the queue/thread handoff.
+  constexpr std::size_t kBig = 64;
+  switch (e.type()) {
+    case ValueType::String: return false;
+    case ValueType::Hash:   return e.hash().size() > kBig;
+    case ValueType::List:   return e.list().size() > kBig;
+    case ValueType::Set:    return e.set().size() > kBig;
+    case ValueType::ZSet:   return e.zset().size() > kBig;
+    case ValueType::Stream: return e.stream_entries().size() > kBig;
+  }
+  return false;
+}
+
+bool DataStore::unlink(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  if (entry_is_big(it->second)) {
+    DB tmp;
+    tmp.insert(db.extract(it));   // O(1) node move out of the live map
+    lazyfree_enqueue(std::move(tmp));
+  } else {
+    db.erase(it);
+  }
+  return true;
+}
+
+void DataStore::flushdb_async() {
+  DB tmp;
+  std::swap(tmp, dbs_[current_db_]);   // O(1): live db becomes empty immediately
+  lazyfree_enqueue(std::move(tmp));
+}
+
+void DataStore::flushall_async() {
+  for (auto& db : dbs_) {
+    DB tmp;
+    std::swap(tmp, db);
+    lazyfree_enqueue(std::move(tmp));
+  }
+}
+
 std::size_t DataStore::dbsize() {
   return dbs_[current_db_].size();
 }

@@ -3613,7 +3613,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("UNLINK", CommandSpec{"UNLINK", -2, {"write"}, 1, -1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           std::size_t n = 0;
-          for (std::size_t i = 1; i < args.size(); ++i) n += store().del(args[i]) ? 1 : 0;
+          // Lazyfree: big values are detached and destructed on a background thread so a
+          // huge-key UNLINK doesn't stall the event loop.
+          for (std::size_t i = 1; i < args.size(); ++i) n += store().unlink(args[i]) ? 1 : 0;
           return encode_integer(n);
         }});
 
@@ -4141,15 +4143,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_simple("OK");
         }});
 
-    t.emplace("FLUSHALL", CommandSpec{"FLUSHALL", 1, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState&, bool&) {
-          store().flushall();
+    t.emplace("FLUSHALL", CommandSpec{"FLUSHALL", -1, {"write"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool async = false;
+          if (args.size() >= 2) {
+            const auto m = upper(args[1]);
+            if (m == "ASYNC") async = true;
+            else if (m != "SYNC") return encode_error("syntax error");
+          }
+          if (async) store().flushall_async(); else store().flushall();
           return encode_simple("OK");
         }});
 
-    t.emplace("FLUSHDB", CommandSpec{"FLUSHDB", 1, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState&, bool&) {
-          store().flushdb();
+    t.emplace("FLUSHDB", CommandSpec{"FLUSHDB", -1, {"write"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          bool async = false;
+          if (args.size() >= 2) {
+            const auto m = upper(args[1]);
+            if (m == "ASYNC") async = true;
+            else if (m != "SYNC") return encode_error("syntax error");
+          }
+          if (async) store().flushdb_async(); else store().flushdb();
           return encode_simple("OK");
         }});
 
