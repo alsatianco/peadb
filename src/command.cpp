@@ -1609,6 +1609,18 @@ bool stream_id_lt(const std::string& a, const std::string& b) {
   return am != bm ? am < bm : as < bs;
 }
 
+// A well-formed explicit stream id: "ms" or "ms-seq", digits only (no "-"/"+"/"*"/garbage).
+bool stream_id_is_valid(const std::string& s) {
+  auto all_digits = [](const std::string& t) {
+    if (t.empty()) return false;
+    for (char c : t) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    return true;
+  };
+  const auto d = s.find('-');
+  if (d == std::string::npos) return all_digits(s);
+  return all_digits(s.substr(0, d)) && all_digits(s.substr(d + 1));
+}
+
 bool parse_f64(const std::string& s, long double& out) {
   // strtold (not std::stold): std::stold throws out_of_range on subnormal underflow
   // (e.g. 9.88e-323), which Redis accepts. strtold returns the (subnormal/zero) value
@@ -4417,8 +4429,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("RENAME", CommandSpec{"RENAME", 3, {"write"}, 1, 2, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           if (!store().rename(args[1], args[2], false)) return encode_error("no such key");
+          // The destination may now hold a stream/list — wake any client blocked on it
+          // (Redis signals the renamed-into key ready so blocked XREAD(GROUP)/BLPOP re-run).
+          notify_key_written(args[2], session.db_index);
           return encode_simple("OK");
         }});
 
@@ -5751,49 +5766,123 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("XINFO", CommandSpec{"XINFO", -2, {"readonly"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           const auto sub = upper(args[1]);
+          const bool r3 = session.resp_version == RespVersion::Resp3;
           auto entry_reply = [](const std::pair<std::string, std::vector<std::pair<std::string, std::string>>>& e) {
             if (e.first.empty()) return encode_null_array();
             std::vector<std::string> fv;
             for (const auto& [f, v] : e.second) { fv.push_back(encode_bulk(f)); fv.push_back(encode_bulk(v)); }
             return encode_array({encode_bulk(e.first), encode_array(fv)});
           };
+          // Encode a map as RESP3 %N (or RESP2 flat *2N) from ordered key/encoded-value pairs.
+          auto map_reply = [&](const std::vector<std::pair<std::string, std::string>>& kv) {
+            std::string s = (r3 ? "%" : "*") + std::to_string(r3 ? kv.size() : kv.size() * 2) + "\r\n";
+            for (const auto& [k, v] : kv) { s += encode_bulk(k); s += v; }
+            return s;
+          };
           if (sub == "STREAM") {
             if (args.size() < 3) return encode_error("wrong number of arguments for 'xinfo|stream' command");
-            // FULL variant not fully modeled yet — fall back to the summary map.
+            const bool full = args.size() >= 4 && upper(args[3]) == "FULL";
+            if (full) {
+              std::size_t fcount = 10;  // Redis default COUNT for FULL (0 = no limit)
+              for (std::size_t i = 4; i < args.size(); ++i) {
+                if (upper(args[i]) == "COUNT" && i + 1 < args.size()) {
+                  std::int64_t c = 0;
+                  if (!parse_i64(args[i + 1], c) || c < 0) return encode_error("value is not an integer or out of range");
+                  fcount = static_cast<std::size_t>(c); ++i;
+                } else {
+                  return encode_error("syntax error");
+                }
+              }
+              DataStore::StreamFullInfo fi; bool wt = false;
+              if (!store().xinfo_stream_full(args[2], fcount, fi, wt)) {
+                if (wt) return wrongtype_error_reply();
+                return encode_error("no such key");
+              }
+              std::vector<std::string> ents;
+              for (const auto& [id, fields] : fi.entries) {
+                std::vector<std::string> fv;
+                for (const auto& [f, v] : fields) { fv.push_back(encode_bulk(f)); fv.push_back(encode_bulk(v)); }
+                ents.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
+              }
+              std::vector<std::string> grps;
+              for (const auto& g : fi.groups) {
+                std::vector<std::string> gpend;
+                for (const auto& p : g.pending)
+                  gpend.push_back(encode_array({encode_bulk(p.id), encode_bulk(p.consumer),
+                                                encode_integer(p.delivery_ms), encode_integer(p.delivery_count)}));
+                std::vector<std::string> gcons;
+                for (const auto& c : g.consumers) {
+                  std::vector<std::string> cpend;
+                  for (const auto& p : c.pending)
+                    cpend.push_back(encode_array({encode_bulk(p.id), encode_integer(p.delivery_ms), encode_integer(p.delivery_count)}));
+                  gcons.push_back(map_reply({{"name", encode_bulk(c.name)},
+                                            {"seen-time", encode_integer(c.seen_time)},
+                                            {"active-time", encode_integer(c.active_time)},
+                                            {"pel-count", encode_integer(static_cast<long long>(c.pending.size()))},
+                                            {"pending", encode_array(cpend)}}));
+                }
+                grps.push_back(map_reply({{"name", encode_bulk(g.name)},
+                                          {"last-delivered-id", encode_bulk(g.last_delivered_id)},
+                                          {"entries-read", g.entries_read < 0 ? encode_null(session.resp_version) : encode_integer(g.entries_read)},
+                                          {"lag", g.lag_valid ? encode_integer(g.lag) : encode_null(session.resp_version)},
+                                          {"pel-count", encode_integer(g.pel_count)},
+                                          {"pending", encode_array(gpend)},
+                                          {"consumers", encode_array(gcons)}}));
+              }
+              return map_reply({{"length", encode_integer(fi.length)},
+                                {"radix-tree-keys", encode_integer(fi.length == 0 ? 1 : (fi.length + 99) / 100)},
+                                {"radix-tree-nodes", encode_integer(fi.length == 0 ? 2 : (fi.length + 99) / 100 + 1)},
+                                {"last-generated-id", encode_bulk(fi.last_id)},
+                                {"max-deleted-entry-id", encode_bulk(fi.max_deleted_id)},
+                                {"entries-added", encode_integer(fi.entries_added)},
+                                {"recorded-first-entry-id", encode_bulk(fi.recorded_first_id)},
+                                {"entries", encode_array(ents)},
+                                {"groups", encode_array(grps)}});
+            }
             DataStore::StreamInfo si;
             bool wt = false;
             if (!store().stream_info(args[2], si, wt)) {
               if (wt) return wrongtype_error_reply();
               return encode_error("no such key");
             }
-            const bool r3 = session.resp_version == RespVersion::Resp3;
-            std::vector<std::string> kv;
-            auto put = [&](const std::string& k, const std::string& v_encoded) {
-              kv.push_back(encode_bulk(k)); kv.push_back(v_encoded);
-            };
-            put("length", encode_integer(si.length));
-            put("radix-tree-keys", encode_integer(si.length == 0 ? 1 : (si.length + 99) / 100));
-            put("radix-tree-nodes", encode_integer(si.length == 0 ? 2 : (si.length + 99) / 100 + 1));
-            put("last-generated-id", encode_bulk(si.last_id));
-            put("max-deleted-entry-id", encode_bulk(si.max_deleted_id));
-            put("entries-added", encode_integer(static_cast<long long>(si.entries_added)));
-            put("recorded-first-entry-id", encode_bulk(si.first.first.empty() ? "0-0" : si.first.first));
-            put("groups", encode_integer(static_cast<long long>(si.groups)));
-            put("first-entry", entry_reply(si.first));
-            put("last-entry", entry_reply(si.last));
-            return (r3 ? "%" : "*") + std::to_string(r3 ? kv.size() / 2 : kv.size()) + "\r\n" +
-                   [&]{ std::string s; for (auto& x : kv) s += x; return s; }();
+            return map_reply({{"length", encode_integer(si.length)},
+                              {"radix-tree-keys", encode_integer(si.length == 0 ? 1 : (si.length + 99) / 100)},
+                              {"radix-tree-nodes", encode_integer(si.length == 0 ? 2 : (si.length + 99) / 100 + 1)},
+                              {"last-generated-id", encode_bulk(si.last_id)},
+                              {"max-deleted-entry-id", encode_bulk(si.max_deleted_id)},
+                              {"entries-added", encode_integer(static_cast<long long>(si.entries_added))},
+                              {"recorded-first-entry-id", encode_bulk(si.first.first.empty() ? "0-0" : si.first.first)},
+                              {"groups", encode_integer(static_cast<long long>(si.groups))},
+                              {"first-entry", entry_reply(si.first)},
+                              {"last-entry", entry_reply(si.last)}});
           }
           if (sub == "GROUPS" && args.size() == 3) {
-            // Minimal: an array of per-group maps (empty groups list → empty array).
-            return with_stream_key(args[2], [&]() -> std::string {
-              DataStore::StreamInfo si; bool wt = false;
-              if (!store().stream_info(args[2], si, wt)) {
-                if (wt) return wrongtype_error_reply();
-                return encode_error("no such key");
-              }
-              return encode_array({});  // group introspection detail deferred
-            });
+            bool wt = false; std::string err;
+            auto gs = store().xinfo_groups(args[2], wt, err);
+            if (wt) return wrongtype_error_reply();
+            if (!err.empty()) return encode_stream_error(err);
+            std::vector<std::string> out;
+            for (const auto& g : gs)
+              out.push_back(map_reply({{"name", encode_bulk(g.name)},
+                                       {"consumers", encode_integer(static_cast<long long>(g.consumers))},
+                                       {"pending", encode_integer(static_cast<long long>(g.pending))},
+                                       {"last-delivered-id", encode_bulk(g.last_delivered_id)},
+                                       {"entries-read", g.entries_read < 0 ? encode_null(session.resp_version) : encode_integer(g.entries_read)},
+                                       {"lag", g.lag_valid ? encode_integer(g.lag) : encode_null(session.resp_version)}}));
+            return encode_array(out);
+          }
+          if (sub == "CONSUMERS" && args.size() == 4) {
+            bool wt = false; std::string err;
+            auto cs = store().xinfo_consumers(args[2], args[3], wt, err);
+            if (wt) return wrongtype_error_reply();
+            if (!err.empty()) return encode_stream_error(err);
+            std::vector<std::string> out;
+            for (const auto& c : cs)
+              out.push_back(map_reply({{"name", encode_bulk(c.name)},
+                                       {"pending", encode_integer(static_cast<long long>(c.pending))},
+                                       {"idle", encode_integer(c.idle)},
+                                       {"inactive", encode_integer(c.inactive)}}));
+            return encode_array(out);
           }
           if (sub == "HELP") {
             if (args.size() != 2) return encode_error("wrong number of arguments for 'xinfo|help' command");
@@ -5955,33 +6044,85 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("XGROUP", CommandSpec{"XGROUP", -2, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           const auto sub = upper(args[1]);
           if (sub == "CREATE") {
             if (args.size() < 5) return encode_error("wrong number of arguments for 'xgroup|create' command");
+            // XGROUP CREATE key group id|$ [MKSTREAM] [ENTRIESREAD n]
             bool mkstream = false;
-            if (args.size() > 5) {
-              if (args.size() == 6 && upper(args[5]) == "MKSTREAM") mkstream = true;
-              else return encode_error("syntax error");
+            bool have_er = false;
+            std::int64_t entries_read = 0;
+            for (std::size_t i = 5; i < args.size(); ++i) {
+              const auto opt = upper(args[i]);
+              if (opt == "MKSTREAM") { mkstream = true; continue; }
+              if (opt == "ENTRIESREAD" && i + 1 < args.size()) {
+                if (!parse_i64(args[i + 1], entries_read))
+                  return encode_error("value is not an integer or out of range");
+                if (entries_read < -1)
+                  return encode_error("value for ENTRIESREAD must be positive or -1");
+                have_er = true; ++i; continue;
+              }
+              return encode_error("syntax error");
             }
             return with_stream_key(args[2], [&]() {
               bool wrongtype = false;
               std::string err;
-              const bool ok = store().xgroup_create(args[2], args[3], args[4], mkstream, wrongtype, err);
+              const bool ok = store().xgroup_create(args[2], args[3], args[4], mkstream, wrongtype, err,
+                                                    have_er ? &entries_read : nullptr);
               if (wrongtype) return wrongtype_error_reply();
-              if (!ok) return encode_error(err.empty() ? "ERR" : err);
+              if (!ok) return err.empty() ? encode_error("ERR") : encode_stream_error(err);
               return encode_simple("OK");
             });
           }
           if (sub == "SETID") {
-            if (args.size() != 5) return encode_error("wrong number of arguments for 'xgroup|setid' command");
+            // XGROUP SETID key group id|$ [ENTRIESREAD n]
+            if (args.size() != 5 && args.size() != 7) return encode_error("wrong number of arguments for 'xgroup|setid' command");
+            bool have_er = false;
+            std::int64_t entries_read = 0;
+            if (args.size() == 7) {
+              if (upper(args[5]) != "ENTRIESREAD") return encode_error("syntax error");
+              if (!parse_i64(args[6], entries_read)) return encode_error("value is not an integer or out of range");
+              if (entries_read < -1) return encode_error("value for ENTRIESREAD must be positive or -1");
+              have_er = true;
+            }
             return with_stream_key(args[2], [&]() {
               bool wrongtype = false;
               std::string err;
-              const bool ok = store().xgroup_setid(args[2], args[3], args[4], wrongtype, err);
+              const bool ok = store().xgroup_setid(args[2], args[3], args[4], wrongtype, err,
+                                                   have_er ? &entries_read : nullptr);
               if (wrongtype) return wrongtype_error_reply();
-              if (!ok) return encode_error(err.empty() ? "ERR" : err);
+              if (!ok) return err.empty() ? encode_error("ERR") : encode_stream_error(err);
               return encode_simple("OK");
+            });
+          }
+          if (sub == "DESTROY") {
+            if (args.size() != 4) return encode_error("wrong number of arguments for 'xgroup|destroy' command");
+            return with_stream_key(args[2], [&]() {
+              bool wrongtype = false;
+              const int n = store().xgroup_destroy(args[2], args[3], wrongtype);
+              if (wrongtype) return wrongtype_error_reply();
+              if (n > 0) notify_key_written(args[2], session.db_index);  // wake blocked XREADGROUP → NOGROUP
+              return encode_integer(n);
+            });
+          }
+          if (sub == "CREATECONSUMER") {
+            if (args.size() != 5) return encode_error("wrong number of arguments for 'xgroup|createconsumer' command");
+            return with_stream_key(args[2], [&]() {
+              bool wrongtype = false; std::string err;
+              const int n = store().xgroup_createconsumer(args[2], args[3], args[4], wrongtype, err);
+              if (wrongtype) return wrongtype_error_reply();
+              if (!err.empty()) return encode_stream_error(err);
+              return encode_integer(n);
+            });
+          }
+          if (sub == "DELCONSUMER") {
+            if (args.size() != 5) return encode_error("wrong number of arguments for 'xgroup|delconsumer' command");
+            return with_stream_key(args[2], [&]() {
+              bool wrongtype = false; std::string err;
+              const std::int64_t n = store().xgroup_delconsumer(args[2], args[3], args[4], wrongtype, err);
+              if (wrongtype) return wrongtype_error_reply();
+              if (!err.empty()) return encode_stream_error(err);
+              return encode_integer(n);
             });
           }
           if (sub == "HELP") {
@@ -6011,7 +6152,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (args.size() < 7) return encode_error("wrong number of arguments for 'xreadgroup' command");
           const std::string group = args[2];
           const std::string consumer = args[3];
-          std::size_t req_count = 1;
+          std::size_t req_count = 0;  // 0 = no limit (Redis default without COUNT)
+          bool noack = false;
           std::int64_t block_ms = -1;
           std::size_t i = 4;
           for (;;) {
@@ -6019,6 +6161,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const auto opt = upper(args[i]);
             if (opt == "STREAMS") break;
             if (opt == "NOACK") {
+              noack = true;
               ++i;
               continue;
             }
@@ -6044,7 +6187,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           ++i;
           const std::size_t rem = args.size() - i;
-          if (rem == 0 || (rem % 2) != 0) return encode_error("syntax error");
+          if (rem == 0 || (rem % 2) != 0)
+            return encode_error("Unbalanced 'xreadgroup' list of streams: for each stream key an ID or '>' must be specified.");
           const std::size_t n = rem / 2;
           std::vector<std::pair<std::string, std::string>> streams;
           for (std::size_t k = 0; k < n; ++k) {
@@ -6052,18 +6196,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           bool wrongtype = false;
           std::string err;
-          std::unordered_map<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>> merged_rows;
-          for (std::size_t attempt = 0; attempt < req_count; ++attempt) {
-            auto rows = store().xreadgroup(group, consumer, streams, wrongtype, err);
-            if (wrongtype) return wrongtype_error_reply();
-            if (!err.empty()) return encode_error(err);
-            if (rows.empty()) break;
-            for (const auto& [key, entries] : rows) {
-              auto& dst = merged_rows[key];
-              dst.insert(dst.end(), entries.begin(), entries.end());
-            }
+          bool consumer_created = false;
+          auto rows = store().xreadgroup(group, consumer, streams, req_count, noack, wrongtype, err, &consumer_created);
+          if (wrongtype) return wrongtype_error_reply();
+          if (!err.empty()) return encode_stream_error(err);
+
+          // XREADGROUP is not propagated verbatim (canonicalize sets emit=false); instead we
+          // propagate its deterministic effects to BOTH the AOF and the replication backlog.
+          auto propagate = [&](std::vector<std::string> cmd) {
+            append_replication_event(cmd, session, nullptr);
+            append_aof_command(cmd, session, nullptr);
+          };
+          // For a NOACK read there is no XCLAIM to carry the consumer, so a newly-created
+          // consumer is propagated as XGROUP CREATECONSUMER up front (Redis creates it when
+          // the command is processed, even if the read then blocks or returns nothing). ACK
+          // reads instead let the per-entry XCLAIM (below) create the consumer on replay.
+          if (consumer_created && noack) {
+            for (const auto& s : streams)
+              if (s.second == ">") propagate({"XGROUP", "CREATECONSUMER", s.first, group, consumer});
           }
-          if (merged_rows.empty()) {
+
+          if (rows.empty()) {
             // Block only when reading new messages (all ids are ">"), like Redis.
             bool all_new = !streams.empty();
             for (const auto& s : streams) if (s.second != ">") { all_new = false; break; }
@@ -6078,17 +6231,37 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_null(RespVersion::Resp2);
           }
 
+          // Propagate deterministic effects (Redis streamReplyWithRange): an ACK read emits
+          // one idempotent XCLAIM per delivered entry, carrying LASTID so the replica/AOF
+          // advances the group cursor (and FORCE creates the consumer + PEL). A NOACK read has
+          // no PEL, so it emits a single XGROUP SETID (last-id + entries-read). History
+          // re-reads (id != ">") change no ownership → nothing to propagate.
+          std::unordered_map<std::string, std::string> idreq_of;
+          for (const auto& s : streams) idreq_of[s.first] = s.second;
           std::vector<std::string> out;
-          for (const auto& [key, entries] : merged_rows) {
+          for (const auto& [key, entries] : rows) {
+            const bool is_new = idreq_of[key] == ">";
             std::vector<std::string> encoded_entries;
             for (const auto& [id, fields] : entries) {
-              append_replication_event({"XCLAIM", key, group, consumer, "0", id}, session);
+              if (is_new && !noack)
+                propagate({"XCLAIM", key, group, consumer, "0", id, "TIME", "0", "RETRYCOUNT", "1",
+                           "FORCE", "JUSTID", "LASTID", id});
+              if (fields.empty()) {
+                // Null-fields sentinel: a pending id whose stream entry was removed.
+                encoded_entries.push_back(encode_array({encode_bulk(id), encode_null_array()}));
+                continue;
+              }
               std::vector<std::string> fv;
               for (const auto& [f, v] : fields) {
                 fv.push_back(encode_bulk(f));
                 fv.push_back(encode_bulk(v));
               }
               encoded_entries.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
+            }
+            if (is_new && noack && !entries.empty()) {
+              std::string lid; std::int64_t er = 0;
+              if (store().stream_group_ids(key, group, lid, er))
+                propagate({"XGROUP", "SETID", key, group, lid, "ENTRIESREAD", std::to_string(er)});
             }
             out.push_back(encode_array({encode_bulk(key), encode_array(encoded_entries)}));
           }
@@ -6125,7 +6298,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (i >= args.size() || upper(args[i]) != "STREAMS") return encode_error("syntax error");
           ++i;
           const auto rem = args.size() - i;
-          if (rem == 0 || (rem % 2) != 0) return encode_error("Unbalanced XREAD list of streams");
+          if (rem == 0 || (rem % 2) != 0)
+            return encode_error("Unbalanced 'xread' list of streams: for each stream key an ID or '$' must be specified.");
           const auto n = rem / 2;
           // Validate types first
           for (std::size_t k = 0; k < n; ++k) {
@@ -6216,31 +6390,76 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("XACK", CommandSpec{"XACK", -4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           std::vector<std::string> ids(args.begin() + 3, args.end());
+          // Validate every id up front: XACK is all-or-nothing, so one bad id is an error
+          // rather than a partial ack (Redis xackCommand parses all IDs before acting).
+          for (const auto& id : ids) {
+            if (!stream_id_is_valid(id))
+              return encode_error("Invalid stream ID specified as stream command argument");
+          }
           return with_stream_key(args[1], [&]() {
             bool wrongtype = false;
             std::string err;
             auto n = store().xack(args[1], args[2], ids, wrongtype, err);
             if (wrongtype) return wrongtype_error_reply();
-            if (!err.empty()) return encode_error(err);
+            if (!err.empty()) return encode_stream_error(err);
             return encode_integer(n);
           });
         }});
 
-    t.emplace("XPENDING", CommandSpec{"XPENDING", 3, {"readonly"}, 1, 1, 1,
+    t.emplace("XPENDING", CommandSpec{"XPENDING", -3, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return with_stream_key(args[1], [&]() {
+          // XPENDING key group                              -> summary form
+          // XPENDING key group [IDLE ms] start end count [consumer] -> extended form
+          return with_stream_key(args[1], [&]() -> std::string {
             bool wrongtype = false;
             std::string err;
-            auto sum = store().xpending_summary(args[1], args[2], wrongtype, err);
+            if (args.size() == 3) {
+              std::vector<std::pair<std::string, std::int64_t>> consumers;
+              auto sum = store().xpending_summary(args[1], args[2], consumers, wrongtype, err);
+              if (wrongtype) return wrongtype_error_reply();
+              if (!err.empty()) return encode_stream_error(err);
+              std::vector<std::string> out;
+              out.push_back(encode_integer(sum.empty() ? 0 : std::stoll(sum[0])));
+              out.push_back(sum.size() > 1 && !sum[1].empty() ? encode_bulk(sum[1]) : encode_null(RespVersion::Resp2));
+              out.push_back(sum.size() > 2 && !sum[2].empty() ? encode_bulk(sum[2]) : encode_null(RespVersion::Resp2));
+              if (consumers.empty()) {
+                out.push_back(encode_null_array());  // no pending: consumer list is nil
+              } else {
+                std::vector<std::string> cs;
+                for (const auto& [c, n] : consumers)
+                  cs.push_back(encode_array({encode_bulk(c), encode_bulk(std::to_string(n))}));
+                out.push_back(encode_array(cs));
+              }
+              return encode_array(out);
+            }
+            // Extended form.
+            std::size_t i = 3;
+            std::int64_t min_idle = 0;
+            if (upper(args[i]) == "IDLE") {
+              if (i + 1 >= args.size()) return encode_error("syntax error");
+              if (!parse_i64(args[i + 1], min_idle) || min_idle < 0) return encode_error("value is not an integer or out of range");
+              i += 2;
+            }
+            if (i + 2 >= args.size()) return encode_error("syntax error");  // need start end count
+            const std::string start = args[i], end = args[i + 1];
+            std::int64_t count = 0;
+            if (!parse_i64(args[i + 2], count)) return encode_error("value is not an integer or out of range");
+            i += 3;
+            std::string consumer;
+            bool have_consumer = false;
+            if (i < args.size()) { consumer = args[i]; have_consumer = true; ++i; }
+            if (i != args.size()) return encode_error("syntax error");
+            auto items = store().xpending_extended(args[1], args[2], start, end, count,
+                                                   have_consumer ? &consumer : nullptr, min_idle, wrongtype, err);
             if (wrongtype) return wrongtype_error_reply();
-            if (!err.empty()) return encode_error(err);
+            if (!err.empty()) return encode_stream_error(err);
             std::vector<std::string> out;
-            out.push_back(encode_integer(sum.empty() ? 0 : std::stoll(sum[0])));
-            out.push_back(sum.size() > 1 && !sum[1].empty() ? encode_bulk(sum[1]) : encode_null(RespVersion::Resp2));
-            out.push_back(sum.size() > 2 && !sum[2].empty() ? encode_bulk(sum[2]) : encode_null(RespVersion::Resp2));
-            out.push_back("*0\r\n");
+            for (const auto& it : items) {
+              out.push_back(encode_array({encode_bulk(it.id), encode_bulk(it.consumer),
+                                          encode_integer(it.idle_ms), encode_integer(it.delivery_count)}));
+            }
             return encode_array(out);
           });
         }});
@@ -8344,16 +8563,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t min_idle = 0;
           if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XAUTOCLAIM");
           std::int64_t count = 100; bool justid = false;
+          // Redis caps COUNT at LONG_MAX / max(sizeof(streamID)=16, attempts_factor=10) = LONG_MAX/16.
+          constexpr std::int64_t kMaxCount = 9223372036854775807LL / 16;
           for (std::size_t i = 6; i < args.size(); ++i) {
             const auto o = upper(args[i]);
-            if (o == "COUNT" && i + 1 < args.size()) { if (!parse_i64(args[++i], count) || count <= 0) return encode_error("COUNT must be > 0"); }
+            if (o == "COUNT" && i + 1 < args.size()) {
+              if (!parse_i64(args[++i], count) || count < 1 || count > kMaxCount) return encode_error("COUNT must be > 0");
+            }
             else if (o == "JUSTID") justid = true;
             else return encode_error("syntax error");
           }
           bool wt = false; std::string err;
           auto res = store().xautoclaim(args[1], args[2], args[3], min_idle, args[5], count, justid, wt, err);
           if (wt) return wrongtype_error_reply();
-          if (!err.empty()) return "-" + err + "\r\n";
+          if (!err.empty()) return encode_stream_error(err);
           std::vector<std::string> ents;
           for (const auto& [id, fields] : res.claimed) ents.push_back(encode_stream_entry(id, fields, justid));
           std::vector<std::string> del;
@@ -8367,16 +8590,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t min_idle = 0;
           if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XCLAIM");
           std::vector<std::string> ids; bool justid = false, force = false;
+          std::string last_id; bool have_last_id = false;
           for (std::size_t i = 5; i < args.size(); ++i) {
             const auto o = upper(args[i]);
-            if ((o == "IDLE" || o == "TIME" || o == "RETRYCOUNT" || o == "LASTID") && i + 1 < args.size()) { ++i; }
+            if (o == "LASTID" && i + 1 < args.size()) { last_id = args[i + 1]; have_last_id = true; ++i; }
+            else if ((o == "IDLE" || o == "TIME" || o == "RETRYCOUNT") && i + 1 < args.size()) { ++i; }
             else if (o == "FORCE") force = true;
             else if (o == "JUSTID") justid = true;
             else ids.push_back(args[i]);
           }
           if (ids.empty()) return encode_error("wrong number of arguments for 'xclaim' command");
           bool wt = false; std::string err;
-          auto claimed = store().xclaim(args[1], args[2], args[3], min_idle, ids, justid, force, wt, err);
+          auto claimed = store().xclaim(args[1], args[2], args[3], min_idle, ids, justid, force, wt, err,
+                                        have_last_id ? &last_id : nullptr);
           if (wt) return wrongtype_error_reply();
           if (!err.empty()) return "-" + err + "\r\n";
           std::vector<std::string> out;
@@ -9365,12 +9591,22 @@ std::string try_unblock_client(SessionState& session) {
       reply = it->second.handler(orig, session, close);
       g_block_disabled = false;
     }
-    // A transient WRONGTYPE (a watched key momentarily became a non-stream, e.g. inside
-    // a MULTI that deletes then re-adds it) must NOT wake the client with an error —
-    // stay blocked until real stream data arrives (Redis blockForKeys semantics).
+    // A blocked XREAD waits for new stream data, so a (possibly transient) wrong-type key —
+    // e.g. inside a MULTI that deletes then re-adds it as a list — must NOT wake it with an
+    // error; it stays blocked until real stream data arrives. XREADGROUP is different: once
+    // its key is a non-stream type (or the group is gone) the block can never be satisfied,
+    // so it unblocks with the WRONGTYPE/NOGROUP error, matching Redis.
     const bool is_wrongtype = reply.rfind("-WRONGTYPE", 0) == 0;
+    const bool wrongtype_stays_blocked = is_wrongtype && cmd0 != "XREADGROUP";
     if (!reply.empty() && reply != encode_null(RespVersion::Resp2) &&
-        reply != encode_null_array(session.resp_version) && !is_wrongtype) {
+        reply != encode_null_array(session.resp_version) && !wrongtype_stays_blocked) {
+      // An error delivered on wakeup (e.g. XGROUP DESTROY → NOGROUP) is a failed call: the
+      // dispatch chokepoint counted the initial (deferred) call, so record the failure here
+      // so INFO commandstats/errorstats and total_error_replies stay accurate.
+      if (is_error_reply(reply)) {
+        record_cmd_failed(cmd0);
+        record_error_stat(error_code_from_reply(reply));
+      }
       unregister_key_waiter(session.fd);
       session.blocked.type = BlockType::None;
       session.blocked.keys.clear();

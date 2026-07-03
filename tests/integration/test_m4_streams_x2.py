@@ -52,7 +52,9 @@ def main():
    id2=cmd(s,'XADD','st','*','f','v2'); assert isid(id2)
    assert cmd(s,'XGROUP','CREATE','st','g','0')=='OK'
 
-   r1=cmd(s,'XREADGROUP','GROUP','g','c1','STREAMS','st','>')
+   # COUNT 1: XREADGROUP without COUNT reads ALL available entries (Redis semantics), so
+   # bound it to one so acking id1 below empties the PEL.
+   r1=cmd(s,'XREADGROUP','GROUP','g','c1','COUNT','1','STREAMS','st','>')
    assert isinstance(r1,list) and len(r1)==1
    got_id=r1[0][1][0][0]
    assert got_id==id1

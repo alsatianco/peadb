@@ -107,6 +107,15 @@
       "mode": "native",
       "skipfile_lines": 11
     },
+    "unit/type/stream-cgroups": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 11,
+        "ok": 56
+      },
+      "mode": "native",
+      "skipfile_lines": 8
+    },
     "unit/type/string": {
       "last_counts": {
         "err": 0,

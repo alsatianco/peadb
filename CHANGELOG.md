@@ -9,6 +9,34 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 5): stream consumer-groups suite adopted
+
+- **`unit/type/stream-cgroups` adopted natively at 0 errors** (13 suites total). This built
+  out a real consumer-group model and fixed multiple drop-in gaps:
+  - **Consumer model** with per-consumer seen-time/active-time; full `XINFO STREAM … FULL`,
+    `XINFO GROUPS`, `XINFO CONSUMERS`; and `XGROUP DESTROY`/`CREATECONSUMER`/`DELCONSUMER`
+    (plus `ENTRIESREAD` on `XGROUP CREATE`/`SETID`, and `-`/`+`/`$` id resolution in `SETID`).
+  - **`XREADGROUP` rewrite**: honors `COUNT` (previously capped at 1), reads PEL history for a
+    non-`>` id (exclusive of the given id, with a nil-fields marker for XDELed entries), and
+    creates the consumer eagerly (even a blocking read that never delivers).
+  - **`XREADGROUP` effect propagation** to AOF *and* replication: `XGROUP CREATECONSUMER` +
+    per-entry `XCLAIM` (ACK) + `XGROUP SETID` (last-id/entries-read) — previously the backlog
+    got a partial XCLAIM and the AOF got nothing, so `DEBUG LOADAOF` lost group progress.
+  - **`entries-read`/`lag` nil-when-indeterminable** semantics (Redis `SCG_INVALID`), including
+    the lazy read-counter recovery on delivery and the tombstone-aware lag estimate.
+  - **`XAUTOCLAIM`** now iterates the PEL (surfacing XDELed-but-pending entries in the deleted
+    array, with the resume cursor), and validates `COUNT` against Redis's upper bound.
+  - **`XACK`/`XDEL` correctness**: `XACK` canonicalizes bare-ms ids and is all-or-nothing on a
+    bad id; `XDEL` (and trimming) leave dangling PEL tombstones (bug #5570) instead of purging
+    them; `XGROUP CREATE` returns `-BUSYGROUP`/`-NOGROUP` verbatim (no `ERR ` prefix).
+  - **Blocking fixes**: a blocked client that disconnects now releases its `blocked_clients`
+    slot (was leaking and cascading `wait_for_blocked_clients` timeouts); a blocked
+    `XREADGROUP` unblocks with `WRONGTYPE`/`NOGROUP` when its key changes type or its group is
+    destroyed/renamed away, and records the failed call in commandstats/errorstats.
+- 8 tests are skipfile-tracked: real-Redis listpack stream RDB `RESTORE` (delta 5), replica
+  offset-sync (`wait_for_ofs_sync`, delta 8), and consumer-time persistence / blocking-key
+  INFO counters (delta 17).
+
 ### Added — parity roadmap Phase 1 (wave 4): stream suite adopted
 
 - **`unit/type/stream` adopted natively at 0 errors** (12 suites total), fixing several

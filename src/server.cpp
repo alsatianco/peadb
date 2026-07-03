@@ -452,6 +452,13 @@ int run_server(const ServerConfig& config) {
   // deferred output-buffer-overflow drain also targets the same fd).
   auto close_client = [&](int fd) {
     if (!sessions.count(fd) && !write_buffers.count(fd)) return;
+    // A client that disconnects while blocked/waiting must release its slot, else the
+    // blocked_clients counter leaks and later blocking commands (and INFO) miscount.
+    auto scit = sessions.find(fd);
+    if (scit != sessions.end()) {
+      if (scit->second.blocked.type != BlockType::None && blocked_count > 0) --blocked_count;
+      if (scit->second.wait_state.has_value() && wait_count > 0) --wait_count;
+    }
     pubsub_unsubscribe_all(fd);
     on_client_disconnect(fd);
     poller.remove(fd);
