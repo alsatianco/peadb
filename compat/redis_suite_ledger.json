@@ -98,6 +98,15 @@
       "mode": "native",
       "skipfile_lines": 1
     },
+    "unit/type/stream": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 18,
+        "ok": 64
+      },
+      "mode": "native",
+      "skipfile_lines": 11
+    },
     "unit/type/string": {
       "last_counts": {
         "err": 0,

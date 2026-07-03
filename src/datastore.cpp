@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
 #include <sstream>
 #include <regex>
 #include <fstream>
@@ -19,6 +20,84 @@ namespace {
 // Reverse-binary-increment SCAN cursor step (defined below; forward-declared for the
 // collection scans that share it with the main-keyspace SCAN).
 std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets);
+
+// ── Stream IDs are (ms, seq) pairs compared NUMERICALLY (never as strings — "10-0"
+//    sorts before "9-0" lexically). These helpers are the single source of truth. ──
+struct StreamID {
+  std::uint64_t ms = 0;
+  std::uint64_t seq = 0;
+};
+inline int stream_id_cmp(const StreamID& a, const StreamID& b) {
+  if (a.ms != b.ms) return a.ms < b.ms ? -1 : 1;
+  if (a.seq != b.seq) return a.seq < b.seq ? -1 : 1;
+  return 0;
+}
+inline std::string stream_id_str(const StreamID& id) {
+  return std::to_string(id.ms) + "-" + std::to_string(id.seq);
+}
+// Parse a bare "ms" or "ms-seq". Returns false on any garbage or overflow.
+inline bool stream_id_parse_strict(const std::string& s, StreamID& out) {
+  if (s.empty()) return false;
+  const auto dash = s.find('-');
+  auto to_u64 = [](const std::string& t, std::uint64_t& v) -> bool {
+    if (t.empty()) return false;
+    for (char c : t) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    errno = 0;
+    char* end = nullptr;
+    v = std::strtoull(t.c_str(), &end, 10);
+    return errno != ERANGE && end == t.c_str() + t.size();
+  };
+  if (dash == std::string::npos) { out.seq = 0; return to_u64(s, out.ms); }
+  return to_u64(s.substr(0, dash), out.ms) && to_u64(s.substr(dash + 1), out.seq);
+}
+// Parse an XRANGE/XREVRANGE bound into an INCLUSIVE StreamID: "-"/"+", optional "("
+// exclusive prefix, bare "ms" (seq defaults 0 for a start bound, UINT64_MAX for a stop
+// bound), or "ms-seq". An exclusive "(id" is converted to the adjacent inclusive id
+// (start: id+1, stop: id-1); overflow past +∞ / underflow below 0-0 is an error, as is
+// "(-"/"(+". Returns false on any invalid bound so the caller can reply -ERR.
+inline bool stream_id_parse_bound(const std::string& in, bool is_start, StreamID& out) {
+  bool exclusive = false;
+  std::string s = in;
+  if (!s.empty() && s[0] == '(') { exclusive = true; s = s.substr(1); }
+  if (!exclusive) {
+    if (s == "-") { out = {0, 0}; return true; }
+    if (s == "+") { out = {UINT64_MAX, UINT64_MAX}; return true; }
+  } else if (s == "-" || s == "+" || s.empty()) {
+    return false;  // exclusive of a special/empty bound is invalid
+  }
+  StreamID id;
+  if (s.find('-') == std::string::npos) {
+    std::uint64_t ms = 0;
+    if (s.empty()) return false;
+    for (char c : s) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    errno = 0;
+    char* end = nullptr;
+    ms = std::strtoull(s.c_str(), &end, 10);
+    if (errno == ERANGE || end != s.c_str() + s.size()) return false;
+    id = {ms, is_start ? 0u : UINT64_MAX};
+  } else if (!stream_id_parse_strict(s, id)) {
+    return false;
+  }
+  if (exclusive) {
+    if (is_start) {  // adjacent-greater
+      if (id.seq == UINT64_MAX) {
+        if (id.ms == UINT64_MAX) return false;  // past +∞
+        id = {id.ms + 1, 0};
+      } else {
+        id.seq++;
+      }
+    } else {  // adjacent-smaller
+      if (id.seq == 0) {
+        if (id.ms == 0) return false;  // below 0-0
+        id = {id.ms - 1, UINT64_MAX};
+      } else {
+        id.seq--;
+      }
+    }
+  }
+  out = id;
+  return true;
+}
 
 // Round-trip-safe double formatting for AOF rewrite (std::to_string gives only ~6
 // significant digits, silently corrupting non-round scores on every rewrite).
@@ -1161,51 +1240,120 @@ std::optional<std::string> DataStore::xadd(
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) {
-    Entry e;
-    e.stream();
-    db[key] = std::move(e);
-    it = db.find(key);
-  } else if (it->second.type() != ValueType::Stream) {
+  const bool key_exists = it != db.end();
+  if (key_exists && it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return std::nullopt;
   }
 
-  std::uint64_t ms = 0, seq = 0;
+  // Compute the ID against the current last-id BEFORE creating anything, so an invalid
+  // ID never leaves an empty stream behind (Redis: XADD with a bad ID doesn't create).
+  const StreamID last = key_exists ? StreamID{it->second.stream_last_ms(), it->second.stream_last_seq()}
+                                   : StreamID{0, 0};
+  // last_id persists after XDEL / on an emptied stream, so new IDs must still exceed it:
+  // gate the monotonicity checks on "has this stream ever assigned an id" (last != 0-0),
+  // not on the current entry count.
+  const bool have_last = key_exists && (last.ms != 0 || last.seq != 0);
+  // Redis rejects any XADD once the stream's last id is the maximal possible value,
+  // regardless of the requested id form (checked before append).
+  if (have_last && last.ms == UINT64_MAX && last.seq == UINT64_MAX) {
+    err = "The stream has exhausted the last possible ID, unable to add more items";
+    return std::nullopt;
+  }
+  StreamID nid;
   if (id == "*") {
+    // Full auto: max(now, last_ms). Bump seq on the same ms; if seq is exhausted the
+    // stream is full (last.ms already UINT64_MAX) — error rather than wrap.
     const auto now = static_cast<std::uint64_t>(now_ms());
-    if (now > it->second.stream_last_ms()) {
-      ms = now;
-      seq = 0;
+    if (have_last && now <= last.ms) {
+      // Same/older ms than last: advance the seq, rolling to (ms+1, 0) on seq overflow.
+      // The (MAX,MAX) case is already rejected by the top-level exhausted guard above.
+      if (last.seq == UINT64_MAX) {
+        nid = {last.ms + 1, 0};
+      } else {
+        nid = {last.ms, last.seq + 1};
+      }
     } else {
-      ms = it->second.stream_last_ms();
-      seq = it->second.stream_last_seq() + 1;
+      nid = {now, 0};
     }
   } else {
-    const auto pos = id.find('-');
-    try {
-      if (pos == std::string::npos) {
-        ms = static_cast<std::uint64_t>(std::stoull(id));
-        seq = 0;
-      } else {
-        ms = static_cast<std::uint64_t>(std::stoull(id.substr(0, pos)));
-        seq = static_cast<std::uint64_t>(std::stoull(id.substr(pos + 1)));
+    // "ms-*" (explicit ms, auto seq) or "ms" / "ms-seq".
+    const auto star = id.rfind("-*");
+    if (star != std::string::npos && star == id.size() - 2) {
+      std::uint64_t ms = 0;
+      const std::string mspart = id.substr(0, star);
+      if (mspart.empty()) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
+      for (char c : mspart) if (!std::isdigit(static_cast<unsigned char>(c))) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
+      errno = 0; char* e2 = nullptr; ms = std::strtoull(mspart.c_str(), &e2, 10);
+      if (errno == ERANGE || e2 != mspart.c_str() + mspart.size()) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
+      if (have_last && ms < last.ms) {
+        err = "The ID specified in XADD is equal or smaller than the target stream top item";
+        return std::nullopt;
       }
-    } catch (...) {
-      err = "Invalid stream ID specified as stream command argument";
-      return std::nullopt;
-    }
-    if (ms < it->second.stream_last_ms() || (ms == it->second.stream_last_ms() && seq <= it->second.stream_last_seq())) {
-      err = "The ID specified in XADD is equal or smaller than the target stream top item";
-      return std::nullopt;
+      if (have_last && ms == last.ms) {
+        if (last.seq == UINT64_MAX) {
+          // ms-* with the same ms and seq already at max: cannot advance the seq, and
+          // Redis does NOT roll over to ms+1 for the partial form — it's "equal or smaller".
+          err = "The ID specified in XADD is equal or smaller than the target stream top item";
+          return std::nullopt;
+        }
+        nid = {ms, last.seq + 1};
+      } else {
+        // New ms (or empty stream): seq starts at 0, except 0-* on an empty stream is
+        // 0-1 since 0-0 is reserved.
+        nid = {ms, ms == 0 ? 1u : 0u};
+      }
+    } else {
+      if (!stream_id_parse_strict(id, nid)) {
+        err = "Invalid stream ID specified as stream command argument";
+        return std::nullopt;
+      }
+      // 0-0 is never a valid explicit XADD id.
+      if (nid.ms == 0 && nid.seq == 0) {
+        err = "The ID specified in XADD must be greater than 0-0";
+        return std::nullopt;
+      }
+      if (have_last && stream_id_cmp(nid, last) <= 0) {
+        err = "The ID specified in XADD is equal or smaller than the target stream top item";
+        return std::nullopt;
+      }
     }
   }
 
-  it->second.stream_last_ms() = ms;
-  it->second.stream_last_seq() = seq;
-  const std::string out_id = std::to_string(ms) + "-" + std::to_string(seq);
+  // ID is valid — now create the stream if the key was absent (deferred so a bad ID
+  // never leaves an empty stream behind).
+  if (!key_exists) {
+    Entry e;
+    e.stream();
+    db[key] = std::move(e);
+    it = db.find(key);
+  }
+  it->second.stream_last_ms() = nid.ms;
+  it->second.stream_last_seq() = nid.seq;
+  it->second.stream().entries_added++;
+  const std::string out_id = stream_id_str(nid);
   it->second.stream_entries().push_back({out_id, fields});
   return out_id;
+}
+
+bool DataStore::stream_info(const std::string& key, StreamInfo& out, bool& wrongtype) {
+  wrongtype = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  const auto& st = it->second.stream();
+  out.length = static_cast<std::int64_t>(st.entries.size());
+  out.last_id = stream_id_str({st.last_ms, st.last_seq});
+  out.max_deleted_id = st.max_deleted_id;
+  out.entries_added = st.entries_added;
+  out.groups = st.groups.size();
+  if (!st.entries.empty()) {
+    out.first = st.entries.front();
+    out.last = st.entries.back();
+  }
+  return true;
 }
 
 std::int64_t DataStore::xlen(const std::string& key, bool& wrongtype) {
@@ -1222,8 +1370,10 @@ std::int64_t DataStore::xlen(const std::string& key, bool& wrongtype) {
 }
 
 std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xrange(
-    const std::string& key, const std::string& start, const std::string& stop, bool rev, bool& wrongtype) {
+    const std::string& key, const std::string& start, const std::string& stop, bool rev, bool& wrongtype,
+    bool* invalid_id) {
   wrongtype = false;
+  if (invalid_id) *invalid_id = false;
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1234,10 +1384,20 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
     return out;
   }
 
-  auto in_range = [&](const std::string& id) {
-    bool ge_start = (start == "-" || id >= start);
-    bool le_stop = (stop == "+" || id <= stop);
-    return ge_start && le_stop;
+  // For XREVRANGE the caller passes bounds as (start=max, stop=min); parse each in its
+  // own role so a bare "ms" defaults seq correctly (0 for the low bound, MAX for high).
+  const std::string& lo_in = rev ? stop : start;
+  const std::string& hi_in = rev ? start : stop;
+  StreamID lo, hi;
+  if (!stream_id_parse_bound(lo_in, /*is_start=*/true, lo) ||
+      !stream_id_parse_bound(hi_in, /*is_start=*/false, hi)) {
+    if (invalid_id) *invalid_id = true;
+    return out;
+  }
+  auto in_range = [&](const std::string& id_str) {
+    StreamID id;
+    if (!stream_id_parse_strict(id_str, id)) return false;
+    return stream_id_cmp(id, lo) >= 0 && stream_id_cmp(id, hi) <= 0;  // bounds already inclusive
   };
 
   if (!rev) {
@@ -1377,7 +1537,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
   return out;
 }
 
-std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype) {
+std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype,
+                             bool is_trim) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1390,14 +1551,27 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
 
   std::int64_t removed = 0;
   for (const auto& id : ids) {
+    // Normalize the requested id ("666" == "666-0") and compare numerically so a bare
+    // ms matches the stored "ms-seq" entry.
+    StreamID want;
+    if (!stream_id_parse_strict(id, want)) continue;
     auto vit = std::find_if(it->second.stream_entries().begin(), it->second.stream_entries().end(),
-                            [&](const auto& e) { return e.first == id; });
+                            [&](const auto& e) {
+                              StreamID eid;
+                              return stream_id_parse_strict(e.first, eid) && stream_id_cmp(eid, want) == 0;
+                            });
     if (vit == it->second.stream_entries().end()) continue;
+    const std::string canon_id = vit->first;  // canonical "ms-seq" for PEL cleanup
+    // Track the highest deleted id (XINFO max-deleted-entry-id) — only for explicit XDEL;
+    // trimming (MAXLEN/MINID) removes entries without advancing this tombstone marker.
+    if (!is_trim && stream_id_gt(canon_id, it->second.stream().max_deleted_id)) {
+      it->second.stream().max_deleted_id = canon_id;
+    }
     it->second.stream_entries().erase(vit);
     ++removed;
 
     for (auto& [_, grp] : it->second.stream_groups()) {
-      auto pit = grp.pending_to_consumer.find(id);
+      auto pit = grp.pending_to_consumer.find(canon_id);
       if (pit == grp.pending_to_consumer.end()) continue;
       auto cit = grp.pending_per_consumer.find(pit->second);
       if (cit != grp.pending_per_consumer.end()) {
@@ -1405,8 +1579,8 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
         else grp.pending_per_consumer.erase(cit);
       }
       grp.pending_to_consumer.erase(pit);
-      grp.pending_delivery_ms.erase(id);
-      grp.pending_delivery_count.erase(id);
+      grp.pending_delivery_ms.erase(canon_id);
+      grp.pending_delivery_count.erase(canon_id);
     }
   }
   return removed;
@@ -1529,24 +1703,64 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   }
 }
 
-bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err) {
+bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err,
+                       const std::string* entries_added, const std::string* max_deleted_id) {
   wrongtype = false; err.clear();
-  auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
-  auto it = db.find(key);
-  if (it == db.end()) { err = "ERR The XSETID command requires the key to exist."; return false; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
-  std::uint64_t ms = 0, seq = 0;
-  if (!parse_stream_id_pair(id, ms, seq)) {
+  StreamID nid;
+  if (!stream_id_parse_strict(id, nid)) {
     err = "ERR Invalid stream ID specified as stream command argument";
     return false;
   }
-  if (!it->second.stream_entries().empty() && stream_id_gt(it->second.stream_entries().back().first, id)) {
-    err = "ERR The ID specified in XSETID is smaller than the target stream top item";
+  StreamID maxdel{0, 0};
+  if (max_deleted_id) {
+    if (!stream_id_parse_strict(*max_deleted_id, maxdel)) {
+      err = "ERR Invalid stream ID specified as stream command argument";
+      return false;
+    }
+    // A supplied max-deleted tombstone may not exceed the new last-id (checked before
+    // the key lookup, matching Redis xsetidCommand's option-parse order).
+    if (stream_id_cmp(nid, maxdel) < 0) {
+      err = "ERR The ID specified in XSETID is smaller than the provided max_deleted_entry_id";
+      return false;
+    }
+  }
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "ERR no such key"; return false; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  auto& st = it->second.stream();
+  // The new last-id cannot regress below the stream's recorded max-deleted tombstone.
+  StreamID cur_maxdel{0, 0};
+  stream_id_parse_strict(st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id, cur_maxdel);
+  if (stream_id_cmp(nid, cur_maxdel) < 0) {
+    err = "ERR The ID specified in XSETID is smaller than current max_deleted_entry_id";
     return false;
   }
-  it->second.stream_last_ms() = ms;
-  it->second.stream_last_seq() = seq;
+  if (!st.entries.empty()) {
+    // The new last-id cannot be below the current top (last valid) entry.
+    StreamID top;
+    stream_id_parse_strict(st.entries.back().first, top);
+    if (stream_id_cmp(nid, top) < 0) {
+      err = "ERR The ID specified in XSETID is smaller than the target stream top item";
+      return false;
+    }
+    // A supplied entries-added counter cannot be below the current stream length.
+    if (entries_added) {
+      errno = 0;
+      const auto ea = std::strtoull(entries_added->c_str(), nullptr, 10);
+      if (st.entries.size() > ea) {
+        err = "ERR The entries_added specified in XSETID is smaller than the target stream length";
+        return false;
+      }
+    }
+  }
+  st.last_ms = nid.ms;
+  st.last_seq = nid.seq;
+  if (entries_added) {
+    errno = 0; st.entries_added = std::strtoull(entries_added->c_str(), nullptr, 10);
+  }
+  if (max_deleted_id) st.max_deleted_id = stream_id_str(maxdel);
   return true;
 }
 
@@ -2032,10 +2246,35 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
           break;
         }
         case ValueType::Stream: {
-          for (const auto& [id, fields] : e.stream_entries()) {
-            std::vector<std::string> cmd{"XADD", key, id};
-            for (const auto& [f, v] : fields) { cmd.push_back(f); cmd.push_back(v); }
-            out.push_back(std::move(cmd));
+          const auto& st = e.stream();
+          if (!st.entries.empty()) {
+            for (const auto& [id, fields] : st.entries) {
+              std::vector<std::string> cmd{"XADD", key, id};
+              for (const auto& [f, v] : fields) { cmd.push_back(f); cmd.push_back(v); }
+              out.push_back(std::move(cmd));
+            }
+          } else {
+            // Empty stream: streams are not deleted when they lose their last entry, so
+            // recreate the key with the XADD MAXLEN 0 trick (Redis rewriteStreamObject).
+            out.push_back({"XADD", key, "MAXLEN", "0", "0-1", "x", "y"});
+          }
+          // Restore last-id / entries-added / max-deleted-entry-id even after XDEL/trim.
+          out.push_back({"XSETID", key, stream_id_str({st.last_ms, st.last_seq}),
+                         "ENTRIESADDED", std::to_string(st.entries_added),
+                         "MAXDELETEDID", st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id});
+          // Recreate consumer groups and their pending-entries lists. XGROUP CREATE
+          // rebuilds the group at its last-delivered-id; XCLAIM ... FORCE re-adds each
+          // pending message to its owning consumer's PEL.
+          for (const auto& [gname, grp] : st.groups) {
+            out.push_back({"XGROUP", "CREATE", key, gname, grp.last_delivered_id});
+            for (const auto& [pid, consumer] : grp.pending_to_consumer) {
+              auto ms_it = grp.pending_delivery_ms.find(pid);
+              auto cnt_it = grp.pending_delivery_count.find(pid);
+              const std::string dms = ms_it != grp.pending_delivery_ms.end() ? std::to_string(ms_it->second) : "0";
+              const std::string dcnt = cnt_it != grp.pending_delivery_count.end() ? std::to_string(cnt_it->second) : "1";
+              out.push_back({"XCLAIM", key, gname, consumer, "0", pid,
+                             "TIME", dms, "RETRYCOUNT", dcnt, "JUSTID", "FORCE"});
+            }
           }
           break;
         }

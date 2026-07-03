@@ -9,6 +9,29 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 4): stream suite adopted
+
+- **`unit/type/stream` adopted natively at 0 errors** (12 suites total), fixing several
+  drop-in stream bugs surfaced by the upstream suite:
+  - **Trimming no longer advances `max-deleted-entry-id`.** `MAXLEN`/`MINID` trimming
+    (in `XADD` and `XTRIM`) reused the same delete path as `XDEL`, which wrongly bumped the
+    tombstone marker Redis only touches on an explicit `XDEL` — corrupting later `XSETID`
+    monotonicity checks. Trim now removes entries without moving the marker.
+  - **`XSETID` validation matches Redis exactly**: rejects an id below the stream's current
+    `max-deleted-entry-id`, below a supplied `MAXDELETEDID`, or an `ENTRIESADDED` below the
+    stream length, each with Redis's precise error text and check ordering.
+  - **`XADD` partial-id overflow** (`ms-*` where the sequence is already at max) now returns
+    "equal or smaller", not "exhausted" (the latter is reserved for a fully-maxed last-id).
+  - **AOF rewrite round-trips streams** (Redis `rewriteStreamObject` shape): empty streams
+    are recreated via the `XADD MAXLEN 0` trick, `XSETID … ENTRIESADDED … MAXDELETEDID`
+    restores metadata after XDEL/trim, and consumer groups + PELs are rebuilt via
+    `XGROUP CREATE` + `XCLAIM … JUSTID FORCE`. Fixes empty streams vanishing across
+    `BGREWRITEAOF`/`DEBUG LOADAOF`.
+  - **`XGROUP HELP` and `XINFO HELP`** subcommands (with correct arity-error text).
+- 11 approximate-trim tests (`MAXLEN ~` / `MINID ~` / `LIMIT`) are skipfile-tracked: they
+  assert Redis's 100-entry listpack-macro-node retained counts, which PeaDB can't reproduce
+  without a real listpack backend (compat/delta.md items 5 & 16).
+
 ### Added — parity roadmap Phase 1 (wave 3): rehash-safe SCAN cursors
 
 - **`unit/scan` adopted natively at 0 errors** (11 suites total, 98.0% pass-rate).

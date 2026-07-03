@@ -1,0 +1,15 @@
+# Approximate trimming (MAXLEN ~ / MINID ~ / LIMIT) removes whole listpack macro-nodes
+# (default 100 entries/node). PeaDB has no macro-node backend, so it trims exactly — a
+# spec-valid "keep at least N" result, but not the exact retained count these tests assert.
+# (compat/delta.md item 16, real listpack/quicklist backends.)
+XADD with MAXLEN option and the '~' argument
+XADD with LIMIT delete entries no more than limit
+XTRIM with MAXLEN option basic test
+XADD with LIMIT consecutive calls
+XTRIM with ~ is limited
+XTRIM with LIMIT delete entries no more than limit
+XADD with ~ MAXLEN can propagate correctly
+XADD with ~ MAXLEN and LIMIT can propagate correctly
+XADD with ~ MINID can propagate correctly
+XADD with ~ MINID and LIMIT can propagate correctly
+XTRIM with ~ MAXLEN can propagate correctly

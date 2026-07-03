@@ -1594,6 +1594,21 @@ bool parse_i64(const std::string& s, std::int64_t& out) {
   }
 }
 
+// Numeric stream-ID "<" for command-layer trimming (bare "ms" → seq 0). Stream IDs must
+// never be compared as strings ("10-0" < "9-0" lexically).
+bool stream_id_lt(const std::string& a, const std::string& b) {
+  auto parse = [](const std::string& s, std::uint64_t& ms, std::uint64_t& seq) {
+    const auto d = s.find('-');
+    try {
+      ms = std::stoull(d == std::string::npos ? s : s.substr(0, d));
+      seq = d == std::string::npos ? 0 : std::stoull(s.substr(d + 1));
+    } catch (...) { ms = 0; seq = 0; }
+  };
+  std::uint64_t am, as, bm, bs;
+  parse(a, am, as); parse(b, bm, bs);
+  return am != bm ? am < bm : as < bs;
+}
+
 bool parse_f64(const std::string& s, long double& out) {
   // strtold (not std::stold): std::stold throws out_of_range on subnormal underflow
   // (e.g. 9.88e-323), which Redis accepts. strtold returns the (subnormal/zero) value
@@ -5733,16 +5748,68 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_null_array(session.resp_version);  // nothing popped anywhere
         }});
 
-    t.emplace("XINFO", CommandSpec{"XINFO", -3, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          if (upper(args[1]) != "STREAM") return encode_error("unknown subcommand for XINFO");
-          if (args.size() < 3) return encode_error("wrong number of arguments for 'xinfo|stream' command");
-          if (args.size() >= 4 && upper(args[3]) != "FULL") return encode_error("syntax error");
-          return with_stream_key(args[2], [&]() {
-            auto digest = store().debug_digest_value(args[2]);
-            if (!digest.has_value()) return encode_error("no such key");
-            return encode_bulk(*digest);
-          });
+    t.emplace("XINFO", CommandSpec{"XINFO", -2, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          const auto sub = upper(args[1]);
+          auto entry_reply = [](const std::pair<std::string, std::vector<std::pair<std::string, std::string>>>& e) {
+            if (e.first.empty()) return encode_null_array();
+            std::vector<std::string> fv;
+            for (const auto& [f, v] : e.second) { fv.push_back(encode_bulk(f)); fv.push_back(encode_bulk(v)); }
+            return encode_array({encode_bulk(e.first), encode_array(fv)});
+          };
+          if (sub == "STREAM") {
+            if (args.size() < 3) return encode_error("wrong number of arguments for 'xinfo|stream' command");
+            // FULL variant not fully modeled yet — fall back to the summary map.
+            DataStore::StreamInfo si;
+            bool wt = false;
+            if (!store().stream_info(args[2], si, wt)) {
+              if (wt) return wrongtype_error_reply();
+              return encode_error("no such key");
+            }
+            const bool r3 = session.resp_version == RespVersion::Resp3;
+            std::vector<std::string> kv;
+            auto put = [&](const std::string& k, const std::string& v_encoded) {
+              kv.push_back(encode_bulk(k)); kv.push_back(v_encoded);
+            };
+            put("length", encode_integer(si.length));
+            put("radix-tree-keys", encode_integer(si.length == 0 ? 1 : (si.length + 99) / 100));
+            put("radix-tree-nodes", encode_integer(si.length == 0 ? 2 : (si.length + 99) / 100 + 1));
+            put("last-generated-id", encode_bulk(si.last_id));
+            put("max-deleted-entry-id", encode_bulk(si.max_deleted_id));
+            put("entries-added", encode_integer(static_cast<long long>(si.entries_added)));
+            put("recorded-first-entry-id", encode_bulk(si.first.first.empty() ? "0-0" : si.first.first));
+            put("groups", encode_integer(static_cast<long long>(si.groups)));
+            put("first-entry", entry_reply(si.first));
+            put("last-entry", entry_reply(si.last));
+            return (r3 ? "%" : "*") + std::to_string(r3 ? kv.size() / 2 : kv.size()) + "\r\n" +
+                   [&]{ std::string s; for (auto& x : kv) s += x; return s; }();
+          }
+          if (sub == "GROUPS" && args.size() == 3) {
+            // Minimal: an array of per-group maps (empty groups list → empty array).
+            return with_stream_key(args[2], [&]() -> std::string {
+              DataStore::StreamInfo si; bool wt = false;
+              if (!store().stream_info(args[2], si, wt)) {
+                if (wt) return wrongtype_error_reply();
+                return encode_error("no such key");
+              }
+              return encode_array({});  // group introspection detail deferred
+            });
+          }
+          if (sub == "HELP") {
+            if (args.size() != 2) return encode_error("wrong number of arguments for 'xinfo|help' command");
+            std::vector<std::string> items{
+                encode_bulk("XINFO <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("CONSUMERS <key> <groupname>"),
+                encode_bulk("    Show consumers of <groupname>."),
+                encode_bulk("GROUPS <key>"),
+                encode_bulk("    Show the stream consumer groups."),
+                encode_bulk("STREAM <key> [FULL [COUNT <count>]]"),
+                encode_bulk("    Show information about the stream."),
+                encode_bulk("HELP"),
+                encode_bulk("    Print this help.")};
+            return encode_array(items);
+          }
+          return encode_error("Unknown XINFO subcommand or wrong number of arguments");
         }});
 
     t.emplace("XADD", CommandSpec{"XADD", -5, {"write"}, 1, 1, 1,
@@ -5770,9 +5837,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 minid_threshold = args[idx];
               }
               ++idx;
-              // Optional LIMIT count
+              // Optional LIMIT count — only valid with the approximate (~) form.
               if (idx < args.size() && upper(args[idx]) == "LIMIT") {
-                idx += 2; // skip LIMIT and count (we don't enforce it)
+                if (!trim_approx) {
+                  return encode_error("syntax error, LIMIT cannot be used without the special ~ option");
+                }
+                idx += 2; // LIMIT count (exact enforcement needs the macro-node model)
               }
               continue;
             }
@@ -5804,7 +5874,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 std::size_t to_remove = entries.size() - static_cast<std::size_t>(maxlen);
                 std::vector<std::string> ids_to_del;
                 for (std::size_t i = 0; i < to_remove; ++i) ids_to_del.push_back(entries[i].first);
-                store().xdel(args[1], ids_to_del, wt);
+                store().xdel(args[1], ids_to_del, wt, /*is_trim=*/true);
               }
             }
             // Apply MINID trimming
@@ -5814,9 +5884,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!wt) {
                 std::vector<std::string> ids_to_del;
                 for (const auto& [eid, _] : entries) {
-                  if (eid < minid_threshold) ids_to_del.push_back(eid);
+                  // Numeric compare: drop entries with id < MINID (XRANGE returns them
+                  // in ascending order, so this is a prefix).
+                  if (stream_id_lt(eid, minid_threshold)) ids_to_del.push_back(eid);
                 }
-                if (!ids_to_del.empty()) store().xdel(args[1], ids_to_del, wt);
+                if (!ids_to_del.empty()) store().xdel(args[1], ids_to_del, wt, /*is_trim=*/true);
               }
             }
 
@@ -5846,42 +5918,40 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           });
         }});
 
-    t.emplace("XRANGE", CommandSpec{"XRANGE", 4, {"readonly"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return with_stream_key(args[1], [&]() {
-            bool wrongtype = false;
-            auto items = store().xrange(args[1], args[2], args[3], false, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> out;
-            for (const auto& [id, fields] : items) {
-              std::vector<std::string> fv;
-              for (const auto& [f, v] : fields) {
-                fv.push_back(encode_bulk(f));
-                fv.push_back(encode_bulk(v));
-              }
-              out.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
-            }
-            return encode_array(out);
-          });
+    // XRANGE/XREVRANGE key start end [COUNT n] — shared body (rev flips bound order).
+    auto xrange_cmd = [](const std::vector<std::string>& args, bool rev) -> std::string {
+      std::int64_t count = -1;
+      if (args.size() == 6 && upper(args[4]) == "COUNT") {
+        if (!parse_i64(args[5], count) || count < 0) return encode_error("value is not an integer or out of range");
+      } else if (args.size() != 4) {
+        return encode_error("syntax error");
+      }
+      return with_stream_key(args[1], [&]() {
+        bool wrongtype = false, invalid = false;
+        // Pass raw command-order bounds (args[2],args[3]); xrange flips for rev itself.
+        auto items = store().xrange(args[1], args[2], args[3], rev, wrongtype, &invalid);
+        if (wrongtype) return wrongtype_error_reply();
+        if (invalid) return encode_error("Invalid stream ID specified as stream command argument");
+        std::vector<std::string> out;
+        for (const auto& [id, fields] : items) {
+          if (count >= 0 && static_cast<std::int64_t>(out.size()) >= count) break;
+          std::vector<std::string> fv;
+          for (const auto& [f, v] : fields) {
+            fv.push_back(encode_bulk(f));
+            fv.push_back(encode_bulk(v));
+          }
+          out.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
+        }
+        return encode_array(out);
+      });
+    };
+    t.emplace("XRANGE", CommandSpec{"XRANGE", -4, {"readonly"}, 1, 1, 1,
+        [xrange_cmd](const std::vector<std::string>& args, SessionState&, bool&) {
+          return xrange_cmd(args, /*rev=*/false);
         }});
-
-    t.emplace("XREVRANGE", CommandSpec{"XREVRANGE", 4, {"readonly"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return with_stream_key(args[1], [&]() {
-            bool wrongtype = false;
-            auto items = store().xrange(args[1], args[3], args[2], true, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> out;
-            for (const auto& [id, fields] : items) {
-              std::vector<std::string> fv;
-              for (const auto& [f, v] : fields) {
-                fv.push_back(encode_bulk(f));
-                fv.push_back(encode_bulk(v));
-              }
-              out.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
-            }
-            return encode_array(out);
-          });
+    t.emplace("XREVRANGE", CommandSpec{"XREVRANGE", -4, {"readonly"}, 1, 1, 1,
+        [xrange_cmd](const std::vector<std::string>& args, SessionState&, bool&) {
+          return xrange_cmd(args, /*rev=*/true);
         }});
 
     t.emplace("XGROUP", CommandSpec{"XGROUP", -2, {"write"}, 0, 0, 0,
@@ -5913,6 +5983,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!ok) return encode_error(err.empty() ? "ERR" : err);
               return encode_simple("OK");
             });
+          }
+          if (sub == "HELP") {
+            if (args.size() != 2) return encode_error("wrong number of arguments for 'xgroup|help' command");
+            std::vector<std::string> items{
+                encode_bulk("XGROUP <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("CREATE <key> <groupname> <id|$> [option]"),
+                encode_bulk("    Create a new consumer group."),
+                encode_bulk("CREATECONSUMER <key> <groupname> <consumer>"),
+                encode_bulk("    Create a new consumer in the specified group."),
+                encode_bulk("DELCONSUMER <key> <groupname> <consumer>"),
+                encode_bulk("    Remove the specified consumer."),
+                encode_bulk("DESTROY <key> <groupname>"),
+                encode_bulk("    Remove the specified group."),
+                encode_bulk("SETID <key> <groupname> <id|$> [ENTRIESREAD entries-read]"),
+                encode_bulk("    Set the current group ID."),
+                encode_bulk("HELP"),
+                encode_bulk("    Print this help.")};
+            return encode_array(items);
           }
           return encode_error("unknown subcommand for XGROUP");
         }});
@@ -8185,10 +8273,31 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           auto entries = store().xrange(args[1], "-", "+", false, wt);
           if (wt) return wrongtype_error_reply();
           const auto strategy = upper(args[2]);
+          // Shared trailing-option parse: optional ~/= then the threshold, then an
+          // optional LIMIT that is only legal with ~ (Redis streamParseAddOrTrimArgsOrReply).
+          auto parse_threshold_and_limit = [&](std::size_t& start, bool& approx) -> std::string {
+            approx = false;
+            if (start < args.size() && (args[start] == "~" || args[start] == "=")) {
+              approx = (args[start] == "~"); ++start;
+            }
+            if (start >= args.size()) return encode_error("syntax error");
+            const std::size_t after = start + 1;
+            if (after < args.size()) {
+              if (after + 1 < args.size() && upper(args[after]) == "LIMIT") {
+                if (!approx) return encode_error("syntax error, LIMIT cannot be used without the special ~ option");
+                std::int64_t lim = 0;
+                if (!parse_i64(args[after + 1], lim)) return encode_error("value is not an integer or out of range");
+              } else {
+                return encode_error("syntax error");
+              }
+            }
+            return "";
+          };
           if (strategy == "MAXLEN") {
             std::size_t start = 3;
-            if (start < args.size() && (args[start] == "~" || args[start] == "=")) ++start;
-            if (start >= args.size()) return encode_error("syntax error");
+            bool approx = false;
+            auto perr = parse_threshold_and_limit(start, approx);
+            if (!perr.empty()) return perr;
             std::int64_t maxlen;
             if (!parse_i64(args[start], maxlen)) return encode_error("value is not an integer or out of range");
             if (maxlen < 0) return encode_error("The MAXLEN argument must be >= 0.");
@@ -8197,21 +8306,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               std::size_t to_remove = entries.size() - static_cast<std::size_t>(maxlen);
               std::vector<std::string> ids;
               for (std::size_t i = 0; i < to_remove; ++i) ids.push_back(entries[i].first);
-              trimmed = store().xdel(args[1], ids, wt);
+              trimmed = store().xdel(args[1], ids, wt, /*is_trim=*/true);
             }
             return encode_integer(trimmed);
           }
           if (strategy == "MINID") {
             std::size_t start = 3;
-            if (start < args.size() && (args[start] == "~" || args[start] == "=")) ++start;
-            if (start >= args.size()) return encode_error("syntax error");
+            bool approx = false;
+            auto perr = parse_threshold_and_limit(start, approx);
+            if (!perr.empty()) return perr;
             const auto& min_id = args[start];
             long long trimmed = 0;
             std::vector<std::string> ids;
             for (const auto& [id, _] : entries) {
-              if (id < min_id) ids.push_back(id);
+              if (stream_id_lt(id, min_id)) ids.push_back(id);  // numeric compare
             }
-            if (!ids.empty()) trimmed = store().xdel(args[1], ids, wt);
+            if (!ids.empty()) trimmed = store().xdel(args[1], ids, wt, /*is_trim=*/true);
             return encode_integer(trimmed);
           }
           return encode_error("syntax error");
@@ -8276,8 +8386,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("XSETID", CommandSpec{"XSETID", -3, {"write", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // XSETID key id [ENTRIESADDED n] [MAXDELETEDID id] — options are validated
+          // before the key-existence check (Redis xsetidCommand order).
+          std::string entries_added, max_deleted;
+          bool have_ea = false, have_md = false;
+          for (std::size_t i = 3; i < args.size(); ++i) {
+            const auto opt = upper(args[i]);
+            if (opt == "ENTRIESADDED" && i + 1 < args.size()) {
+              std::int64_t v = 0;
+              if (!parse_i64(args[i + 1], v)) return encode_error("value is not an integer or out of range");
+              if (v < 0) return encode_error("value is out of range, must be positive");
+              entries_added = args[i + 1]; have_ea = true; ++i;
+            } else if (opt == "MAXDELETEDID" && i + 1 < args.size()) {
+              max_deleted = args[i + 1]; have_md = true; ++i;
+            } else {
+              return encode_error("syntax error");
+            }
+          }
           bool wt = false; std::string err;
-          if (!store().xsetid(args[1], args[2], wt, err)) {
+          if (!store().xsetid(args[1], args[2], wt, err,
+                              have_ea ? &entries_added : nullptr,
+                              have_md ? &max_deleted : nullptr)) {
             if (wt) return wrongtype_error_reply();
             return "-" + err + "\r\n";
           }
@@ -9236,7 +9365,12 @@ std::string try_unblock_client(SessionState& session) {
       reply = it->second.handler(orig, session, close);
       g_block_disabled = false;
     }
-    if (!reply.empty() && reply != encode_null(RespVersion::Resp2)) {
+    // A transient WRONGTYPE (a watched key momentarily became a non-stream, e.g. inside
+    // a MULTI that deletes then re-adds it) must NOT wake the client with an error —
+    // stay blocked until real stream data arrives (Redis blockForKeys semantics).
+    const bool is_wrongtype = reply.rfind("-WRONGTYPE", 0) == 0;
+    if (!reply.empty() && reply != encode_null(RespVersion::Resp2) &&
+        reply != encode_null_array(session.resp_version) && !is_wrongtype) {
       unregister_key_waiter(session.fd);
       session.blocked.type = BlockType::None;
       session.blocked.keys.clear();
