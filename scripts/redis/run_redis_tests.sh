@@ -47,6 +47,13 @@
 #   PEADB_BIN         Path to peadb-server binary (default: ./peadb-server).
 #   START_PEADB       Set to "0" to skip starting peadb-server (test
 #                     against an already-running instance).
+#   SUITE_MODE        "external" (default): runtest connects to a pre-started
+#                     server via --host/--port (skips every test needing
+#                     restarts/config/DEBUG helpers).
+#                     "native": the upstream harness spawns peadb-server itself
+#                     as a redis-server stand-in (REDIS_SERVER_BIN patch), giving
+#                     full-suite coverage. Per-suite skipfiles are honored from
+#                     scripts/redis/skipfiles/<suite>.skip.
 #   OUT_DIR           Output directory for logs and artifacts
 #                     (default: artifacts/redis-stage-a).
 #   SUITE_TIMEOUT     Per-suite timeout in seconds (default: 120).
@@ -85,21 +92,25 @@ PEADB_CACHE_DIR="${PEADB_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/peadb}"
 REDIS_DIR="${REDIS_DIR:-$PEADB_CACHE_DIR/redis-$REDIS_VERSION}"
 PEADB_BIN="${PEADB_BIN:-./peadb-server}"
 START_PEADB="${START_PEADB:-1}"
+SUITE_MODE="${SUITE_MODE:-external}"
 PEADB_PID=""
 OUT_DIR="${OUT_DIR:-artifacts/redis-stage-a}"
-SUITE_TIMEOUT="${SUITE_TIMEOUT:-120}"
+# Native mode restarts the server many times per suite — needs a larger budget.
+if [[ "$SUITE_MODE" == "native" ]]; then
+  SUITE_TIMEOUT="${SUITE_TIMEOUT:-600}"
+else
+  SUITE_TIMEOUT="${SUITE_TIMEOUT:-120}"
+fi
+# PeaDB bundles Lua 5.1 (third_party/lua-5.1.5) on every platform, so the
+# scripting suite runs everywhere — the old macOS system-Lua exclusion is gone.
 SUITES=(
   "unit/keyspace"
   "unit/type/string"
+  "unit/type/incr"
   "unit/expire"
   "unit/multi"
+  "unit/scripting"
 )
-# The upstream scripting suite relies on Lua 5.1 internals.  On macOS with
-# system Lua 5.5 the test triggers a crash in the Lua/compiler interaction.
-# Include the suite only on Linux where Lua 5.1 is the norm.
-if [[ "$(uname)" != "Darwin" ]]; then
-  SUITES+=("unit/scripting")
-fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
@@ -184,6 +195,16 @@ ensure_redis_harness() {
 
 ensure_redis_harness
 
+# Native mode: the upstream harness spawns peadb-server directly. Requires the
+# one-line REDIS_SERVER_BIN patch to tests/support/server.tcl (applied idempotently).
+apply_native_patch() {
+  if grep -q 'REDIS_SERVER_BIN' "$REDIS_DIR/tests/support/server.tcl"; then
+    return 0
+  fi
+  echo "=== Applying harness-native.patch to $REDIS_DIR ==="
+  (cd "$REDIS_DIR" && patch -p1 --forward --silent < "$ROOT_DIR/scripts/redis/harness-native.patch")
+}
+
 cleanup() {
   if [[ -n "$PEADB_PID" ]]; then
     kill "$PEADB_PID" >/dev/null 2>&1 || true
@@ -197,6 +218,60 @@ mkdir -p "$OUT_DIR"
 # Kill stale peadb-server processes from previous test stages.
 pkill -9 -f "peadb-server" 2>/dev/null || true
 sleep 1
+
+if [[ "$SUITE_MODE" == "native" ]]; then
+  if [[ ! -x "$PEADB_BIN" ]]; then
+    echo "Missing PeaDB binary at $PEADB_BIN" >&2
+    exit 1
+  fi
+  apply_native_patch
+  export REDIS_SERVER_BIN="$PEADB_BIN"
+
+  FAILED=()
+  REPRO_FILE="$OUT_DIR/repro_commands.txt"
+  : > "$REPRO_FILE"
+  cd "$REDIS_DIR"
+  for suite in "${SUITES[@]}"; do
+    log_name="${suite//\//_}.log"
+    log_path="$OUT_DIR/$log_name"
+    skipfile="$ROOT_DIR/scripts/redis/skipfiles/${suite//\//_}.skip"
+    extra_args=()
+    if [[ -f "$skipfile" ]]; then
+      extra_args+=(--skipfile "$skipfile")
+    fi
+    # Per-suite command-coverage capture (consumed by generate_compat_scoreboard.py;
+    # only suites that finish green are counted there).
+    export PEADB_COMMAND_COVERAGE_FILE="$OUT_DIR/coverage_${suite//\//_}.txt"
+    rm -f "$PEADB_COMMAND_COVERAGE_FILE"
+    echo "=== Running $suite (native) ==="
+    rc=0
+    timeout --signal=TERM --kill-after=10 "$SUITE_TIMEOUT" \
+      ./runtest \
+        --single "$suite" \
+        --clients 1 \
+        --tags "-tls -cluster -modules -needs:pfdebug -leaks" \
+        --dont-clean \
+        ${extra_args[@]+"${extra_args[@]}"} >"$log_path" 2>&1 || rc=$?
+    if [[ $rc -ne 0 ]]; then
+      if [[ $rc -eq 124 ]]; then
+        echo "TIMEOUT $suite after ${SUITE_TIMEOUT}s (log: $log_path)" >&2
+      else
+        echo "FAILED $suite (log: $log_path)" >&2
+      fi
+      FAILED+=("$suite")
+      echo "cd $REDIS_DIR && REDIS_SERVER_BIN=$PEADB_BIN ./runtest --single $suite --clients 1 --tags '-tls -cluster -modules -needs:pfdebug' --dont-clean" >> "$REPRO_FILE"
+    fi
+  done
+
+  if [[ ${#FAILED[@]} -gt 0 ]]; then
+    printf "%s\n" "${FAILED[@]}" > "$OUT_DIR/failed_suites.txt"
+    echo "Redis native-mode suites failed: ${FAILED[*]}" >&2
+    echo "Repro commands saved to $OUT_DIR/repro_commands.txt" >&2
+    exit 1
+  fi
+  echo "Redis native-mode suites passed"
+  exit 0
+fi
 
 if [[ "$START_PEADB" == "1" ]]; then
   if [[ ! -x "$PEADB_BIN" ]]; then

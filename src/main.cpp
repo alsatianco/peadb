@@ -59,15 +59,19 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, signal_handler);
   install_crash_handlers();
 
-  // First pass: find --config so we can load the file before applying CLI overrides
+  // First pass: find the config file. Two spellings are accepted: redis-server style
+  // (first positional argument, `peadb-server /path/peadb.conf ...`) — required by the
+  // upstream Redis test harness, which spawns `$binary $config_file` — and the native
+  // `--config <path>` flag. CLI flags override file values either way.
   std::string config_path;
+  if (argc >= 2 && argv[1][0] != '-') config_path = argv[1];
   for (int i = 1; i < argc; ++i) {
     if (std::string(argv[i]) == "--config" && i + 1 < argc) {
       config_path = argv[i + 1];
       break;
     }
     if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
-      std::cout << "Usage: peadb-server [--port <port>] [--bind <ip>] [--loglevel <error|warn|info|debug>]\n"
+      std::cout << "Usage: peadb-server [<config-file>] [--port <port>] [--bind <ip>] [--loglevel <error|warn|info|debug>]\n"
                    "                    [--dir <path>] [--dbfilename <file>] [--config <path>]\n"
                    "                    [--requirepass <pass>] [--masterauth <pass>]\n"
                    "                    [--protected-mode <yes|no>] [--enable-module-command <yes|no|local>]\n";
@@ -79,7 +83,7 @@ int main(int argc, char** argv) {
   peadb::ServerConfig config = config_path.empty() ? peadb::ServerConfig{}
                                                     : peadb::load_config(config_path);
 
-  for (int i = 1; i < argc; ++i) {
+  for (int i = (argc >= 2 && argv[1][0] != '-') ? 2 : 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--config" && i + 1 < argc) { ++i; continue; } // already handled
     if (arg == "--port" && i + 1 < argc) { config.port = std::stoi(argv[++i]); continue; }
@@ -95,6 +99,7 @@ int main(int argc, char** argv) {
     if (arg == "--maxmemory-policy" && i + 1 < argc) { config.maxmemory_policy = argv[++i]; continue; }
     if (arg == "--maxmemory-samples" && i + 1 < argc) { config.maxmemory_samples = argv[++i]; continue; }
     if (arg == "--timeout" && i + 1 < argc) { config.timeout = argv[++i]; continue; }
+    if (arg == "--tcp-backlog" && i + 1 < argc) { try { config.tcp_backlog = std::stoi(argv[++i]); } catch (...) {} continue; }
     if (arg == "--client-output-buffer-limit" && i + 1 < argc) { config.client_output_buffer_limit = argv[++i]; continue; }
     if (arg == "--save" && i + 1 < argc) { config.save = argv[++i]; continue; }
     if (arg == "--appendonly" && i + 1 < argc) { const std::string v = argv[++i]; config.appendonly = (v == "yes" || v == "1" || v == "true"); continue; }
@@ -104,7 +109,11 @@ int main(int argc, char** argv) {
   }
 
   peadb::set_log_level(peadb::parse_log_level(config.log_level));
-  peadb::log(peadb::LogLevel::Info, "starting peadb-server");
+  // Startup log contract (relied on by the upstream Redis test harness): a line
+  // containing " PID: <pid>", then "Server initialized", then "Ready to accept"
+  // once the listeners are up (logged in run_server).
+  peadb::log(peadb::LogLevel::Info,
+             "PeaDB starting, version 7.2.5-compat, PID: " + std::to_string(getpid()));
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
@@ -118,6 +127,7 @@ int main(int argc, char** argv) {
   peadb::configure_maxmemory_policy(config.maxmemory_policy);
   peadb::configure_maxmemory_samples(config.maxmemory_samples);
   peadb::configure_timeout(config.timeout);
+  peadb::configure_tcp_backlog(config.tcp_backlog);
   peadb::configure_client_output_buffer_limit(config.client_output_buffer_limit);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
@@ -129,6 +139,8 @@ int main(int argc, char** argv) {
       [](const std::vector<std::string>& args, peadb::SessionState& session, bool& close) -> std::string {
         return peadb::handle_command(args, session, close);
       });
+
+  peadb::log(peadb::LogLevel::Info, "Server initialized");
 
   const auto snap = std::filesystem::path(config.dir) / config.dbfilename;
   if (std::filesystem::exists(snap)) {

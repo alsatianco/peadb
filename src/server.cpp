@@ -15,6 +15,7 @@
 #include <netinet/tcp.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <exception>
@@ -184,15 +185,45 @@ int run_server(const ServerConfig& config) {
   }
 
   if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    log(LogLevel::Error, "bind() failed: " + std::string(std::strerror(errno)));
+    // "Failed listening on port" is grepped by the upstream Redis test harness to
+    // detect port-in-use and retry with a different port — keep the phrase intact.
+    log(LogLevel::Error, "bind() failed: " + std::string(std::strerror(errno)) +
+                             " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
     close(listen_fd);
     return 1;
   }
 
-  if (listen(listen_fd, 4096) != 0) {
-    log(LogLevel::Error, "listen() failed: " + std::string(std::strerror(errno)));
+  if (listen(listen_fd, config.tcp_backlog) != 0) {
+    log(LogLevel::Error, "listen() failed: " + std::string(std::strerror(errno)) +
+                             " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
     close(listen_fd);
     return 1;
+  }
+
+  // Optional AF_UNIX listener (redis.conf `unixsocket`). The upstream test harness
+  // force-adds `unixsocket <dir>/socket` to every spawned server's config.
+  int unix_fd = -1;
+  if (!config.unixsocket.empty()) {
+    unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    sockaddr_un uaddr {};
+    uaddr.sun_family = AF_UNIX;
+    if (unix_fd < 0 || config.unixsocket.size() >= sizeof(uaddr.sun_path)) {
+      log(LogLevel::Error, "unixsocket setup failed (path too long or socket() error): " + config.unixsocket);
+      if (unix_fd >= 0) close(unix_fd);
+      close(listen_fd);
+      return 1;
+    }
+    std::strncpy(uaddr.sun_path, config.unixsocket.c_str(), sizeof(uaddr.sun_path) - 1);
+    ::unlink(config.unixsocket.c_str());  // remove a stale socket file from a previous run
+    set_nonblocking(unix_fd);
+    if (bind(unix_fd, reinterpret_cast<sockaddr*>(&uaddr), sizeof(uaddr)) != 0 ||
+        listen(unix_fd, config.tcp_backlog) != 0) {
+      log(LogLevel::Error, "Failed listening on unix socket " + config.unixsocket + ": " +
+                               std::string(std::strerror(errno)));
+      close(unix_fd);
+      close(listen_fd);
+      return 1;
+    }
   }
 
   int reserved_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -247,7 +278,11 @@ int run_server(const ServerConfig& config) {
     return 1;
   }
   poller.add_read(listen_fd);
+  if (unix_fd >= 0) poller.add_read(unix_fd);
   if (cbus_fd >= 0) poller.add_read(cbus_fd);
+  // Third line of the startup log contract; the upstream harness counts these lines
+  // to detect (re)starts.
+  log(LogLevel::Info, "Ready to accept connections tcp");
   std::vector<PollEvent> ep_events;
   std::unordered_map<int, std::string> buffers;
   std::unordered_map<int, WriteBuf> write_buffers;
@@ -596,13 +631,13 @@ int run_server(const ServerConfig& config) {
       const int fd = ep_events[i].fd;
 
       // Skip fds already closed (e.g. by blocked-client cleanup above).
-      if (fd != listen_fd && fd != cbus_fd &&
+      if (fd != listen_fd && fd != cbus_fd && fd != unix_fd &&
           !sessions.count(fd) && !cbus_buffers.count(fd)) {
         continue;
       }
 
       // ── Handle errors / hangups ──
-      if (ep_events[i].error && fd != listen_fd && fd != cbus_fd) {
+      if (ep_events[i].error && fd != listen_fd && fd != cbus_fd && fd != unix_fd) {
         if (cbus_buffers.count(fd)) {
           poller.remove(fd);
           ::close(fd);
@@ -614,7 +649,7 @@ int run_server(const ServerConfig& config) {
       }
 
       // ── Flush pending output on writable ──
-      if (ep_events[i].writable && fd != listen_fd && fd != cbus_fd) {
+      if (ep_events[i].writable && fd != listen_fd && fd != cbus_fd && fd != unix_fd) {
         if (!flush_output(fd)) {
           close_client(fd);
           continue;
@@ -623,18 +658,19 @@ int run_server(const ServerConfig& config) {
 
       if (!ep_events[i].readable) continue;
 
-      if (fd == listen_fd) {
+      if (fd == listen_fd || (unix_fd >= 0 && fd == unix_fd)) {
+        const bool is_unix = (unix_fd >= 0 && fd == unix_fd);
         // Accept all pending connections (non-blocking accept loop)
         while (true) {
-          sockaddr_in client_addr {};
+          sockaddr_storage client_addr {};
           socklen_t len = sizeof(client_addr);
-          const int client_fd = accept_nonblock(listen_fd,
+          const int client_fd = accept_nonblock(fd,
                                         reinterpret_cast<sockaddr*>(&client_addr), &len);
           if (client_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
             if (errno == EMFILE || errno == ENFILE) {
-              handle_accept_fd_exhaustion(listen_fd, "client listener");
+              handle_accept_fd_exhaustion(fd, "client listener");
               break;
             }
             log(LogLevel::Warn, "accept() failed: " + std::string(std::strerror(errno)));
@@ -651,10 +687,11 @@ int run_server(const ServerConfig& config) {
 
           // ── protected-mode ── refuse non-loopback clients when no password is set,
           // so an accidentally network-exposed server is not wide open. Loopback
-          // (127.0.0.0/8) is always allowed.
-          if (protected_mode_enabled() && !requirepass_is_set()) {
+          // (127.0.0.0/8) and unix-socket clients are always allowed (like Redis).
+          if (!is_unix && protected_mode_enabled() && !requirepass_is_set()) {
+            const auto* in4 = reinterpret_cast<const sockaddr_in*>(&client_addr);
             const bool is_loopback =
-                (ntohl(client_addr.sin_addr.s_addr) >> 24) == 127;
+                (ntohl(in4->sin_addr.s_addr) >> 24) == 127;
             if (!is_loopback) {
               static constexpr const char kDenied[] =
                   "-DENIED PeaDB is running in protected mode because protected mode is enabled, "
@@ -668,8 +705,10 @@ int run_server(const ServerConfig& config) {
             }
           }
 
-          set_tcp_nodelay(client_fd);
-          set_tcp_keepalive(client_fd);
+          if (!is_unix) {
+            set_tcp_nodelay(client_fd);
+            set_tcp_keepalive(client_fd);
+          }
 
           if (!poller.add_read(client_fd)) {
             log(LogLevel::Warn, "poller add failed for client fd=" + std::to_string(client_fd) +
@@ -685,9 +724,14 @@ int run_server(const ServerConfig& config) {
             sess = SessionState{};
             sess.client_id = g_next_client_id.fetch_add(1);
             sess.fd = client_fd;
-            char ipbuf[INET_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET, &client_addr.sin_addr, ipbuf, sizeof(ipbuf));
-            sess.addr = std::string(ipbuf) + ":" + std::to_string(ntohs(client_addr.sin_port));
+            if (is_unix) {
+              sess.addr = config.unixsocket + ":0";  // Redis reports <socketpath>:0
+            } else {
+              const auto* in4 = reinterpret_cast<const sockaddr_in*>(&client_addr);
+              char ipbuf[INET_ADDRSTRLEN] = {0};
+              inet_ntop(AF_INET, &in4->sin_addr, ipbuf, sizeof(ipbuf));
+              sess.addr = std::string(ipbuf) + ":" + std::to_string(ntohs(in4->sin_port));
+            }
             const auto snow = DataStore::now_ms();
             sess.created_ms = snow;
             sess.last_interaction_ms = snow;
@@ -861,6 +905,10 @@ int run_server(const ServerConfig& config) {
   for (auto& [fd, _] : sessions) ::close(fd);
   for (auto& [fd, _] : cbus_buffers) ::close(fd);
   close(listen_fd);
+  if (unix_fd >= 0) {
+    close(unix_fd);
+    ::unlink(config.unixsocket.c_str());
+  }
   if (cbus_fd >= 0) close(cbus_fd);
   if (reserved_fd >= 0) close(reserved_fd);
   poller.destroy();

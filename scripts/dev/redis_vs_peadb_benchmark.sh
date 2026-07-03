@@ -141,9 +141,9 @@ memtier() {
   fi
 
   docker run --rm --network=host \
-    "${vol_mount[@]}" \
+    ${vol_mount[@]+"${vol_mount[@]}"} \
     "$MEMTIER_DOCKER_IMAGE" \
-    "${docker_args[@]}"
+    ${docker_args[@]+"${docker_args[@]}"}
 }
 
 # ── Container run helper (applies resource limits) ───────────────────────────
@@ -207,11 +207,14 @@ start_redis() {
   docker pull "$REDIS_IMAGE" 2>/dev/null
   _log "Starting Redis container…"
   local res_flags
-  mapfile -t res_flags < <(_docker_resource_flags)
+  res_flags=()
+  while IFS= read -r _rf_line; do
+    [[ -n "$_rf_line" ]] && res_flags+=("$_rf_line")
+  done < <(_docker_resource_flags)  # portable mapfile (macOS ships bash 3.2)
   docker run -d --name bench-redis \
     --network=host \
     --ulimit "nofile=${BENCH_NOFILE_SOFT}:${BENCH_NOFILE_HARD}" \
-    "${res_flags[@]}" \
+    ${res_flags[@]+"${res_flags[@]}"} \
     --rm \
     "$REDIS_IMAGE" \
     redis-server \
@@ -247,11 +250,14 @@ start_peadb() {
   fi
   _log "Starting PeaDB container…"
   local res_flags
-  mapfile -t res_flags < <(_docker_resource_flags)
+  res_flags=()
+  while IFS= read -r _rf_line; do
+    [[ -n "$_rf_line" ]] && res_flags+=("$_rf_line")
+  done < <(_docker_resource_flags)  # portable mapfile (macOS ships bash 3.2)
   docker run -d --name bench-peadb \
     --network=host \
     --ulimit "nofile=${BENCH_NOFILE_SOFT}:${BENCH_NOFILE_HARD}" \
-    "${res_flags[@]}" \
+    ${res_flags[@]+"${res_flags[@]}"} \
     --rm \
     peadb:bench \
     --port "$PORT" --bind 0.0.0.0 >/dev/null
@@ -488,7 +494,7 @@ run_long_stability_test() {
 run_all_benchmarks() {
   local label="$1"
   _log "═══════════════════════════════════════"
-  _log "  Running all benchmarks for: ${label^^}"
+  _log "  Running all benchmarks for: $(printf "%s" "$label" | tr "[:lower:]" "[:upper:]")"
   _log "═══════════════════════════════════════"
 
   warmup

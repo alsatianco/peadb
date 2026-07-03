@@ -1,0 +1,15 @@
+--- a/tests/support/server.tcl
++++ b/tests/support/server.tcl
+@@ -272,7 +272,11 @@
+ }
+ 
+ proc spawn_server {config_file stdout stderr args} {
+-    set cmd [list src/redis-server $config_file]
++    if {[info exists ::env(REDIS_SERVER_BIN)] && $::env(REDIS_SERVER_BIN) ne ""} {
++        set cmd [list $::env(REDIS_SERVER_BIN) $config_file]
++    } else {
++        set cmd [list src/redis-server $config_file]
++    }
+     set args {*}$args
+     if {[llength $args] > 0} {
+         lappend cmd {*}$args

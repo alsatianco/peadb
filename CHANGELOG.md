@@ -9,7 +9,47 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
-### Added — production-readiness pass (from `AI-temp/analysis-opus.md`)
+### Added — parity roadmap Phase 0: the verification ratchet + native upstream suite
+
+- **Native-mode upstream TCL harness.** The official Redis 7.2.5 test harness now spawns
+  `peadb-server` as a redis-server stand-in (`SUITE_MODE=native scripts/redis/run_redis_tests.sh`,
+  one-line `harness-native.patch`): positional config-file argv, `unixsocket` listener,
+  Redis startup-log contract (` PID:` / `Server initialized` / `Ready to accept`), logger on
+  stdout. Six suites adopted at **0 errors** (keyspace, type/string, type/incr, expire, multi,
+  scripting — 598 ok, 17 tracked skips, 97.2% pass-rate).
+- **The parity ratchet.** `compat/redis_suite_ledger.json` (adopted suites + baselines),
+  `scripts/redis/parse_tcl_results.py` (pass-rate report), `scripts/ci/check_suite_ratchet.py`
+  (adopted suites must stay at 0 err; skipfile growth or count regressions require a
+  `compat/delta.md` change). Skipfiles under `scripts/redis/skipfiles/` are tracked debts.
+- **Proof-based scoreboard.** `compat/commands.generated.md` statuses now derive from real
+  signals (green upstream-suite coverage via the `PEADB_COMMAND_COVERAGE_FILE` hook +
+  differential corpus): `full`/`upstream`/`diff`/`tested`/`registered` replaces the old
+  mention-counting `full`/`partial`/`stub`.
+- **Bundled Lua 5.1.5** (`third_party/lua-5.1.5`) on every platform — the interpreter Redis
+  7.2.5 embeds. Fixes cjson float formatting and cmsgpack table-order byte-parity with Redis;
+  removes the system-Lua dependency and the macOS system-Lua miscompile caveat.
+- **Scripting parity.** `redis.replicate_commands()`, `redis.set_repl()` + `REPL_*` constants
+  (honored by both replica and AOF propagation), `SCRIPT DEBUG yes|sync|no` accepted,
+  HELLO/AUTH/RESET/QUIT allowed during BUSY scripts.
+- **Command/option gaps closed.** `LPOP`/`RPOP` `COUNT`; `READONLY`/`READWRITE`; RESP2
+  subscribe-mode command gate enforced (incl. array-form `PING` while subscribed); keyspace
+  `new` ('n') events; dynamic `HELLO` reply; `OBJECT IDLETIME`/`FREQ`/`HELP` + shared-integer
+  `REFCOUNT`; strict `INCR`-family value parsing + overflow errors (`increment or decrement
+  would overflow`, `decrement would overflow`); strict `INCRBYFLOAT` (`string2ld` rules, NaN/Inf
+  rejection); `SETBIT`/`GETBIT`/`SETRANGE`/`APPEND` proto-max-bulk-len (512 MB) bounds;
+  Redis-exact `numkeys` error wording; two-arg `AUTH` returns `WRONGPASS` for unknown users;
+  `tcp-backlog` config knob.
+- **DEBUG verbs for the harness.** `DIGEST` (order-independent dataset digest), `RELOAD`
+  (RDB save+flush+load), real `LOADAOF` (fsync+flush+replay), `POPULATE`, real `OBJECT`
+  fields (raw-dict peek: expired-but-unreaped keys still report), `SET-SKIP-CHECKSUM-VALIDATION`,
+  `QUICKLIST-PACKED-THRESHOLD`, `PAUSE-CRON`, `JMAP`.
+- **AOF/replication propagation correctness.** AOF appends are now canonicalized like the
+  replication stream (shared rewriter): relative expirations → `PEXPIREAT`, `SPOP` → `SREM`,
+  `XADD *` → the concrete generated id (fixes nondeterministic stream ids on replay/replicas),
+  `INCRBYFLOAT` → `SET`; AOF now emits `SELECT` on db change (multi-db AOF replay was broken);
+  `INCR` preserves TTL.
+
+### Added — production-readiness pass
 - **Key eviction (`maxmemory-policy`).** All eight Redis modes — `noeviction`,
   `allkeys-lru`/`-lfu`/`-random`, `volatile-lru`/`-lfu`/`-random`/`-ttl` — via approximate
   sampling (`maxmemory-samples`, default 5). Over `maxmemory`, keys are evicted (counted in

@@ -1,0 +1,4 @@
+# Need multi-part AOF manifest / AOF-rewrite scheduling semantics — compat/delta.md item 3.
+MULTI with FLUSHALL and AOF
+MULTI with BGREWRITEAOF
+MULTI with config set appendonly

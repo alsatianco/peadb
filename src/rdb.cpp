@@ -28,6 +28,13 @@
 #include <unistd.h>
 
 namespace peadb {
+
+namespace {
+bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
+}  // namespace
+
+void rdb_set_skip_checksum_validation(bool skip) { g_skip_checksum_validation = skip; }
+
 namespace {
 
 // fsync the parent directory of `path` so an atomic rename is durable across
@@ -1279,16 +1286,18 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
     return false;
   }
 
-  // Verify CRC
-  size_t crc_offset = payload.size() - 8;
-  uint64_t stored_crc = 0;
-  for (int i = 0; i < 8; ++i) {
-    stored_crc |= static_cast<uint64_t>(static_cast<uint8_t>(payload[crc_offset + i])) << (i * 8);
-  }
-  uint64_t computed_crc = crc64(0, reinterpret_cast<const uint8_t*>(payload.data()), crc_offset);
-  if (stored_crc != computed_crc) {
-    err = "DUMP payload version or checksum are wrong";
-    return false;
+  // Verify CRC (skippable via DEBUG SET-SKIP-CHECKSUM-VALIDATION, like Redis)
+  if (!g_skip_checksum_validation) {
+    size_t crc_offset = payload.size() - 8;
+    uint64_t stored_crc = 0;
+    for (int i = 0; i < 8; ++i) {
+      stored_crc |= static_cast<uint64_t>(static_cast<uint8_t>(payload[crc_offset + i])) << (i * 8);
+    }
+    uint64_t computed_crc = crc64(0, reinterpret_cast<const uint8_t*>(payload.data()), crc_offset);
+    if (stored_crc != computed_crc) {
+      err = "DUMP payload version or checksum are wrong";
+      return false;
+    }
   }
 
   // Strip the 2-byte version + 8-byte CRC

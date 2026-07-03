@@ -336,6 +336,13 @@ class DataStore {
   std::vector<std::vector<std::string>> export_aof_commands() const;
   std::optional<std::string> object_encoding(const std::string& key);
   std::optional<std::string> debug_digest_value(const std::string& key);
+  std::string debug_digest();  // order-independent whole-dataset digest (DEBUG DIGEST)
+  // Raw keyspace presence, ignoring logical expiry — DEBUG OBJECT peeks the dict like
+  // Redis's debugCommand (an expired-but-unreaped key still reports its object info).
+  bool key_exists_raw(const std::string& key) const;
+  // OBJECT IDLETIME/FREQ readers over Entry::lru (nullopt = missing/expired key).
+  std::optional<std::int64_t> object_idletime_seconds(const std::string& key);
+  std::optional<std::int64_t> object_freq(const std::string& key);
   void set_zset_max_ziplist_entries(std::int64_t v);
   std::int64_t zset_max_ziplist_entries() const;
   static void freeze_time();

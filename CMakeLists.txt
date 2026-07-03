@@ -10,8 +10,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# On macOS with non-bundled Lua (5.2+), -O3 triggers miscompilation in Lua C
-# API interactions.  Cap at -O2 until PeaDB bundles its own Lua 5.1.
+# Historical: macOS system Lua (5.2+) miscompiled at -O3. PeaDB now bundles Lua 5.1
+# (third_party/lua-5.1.5) on every platform, matching the interpreter Redis 7.2.5
+# embeds (number formatting, table iteration order, cjson/cmsgpack semantics).
+# Keep -O2 on macOS for now so benchmark baselines stay comparable.
 if(APPLE AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_C_FLAGS_RELEASE   "-O2 -DNDEBUG" CACHE STRING "" FORCE)
   set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
@@ -27,17 +29,22 @@ if(PkgConfig_FOUND AND NOT APPLE)
   endif()
 endif()
 
-find_package(Lua 5.1)
-if(NOT LUA_LIBRARIES OR NOT LUA_INCLUDE_DIR)
-  message(FATAL_ERROR
-    "Lua 5.1 development files not found (headers + library).\n"
-    "\n"
-    "Install Lua 5.1 dev package, e.g.:\n"
-    "  Ubuntu/Debian: sudo apt-get install liblua5.1-0-dev\n"
-    "\n"
-    "Alternatively, set LUA_INCLUDE_DIR and LUA_LIBRARIES to point at your Lua 5.1 install."
-  )
+# Bundled Lua 5.1.5 — the exact interpreter Redis 7.2.5 embeds. Scripting parity
+# (float tostring, table hash order, cjson/cmsgpack output) depends on it, so the
+# system Lua is never used.
+file(GLOB LUA_BUNDLED_SOURCES ${CMAKE_SOURCE_DIR}/third_party/lua-5.1.5/src/*.c)
+add_library(lua_bundled STATIC ${LUA_BUNDLED_SOURCES})
+target_include_directories(lua_bundled PUBLIC ${CMAKE_SOURCE_DIR}/third_party/lua-5.1.5/src)
+if(APPLE)
+  target_compile_definitions(lua_bundled PRIVATE LUA_USE_MACOSX)
+elseif(UNIX)
+  target_compile_definitions(lua_bundled PRIVATE LUA_USE_LINUX)
 endif()
+set_target_properties(lua_bundled PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# Vanilla Lua 5.1 contains well-known benign UB (float->int casts in ltable.c) that
+# Redis also ships; keep sanitizers out of the vendored code so ASAN/UBSAN builds of
+# PeaDB itself stay usable.
+target_compile_options(lua_bundled PRIVATE -fno-sanitize=all)
 
 add_library(peadb_core
     src/command.cpp
@@ -54,8 +61,8 @@ add_library(peadb_core
     src/lua_bit_stub.c
     src/lua_struct_stub.c
 )
-target_include_directories(peadb_core PUBLIC include ${LUA_INCLUDE_DIR})
-target_link_libraries(peadb_core PUBLIC ${LUA_LIBRARIES} m)
+target_include_directories(peadb_core PUBLIC include)
+target_link_libraries(peadb_core PUBLIC lua_bundled m)
 target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(peadb_core PUBLIC PEADB_NUM_SHARDS=${PEADB_NUM_SHARDS})
 if(LIBURING_FOUND)

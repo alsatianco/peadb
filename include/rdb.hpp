@@ -26,4 +26,8 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
                      std::int64_t ttl_ms, bool replace, bool absttl,
                      std::string& err);
 
+// DEBUG SET-SKIP-CHECKSUM-VALIDATION: when set, RESTORE skips the DUMP-payload CRC64
+// check (the upstream Redis test suite uses this to feed synthetic payloads).
+void rdb_set_skip_checksum_validation(bool skip);
+
 } // namespace peadb

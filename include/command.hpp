@@ -96,6 +96,8 @@ void configure_maxmemory_policy(const std::string& spec);   // e.g. "allkeys-lru
 void configure_maxmemory_samples(const std::string& spec);  // eviction sample size; "" = 5
 void init_replication_id();   // randomize the replication id at startup (call once in main)
 void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
+void configure_tcp_backlog(int backlog);            // listen(2) backlog, for CONFIG GET reporting
+void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
 int client_timeout_seconds();                       // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping
 

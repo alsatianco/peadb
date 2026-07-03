@@ -1043,6 +1043,30 @@ void register_redis_lib(lua_State* L) {
   lua_pushcfunction(L, lua_redis_sha1hex);
   lua_setfield(L, -2, "sha1hex");
 
+  // Redis 7 always uses effects replication; redis.replicate_commands() is kept as an
+  // always-true no-op for script compatibility (scripts still call it defensively).
+  lua_pushcfunction(L, [](lua_State* S) -> int {
+    lua_pushboolean(S, 1);
+    return 1;
+  });
+  lua_setfield(L, -2, "replicate_commands");
+
+  // redis.set_repl(REPL_*): selective propagation of script effects (AOF/replica bits).
+  lua_pushcfunction(L, [](lua_State* S) -> int {
+    const lua_Integer flags = luaL_checkinteger(S, 1);
+    if (flags < 0 || flags > 3) {
+      return luaL_error(S, "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_SLAVE or REPL_ALL");
+    }
+    peadb::script_set_repl_flags(static_cast<int>(flags));
+    return 0;
+  });
+  lua_setfield(L, -2, "set_repl");
+  lua_pushinteger(L, 0); lua_setfield(L, -2, "REPL_NONE");
+  lua_pushinteger(L, 1); lua_setfield(L, -2, "REPL_AOF");
+  lua_pushinteger(L, 2); lua_setfield(L, -2, "REPL_SLAVE");
+  lua_pushinteger(L, 2); lua_setfield(L, -2, "REPL_REPLICA");
+  lua_pushinteger(L, 3); lua_setfield(L, -2, "REPL_ALL");
+
   lua_pushcfunction(L, lua_redis_log);
   lua_setfield(L, -2, "log");
 

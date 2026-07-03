@@ -37,6 +37,13 @@ ServerConfig load_config(const std::string& path) {
     std::string value;
     std::getline(iss, value);
     value = trim(value);
+    // redis.conf values may be quoted ('' / "" denote the empty value); strip one
+    // layer of matching quotes so `logfile ''` and `save ""` behave like Redis.
+    if (value.size() >= 2 &&
+        ((value.front() == '"' && value.back() == '"') ||
+         (value.front() == '\'' && value.back() == '\''))) {
+      value = value.substr(1, value.size() - 2);
+    }
 
     // rename-command takes two tokens (FROM TO) and an empty TO is meaningful
     // (it disables the command), so it must be handled before the empty-value skip.
@@ -104,6 +111,10 @@ ServerConfig load_config(const std::string& path) {
       cfg.maxmemory_samples = value;
     } else if (key == "timeout") {
       cfg.timeout = value;
+    } else if (key == "tcp-backlog") {
+      try { cfg.tcp_backlog = std::stoi(value); } catch (...) {}
+    } else if (key == "unixsocket") {
+      cfg.unixsocket = value;
     } else if (key == "repl-backlog-size") {
       cfg.repl_backlog_size = value;
     } else if (key == "notify-keyspace-events") {
