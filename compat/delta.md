@@ -343,3 +343,17 @@ storage until real listpack/intset backends land).
   `total_blocking_keys` / `total_blocking_keys_on_nokey`.
 - Tracking: seen/active-time persistence rides with the stream RDB byte-parity work (item 5);
   blocking-key counters land with the replication/introspection hardening in Phase 4.
+
+18. Dirty-counter granularity (rdb_changes_since_last_save per command, not per change)
+- Status: `partial` (counter exists and drives save points; granularity is coarser than Redis)
+- Owner: persistence-compat
+- Severity: low
+- Target milestone: P4
+- Implemented: `rdb_changes_since_last_save` (INFO Persistence) is the mutation epoch, bumped
+  once per successful write command; save points and `BGSAVE`-since-last-change logic use it.
+- Missing: Redis increments `server.dirty` by the number of *actual* changes, so a no-op write
+  (e.g. `SETBIT`/`BITFIELD SET` writing the same value, `SADD` of an existing member) adds 0.
+  PeaDB's per-command counter over-counts such no-ops — one `unit/bitops` test is skipfile-tracked
+  (`scripts/redis/skipfiles/unit_bitops.skip`).
+- Tracking: needs per-command dirty deltas (handlers report how much they changed); folded into
+  the persistence-hardening work in Phase 4.

@@ -9,6 +9,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 6): quit + auth + bitops suites adopted
+
+- **`unit/quit`, `unit/auth`, and `unit/bitops` adopted natively at 0 errors** (16 suites total).
+  - **`AUTH`** error parity: `AUTH <pass>` with no password configured returns Redis's
+    "AUTH `<password>` called without any password configured for the default user…" message,
+    and `AUTH a b c` (too many args) returns `syntax error` (not a wrong-arity message).
+  - **`BITCOUNT`** now rejects a lone start argument (`BITCOUNT key start` with no end) and
+    trailing junk as a syntax error instead of silently ignoring it.
+- 1 `unit/bitops` test is skipfile-tracked: `rdb_changes_since_last_save` is command-granular
+  in PeaDB, so a no-op `SETBIT`/`BITFIELD` still counts as one change (delta 18).
+
 ### Added — parity roadmap Phase 1 (wave 5): stream consumer-groups suite adopted
 
 - **`unit/type/stream-cgroups` adopted natively at 0 errors** (13 suites total). This built

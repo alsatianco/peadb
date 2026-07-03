@@ -2570,8 +2570,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("AUTH", CommandSpec{"AUTH", -2, {"fast", "no_auth"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
-          if (args.size() != 2 && args.size() != 3)
-            return encode_error("wrong number of arguments for 'auth' command");
+          // Only the two- and three-argument forms are valid; more is a syntax error (Redis).
+          if (args.size() > 3) return encode_error("syntax error");
           std::string user = "default";
           std::string pass;
           if (args.size() == 3) { user = args[1]; pass = args[2]; }
@@ -2582,7 +2582,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return std::string("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
           }
           if (g_requirepass.empty()) {
-            return encode_error("Client sent AUTH, but no password is set. Did you mean AUTH <username> <password>?");
+            // Matches Redis authCommand's two-argument (default-user, no-pass) branch.
+            return encode_error("AUTH <password> called without any password configured for "
+                                "the default user. Are you sure your configuration is correct?");
           }
           if (!const_time_eq(pass, g_requirepass)) {
             return std::string("-WRONGPASS invalid username-password pair or user is disabled.\r\n");
@@ -8044,6 +8046,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── BITCOUNT ────────────────────────────────────────────────────────
     t.emplace("BITCOUNT", CommandSpec{"BITCOUNT", -2, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // Valid forms: BITCOUNT key | key start end | key start end BYTE|BIT. A lone start
+          // (or trailing junk) is a syntax error (Redis), not a silently-ignored argument.
+          if (args.size() == 3 || args.size() > 5) return encode_error("syntax error");
           if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
           auto val = store().get(args[1]);
           if (!val) return encode_integer(0);

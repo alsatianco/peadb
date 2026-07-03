@@ -46,7 +46,7 @@ def main():
   with socket.create_connection(('127.0.0.1',6417),timeout=2) as s:
    # With no requirepass configured, AUTH is an error (matches Redis); the
    # connection remains usable because no authentication is required.
-   r=cmd(s,'AUTH','x'); assert isinstance(r,tuple) and r[0]=='ERR' and 'no password is set' in r[1], r
+   r=cmd(s,'AUTH','x'); assert isinstance(r,tuple) and r[0]=='ERR' and 'any password' in r[1], r
    assert cmd(s,'SET','k','v')=='OK'
    assert cmd(s,'GETDEL','k')=='v'
    assert cmd(s,'SET','k2','v2')=='OK'

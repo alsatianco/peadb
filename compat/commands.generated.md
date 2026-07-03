@@ -5,21 +5,21 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 9, upstream: 178, diff: 2, tested: 45, registered: 0
+Total: **234** commands — full: 10, upstream: 182, diff: 1, tested: 41, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
 | `ACL` | tested | test_p3_repl_cluster_surface.py |
 | `APPEND` | upstream | test_m2_strings_expire.py |
 | `ASKING` | tested | test_p3_repl_cluster_surface.py |
-| `AUTH` | tested | test_command_coverage_extras.py |
+| `AUTH` | upstream | test_command_coverage_extras.py |
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
 | `BGSAVE` | tested | test_m5_persistence_commands.py |
-| `BITCOUNT` | tested | test_p3_ecosystem_commands.py |
+| `BITCOUNT` | upstream | test_p3_ecosystem_commands.py |
 | `BITFIELD` | tested | test_p3_ecosystem_commands.py |
 | `BITFIELD_RO` | tested | test_b5_commands.py |
-| `BITOP` | tested | test_p3_ecosystem_commands.py |
-| `BITPOS` | tested | test_p3_ecosystem_commands.py |
+| `BITOP` | upstream | test_p3_ecosystem_commands.py |
+| `BITPOS` | upstream | test_p3_ecosystem_commands.py |
 | `BLMOVE` | upstream | test_m4_list_moves.py |
 | `BLMPOP` | upstream | — |
 | `BLPOP` | upstream | test_m4_blpop_brpop.py |
@@ -133,7 +133,7 @@ Total: **234** commands — full: 9, upstream: 178, diff: 2, tested: 45, registe
 | `PUBLISH` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_p1_publish.py, test_p4_subscribe_mode_gate.py |
 | `PUBSUB` | tested | test_b5_commands.py |
 | `PUNSUBSCRIBE` | tested | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
-| `QUIT` | diff | test_m1_commands.py |
+| `QUIT` | full | test_m1_commands.py |
 | `RANDOMKEY` | upstream | test_p1_randomkey.py |
 | `READONLY` | tested | test_p4_lpop_count_readonly.py |
 | `READWRITE` | tested | test_p4_lpop_count_readonly.py |

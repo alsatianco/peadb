@@ -1,6 +1,24 @@
 {
   "comment": "Canonical upstream-TCL-suite adoption ledger. mode: native (harness spawns peadb-server), external (--host/--port, limited coverage), excluded (out of scope, reason required). last_counts/skipfile_lines are the ratchet baselines maintained by scripts/ci/check_suite_ratchet.py --update; regressions require a compat/delta.md change. The headline parity number is sum(ok)/sum(ok+err+skipfile_lines) over non-excluded suites (scripts/redis/parse_tcl_results.py).",
   "suites": {
+    "unit/auth": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 6
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
+    "unit/bitops": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 4,
+        "ok": 44
+      },
+      "mode": "native",
+      "skipfile_lines": 1
+    },
     "unit/cluster": {
       "exclusion_reason": "Full Redis Cluster is out of scope (single node + replication); see compat/delta.md item 6.",
       "mode": "excluded"
@@ -39,6 +57,15 @@
     "unit/oom-score-adj": {
       "exclusion_reason": "Linux-specific oom-score-adj not implemented; revisit with the ops/config sweep.",
       "mode": "excluded"
+    },
+    "unit/quit": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 3
+      },
+      "mode": "native",
+      "skipfile_lines": 0
     },
     "unit/scan": {
       "last_counts": {
