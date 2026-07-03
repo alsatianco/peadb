@@ -109,10 +109,16 @@ storage until real listpack/intset backends land).
   succeed with stream keys, and PSYNC full-resync replicates stream-containing datasets,
   so RDB persistence and replication bootstrap work end-to-end within PeaDB. Full PEL
   model drives XPENDING/XACK/XCLAIM/XAUTOCLAIM; XSETID/XTRIM (MAXLEN) and blocking
-  XREAD/XREADGROUP are implemented. AOF persistence of streams remains available too.
+  XREAD/XREADGROUP are implemented. AOF rewrite round-trips streams command-for-command
+  (Redis `rewriteStreamObject` shape): empty streams are recreated with the `XADD MAXLEN 0`
+  trick, `XSETID … ENTRIESADDED … MAXDELETEDID` restores last-id/entries-added/max-deleted
+  even after XDEL or trim, and consumer groups + PELs are rebuilt via `XGROUP CREATE` +
+  `XCLAIM … JUSTID FORCE`.
 - Missing: Redis's exact RDB_TYPE_STREAM_LISTPACKS_3 byte layout — a real redis-server
   cannot load a PeaDB RDB that contains streams (cross-engine stream migration still uses
-  the AOF/bridge path). Ties to the broader Redis-RDB-v11 parity track (item 2).
+  the AOF/bridge path). Ties to the broader Redis-RDB-v11 parity track (item 2). AOF-replayed
+  PEL delivery time/count are approximate (the `XCLAIM TIME`/`RETRYCOUNT` options are
+  accepted but not yet applied on replay); the RDB path preserves them exactly.
 - Tracking: P2-1 done (PeaDB-internal); byte-compat folded into RDB parity hardening.
 
 6. Cluster bus gossip protocol
@@ -312,5 +318,10 @@ storage until real listpack/intset backends land).
 - Missing: byte-exact listpack layout, so a handful of encoding-transition/insertion-order
   tests are skipfile-tracked (`Hash ziplist of various encodings`, `SRANDMEMBER with a
   dict containing long chain`, `List listpack -> quicklist encoding conversion`, `List
-  encoding conversion when RDB loading`). Real backends land in Phase 6 (item 13).
+  encoding conversion when RDB loading`). The same missing macro-node model means stream
+  approximate trimming (`XADD`/`XTRIM` with `MAXLEN ~` / `MINID ~` / `LIMIT`, governed by
+  `stream-node-max-entries`) removes whole 100-entry nodes in Redis but trims exactly in
+  PeaDB — a spec-valid "keep at least N" result with a different retained count, so 11
+  `unit/type/stream` tests are skipfile-tracked (`scripts/redis/skipfiles/unit_type_stream.skip`).
+  Real backends land in Phase 6 (item 13).
 - Tracking: folded into the compact-encodings track (item 13).

@@ -73,6 +73,8 @@ struct Entry {
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> entries;
     std::uint64_t last_ms = 0;
     std::uint64_t last_seq = 0;
+    std::uint64_t entries_added = 0;      // total ever XADDed (XINFO entries-added)
+    std::string max_deleted_id = "0-0";   // highest id ever XDELed (XINFO max-deleted-entry-id)
     std::unordered_map<std::string, StreamGroup> groups;
   };
   using Payload = std::variant<std::string,
@@ -245,7 +247,20 @@ class DataStore {
                                   bool& wrongtype, std::string& err);
   std::int64_t xlen(const std::string& key, bool& wrongtype);
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> xrange(
-      const std::string& key, const std::string& start, const std::string& stop, bool rev, bool& wrongtype);
+      const std::string& key, const std::string& start, const std::string& stop, bool rev, bool& wrongtype,
+      bool* invalid_id = nullptr);
+  // XINFO STREAM summary. first/last are the {id, fields} of the boundary entries (id
+  // empty when the stream is empty). Returns false (wrongtype=true) for a non-stream.
+  struct StreamInfo {
+    std::int64_t length = 0;
+    std::string last_id = "0-0";
+    std::string max_deleted_id = "0-0";
+    std::uint64_t entries_added = 0;
+    std::size_t groups = 0;
+    std::pair<std::string, std::vector<std::pair<std::string, std::string>>> first;
+    std::pair<std::string, std::vector<std::pair<std::string, std::string>>> last;
+  };
+  bool stream_info(const std::string& key, StreamInfo& out, bool& wrongtype);
   bool xgroup_create(const std::string& key, const std::string& group, const std::string& start_id,
                      bool mkstream, bool& wrongtype, std::string& err);
   bool xgroup_setid(const std::string& key, const std::string& group, const std::string& id,
@@ -253,7 +268,10 @@ class DataStore {
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> xreadgroup(
       const std::string& group, const std::string& consumer, const std::vector<std::pair<std::string, std::string>>& streams,
       bool& wrongtype, std::string& err);
-  std::int64_t xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype);
+  // is_trim=true removes entries as part of MAXLEN/MINID trimming, which (unlike an
+  // explicit XDEL) must NOT advance max-deleted-entry-id — Redis only bumps that on XDEL.
+  std::int64_t xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype,
+                    bool is_trim = false);
   std::int64_t xack(const std::string& key, const std::string& group, const std::vector<std::string>& ids,
                     bool& wrongtype, std::string& err);
   std::vector<std::string> xpending_summary(const std::string& key, const std::string& group,
@@ -272,7 +290,8 @@ class DataStore {
   void restore_stream(const std::string& key, const StreamDump& d);
 
   // ── Stream ops (Batch 6) ──
-  bool xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err);
+  bool xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err,
+              const std::string* entries_added = nullptr, const std::string* max_deleted_id = nullptr);
   // XCLAIM: returns claimed entries (id, fields) for ids that were pending; updates PEL ownership.
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> xclaim(
       const std::string& key, const std::string& group, const std::string& consumer,
