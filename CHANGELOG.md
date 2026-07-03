@@ -9,6 +9,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 3): rehash-safe SCAN cursors
+
+- **`unit/scan` adopted natively at 0 errors** (11 suites total, 98.0% pass-rate).
+- **Rehash-safe `HSCAN`/`SSCAN`/`ZSCAN` cursors.** Replaced the ordinal (index) cursor —
+  which silently skipped elements when the collection was mutated mid-scan (Redis
+  issue #4906) — with the same reverse-binary / monotonic bucket cursor the main-keyspace
+  `SCAN` uses, so every element present throughout a scan is guaranteed to be returned.
+- **`HSCAN NOVALUES`** (fields-only) and **`MATCH`** on `HSCAN`/`SSCAN`/`ZSCAN`.
+- **Subnormal float parsing.** `parse_f64` now uses `strtold` instead of `std::stold`,
+  which threw `out_of_range` on subnormal underflow (e.g. `9.88e-323`); such values are
+  valid in Redis (`ZADD`, `INCRBYFLOAT`, score bounds).
+
 ### Added — parity roadmap Phase 1 (wave 2): list + zset suites adopted
 
 - **`unit/type/zset` (320 ok) and `unit/type/list` (264 ok) adopted natively at 0 errors**

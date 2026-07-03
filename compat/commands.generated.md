@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 9, upstream: 165, diff: 2, tested: 58, registered: 0
+Total: **234** commands — full: 9, upstream: 168, diff: 2, tested: 55, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -83,7 +83,7 @@ Total: **234** commands — full: 9, upstream: 165, diff: 2, tested: 58, registe
 | `HMGET` | upstream | test_p3_hash_extras.py |
 | `HMSET` | upstream | test_p3_hash_extras.py |
 | `HRANDFIELD` | upstream | test_p3_ecosystem_commands.py |
-| `HSCAN` | tested | test_m4_hash.py |
+| `HSCAN` | upstream | test_m4_hash.py |
 | `HSET` | upstream | test_b5_commands.py, test_m4_hash.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
 | `HSETNX` | upstream | test_p3_hash_extras.py |
 | `HSTRLEN` | upstream | — |
@@ -177,7 +177,7 @@ Total: **234** commands — full: 9, upstream: 165, diff: 2, tested: 58, registe
 | `SPUBLISH` | tested | test_b5_commands.py |
 | `SRANDMEMBER` | upstream | test_p3_ecosystem_commands.py |
 | `SREM` | upstream | test_m4_set.py |
-| `SSCAN` | tested | test_m4_set.py |
+| `SSCAN` | upstream | test_m4_set.py |
 | `SSUBSCRIBE` | tested | test_b5_commands.py |
 | `STRLEN` | upstream | test_m2_strings_expire.py |
 | `SUBSCRIBE` | tested | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b5_commands.py, test_p3_pubsub_surface.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
@@ -239,7 +239,7 @@ Total: **234** commands — full: 9, upstream: 165, diff: 2, tested: 58, registe
 | `ZREVRANGEBYLEX` | upstream | — |
 | `ZREVRANGEBYSCORE` | upstream | test_p3_ecosystem_commands.py |
 | `ZREVRANK` | upstream | test_p3_ecosystem_commands.py |
-| `ZSCAN` | tested | test_m4_zset.py |
+| `ZSCAN` | upstream | test_m4_zset.py |
 | `ZSCORE` | upstream | test_p3_ecosystem_commands.py |
 | `ZUNION` | upstream | test_p3_ecosystem_commands.py |
 | `ZUNIONSTORE` | upstream | test_p3_ecosystem_commands.py |

@@ -16,6 +16,10 @@
 namespace peadb {
 
 namespace {
+// Reverse-binary-increment SCAN cursor step (defined below; forward-declared for the
+// collection scans that share it with the main-keyspace SCAN).
+std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets);
+
 // Round-trip-safe double formatting for AOF rewrite (std::to_string gives only ~6
 // significant digits, silently corrupting non-round scores on every rewrite).
 std::string fmt_double(double d) {
@@ -716,16 +720,29 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataS
     return {0, out};
   }
 
-  std::size_t idx = 0;
-  std::size_t emitted = 0;
-  for (const auto& kv : it->second.hash()) {
-    if (idx++ < cursor) continue;
-    out.push_back(kv);
-    if (++emitted >= count) break;
+  // Bucket-based reverse-binary cursor (rehash-safe, like the main SCAN).
+  const auto& h = it->second.hash();
+  const std::uint64_t nb = h.bucket_count();
+  if (nb == 0 || h.empty()) return {0, out};
+  const bool is_pow2 = (nb & (nb - 1)) == 0;
+  std::uint64_t bucket = cursor % nb;
+  if (!is_pow2) {
+    while (bucket < nb) {
+      for (auto bit = h.begin(bucket); bit != h.end(bucket); ++bit) out.push_back(*bit);
+      ++bucket;
+      if (out.size() >= count) break;
+    }
+    return {(bucket >= nb) ? 0 : bucket, out};
   }
-
-  const std::uint64_t next = (cursor + emitted) >= it->second.hash().size() ? 0 : (cursor + emitted);
-  return {next, out};
+  std::uint64_t visited = 0;
+  while (visited < nb) {
+    for (auto bit = h.begin(bucket); bit != h.end(bucket); ++bit) out.push_back(*bit);
+    ++visited;
+    bucket = scan_next_cursor(bucket, nb);
+    if (bucket == cursor % nb) { bucket = 0; break; }
+    if (out.size() >= count) break;
+  }
+  return {(visited >= nb) ? 0 : bucket, out};
 }
 
 std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype) {
@@ -963,14 +980,32 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
     return {0, out};
   }
 
-  std::size_t idx = 0, emitted = 0;
-  for (const auto& m : it->second.set()) {
-    if (idx++ < cursor) continue;
-    out.push_back(m);
-    if (++emitted >= count) break;
+  // Bucket-based reverse-binary cursor (like the main-keyspace SCAN) so elements present
+  // throughout the scan are always returned even as the set is mutated/rehashed between
+  // calls — fixes the ordinal-cursor bug (Redis issue #4906).
+  const auto& set = it->second.set();
+  const std::uint64_t nb = set.bucket_count();
+  if (nb == 0 || set.empty()) return {0, out};
+  const bool is_pow2 = (nb & (nb - 1)) == 0;
+  std::uint64_t bucket = cursor % nb;
+  if (!is_pow2) {
+    // libc++/libstdc++ use prime bucket counts: advance monotonically and stop at nb.
+    while (bucket < nb) {
+      for (auto bit = set.begin(bucket); bit != set.end(bucket); ++bit) out.push_back(*bit);
+      ++bucket;
+      if (out.size() >= count) break;
+    }
+    return {(bucket >= nb) ? 0 : bucket, out};
   }
-  const auto next = (cursor + emitted) >= it->second.set().size() ? 0 : (cursor + emitted);
-  return {next, out};
+  std::uint64_t visited = 0;
+  while (visited < nb) {
+    for (auto bit = set.begin(bucket); bit != set.end(bucket); ++bit) out.push_back(*bit);
+    ++visited;
+    bucket = scan_next_cursor(bucket, nb);
+    if (bucket == cursor % nb) { bucket = 0; break; }
+    if (out.size() >= count) break;
+  }
+  return {(visited >= nb) ? 0 : bucket, out};
 }
 
 DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, const std::string& member,
@@ -1063,14 +1098,29 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
     return {0, out};
   }
 
-  std::size_t idx = 0, emitted = 0;
-  for (const auto& kv : it->second.zset()) {
-    if (idx++ < cursor) continue;
-    out.push_back(kv);
-    if (++emitted >= count) break;
+  // Bucket-based reverse-binary cursor (rehash-safe, like the main SCAN).
+  const auto& z = it->second.zset();
+  const std::uint64_t nb = z.bucket_count();
+  if (nb == 0 || z.empty()) return {0, out};
+  const bool is_pow2 = (nb & (nb - 1)) == 0;
+  std::uint64_t bucket = cursor % nb;
+  if (!is_pow2) {
+    while (bucket < nb) {
+      for (auto bit = z.begin(bucket); bit != z.end(bucket); ++bit) out.push_back(*bit);
+      ++bucket;
+      if (out.size() >= count) break;
+    }
+    return {(bucket >= nb) ? 0 : bucket, out};
   }
-  const auto next = (cursor + emitted) >= it->second.zset().size() ? 0 : (cursor + emitted);
-  return {next, out};
+  std::uint64_t visited = 0;
+  while (visited < nb) {
+    for (auto bit = z.begin(bucket); bit != z.end(bucket); ++bit) out.push_back(*bit);
+    ++visited;
+    bucket = scan_next_cursor(bucket, nb);
+    if (bucket == cursor % nb) { bucket = 0; break; }
+    if (out.size() >= count) break;
+  }
+  return {(visited >= nb) ? 0 : bucket, out};
 }
 
 std::vector<std::pair<std::string, double>> DataStore::zpop(
