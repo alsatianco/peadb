@@ -112,6 +112,7 @@ SUITES=(
   "unit/type/list"
   "unit/type/zset"
   "unit/type/stream"
+  "unit/type/stream-cgroups"
   "unit/scan"
   "unit/expire"
   "unit/multi"

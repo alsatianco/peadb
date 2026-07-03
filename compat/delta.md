@@ -325,3 +325,21 @@ storage until real listpack/intset backends land).
   `unit/type/stream` tests are skipfile-tracked (`scripts/redis/skipfiles/unit_type_stream.skip`).
   Real backends land in Phase 6 (item 13).
 - Tracking: folded into the compact-encodings track (item 13).
+
+17. Stream consumer-group introspection depth (seen/active-time persistence, blocking-key counters)
+- Status: `partial` (consumer groups are functionally complete; two introspection details lag)
+- Owner: streams
+- Severity: low
+- Target milestone: P4
+- Implemented: full consumer-group model — per-consumer objects with seen-time/active-time,
+  `XINFO STREAM … FULL`, `XINFO GROUPS`, `XINFO CONSUMERS`, `XGROUP CREATE/SETID/DESTROY/
+  CREATECONSUMER/DELCONSUMER`, `entries-read`/`lag` with Redis's nil-when-indeterminable
+  semantics, and AOF round-trip of groups + consumers + PELs (`XGROUP CREATE … ENTRIESREAD`
+  + `CREATECONSUMER` + `XCLAIM`) plus XREADGROUP effect propagation (CREATECONSUMER / XCLAIM
+  / XGROUP SETID) to AOF and the replication backlog.
+- Missing: (each skipfile-tracked in `scripts/redis/skipfiles/unit_type_stream-cgroups.skip`)
+  per-consumer seen-time/active-time do not survive a DUMP/RESTORE or RDB round-trip (the
+  PeaDB stream RDB encoding, item 5, omits them), and INFO Clients does not expose
+  `total_blocking_keys` / `total_blocking_keys_on_nokey`.
+- Tracking: seen/active-time persistence rides with the stream RDB byte-parity work (item 5);
+  blocking-key counters land with the replication/introspection hardening in Phase 4.

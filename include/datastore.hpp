@@ -54,8 +54,14 @@ enum class MaxmemoryPolicy {
 // payloads. The mutable accessors materialize the active payload (get-or-create), which
 // also replaces the old manual type-reset logic.
 struct Entry {
+  struct StreamConsumer {
+    std::int64_t seen_time = 0;      // last time the consumer attempted any read (XINFO idle)
+    std::int64_t active_time = -1;   // last time it actually got data/claimed (XINFO inactive; -1=never)
+  };
   struct StreamGroup {
     std::string last_delivered_id = "0-0";
+    std::int64_t entries_read = 0;   // logical read counter (XINFO GROUPS entries-read; -1 = unknown)
+    std::map<std::string, StreamConsumer> consumers;  // name -> consumer (ordered for XINFO)
     std::unordered_map<std::string, std::string> pending_to_consumer;     // id -> consumer
     std::unordered_map<std::string, std::size_t> pending_per_consumer;    // consumer -> count
     std::unordered_map<std::string, std::int64_t> pending_delivery_ms;    // id -> last delivery time (ms)
@@ -261,21 +267,70 @@ class DataStore {
     std::pair<std::string, std::vector<std::pair<std::string, std::string>>> last;
   };
   bool stream_info(const std::string& key, StreamInfo& out, bool& wrongtype);
+  // start_id may be "$" (resolved to the stream's current last-id). entries_read, when
+  // non-null, seeds the group's read counter (already validated >= -1 by the caller).
   bool xgroup_create(const std::string& key, const std::string& group, const std::string& start_id,
-                     bool mkstream, bool& wrongtype, std::string& err);
+                     bool mkstream, bool& wrongtype, std::string& err,
+                     const std::int64_t* entries_read = nullptr);
   bool xgroup_setid(const std::string& key, const std::string& group, const std::string& id,
-                    bool& wrongtype, std::string& err);
+                    bool& wrongtype, std::string& err, const std::int64_t* entries_read = nullptr);
+  // count=0 means "no limit". noack skips adding delivered entries to the PEL. An idreq of
+  // ">" delivers new entries (advancing the group's last-delivered-id and, unless noack,
+  // adding to the consumer's PEL); any other id is a history read of the consumer's own PEL
+  // (id >= start), which re-emits pending entries — a returned entry with EMPTY fields is
+  // the null-fields sentinel for a pending id whose stream entry was since removed.
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> xreadgroup(
       const std::string& group, const std::string& consumer, const std::vector<std::pair<std::string, std::string>>& streams,
-      bool& wrongtype, std::string& err);
+      std::size_t count, bool noack, bool& wrongtype, std::string& err, bool* consumer_created = nullptr);
+  // Fetch a group's current last-delivered-id and entries-read (for NOACK propagation).
+  bool stream_group_ids(const std::string& key, const std::string& group,
+                        std::string& last_id, std::int64_t& entries_read);
   // is_trim=true removes entries as part of MAXLEN/MINID trimming, which (unlike an
   // explicit XDEL) must NOT advance max-deleted-entry-id — Redis only bumps that on XDEL.
   std::int64_t xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype,
                     bool is_trim = false);
   std::int64_t xack(const std::string& key, const std::string& group, const std::vector<std::string>& ids,
                     bool& wrongtype, std::string& err);
+  // Summary form: returns {total, min_id, max_id} and fills `consumers` with the per-consumer
+  // {name, count} breakdown (Redis XPENDING key group).
   std::vector<std::string> xpending_summary(const std::string& key, const std::string& group,
+                                            std::vector<std::pair<std::string, std::int64_t>>& consumers,
                                             bool& wrongtype, std::string& err);
+  // Extended form: one entry per pending message in [start,end], optionally restricted to a
+  // consumer and to messages idle for at least min_idle_ms, ordered by id, capped at count.
+  struct PendingItem { std::string id; std::string consumer; std::int64_t idle_ms; std::int64_t delivery_count; };
+  std::vector<PendingItem> xpending_extended(const std::string& key, const std::string& group,
+                                             const std::string& start, const std::string& end, std::int64_t count,
+                                             const std::string* consumer, std::int64_t min_idle_ms,
+                                             bool& wrongtype, std::string& err);
+
+  // ── Consumer-group management ──
+  int xgroup_destroy(const std::string& key, const std::string& group, bool& wrongtype);
+  int xgroup_createconsumer(const std::string& key, const std::string& group, const std::string& consumer,
+                            bool& wrongtype, std::string& err);
+  std::int64_t xgroup_delconsumer(const std::string& key, const std::string& group, const std::string& consumer,
+                                  bool& wrongtype, std::string& err);
+
+  // ── XINFO ──
+  // entries_read == -1 means "unknown" (reported as nil). lag_valid=false → lag is nil.
+  struct GroupInfo { std::string name, last_delivered_id; std::int64_t entries_read; bool lag_valid; std::int64_t lag;
+                     std::size_t pending; std::size_t consumers; };
+  std::vector<GroupInfo> xinfo_groups(const std::string& key, bool& wrongtype, std::string& err);
+  struct ConsumerInfo { std::string name; std::size_t pending; std::int64_t idle; std::int64_t inactive; };
+  std::vector<ConsumerInfo> xinfo_consumers(const std::string& key, const std::string& group,
+                                            bool& wrongtype, std::string& err);
+  struct StreamFullPel { std::string id; std::int64_t delivery_ms; std::int64_t delivery_count; };
+  struct StreamFullConsumer { std::string name; std::int64_t seen_time; std::int64_t active_time;
+                              std::vector<StreamFullPel> pending; };
+  struct StreamFullGroupPel { std::string id; std::string consumer; std::int64_t delivery_ms; std::int64_t delivery_count; };
+  struct StreamFullGroup { std::string name, last_delivered_id; std::int64_t entries_read; bool lag_valid; std::int64_t lag;
+                           std::int64_t pel_count; std::vector<StreamFullGroupPel> pending;
+                           std::vector<StreamFullConsumer> consumers; };
+  struct StreamFullInfo { std::int64_t length; std::string last_id, max_deleted_id, recorded_first_id;
+                          std::int64_t entries_added;
+                          std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> entries;
+                          std::vector<StreamFullGroup> groups; };
+  bool xinfo_stream_full(const std::string& key, std::size_t count, StreamFullInfo& out, bool& wrongtype);
 
   // ── Stream serialization (for RDB persistence + replication of streams) ──
   struct StreamPel { std::string id; std::string consumer; std::int64_t delivery_ms; std::int64_t delivery_count; };
@@ -293,10 +348,12 @@ class DataStore {
   bool xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err,
               const std::string* entries_added = nullptr, const std::string* max_deleted_id = nullptr);
   // XCLAIM: returns claimed entries (id, fields) for ids that were pending; updates PEL ownership.
+  // last_id, when non-null, advances the group's last-delivered-id if greater (XCLAIM LASTID),
+  // so a replayed/replicated XCLAIM restores the group cursor an ACK read had advanced.
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> xclaim(
       const std::string& key, const std::string& group, const std::string& consumer,
       std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
-      bool& wrongtype, std::string& err);
+      bool& wrongtype, std::string& err, const std::string* last_id = nullptr);
   // XAUTOCLAIM: from start cursor, claim up to count idle entries; returns {next_cursor, entries, deleted}.
   struct AutoClaimResult {
     std::string next_cursor;

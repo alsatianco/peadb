@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 9, upstream: 171, diff: 2, tested: 52, registered: 0
+Total: **234** commands — full: 9, upstream: 178, diff: 2, tested: 45, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -48,7 +48,7 @@ Total: **234** commands — full: 9, upstream: 171, diff: 2, tested: 52, registe
 | `EXEC` | upstream | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py |
 | `EXISTS` | upstream | test_b14_lazyfree.py, test_m2_strings_expire.py, test_p1_move.py, test_p1_set_get_option.py, test_p1_string_range_ops.py, test_p2_scripting_time_freeze.py, test_p4_lpop_count_readonly.py |
 | `EXPIRE` | upstream | test_m2_strings_expire.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py |
-| `EXPIREAT` | tested | test_command_coverage_extras.py |
+| `EXPIREAT` | upstream | test_command_coverage_extras.py |
 | `EXPIRETIME` | upstream | test_p1_expiretime_debug_digest.py |
 | `FCALL` | upstream | test_p2_function_basic.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py |
 | `FCALL_RO` | upstream | test_p3_sort_zmpop.py |
@@ -118,9 +118,9 @@ Total: **234** commands — full: 9, upstream: 171, diff: 2, tested: 52, registe
 | `MSETNX` | upstream | test_p1_msetnx_debug_loadaof.py |
 | `MULTI` | upstream | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py, test_p4_subscribe_mode_gate.py |
 | `OBJECT` | upstream | test_m3_object_encoding.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p4_encoding_shim.py, test_p4_new_events_hello_object.py |
-| `PERSIST` | tested | test_m2_strings_expire.py |
+| `PERSIST` | upstream | test_m2_strings_expire.py |
 | `PEXPIRE` | upstream | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py, test_p4_debug_verbs.py |
-| `PEXPIREAT` | tested | test_command_coverage_extras.py |
+| `PEXPIREAT` | upstream | test_command_coverage_extras.py |
 | `PEXPIRETIME` | upstream | test_p1_expiretime_debug_digest.py |
 | `PFADD` | tested | test_b5_commands.py |
 | `PFCOUNT` | tested | test_b5_commands.py |
@@ -196,15 +196,15 @@ Total: **234** commands — full: 9, upstream: 171, diff: 2, tested: 52, registe
 | `UNWATCH` | upstream | test_m4_tx.py |
 | `WAIT` | upstream | test_b8_repl_safety.py, test_m6_wait.py |
 | `WATCH` | upstream | test_m4_tx.py |
-| `XACK` | tested | test_m4_streams_x2.py |
+| `XACK` | upstream | test_m4_streams_x2.py |
 | `XADD` | upstream | test_b6_streams.py, test_m4_streams_x1.py, test_m4_streams_x2.py, test_p1_bitmap_xreadgroup.py, test_p1_xdel.py, test_p1_xgroup_setid.py, test_p1_xinfo_stream_full.py, test_p1_xreadgroup_propagation.py, test_p3_ecosystem_commands.py, test_p4_debug_verbs.py |
-| `XAUTOCLAIM` | tested | test_b6_streams.py, test_p3_ecosystem_commands.py |
-| `XCLAIM` | tested | test_b6_streams.py |
+| `XAUTOCLAIM` | upstream | test_b6_streams.py, test_p3_ecosystem_commands.py |
+| `XCLAIM` | upstream | test_b6_streams.py |
 | `XDEL` | upstream | test_p1_xdel.py |
 | `XGROUP` | upstream | test_b6_streams.py, test_m4_streams_x2.py, test_p1_bitmap_xreadgroup.py, test_p1_xgroup_setid.py, test_p1_xinfo_stream_full.py, test_p1_xreadgroup_propagation.py, test_p3_ecosystem_commands.py |
 | `XINFO` | upstream | test_p1_xinfo_stream_full.py |
 | `XLEN` | upstream | test_b6_streams.py, test_m4_streams_x1.py, test_p1_xdel.py |
-| `XPENDING` | tested | test_b6_streams.py, test_m4_streams_x2.py |
+| `XPENDING` | upstream | test_b6_streams.py, test_m4_streams_x2.py |
 | `XRANGE` | upstream | test_b6_streams.py, test_m4_streams_x1.py, test_p1_xdel.py |
 | `XREAD` | upstream | test_b6_streams.py, test_p1_xread.py |
 | `XREADGROUP` | upstream | test_b6_streams.py, test_m4_streams_x2.py, test_p1_bitmap_xreadgroup.py, test_p1_xgroup_setid.py, test_p1_xinfo_stream_full.py, test_p1_xreadgroup_propagation.py |

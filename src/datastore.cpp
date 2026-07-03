@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <random>
 #include <limits>
+#include <set>
 #include <fnmatch.h>
 
 namespace peadb {
@@ -105,6 +106,57 @@ std::string fmt_double(double d) {
   char buf[64];
   std::snprintf(buf, sizeof(buf), "%.17g", d);
   return buf;
+}
+
+constexpr std::int64_t kInvalidEntriesRead = -1;  // Redis SCG_INVALID_ENTRIES_READ
+
+// Does the range [start, +inf] of the stream include the max-deleted tombstone?
+// (Mirrors Redis streamRangeHasTombstones — used to decide if entries-read stays valid.)
+bool stream_range_has_tombstones(const Entry::StreamT& st, const StreamID& start) {
+  StreamID maxdel{0, 0};
+  stream_id_parse_strict(st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id, maxdel);
+  if (st.entries.empty() || (maxdel.ms == 0 && maxdel.seq == 0)) return false;
+  StreamID first{0, 0};
+  stream_id_parse_strict(st.entries.front().first, first);
+  if (stream_id_cmp(first, maxdel) > 0) return false;  // tombstone is before the first entry
+  return stream_id_cmp(start, maxdel) <= 0;             // start <= maxdel <= +inf
+}
+
+// Estimate a group's logical read-counter for a given id, or kInvalidEntriesRead when it
+// cannot be determined (Redis streamEstimateDistanceFromFirstEverEntry).
+std::int64_t stream_estimate_distance(const Entry::StreamT& st, const StreamID& id) {
+  const std::int64_t added = static_cast<std::int64_t>(st.entries_added);
+  if (added == 0) return 0;
+  const std::int64_t length = static_cast<std::int64_t>(st.entries.size());
+  const StreamID last{st.last_ms, st.last_seq};
+  if (length == 0 && stream_id_cmp(id, last) < 1) return added;
+  const int cmp_last = stream_id_cmp(id, last);
+  if (cmp_last == 0) return added;
+  if (cmp_last > 0) return kInvalidEntriesRead;  // a future id's counter is unknown
+  StreamID first{0, 0};
+  if (!st.entries.empty()) stream_id_parse_strict(st.entries.front().first, first);
+  StreamID maxdel{0, 0};
+  stream_id_parse_strict(st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id, maxdel);
+  const bool maxdel_zero = (maxdel.ms == 0 && maxdel.seq == 0);
+  const int cmp_id_first = stream_id_cmp(id, first);
+  if (maxdel_zero || stream_id_cmp(maxdel, first) < 0) {  // no fragmentation ahead
+    if (cmp_id_first < 0) return added - length;
+    if (cmp_id_first == 0) return added - length + 1;
+  }
+  return kInvalidEntriesRead;  // fragmented or arbitrary id → can't predict
+}
+
+// A consumer group's lag (entries not yet delivered), or nullopt when fragmentation makes
+// it indeterminable (Redis streamReplyWithCGLag → null).
+std::optional<std::int64_t> stream_cg_lag(const Entry::StreamT& st, const Entry::StreamGroup& g) {
+  if (st.entries_added == 0) return 0;  // never-used stream
+  StreamID glast{0, 0};
+  stream_id_parse_strict(g.last_delivered_id, glast);
+  if (g.entries_read != kInvalidEntriesRead && !stream_range_has_tombstones(st, glast))
+    return static_cast<std::int64_t>(st.entries_added) - g.entries_read;
+  const std::int64_t est = stream_estimate_distance(st, glast);
+  if (est != kInvalidEntriesRead) return static_cast<std::int64_t>(st.entries_added) - est;
+  return std::nullopt;
 }
 }  // namespace
 
@@ -1432,7 +1484,8 @@ bool stream_id_gt(const std::string& a, const std::string& b) {
 } // namespace
 
 bool DataStore::xgroup_create(const std::string& key, const std::string& group, const std::string& start_id,
-                              bool mkstream, bool& wrongtype, std::string& err) {
+                              bool mkstream, bool& wrongtype, std::string& err,
+                              const std::int64_t* entries_read) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1440,7 +1493,7 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group, 
   auto it = db.find(key);
   if (it == db.end()) {
     if (!mkstream) {
-      err = "The XGROUP subcommand requires the key to exist";
+      err = "The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.";
       return false;
     }
     Entry e;
@@ -1456,14 +1509,27 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group, 
     err = "BUSYGROUP Consumer Group name already exists";
     return false;
   }
+  auto& st = it->second.stream();
+  const StreamID last{st.last_ms, st.last_seq};
+  // "$" means "start after the current last entry"; otherwise validate the explicit id.
+  StreamID startk;
+  if (start_id == "$") {
+    startk = last;
+  } else if (!stream_id_parse_strict(start_id, startk)) {
+    err = "Invalid stream ID specified as stream command argument";
+    return false;
+  }
   Entry::StreamGroup g;
-  g.last_delivered_id = start_id;
+  g.last_delivered_id = stream_id_str(startk);
+  // Redis does NOT auto-derive entries-read on CREATE: it uses the explicit ENTRIESREAD or
+  // leaves the counter invalid (-1 → reported as nil), later recovered lazily on read.
+  g.entries_read = entries_read ? *entries_read : kInvalidEntriesRead;
   it->second.stream_groups()[group] = std::move(g);
   return true;
 }
 
 bool DataStore::xgroup_setid(const std::string& key, const std::string& group, const std::string& id,
-                             bool& wrongtype, std::string& err) {
+                             bool& wrongtype, std::string& err, const std::int64_t* entries_read) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1482,59 +1548,133 @@ bool DataStore::xgroup_setid(const std::string& key, const std::string& group, c
     err = "NOGROUP No such key or consumer group";
     return false;
   }
-
-  std::string next_id = id;
+  auto& st = it->second.stream();
+  // SETID accepts "$" (current last-id, persists past XDEL), "-"/"+" (min/max), or an id.
+  StreamID nid;
   if (id == "$") {
-    next_id = it->second.stream_entries().empty() ? "0-0" : it->second.stream_entries().back().first;
-  } else {
-    std::uint64_t ms = 0, seq = 0;
-    if (!parse_stream_id_pair(id, ms, seq)) {
-      err = "Invalid stream ID specified as stream command argument";
-      return false;
-    }
+    nid = {st.last_ms, st.last_seq};
+  } else if (id == "-") {
+    nid = {0, 0};
+  } else if (id == "+") {
+    nid = {UINT64_MAX, UINT64_MAX};
+  } else if (!stream_id_parse_strict(id, nid)) {
+    err = "Invalid stream ID specified as stream command argument";
+    return false;
   }
-  git->second.last_delivered_id = next_id;
+  git->second.last_delivered_id = stream_id_str(nid);
+  if (entries_read) git->second.entries_read = *entries_read;
   return true;
 }
 
 std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> DataStore::xreadgroup(
     const std::string& group, const std::string& consumer, const std::vector<std::pair<std::string, std::string>>& streams,
-    bool& wrongtype, std::string& err) {
+    std::size_t count, bool noack, bool& wrongtype, std::string& err, bool* consumer_created) {
   wrongtype = false;
   err.clear();
+  if (consumer_created) *consumer_created = false;
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> out;
   auto& db = dbs_[current_db_];
 
   for (const auto& [key, idreq] : streams) {
     expire_if_needed(db, key);
     auto it = db.find(key);
-    if (it == db.end()) continue;
+    if (it == db.end()) {
+      // Redis reports NOGROUP for a missing key too (the group can't exist).
+      err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "' in XREADGROUP with GROUP option";
+      return {};
+    }
     if (it->second.type() != ValueType::Stream) {
       wrongtype = true;
       return {};
     }
     auto git = it->second.stream_groups().find(group);
     if (git == it->second.stream_groups().end()) {
-      err = "NOGROUP No such key or consumer group";
+      err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "' in XREADGROUP with GROUP option";
       return {};
     }
+    auto& g = git->second;
+    // The consumer is created (and its seen-time bumped) whenever an XREADGROUP is processed
+    // for the group — even a "> " read that finds no data and is about to block — matching
+    // Redis. active-time is only bumped when data is actually delivered.
+    {
+      const bool is_new = g.consumers.find(consumer) == g.consumers.end();
+      g.consumers[consumer].seen_time = now_ms();
+      if (consumer_created && is_new) *consumer_created = true;
+    }
+    auto mark_active = [&]() { g.consumers[consumer].active_time = now_ms(); };
 
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> rows;
     if (idreq == ">") {
+      // Deliver new entries (id > group last-delivered-id), up to count.
       for (const auto& e : it->second.stream_entries()) {
-        if (!stream_id_gt(e.first, git->second.last_delivered_id)) continue;
+        if (!stream_id_gt(e.first, g.last_delivered_id)) continue;
         rows.push_back(e);
-        git->second.pending_to_consumer[e.first] = consumer;
-        git->second.pending_per_consumer[consumer] += 1;
-        git->second.pending_delivery_ms[e.first] = now_ms();
-        git->second.pending_delivery_count[e.first] = 1;
-        git->second.last_delivered_id = e.first;
-        break;
+        if (!noack) {
+          g.pending_to_consumer[e.first] = consumer;
+          g.pending_per_consumer[consumer] += 1;
+          g.pending_delivery_ms[e.first] = now_ms();
+          g.pending_delivery_count[e.first] = 1;
+        }
+        // Advance the read counter: increment when it's valid and no tombstone lies ahead,
+        // otherwise recover it via the estimate (Redis streamReplyWithRange group logic).
+        StreamID eid; stream_id_parse_strict(e.first, eid);
+        auto& stt = it->second.stream();
+        if (g.entries_read != -1 && !stream_range_has_tombstones(stt, eid)) {
+          ++g.entries_read;
+        } else if (stt.entries_added != 0) {
+          g.entries_read = stream_estimate_distance(stt, eid);
+        }
+        g.last_delivered_id = e.first;
+        if (count && rows.size() >= count) break;
       }
+      if (!rows.empty()) { mark_active(); out.push_back({key, std::move(rows)}); }
+    } else {
+      // History read: re-emit this consumer's own pending entries with id STRICTLY GREATER
+      // than the given id (Redis increments the start id, treating it as already-delivered).
+      StreamID start{0, 0};
+      stream_id_parse_strict(idreq, start);  // "0" -> 0-0; bare ms gets seq 0
+      std::vector<std::string> pel_ids;
+      for (const auto& [pid, owner] : g.pending_to_consumer) {
+        if (owner != consumer) continue;
+        StreamID pidk;
+        if (stream_id_parse_strict(pid, pidk) && stream_id_cmp(pidk, start) > 0) pel_ids.push_back(pid);
+      }
+      std::sort(pel_ids.begin(), pel_ids.end(), [](const std::string& a, const std::string& b) {
+        StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+        return stream_id_cmp(ia, ib) < 0;
+      });
+      const auto& entries = it->second.stream_entries();
+      for (const auto& pid : pel_ids) {
+        auto eit = std::find_if(entries.begin(), entries.end(),
+                                [&](const auto& e) { return e.first == pid; });
+        if (eit != entries.end()) {
+          rows.push_back(*eit);
+          g.pending_delivery_ms[pid] = now_ms();
+          g.pending_delivery_count[pid] += 1;  // Redis bumps the counter on history re-read
+        } else {
+          // Pending id whose stream entry was removed: emit id + empty fields (null sentinel).
+          rows.push_back({pid, {}});
+        }
+        if (count && rows.size() >= count) break;
+      }
+      if (!rows.empty()) mark_active();
+      // A specific-id read always reports the key, even with an empty result set.
+      out.push_back({key, std::move(rows)});
     }
-    if (!rows.empty()) out.push_back({key, rows});
   }
   return out;
+}
+
+bool DataStore::stream_group_ids(const std::string& key, const std::string& group,
+                                 std::string& last_id, std::int64_t& entries_read) {
+  auto& db = dbs_[current_db_];
+  auto it = db.find(key);
+  if (it == db.end() || it->second.type() != ValueType::Stream) return false;
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) return false;
+  last_id = git->second.last_delivered_id;
+  entries_read = git->second.entries_read;
+  return true;
 }
 
 std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype,
@@ -1561,7 +1701,7 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
                               return stream_id_parse_strict(e.first, eid) && stream_id_cmp(eid, want) == 0;
                             });
     if (vit == it->second.stream_entries().end()) continue;
-    const std::string canon_id = vit->first;  // canonical "ms-seq" for PEL cleanup
+    const std::string canon_id = vit->first;
     // Track the highest deleted id (XINFO max-deleted-entry-id) — only for explicit XDEL;
     // trimming (MAXLEN/MINID) removes entries without advancing this tombstone marker.
     if (!is_trim && stream_id_gt(canon_id, it->second.stream().max_deleted_id)) {
@@ -1569,19 +1709,10 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
     }
     it->second.stream_entries().erase(vit);
     ++removed;
-
-    for (auto& [_, grp] : it->second.stream_groups()) {
-      auto pit = grp.pending_to_consumer.find(canon_id);
-      if (pit == grp.pending_to_consumer.end()) continue;
-      auto cit = grp.pending_per_consumer.find(pit->second);
-      if (cit != grp.pending_per_consumer.end()) {
-        if (cit->second > 1) --cit->second;
-        else grp.pending_per_consumer.erase(cit);
-      }
-      grp.pending_to_consumer.erase(pit);
-      grp.pending_delivery_ms.erase(canon_id);
-      grp.pending_delivery_count.erase(canon_id);
-    }
+    // NOTE: consumer-group PEL entries are intentionally NOT removed here. In Redis, XDEL
+    // (and trimming) leave a dangling NACK — a deleted-but-still-pending message stays in
+    // XPENDING and is re-read by XREADGROUP history as "<id> nil" until it is XACK'd
+    // (bug #5570). Only XACK removes PEL entries.
   }
   return removed;
 }
@@ -1605,12 +1736,16 @@ std::int64_t DataStore::xack(const std::string& key, const std::string& group, c
   }
   std::int64_t acked = 0;
   for (const auto& id : ids) {
-    auto pit = git->second.pending_to_consumer.find(id);
+    // Canonicalize "667" -> "667-0" so a bare-ms ack matches the stored PEL key.
+    StreamID want;
+    if (!stream_id_parse_strict(id, want)) continue;
+    const std::string canon = stream_id_str(want);
+    auto pit = git->second.pending_to_consumer.find(canon);
     if (pit == git->second.pending_to_consumer.end()) continue;
     const auto consumer = pit->second;
     git->second.pending_to_consumer.erase(pit);
-    git->second.pending_delivery_ms.erase(id);
-    git->second.pending_delivery_count.erase(id);
+    git->second.pending_delivery_ms.erase(canon);
+    git->second.pending_delivery_count.erase(canon);
     auto cit = git->second.pending_per_consumer.find(consumer);
     if (cit != git->second.pending_per_consumer.end() && cit->second > 0) {
       cit->second -= 1;
@@ -1622,35 +1757,266 @@ std::int64_t DataStore::xack(const std::string& key, const std::string& group, c
 }
 
 std::vector<std::string> DataStore::xpending_summary(const std::string& key, const std::string& group,
+                                                     std::vector<std::pair<std::string, std::int64_t>>& consumers,
                                                      bool& wrongtype, std::string& err) {
   wrongtype = false;
   err.clear();
+  consumers.clear();
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) return {"0", "", "", ""};
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return {}; }
   if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return {};
   }
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) {
-    err = "NOGROUP No such key or consumer group";
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
     return {};
   }
-  if (git->second.pending_to_consumer.empty()) return {"0", "", "", ""};
+  const auto& g = git->second;
+  if (g.pending_to_consumer.empty()) return {"0", "", ""};
   std::string min_id, max_id;
   bool first = true;
-  for (const auto& kv : git->second.pending_to_consumer) {
-    if (first) {
-      min_id = max_id = kv.first;
-      first = false;
-      continue;
+  std::map<std::string, std::int64_t> per_consumer;  // ordered for stable output
+  for (const auto& kv : g.pending_to_consumer) {
+    if (first) { min_id = max_id = kv.first; first = false; }
+    else {
+      if (stream_id_gt(min_id, kv.first)) min_id = kv.first;
+      if (stream_id_gt(kv.first, max_id)) max_id = kv.first;
     }
-    if (stream_id_gt(min_id, kv.first)) min_id = kv.first;
-    if (stream_id_gt(kv.first, max_id)) max_id = kv.first;
+    per_consumer[kv.second] += 1;
   }
-  return {std::to_string(git->second.pending_to_consumer.size()), min_id, max_id, std::to_string(git->second.pending_per_consumer.size())};
+  for (const auto& [c, n] : per_consumer) consumers.push_back({c, n});
+  return {std::to_string(g.pending_to_consumer.size()), min_id, max_id};
+}
+
+std::vector<DataStore::PendingItem> DataStore::xpending_extended(
+    const std::string& key, const std::string& group, const std::string& start, const std::string& end,
+    std::int64_t count, const std::string* consumer, std::int64_t min_idle_ms, bool& wrongtype, std::string& err) {
+  wrongtype = false;
+  err.clear();
+  std::vector<PendingItem> out;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return out;
+  }
+  const auto& g = git->second;
+  StreamID lo, hi;
+  if (!stream_id_parse_bound(start, /*is_start=*/true, lo)) { err = "Invalid stream ID specified as stream command argument"; return out; }
+  if (!stream_id_parse_bound(end, /*is_start=*/false, hi)) { err = "Invalid stream ID specified as stream command argument"; return out; }
+  const auto now = now_ms();
+  for (const auto& [pid, owner] : g.pending_to_consumer) {
+    if (consumer && owner != *consumer) continue;
+    StreamID pk;
+    if (!stream_id_parse_strict(pid, pk)) continue;
+    if (stream_id_cmp(pk, lo) < 0 || stream_id_cmp(pk, hi) > 0) continue;
+    auto dm = g.pending_delivery_ms.find(pid);
+    const std::int64_t dms = dm != g.pending_delivery_ms.end() ? dm->second : now;
+    const std::int64_t idle = now - dms;
+    if (idle < min_idle_ms) continue;
+    auto dc = g.pending_delivery_count.find(pid);
+    out.push_back({pid, owner, idle, dc != g.pending_delivery_count.end() ? dc->second : 1});
+  }
+  std::sort(out.begin(), out.end(), [](const PendingItem& a, const PendingItem& b) {
+    StreamID ia, ib; stream_id_parse_strict(a.id, ia); stream_id_parse_strict(b.id, ib);
+    return stream_id_cmp(ia, ib) < 0;
+  });
+  if (count >= 0 && static_cast<std::int64_t>(out.size()) > count) out.resize(static_cast<std::size_t>(count));
+  return out;
+}
+
+int DataStore::xgroup_destroy(const std::string& key, const std::string& group, bool& wrongtype) {
+  wrongtype = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return 0;
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  return it->second.stream_groups().erase(group) ? 1 : 0;
+}
+
+int DataStore::xgroup_createconsumer(const std::string& key, const std::string& group, const std::string& consumer,
+                                     bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0;
+  }
+  if (git->second.consumers.count(consumer)) return 0;  // already exists
+  auto& c = git->second.consumers[consumer];
+  c.seen_time = now_ms();
+  c.active_time = -1;
+  return 1;
+}
+
+std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::string& group, const std::string& consumer,
+                                           bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0;
+  }
+  auto& g = git->second;
+  std::int64_t removed = 0;
+  for (auto pit = g.pending_to_consumer.begin(); pit != g.pending_to_consumer.end();) {
+    if (pit->second == consumer) {
+      g.pending_delivery_ms.erase(pit->first);
+      g.pending_delivery_count.erase(pit->first);
+      pit = g.pending_to_consumer.erase(pit);
+      ++removed;
+    } else {
+      ++pit;
+    }
+  }
+  g.pending_per_consumer.erase(consumer);
+  g.consumers.erase(consumer);
+  return removed;  // number of pending entries owned by the deleted consumer
+}
+
+std::vector<DataStore::GroupInfo> DataStore::xinfo_groups(const std::string& key, bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  std::vector<GroupInfo> out;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "no such key"; return out; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  const auto& st = it->second.stream();
+  std::vector<std::string> gnames;
+  for (const auto& [name, _] : st.groups) gnames.push_back(name);
+  std::sort(gnames.begin(), gnames.end());  // Redis iterates groups name-ordered (rax)
+  for (const auto& name : gnames) {
+    const auto& g = st.groups.at(name);
+    GroupInfo gi;
+    gi.name = name;
+    gi.last_delivered_id = g.last_delivered_id;
+    gi.entries_read = g.entries_read;
+    const auto lag = stream_cg_lag(st, g);
+    gi.lag_valid = lag.has_value();
+    gi.lag = lag.value_or(0);
+    gi.pending = g.pending_to_consumer.size();
+    // Consumer count spans both explicitly-created consumers and any that only own PEL entries.
+    std::set<std::string> names;
+    for (const auto& [n, _] : g.consumers) names.insert(n);
+    for (const auto& [_, owner] : g.pending_to_consumer) names.insert(owner);
+    gi.consumers = names.size();
+    out.push_back(std::move(gi));
+  }
+  return out;
+}
+
+std::vector<DataStore::ConsumerInfo> DataStore::xinfo_consumers(const std::string& key, const std::string& group,
+                                                               bool& wrongtype, std::string& err) {
+  wrongtype = false; err.clear();
+  std::vector<ConsumerInfo> out;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) { err = "no such key"; return out; }
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  auto git = it->second.stream_groups().find(group);
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out;
+  }
+  const auto& g = git->second;
+  // Union of registered consumers and PEL owners, name-ordered (Redis iterates a sorted rax).
+  std::map<std::string, Entry::StreamConsumer> all(g.consumers.begin(), g.consumers.end());
+  std::map<std::string, std::size_t> pend;
+  for (const auto& [_, owner] : g.pending_to_consumer) { pend[owner]++; all.emplace(owner, Entry::StreamConsumer{}); }
+  const auto now = now_ms();
+  for (const auto& [name, c] : all) {
+    ConsumerInfo ci;
+    ci.name = name;
+    ci.pending = pend.count(name) ? pend[name] : 0;
+    ci.idle = now - c.seen_time;
+    ci.inactive = c.active_time < 0 ? -1 : now - c.active_time;
+    out.push_back(std::move(ci));
+  }
+  return out;
+}
+
+bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, StreamFullInfo& out, bool& wrongtype) {
+  wrongtype = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  const auto& st = it->second.stream();
+  out.length = static_cast<std::int64_t>(st.entries.size());
+  out.last_id = stream_id_str({st.last_ms, st.last_seq});
+  out.max_deleted_id = st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id;
+  out.recorded_first_id = st.entries.empty() ? "0-0" : st.entries.front().first;
+  out.entries_added = static_cast<std::int64_t>(st.entries_added);
+  out.entries.clear();
+  const std::size_t lim = count == 0 ? st.entries.size() : count;
+  for (std::size_t i = 0; i < st.entries.size() && i < lim; ++i) out.entries.push_back(st.entries[i]);
+  out.groups.clear();
+  std::vector<std::string> gnames;
+  for (const auto& [gname, _] : st.groups) gnames.push_back(gname);
+  std::sort(gnames.begin(), gnames.end());  // name-ordered groups (Redis rax order)
+  for (const auto& gname : gnames) {
+    const auto& g = st.groups.at(gname);
+    StreamFullGroup fg;
+    fg.name = gname;
+    fg.last_delivered_id = g.last_delivered_id;
+    fg.entries_read = g.entries_read;
+    const auto lag = stream_cg_lag(st, g);
+    fg.lag_valid = lag.has_value();
+    fg.lag = lag.value_or(0);
+    fg.pel_count = static_cast<std::int64_t>(g.pending_to_consumer.size());
+    // Group-level PEL, id-ordered.
+    std::vector<std::string> ids;
+    for (const auto& [pid, _] : g.pending_to_consumer) ids.push_back(pid);
+    std::sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) {
+      StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+      return stream_id_cmp(ia, ib) < 0;
+    });
+    auto dms = [&](const std::string& id) { auto i = g.pending_delivery_ms.find(id); return i != g.pending_delivery_ms.end() ? i->second : 0; };
+    auto dcnt = [&](const std::string& id) { auto i = g.pending_delivery_count.find(id); return i != g.pending_delivery_count.end() ? i->second : 1; };
+    for (const auto& id : ids) {
+      auto owner = g.pending_to_consumer.at(id);
+      fg.pending.push_back({id, owner, dms(id), dcnt(id)});
+    }
+    // Consumers (name-ordered), each with its own id-ordered PEL.
+    std::map<std::string, Entry::StreamConsumer> all(g.consumers.begin(), g.consumers.end());
+    for (const auto& [_, owner] : g.pending_to_consumer) all.emplace(owner, Entry::StreamConsumer{});
+    const auto now = now_ms();
+    for (const auto& [cname, c] : all) {
+      StreamFullConsumer fc;
+      fc.name = cname;
+      fc.seen_time = c.seen_time ? c.seen_time : now;
+      fc.active_time = c.active_time;
+      std::vector<std::string> cids;
+      for (const auto& [pid, own] : g.pending_to_consumer) if (own == cname) cids.push_back(pid);
+      std::sort(cids.begin(), cids.end(), [](const std::string& a, const std::string& b) {
+        StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+        return stream_id_cmp(ia, ib) < 0;
+      });
+      for (const auto& id : cids) fc.pending.push_back({id, dms(id), dcnt(id)});
+      fg.consumers.push_back(std::move(fc));
+    }
+    out.groups.push_back(std::move(fg));
+  }
+  return true;
 }
 
 bool DataStore::dump_stream(const std::string& key, StreamDump& out) {
@@ -1766,8 +2132,8 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
 
 std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xclaim(
     const std::string& key, const std::string& group, const std::string& consumer,
-    std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
-    bool& wrongtype, std::string& err) {
+    std::int64_t min_idle_ms, const std::vector<std::string>& ids_in, bool justid, bool force,
+    bool& wrongtype, std::string& err, const std::string* last_id) {
   wrongtype = false; err.clear();
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
   auto& db = dbs_[current_db_];
@@ -1778,8 +2144,28 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
   auto& g = git->second;
+  // XCLAIM creates the target consumer as a side effect (needed so a replayed XCLAIM restores
+  // the consumer even when the read that produced it was propagated as bare XCLAIMs).
+  g.consumers[consumer].seen_time = now_ms();
+  // LASTID advances the group cursor (used by XREADGROUP-effect propagation for ACK reads).
+  if (last_id) {
+    StreamID lid;
+    if (stream_id_parse_strict(*last_id, lid)) {
+      StreamID cur{0, 0};
+      stream_id_parse_strict(g.last_delivered_id.empty() ? "0-0" : g.last_delivered_id, cur);
+      if (stream_id_cmp(lid, cur) > 0) g.last_delivered_id = stream_id_str(lid);
+    }
+  }
   const std::int64_t now = now_ms();
   auto& entries = it->second.stream_entries();
+  // Canonicalize requested ids ("5" -> "5-0") to match the stored PEL keys.
+  std::vector<std::string> ids;
+  ids.reserve(ids_in.size());
+  for (const auto& raw : ids_in) {
+    StreamID k;
+    ids.push_back(stream_id_parse_strict(raw, k) ? stream_id_str(k) : raw);
+  }
+  bool got_data = false;
   for (const auto& id : ids) {
     auto pit = g.pending_to_consumer.find(id);
     const bool in_pel = pit != g.pending_to_consumer.end();
@@ -1813,7 +2199,9 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
     g.pending_delivery_ms[id] = now;
     if (!justid) g.pending_delivery_count[id] += 1;
     out.push_back(*eit);
+    got_data = true;
   }
+  if (got_data) g.consumers[consumer].active_time = now_ms();
   return out;
 }
 
@@ -1834,27 +2222,68 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
   auto& g = git->second;
   const std::int64_t now = now_ms();
   if (count <= 0) count = 100;
-  auto& entries = it->second.stream_entries();
-  std::int64_t claimed = 0;
-  for (const auto& e : entries) {
-    if (stream_id_gt(start, e.first)) continue;          // skip ids before the cursor
-    auto pit = g.pending_to_consumer.find(e.first);
-    if (pit == g.pending_to_consumer.end()) continue;    // not pending
-    const auto dm = g.pending_delivery_ms.find(e.first);
+  // Ensure the target consumer exists (XAUTOCLAIM creates it as a side effect).
+  { auto& c = g.consumers[consumer]; c.seen_time = now; }
+  StreamID startk{0, 0};
+  stream_id_parse_strict(start == "-" ? "0-0" : start, startk);
+  // Iterate the group PEL (id-ordered) from the start cursor — this is what lets XAUTOCLAIM
+  // surface entries that were XDELed from the stream but still linger in the PEL.
+  std::vector<std::string> pel;
+  for (const auto& [pid, _] : g.pending_to_consumer) {
+    StreamID pk;
+    if (stream_id_parse_strict(pid, pk) && stream_id_cmp(pk, startk) >= 0) pel.push_back(pid);
+  }
+  std::sort(pel.begin(), pel.end(), [](const std::string& a, const std::string& b) {
+    StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+    return stream_id_cmp(ia, ib) < 0;
+  });
+  const auto& entries = it->second.stream_entries();
+  auto exists = [&](const std::string& id) {
+    return std::any_of(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+  };
+  auto remove_pel = [&](const std::string& id) {
+    auto pit = g.pending_to_consumer.find(id);
+    if (pit != g.pending_to_consumer.end()) {
+      auto cit = g.pending_per_consumer.find(pit->second);
+      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+      g.pending_to_consumer.erase(pit);
+    }
+    g.pending_delivery_ms.erase(id);
+    g.pending_delivery_count.erase(id);
+  };
+  std::int64_t attempts = count * 10;  // bound iterations like Redis (attempts_factor=10)
+  std::int64_t remaining = count;
+  std::size_t i = 0;
+  bool got_data = false;
+  for (; i < pel.size() && attempts > 0 && remaining > 0; --attempts) {
+    const std::string id = pel[i];
+    ++i;
+    if (!exists(id)) {           // entry was XDELed/trimmed away → surface as deleted, drop NACK
+      remove_pel(id);
+      res.deleted.push_back(id);
+      --remaining;
+      continue;
+    }
+    auto dm = g.pending_delivery_ms.find(id);
     const std::int64_t idle = now - (dm != g.pending_delivery_ms.end() ? dm->second : 0);
-    if (idle < min_idle_ms) continue;
-    if (claimed >= count) { res.next_cursor = e.first; break; }  // more remain → cursor here
-    if (pit->second != consumer) {
+    if (min_idle_ms > 0 && idle < min_idle_ms) continue;  // still owned; skip but don't claim
+    auto pit = g.pending_to_consumer.find(id);
+    if (pit != g.pending_to_consumer.end() && pit->second != consumer) {
       auto cit = g.pending_per_consumer.find(pit->second);
       if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
       pit->second = consumer;
       g.pending_per_consumer[consumer] += 1;
     }
-    g.pending_delivery_ms[e.first] = now;
-    if (!justid) g.pending_delivery_count[e.first] += 1;
-    res.claimed.push_back(e);
-    ++claimed;
+    g.pending_delivery_ms[id] = now;
+    if (!justid) g.pending_delivery_count[id] += 1;
+    auto eit = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+    res.claimed.push_back(*eit);
+    got_data = true;
+    --remaining;
   }
+  if (got_data) g.consumers[consumer].active_time = now;
+  // Cursor = next unprocessed PEL id, or 0-0 when the PEL was fully scanned.
+  res.next_cursor = (i < pel.size()) ? pel[i] : "0-0";
   return res;
 }
 
@@ -2263,10 +2692,15 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
                          "ENTRIESADDED", std::to_string(st.entries_added),
                          "MAXDELETEDID", st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id});
           // Recreate consumer groups and their pending-entries lists. XGROUP CREATE
-          // rebuilds the group at its last-delivered-id; XCLAIM ... FORCE re-adds each
-          // pending message to its owning consumer's PEL.
+          // rebuilds the group (preserving its entries-read counter, including the -1
+          // "invalid" sentinel); XGROUP CREATECONSUMER recreates every consumer — even
+          // those with no PEL (e.g. created by NOACK reads) — and XCLAIM ... FORCE re-adds
+          // each pending message to its owning consumer's PEL.
           for (const auto& [gname, grp] : st.groups) {
-            out.push_back({"XGROUP", "CREATE", key, gname, grp.last_delivered_id});
+            out.push_back({"XGROUP", "CREATE", key, gname, grp.last_delivered_id,
+                           "ENTRIESREAD", std::to_string(grp.entries_read)});
+            for (const auto& [cname, _] : grp.consumers)
+              out.push_back({"XGROUP", "CREATECONSUMER", key, gname, cname});
             for (const auto& [pid, consumer] : grp.pending_to_consumer) {
               auto ms_it = grp.pending_delivery_ms.find(pid);
               auto cnt_it = grp.pending_delivery_count.find(pid);
