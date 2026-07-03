@@ -1595,13 +1595,16 @@ bool parse_i64(const std::string& s, std::int64_t& out) {
 }
 
 bool parse_f64(const std::string& s, long double& out) {
-  try {
-    std::size_t idx = 0;
-    out = std::stold(s, &idx);
-    return idx == s.size();
-  } catch (...) {
-    return false;
-  }
+  // strtold (not std::stold): std::stold throws out_of_range on subnormal underflow
+  // (e.g. 9.88e-323), which Redis accepts. strtold returns the (subnormal/zero) value
+  // and sets errno=ERANGE; accept ERANGE-underflow but reject ERANGE-overflow (inf).
+  if (s.empty()) return false;
+  errno = 0;
+  char* end = nullptr;
+  out = std::strtold(s.c_str(), &end);
+  if (end != s.c_str() + s.size()) return false;
+  if (errno == ERANGE && std::isinf(static_cast<double>(out))) return false;
+  return true;
 }
 
 // Parse a blocking-command timeout (seconds, float), mirroring Redis's
@@ -4949,22 +4952,30 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_error("invalid cursor");
           }
           std::size_t count = 10;
+          std::string match_pat;
+          bool novalues = false;
           for (std::size_t i = 3; i < args.size(); ++i) {
-            if (upper(args[i]) == "COUNT" && i + 1 < args.size()) {
+            const auto o = upper(args[i]);
+            if (o == "COUNT" && i + 1 < args.size()) {
               try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-              continue;
+            } else if (o == "MATCH" && i + 1 < args.size()) {
+              match_pat = args[++i];
+            } else if (o == "NOVALUES") {
+              novalues = true;  // Redis 7.4/backported: return fields only
+            } else {
+              return encode_error("syntax error");
             }
-            return encode_error("syntax error");
           }
           return with_hash_key(args[1], [&]() {
             bool wrongtype = false;
             const auto [next, fields] = store().hscan(args[1], cursor, count, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> inner;
-            inner.reserve(fields.size() * 2);
+            inner.reserve(fields.size() * (novalues ? 1 : 2));
             for (const auto& [f, v] : fields) {
+              if (!match_pat.empty() && !pattern_matches(match_pat, f)) continue;
               inner.push_back(encode_bulk(f));
-              inner.push_back(encode_bulk(v));
+              if (!novalues) inner.push_back(encode_bulk(v));
             }
             return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
           });
@@ -5440,12 +5451,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::uint64_t cursor = 0;
           try { cursor = static_cast<std::uint64_t>(std::stoull(args[2])); } catch (...) { return encode_error("invalid cursor"); }
           std::size_t count = 10;
+          std::string match_pat;
           for (std::size_t i = 3; i < args.size(); ++i) {
-            if (upper(args[i]) == "COUNT" && i + 1 < args.size()) {
+            const auto o = upper(args[i]);
+            if (o == "COUNT" && i + 1 < args.size()) {
               try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-              continue;
+            } else if (o == "MATCH" && i + 1 < args.size()) {
+              match_pat = args[++i];
+            } else {
+              return encode_error("syntax error");
             }
-            return encode_error("syntax error");
           }
           return with_set_key(args[1], [&]() {
             bool wrongtype = false;
@@ -5453,7 +5468,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> inner;
             inner.reserve(members.size());
-            for (const auto& m : members) inner.push_back(encode_bulk(m));
+            for (const auto& m : members) {
+              if (!match_pat.empty() && !pattern_matches(match_pat, m)) continue;
+              inner.push_back(encode_bulk(m));
+            }
             return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
           });
         }});
@@ -5591,12 +5609,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::uint64_t cursor = 0;
           try { cursor = static_cast<std::uint64_t>(std::stoull(args[2])); } catch (...) { return encode_error("invalid cursor"); }
           std::size_t count = 10;
+          std::string match_pat;
           for (std::size_t i = 3; i < args.size(); ++i) {
-            if (upper(args[i]) == "COUNT" && i + 1 < args.size()) {
+            const auto o = upper(args[i]);
+            if (o == "COUNT" && i + 1 < args.size()) {
               try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-              continue;
+            } else if (o == "MATCH" && i + 1 < args.size()) {
+              match_pat = args[++i];
+            } else {
+              return encode_error("syntax error");
             }
-            return encode_error("syntax error");
           }
           return with_zset_key(args[1], [&]() {
             bool wrongtype = false;
@@ -5604,6 +5626,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::vector<std::string> inner;
             for (const auto& [m, s] : vals) {
+              if (!match_pat.empty() && !pattern_matches(match_pat, m)) continue;
               inner.push_back(encode_bulk(m));
               inner.push_back(encode_bulk(format_score(s)));
             }

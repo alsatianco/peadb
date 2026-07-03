@@ -111,6 +111,7 @@ SUITES=(
   "unit/type/set"
   "unit/type/list"
   "unit/type/zset"
+  "unit/scan"
   "unit/expire"
   "unit/multi"
   "unit/scripting"

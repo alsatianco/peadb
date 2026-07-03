@@ -42,7 +42,7 @@ When `used_memory()` exceeds `maxmemory` and a policy other than `noeviction` is
 
 ## SCAN
 
-The main-keyspace `SCAN` is bucket-based and advances the cursor with **reverse-binary-increment**, making it resilient to rehashing across calls (a monotonic non-wrapping path covers non-power-of-two bucket counts). Per-collection `HSCAN`/`SSCAN`/`ZSCAN` use simpler ordinal cursors.
+The main-keyspace `SCAN` is bucket-based and advances the cursor with **reverse-binary-increment**, making it resilient to rehashing across calls (a monotonic non-wrapping path covers non-power-of-two bucket counts). Per-collection `HSCAN`/`SSCAN`/`ZSCAN` use the **same bucket cursor** over their backing `unordered_map`/`unordered_set`, so an element present throughout a scan is always returned even as the collection is mutated between calls (Redis issue #4906 guarantee).
 
 ## Persistence
 

@@ -294,7 +294,9 @@ storage until real listpack/intset backends land).
   blocked key with an elapsed TTL is moved into place via SWAPDB / created inside MULTI
   (`SWAPDB wants to wake ...`, `MULTI + LPUSH + EXPIRE ...`); blocked-BLPOP-pop and
   in-script SELECT effects replication (`Replication of script multiple pushes to list
-  with BLPOP`, `Lua scripts using SELECT are replicated correctly`).
+  with BLPOP`, `Lua scripts using SELECT are replicated correctly`); deterministic
+  lazy-expire-DEL propagation on RANDOMKEY (`RANDOMKEY: Lazy-expire should not be wrapped
+  in MULTI/EXEC` — RNG-dependent DEL count today).
 - Tracking: implement the ready-keys queue + expiry propagation in the Phase-1
   scripting/replication pass, then drop the skips.
 
