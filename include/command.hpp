@@ -30,6 +30,7 @@ struct BlockedState {
   bool pop_left = true;              // for list: BLPOP vs BRPOP
   bool zpop_max = false;             // for zset: BZPOPMIN vs BZPOPMAX
   std::int64_t deadline_ms = 0;      // 0 = infinite
+  std::uint64_t seq = 0;             // FIFO serving order (set when the block registers)
   std::vector<std::string> original_args; // original command args for context
 };
 
@@ -151,6 +152,10 @@ extern std::function<int()> g_blocked_clients_cb;
 // Callback: close clients matching (by="ID"|"ADDR"|"ANY", val), excluding skip_fd.
 // Returns the number closed. Wired by server.cpp (owns fd lifecycle).
 extern std::function<int(const std::string& by, const std::string& val, int skip_fd)> g_client_kill_cb;
+// CLIENT UNBLOCK <id> [TIMEOUT|ERROR]: unblock a blocked client by id. error=true
+// delivers -UNBLOCKED; error=false delivers the command's timeout reply. Returns 1 if
+// a matching, currently-blocked client was found, else 0.
+extern std::function<int(std::uint64_t client_id, bool error)> g_client_unblock_cb;
 // Clear per-fd server-side registries (monitors, etc.) when a client disconnects.
 void on_client_disconnect(int fd);
 

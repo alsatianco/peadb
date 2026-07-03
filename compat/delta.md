@@ -279,15 +279,36 @@ storage until real listpack/intset backends land).
   Lua path (Linux CI unaffected; needs a leak hunt).
 - Tracking: burn down the skipfile; each removed line is a ratchet win.
 
-15. Blocked-client pops and in-script SELECT are not propagated
-- Status: known replication gaps (found by the native unit/scripting suite)
+15. Blocked-client serving order + expiry/SELECT propagation edges
+- Status: known gaps (surfaced by the native list/zset/scripting suites)
 - Owner: replication-compat
 - Severity: medium
-- Target milestone: P1
-- Implemented: n/a — this item registers two propagation bugs, not a feature.
-- Missing: a BLPOP served by the unblock path does not propagate the pop to
-  replicas/AOF (master and replica lists diverge), and SELECT issued inside a script
-  is not reflected in captured effects replication. Both are skipfile-tracked
-  (`Replication of script multiple pushes to list with BLPOP`,
-  `Lua scripts using SELECT are replicated correctly`).
-- Tracking: fix in the Phase-1 scripting/replication pass, then drop the skips.
+- Target milestone: P1/P4
+- Implemented: BLPOP/BRPOP/BLMOVE/BRPOPLPUSH/BLMPOP/BZPOPMIN/BZPOPMAX/BZMPOP block and
+  wake with correct data, deterministic effect propagation (LPOP/RPOP/LMOVE/ZPOPMIN/
+  ZPOPMAX with counts), millisecond-precise timeouts, FIFO-ordered wakeups, and
+  CLIENT UNBLOCK [TIMEOUT|ERROR].
+- Missing: (each skipfile-tracked) a "ready keys" serving queue so an already-blocked
+  client is served before a later same-batch pop takes the value (`Unblock fairness
+  ...`, `... blocked twice`); nested-unblock propagation ordering; DEL propagation when a
+  blocked key with an elapsed TTL is moved into place via SWAPDB / created inside MULTI
+  (`SWAPDB wants to wake ...`, `MULTI + LPUSH + EXPIRE ...`); blocked-BLPOP-pop and
+  in-script SELECT effects replication (`Replication of script multiple pushes to list
+  with BLPOP`, `Lua scripts using SELECT are replicated correctly`).
+- Tracking: implement the ready-keys queue + expiry propagation in the Phase-1
+  scripting/replication pass, then drop the skips.
+
+16. Compact encodings for list/hash/set/zset (OBJECT ENCODING label precision)
+- Status: `partial` (cosmetic labels over hashtable/deque storage — see item 13)
+- Owner: memory-eviction
+- Severity: low
+- Target milestone: P6
+- Implemented: `OBJECT ENCODING` synthesizes listpack/intset/quicklist/skiplist/hashtable
+  from element counts, value sizes, and the `*-max-listpack-*` / `set-max-intset-entries`
+  / `list-max-listpack-size` thresholds (incl. negative list size-classes and 0→1
+  clamping), with sticky one-way conversion for hash/set/zset and bidirectional for lists.
+- Missing: byte-exact listpack layout, so a handful of encoding-transition/insertion-order
+  tests are skipfile-tracked (`Hash ziplist of various encodings`, `SRANDMEMBER with a
+  dict containing long chain`, `List listpack -> quicklist encoding conversion`, `List
+  encoding conversion when RDB loading`). Real backends land in Phase 6 (item 13).
+- Tracking: folded into the compact-encodings track (item 13).

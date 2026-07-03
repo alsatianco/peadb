@@ -113,18 +113,18 @@ def main() -> int:
             r = cmd(s, "ZMPOP", "1", "zs1", "MIN")
             assert isinstance(r, list) and len(r) == 2
             assert r[0] == "zs1"
-            assert r[1] == ["a", "1"]
+            assert r[1] == [["a", "1"]]  # Redis nested [member, score] pairs
 
             # ZMPOP 1 key MAX
             r = cmd(s, "ZMPOP", "1", "zs1", "MAX")
             assert r[0] == "zs1"
-            assert r[1] == ["c", "3"]
+            assert r[1] == [["c", "3"]]
 
             # ZMPOP with COUNT
             cmd(s, "ZADD", "zs2", "1", "x", "2", "y", "3", "z")
             r = cmd(s, "ZMPOP", "1", "zs2", "MIN", "COUNT", "2")
             assert r[0] == "zs2"
-            assert len(r[1]) == 4  # 2 members × 2 (member + score)
+            assert r[1] == [["x", "1"], ["y", "2"]]  # nested pairs, MIN order
 
             # ZMPOP on empty key → nil
             r = cmd(s, "ZMPOP", "1", "emptykey", "MIN")
@@ -134,7 +134,7 @@ def main() -> int:
             cmd(s, "ZADD", "zs3", "10", "m")
             r = cmd(s, "ZMPOP", "2", "emptykey", "zs3", "MIN")
             assert r[0] == "zs3"
-            assert r[1] == ["m", "10"]
+            assert r[1] == [["m", "10"]]
 
             # ── EVALSHA_RO / FCALL_RO surface ────────────────────
             # EVALSHA_RO with non-existent SHA → NOSCRIPT error

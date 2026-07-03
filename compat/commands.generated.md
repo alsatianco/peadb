@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registered: 0
+Total: **234** commands — full: 9, upstream: 165, diff: 2, tested: 58, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -21,12 +21,14 @@ Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registe
 | `BITOP` | tested | test_p3_ecosystem_commands.py |
 | `BITPOS` | tested | test_p3_ecosystem_commands.py |
 | `BLMOVE` | upstream | test_m4_list_moves.py |
+| `BLMPOP` | upstream | — |
 | `BLPOP` | upstream | test_m4_blpop_brpop.py |
 | `BRPOP` | upstream | test_m4_blpop_brpop.py |
 | `BRPOPLPUSH` | upstream | test_m4_list_moves.py |
+| `BZMPOP` | upstream | — |
 | `BZPOPMAX` | upstream | test_p1_bzpop.py |
 | `BZPOPMIN` | upstream | test_p1_bzpop.py |
-| `CLIENT` | tested | test_b4_observability.py, test_p3_ecosystem_commands.py, test_p4_new_events_hello_object.py |
+| `CLIENT` | upstream | test_b4_observability.py, test_p3_ecosystem_commands.py, test_p4_new_events_hello_object.py |
 | `CLUSTER` | tested | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py |
 | `COMMAND` | tested | test_b5_commands.py, test_m1_commands.py |
 | `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py |
@@ -93,19 +95,19 @@ Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registe
 | `KEYS` | full | test_p1_keys_pattern.py |
 | `LATENCY` | tested | test_p3_ecosystem_commands.py |
 | `LCS` | upstream | test_p1_lcs.py |
-| `LINDEX` | tested | test_p3_ecosystem_commands.py |
-| `LINSERT` | tested | test_p3_ecosystem_commands.py |
-| `LLEN` | tested | test_m4_list.py, test_m5_snapshot_roundtrip.py, test_p4_lpop_count_readonly.py |
-| `LMOVE` | tested | test_m4_list_moves.py |
-| `LMPOP` | tested | test_p3_ecosystem_commands.py, test_p4_limits_errors.py |
+| `LINDEX` | upstream | test_p3_ecosystem_commands.py |
+| `LINSERT` | upstream | test_p3_ecosystem_commands.py |
+| `LLEN` | upstream | test_m4_list.py, test_m5_snapshot_roundtrip.py, test_p4_lpop_count_readonly.py |
+| `LMOVE` | upstream | test_m4_list_moves.py |
+| `LMPOP` | upstream | test_p3_ecosystem_commands.py, test_p4_limits_errors.py |
 | `LPOP` | upstream | test_m4_list.py, test_p4_lpop_count_readonly.py |
-| `LPOS` | tested | test_p3_ecosystem_commands.py |
+| `LPOS` | upstream | test_p3_ecosystem_commands.py |
 | `LPUSH` | upstream | test_m4_blpop_brpop.py, test_m4_list.py, test_m5_snapshot_roundtrip.py, test_p1_bitmap_xreadgroup.py, test_p1_string_range_ops.py, test_p4_new_events_hello_object.py |
-| `LPUSHX` | tested | test_p3_ecosystem_commands.py |
+| `LPUSHX` | upstream | test_p3_ecosystem_commands.py |
 | `LRANGE` | upstream | test_b13_obuf_limit.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py |
-| `LREM` | tested | test_p3_ecosystem_commands.py |
-| `LSET` | tested | test_p3_ecosystem_commands.py |
-| `LTRIM` | tested | test_p3_ecosystem_commands.py |
+| `LREM` | upstream | test_p3_ecosystem_commands.py |
+| `LSET` | upstream | test_p3_ecosystem_commands.py |
+| `LTRIM` | upstream | test_p3_ecosystem_commands.py |
 | `MEMORY` | upstream | test_p3_ecosystem_commands.py |
 | `MGET` | upstream | test_m2_strings_expire.py |
 | `MIGRATE` | tested | test_m7_migrate.py |
@@ -143,9 +145,9 @@ Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registe
 | `RESTORE` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
 | `ROLE` | tested | test_p3_ecosystem_commands.py |
 | `RPOP` | upstream | test_m4_list.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
-| `RPOPLPUSH` | tested | test_p3_ecosystem_commands.py |
+| `RPOPLPUSH` | upstream | test_p3_ecosystem_commands.py |
 | `RPUSH` | upstream | test_b13_obuf_limit.py, test_b5_commands.py, test_m4_blpop_brpop.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
-| `RPUSHX` | tested | test_p3_ecosystem_commands.py |
+| `RPUSHX` | upstream | test_p3_ecosystem_commands.py |
 | `SADD` | upstream | test_b5_commands.py, test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py, test_p1_object_encoding_policies.py, test_p2_script_rewrite_ops.py, test_p2_sort_in_script.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
 | `SAVE` | tested | test_b6_streams.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py |
 | `SCAN` | upstream | test_p1_expire_lazy_scan.py |
@@ -188,7 +190,7 @@ Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registe
 | `TIME` | upstream | test_p1_copy_spop_time.py |
 | `TOUCH` | tested | test_p3_ecosystem_commands.py |
 | `TTL` | upstream | test_m2_strings_expire.py, test_p1_expire_options.py, test_p1_move.py, test_p1_setex_psetex.py |
-| `TYPE` | tested | test_m2_strings_expire.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py |
+| `TYPE` | upstream | test_m2_strings_expire.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py |
 | `UNLINK` | tested | test_b14_lazyfree.py, test_command_coverage_extras.py |
 | `UNSUBSCRIBE` | tested | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `UNWATCH` | upstream | test_m4_tx.py |
@@ -210,28 +212,34 @@ Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registe
 | `XSETID` | tested | test_b6_streams.py |
 | `XTRIM` | tested | test_b6_streams.py, test_p3_ecosystem_commands.py |
 | `ZADD` | upstream | test_b10_protocol.py, test_b5_commands.py, test_m4_zset.py, test_m5_snapshot_roundtrip.py, test_p1_object_encoding_policies.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
-| `ZCARD` | tested | test_b5_commands.py, test_p3_ecosystem_commands.py |
-| `ZCOUNT` | tested | test_p3_ecosystem_commands.py |
-| `ZDIFF` | tested | test_p3_ecosystem_commands.py |
-| `ZDIFFSTORE` | tested | test_p3_ecosystem_commands.py |
-| `ZINCRBY` | tested | test_p3_ecosystem_commands.py |
-| `ZINTER` | tested | test_p3_ecosystem_commands.py |
-| `ZINTERSTORE` | tested | test_p3_ecosystem_commands.py |
-| `ZLEXCOUNT` | tested | test_p3_ecosystem_commands.py |
+| `ZCARD` | upstream | test_b5_commands.py, test_p3_ecosystem_commands.py |
+| `ZCOUNT` | upstream | test_p3_ecosystem_commands.py |
+| `ZDIFF` | upstream | test_p3_ecosystem_commands.py |
+| `ZDIFFSTORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZINCRBY` | upstream | test_p3_ecosystem_commands.py |
+| `ZINTER` | upstream | test_p3_ecosystem_commands.py |
+| `ZINTERCARD` | upstream | — |
+| `ZINTERSTORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZLEXCOUNT` | upstream | test_p3_ecosystem_commands.py |
 | `ZMPOP` | upstream | test_p3_sort_zmpop.py |
-| `ZMSCORE` | tested | test_p3_ecosystem_commands.py |
-| `ZPOPMAX` | tested | test_m4_zset.py |
-| `ZPOPMIN` | tested | test_m4_zset.py |
-| `ZRANDMEMBER` | tested | test_p3_ecosystem_commands.py |
-| `ZRANGE` | tested | test_b10_protocol.py, test_m4_zset.py, test_m5_snapshot_roundtrip.py |
-| `ZRANGEBYSCORE` | tested | test_p3_ecosystem_commands.py |
-| `ZRANGESTORE` | tested | test_b10_protocol.py, test_b5_commands.py |
-| `ZRANK` | tested | test_p3_ecosystem_commands.py |
-| `ZREM` | tested | test_p3_ecosystem_commands.py |
-| `ZREVRANGE` | tested | test_p3_ecosystem_commands.py |
-| `ZREVRANGEBYSCORE` | tested | test_p3_ecosystem_commands.py |
-| `ZREVRANK` | tested | test_p3_ecosystem_commands.py |
+| `ZMSCORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZPOPMAX` | upstream | test_m4_zset.py |
+| `ZPOPMIN` | upstream | test_m4_zset.py |
+| `ZRANDMEMBER` | upstream | test_p3_ecosystem_commands.py |
+| `ZRANGE` | upstream | test_b10_protocol.py, test_m4_zset.py, test_m5_snapshot_roundtrip.py |
+| `ZRANGEBYLEX` | upstream | — |
+| `ZRANGEBYSCORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZRANGESTORE` | upstream | test_b10_protocol.py, test_b5_commands.py |
+| `ZRANK` | upstream | test_p3_ecosystem_commands.py |
+| `ZREM` | upstream | test_p3_ecosystem_commands.py |
+| `ZREMRANGEBYLEX` | upstream | — |
+| `ZREMRANGEBYRANK` | upstream | — |
+| `ZREMRANGEBYSCORE` | upstream | — |
+| `ZREVRANGE` | upstream | test_p3_ecosystem_commands.py |
+| `ZREVRANGEBYLEX` | upstream | — |
+| `ZREVRANGEBYSCORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZREVRANK` | upstream | test_p3_ecosystem_commands.py |
 | `ZSCAN` | tested | test_m4_zset.py |
-| `ZSCORE` | tested | test_p3_ecosystem_commands.py |
-| `ZUNION` | tested | test_p3_ecosystem_commands.py |
-| `ZUNIONSTORE` | tested | test_p3_ecosystem_commands.py |
+| `ZSCORE` | upstream | test_p3_ecosystem_commands.py |
+| `ZUNION` | upstream | test_p3_ecosystem_commands.py |
+| `ZUNIONSTORE` | upstream | test_p3_ecosystem_commands.py |

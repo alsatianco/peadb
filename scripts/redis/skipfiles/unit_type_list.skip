@@ -1,0 +1,22 @@
+# When a key with an already-elapsed TTL is moved into place (SWAPDB) or created inside
+# a MULTI while a client blocks on it, Redis propagates a DEL for the lazily-expired key.
+# PeaDB's blocked-client wakeup path doesn't yet emit that DEL (expiry-propagation track,
+# compat/delta.md item 15).
+SWAPDB wants to wake blocked client, but the key already expired
+MULTI + LPUSH + EXPIRE + DEBUG SLEEP on blocked client, key already expired
+# Byte-exact listpack<->quicklist encoding-transition labels depend on the real
+# listpack layout; PeaDB approximates OBJECT ENCODING over hashtable/deque storage
+# (compat/delta.md item 13). List operations themselves are correct.
+List listpack -> quicklist encoding conversion
+List encoding conversion when RDB loading
+# Blocked-client "ready keys" serving order: a client already blocked on a key must be
+# served before a later same-batch pop takes the value. PeaDB's immediate synchronous
+# pop doesn't yet defer to a ready-keys queue (compat/delta.md item 15, blocked-client
+# fairness). The pop operations themselves are correct.
+Unblock fairness is kept while pipelining
+Unblock fairness is kept during nested unblock
+Blocking command accounted only once in commandstats
+Blocking command accounted only once in commandstats after timeout
+# Nested-unblock propagation order (a woken command unblocking another) depends on the
+# same ready-keys serving queue — compat/delta.md item 15.
+Command being unblocked cause another command to get unblocked execution order test

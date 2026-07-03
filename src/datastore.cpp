@@ -2038,10 +2038,31 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
     return e.str().size() <= 44 ? "embstr" : "raw";  // OBJ_ENCODING_EMBSTR_SIZE_LIMIT
   }
   if (e.type() == ValueType::List) {
-    const std::int64_t list_limit = lim.list_size < 0 ? 128 : lim.list_size;
-    bool small = within(e.list().size(), list_limit);
-    if (small) for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
-    return sticky(small, "listpack", "quicklist");
+    // Redis 7.2 lists convert listpack<->quicklist in BOTH directions, so this is
+    // recomputed each call (no sticky flag). Byte estimates approximate the listpack
+    // layout — exact parity needs the real backend (compat/delta.md item 13).
+    bool small;
+    if (lim.list_size < 0) {
+      // Negative size class: total serialized bytes fit the node budget
+      // (-1=4KB, -2=8KB, ... -5=64KB); values below -5 are clamped to -5 (Redis).
+      int cls = static_cast<int>(-lim.list_size);
+      if (cls > 5) cls = 5;
+      const std::size_t budget = std::size_t{4096} << (cls - 1);
+      std::size_t bytes = 11;  // listpack header + terminator
+      small = true;
+      for (const auto& v : e.list()) {
+        // A listpack element is ~1-5 bytes for a small integer, else len + a small
+        // header + 1-byte backlen; approximate with size + 2 (min 3 for ints).
+        bytes += (v.size() <= 2 ? 3 : v.size() + 2);
+        if (bytes > budget) { small = false; break; }
+      }
+    } else {
+      // 0 is treated as 1 (a single element is still listpack).
+      const std::int64_t entry_limit = lim.list_size == 0 ? 1 : lim.list_size;
+      small = within(e.list().size(), entry_limit);
+      if (small) for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
+    }
+    return small ? "listpack" : "quicklist";
   }
   if (e.type() == ValueType::Set) {
     bool all_int = true;

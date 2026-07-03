@@ -8,6 +8,7 @@
 #include "server_context.hpp"
 
 #include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -478,6 +479,7 @@ int run_server(const ServerConfig& config) {
     return static_cast<int>(to_kill.size());
   };
 
+
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
   // wakeup. Without this, those commands stall until the client sends more data.
   // Returns fds that should be closed (connection error or close-on-command).
@@ -512,6 +514,36 @@ int run_server(const ServerConfig& config) {
     }
   };
 
+  g_client_unblock_cb = [&](std::uint64_t client_id, bool error) -> int {
+    for (auto& [fd, sess] : sessions) {
+      if (sess.client_id != client_id || sess.blocked.type == BlockType::None) continue;
+      // TIMEOUT: deliver the command's normal timeout reply (nil array, or nil bulk for
+      // the BLMOVE/BRPOPLPUSH move forms). ERROR: deliver -UNBLOCKED. Then clear the
+      // block and drain any pipelined follow-up, exactly like a natural wakeup.
+      const bool r3 = sess.resp_version == RespVersion::Resp3;
+      std::string reply;
+      if (error) {
+        reply = "-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n";
+      } else {
+        std::string bcmd;
+        if (!sess.blocked.original_args.empty()) {
+          bcmd = sess.blocked.original_args[0];
+          for (auto& c : bcmd) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        }
+        const bool null_bulk = bcmd == "BLMOVE" || bcmd == "BRPOPLPUSH";
+        reply = r3 ? "_\r\n" : (null_bulk ? "$-1\r\n" : "*-1\r\n");
+      }
+      sess.blocked = BlockedState{};  // clear the block
+      --blocked_count;
+      if (!enqueue_output(fd, reply)) { close_client(fd); return 1; }
+      std::vector<int> one{fd}, dclose;
+      drain_pipelined(one, blocked_count, wait_count, dclose);
+      for (int c : dclose) close_client(c);
+      return 1;
+    }
+    return 0;
+  };
+
   // Recheck blocked clients (BLPOP/BRPOP/BLMOVE/BZPOPMIN/XREAD…): deliver to any whose
   // key now has data, or whose block timed out. Extracted so it can run both at loop top
   // and again right after processing readable fds — the latter removes the ~100ms latency
@@ -519,8 +551,18 @@ int run_server(const ServerConfig& config) {
   auto recheck_blocked = [&]() {
     if (blocked_count <= 0) return;
     std::vector<int> to_close, to_drain;
+    // Serve blocked clients FIFO (Redis serveClientsBlockedOnKeys order): the earliest
+    // blocker gets the data. The sessions map iterates in arbitrary order, so collect
+    // and sort by the block sequence number.
+    std::vector<std::pair<std::uint64_t, int>> ordered;
     for (auto& [bfd, session] : sessions) {
-      if (session.blocked.type == BlockType::None) continue;
+      if (session.blocked.type != BlockType::None) ordered.push_back({session.blocked.seq, bfd});
+    }
+    std::sort(ordered.begin(), ordered.end());
+    for (const auto& [seq, bfd] : ordered) {
+      auto sit = sessions.find(bfd);
+      if (sit == sessions.end() || sit->second.blocked.type == BlockType::None) continue;
+      auto& session = sit->second;
       const std::string reply = try_unblock_client(session);
       if (!reply.empty()) {
         --blocked_count;
@@ -585,7 +627,19 @@ int run_server(const ServerConfig& config) {
   };
 
   while (!shutdown_requested()) {
-    const int nready = poller.wait(ep_events, 100);
+    // Poll timeout: default 100 ms housekeeping tick, but clamp to the nearest blocked-
+    // client deadline so BLPOP-style timeouts fire with millisecond precision instead
+    // of up to a tick late (the upstream suite asserts ~150 ms slack on a 1 s timeout).
+    int poll_ms = 100;
+    if (blocked_count > 0) {
+      const auto pnow = DataStore::now_ms();
+      for (const auto& [bfd, bsession] : sessions) {
+        if (bsession.blocked.type == BlockType::None || bsession.blocked.deadline_ms <= 0) continue;
+        const auto delta = bsession.blocked.deadline_ms - pnow;
+        if (delta < poll_ms) poll_ms = delta > 1 ? static_cast<int>(delta) : 1;
+      }
+    }
+    const int nready = poller.wait(ep_events, poll_ms);
     if (nready < 0) {
       if (errno == EINTR) continue;
       log(LogLevel::Error, "poller wait failed: " + std::string(std::strerror(errno)));
@@ -839,7 +893,11 @@ int run_server(const ServerConfig& config) {
       }
 
       // Track blocked/replica/wait state changes
-      if (!was_blocked && session.blocked.type != BlockType::None) ++blocked_count;
+      if (!was_blocked && session.blocked.type != BlockType::None) {
+        ++blocked_count;
+        static std::uint64_t block_seq = 0;
+        session.blocked.seq = ++block_seq;  // FIFO serving order
+      }
       if (!was_waiting && session.wait_state.has_value()) ++wait_count;
       if (!was_replica && session.replica_stream) ++replica_count;
 
