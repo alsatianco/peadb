@@ -13,6 +13,14 @@ Requires: `cmake`, `g++` (C++20). Lua 5.1.5 is **bundled** (`third_party/lua-5.1
 
 On macOS `-O2` is kept for Release builds so benchmark baselines stay comparable (see `CMakeLists.txt`).
 
+## Coding Conventions
+
+- **Standard**: C++20, `-Wall -Wextra -Wpedantic -Werror`
+- **Style**: Google-based `.clang-format`, 4-space indent, 100-column limit, `Attach` braces
+- **Naming** (enforced by `.clang-tidy`):
+  - Namespaces `lower_case` (`kawasan::storage`); Classes/Structs `CamelCase` (`LogSegment`); Functions `camelBack` (`getMetadata()`); Variables `lower_case` (`partition_id`); Constants `UPPER_CASE`; Member variables `lower_case_` (trailing underscore)
+- **Commits**: after each completed, coherent change, commit it without being asked — one concise **single-line** [Conventional Commits](https://www.conventionalcommits.org/) subject (`feat:`, `fix:`, `refactor:`, `docs:`, `test:`, …), imperative mood, no body unless essential. Only commit complete, non-broken states (not mid-task checkpoints). Don't `git push` unless asked. Don't create or switch branch. We want a linear git history.
+
 ## Tests
 
 ```bash

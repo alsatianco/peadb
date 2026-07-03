@@ -90,7 +90,7 @@ def fcall(sock: socket.socket, numkeys: int, *keys: str):
 
 
 def main() -> int:
-    port = 6506
+    port = 6547
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"])
     try:
         wait_until_ready(port)

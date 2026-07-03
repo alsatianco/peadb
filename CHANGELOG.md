@@ -9,6 +9,27 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 1): encoding shim + hash/set suites adopted
+
+- **Encoding-transition thresholds.** All eight `*-max-listpack-*` / `set-max-intset-entries`
+  / `list-max-(ziplist|listpack)-size` params (config file, `CONFIG GET/SET`, ziplist
+  aliases) drive `OBJECT ENCODING`, with Redis-style one-way sticky conversions (per-entry
+  flags; intset disqualification detected at `SADD` time). `embstr` boundary corrected to 44.
+- **`unit/type/hash` + `unit/type/set` adopted natively at 0 errors** (70 + 118 ok; 8 suites
+  total now green — 786 ok, 97.5% pass-rate). Fixes pulled in by the suites:
+  - **Plain `SET`/`SETEX`/`PSETEX` now overwrite keys of any type** (was WRONGTYPE — a
+    fundamental drop-in bug); `SETNX` returns 0 without a type error; `SET ... GET` still
+    type-checks.
+  - `HRANDFIELD`/`SRANDMEMBER`: positive counts return **distinct** elements, RESP3
+    `WITHVALUES` returns pairs, `-INT64_MIN` counts rejected (crashed before).
+  - `HSTRLEN` implemented; `HINCRBY`/`HINCRBYFLOAT` strict value parsing + overflow/NaN
+    errors with Redis wording; `INCRBYFLOAT`/`HINCRBYFLOAT` results use Redis's fixed
+    `%.17Lf`-and-trim formatting (never scientific notation).
+  - `SPOP <key> <count>` that empties the set propagates `DEL`/`UNLINK`
+    (`lazyfree-lazy-server-del` knob added); single-member SPOP keeps SREM.
+  - `SINTERCARD` error wording (`Number of keys can't be greater than number of args`,
+    `LIMIT can't be negative`).
+
 ### Added — parity roadmap Phase 0: the verification ratchet + native upstream suite
 
 - **Native-mode upstream TCL harness.** The official Redis 7.2.5 test harness now spawns

@@ -107,6 +107,8 @@ SUITES=(
   "unit/keyspace"
   "unit/type/string"
   "unit/type/incr"
+  "unit/type/hash"
+  "unit/type/set"
   "unit/expire"
   "unit/multi"
   "unit/scripting"

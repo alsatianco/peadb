@@ -35,8 +35,10 @@ debt with a comment naming its delta item. Current tracked skipfile debts:
 multi-part-AOF manifest tests (item 3), writable replicas + replica script gating
 (item 8 note), ACL-dependent scripting (item 1), Lua debugger LDB protocol,
 SCRIPT KILL UNKILLABLE semantics, blocked-client-pop replication, in-script SELECT
-replication, busy-script event-loop I/O, and a macOS `leaks` report on the Lua path
-(items 14–15 below).
+replication, busy-script event-loop I/O, a macOS `leaks` report on the Lua path
+(items 14–15 below), listpack insertion-order for hashes and the incremental
+dict-rehash internals (`DEBUG HTSTATS-KEY`) for sets — both item 13 (hashtable-grade
+storage until real listpack/intset backends land).
 
 ## Known Deltas
 

@@ -89,6 +89,8 @@ bool DataStore::set(const std::string& key, const std::string& value, bool nx, b
   // old per-field clear + type reset).
   e.str() = value;
   e.string_force_raw = false;
+  e.encoding_big = false;  // a fresh value starts over on the encoding ladder
+  e.encoding_no_intset = false;
   if (!exists_now || !keep_ttl) {
     e.expire_at_ms = expire_at_ms;
   }
@@ -398,8 +400,10 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
     err = "increment would produce NaN or Infinity";
     return "";
   }
-  char buf[256];
-  std::snprintf(buf, sizeof(buf), "%.17Lg", out);
+  // Redis ld2string: fixed %.17Lf notation with trailing zeros trimmed — never
+  // scientific notation (INCRBYFLOAT 0.0000005 must yield "0.0000005", not "5e-07").
+  char buf[5120];
+  std::snprintf(buf, sizeof(buf), "%.17Lf", out);
   std::string s(buf);
   // Remove trailing zeros after decimal point
   if (s.find('.') != std::string::npos) {
@@ -847,7 +851,26 @@ std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::stri
     return 0;
   }
   std::int64_t added = 0;
-  for (const auto& m : members) added += it->second.set().insert(m).second ? 1 : 0;
+  auto& e = it->second;
+  for (const auto& m : members) {
+    added += e.set().insert(m).second ? 1 : 0;
+    // Intset disqualification is one-way in Redis: a non-integer member (or growing
+    // past set-max-intset-entries) converts the set away from intset permanently,
+    // even if the offending member is later removed. Detected at write time because
+    // OBJECT ENCODING may not be consulted between the add and the removal.
+    if (!e.encoding_no_intset) {
+      bool is_int = !m.empty();
+      std::size_t i = (m[0] == '-' ? 1 : 0);
+      if (i >= m.size() || (m[i] == '0' && m.size() - i > 1)) is_int = false;
+      for (std::size_t j = i; is_int && j < m.size(); ++j) {
+        if (!std::isdigit(static_cast<unsigned char>(m[j]))) is_int = false;
+      }
+      if (is_int && m.size() > 19) is_int = false;  // beyond int64 digits
+      if (!is_int || e.set().size() > static_cast<std::size_t>(std::max<std::int64_t>(0, encoding_limits_.set_intset))) {
+        e.encoding_no_intset = true;
+      }
+    }
+  }
   return added;
 }
 
@@ -1980,12 +2003,18 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  const auto& e = it->second;
+  auto& e = it->second;  // non-const: computing a big encoding sets the sticky flag
+  const auto& lim = encoding_limits_;
+  // Redis string2ll-style integer check for the "int" / intset encodings: digits with
+  // optional '-', no leading zeros (except "0" itself), must fit in int64.
   auto is_int = [](const std::string& s) -> bool {
     if (s.empty()) return false;
     std::size_t i = (s[0] == '-' ? 1 : 0);
     if (i >= s.size()) return false;
-    for (; i < s.size(); ++i) if (!std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+    if (s[i] == '0' && s.size() - i > 1) return false;  // leading zero
+    for (std::size_t j = i; j < s.size(); ++j) {
+      if (!std::isdigit(static_cast<unsigned char>(s[j]))) return false;
+    }
     try {
       std::size_t consumed = 0;
       (void)std::stoll(s, &consumed);
@@ -1994,34 +2023,49 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
       return false;
     }
   };
+  // Entry-count thresholds: <= 0 disables the small encoding entirely (Redis semantics
+  // for `config set hash-max-listpack-entries 0`); negative list size-classes ~ 128.
+  auto within = [](std::size_t n, std::int64_t limit) {
+    return limit > 0 && n <= static_cast<std::size_t>(limit);
+  };
+  auto sticky = [&e](bool small, const char* small_enc, const char* big_enc) {
+    if (!small) e.encoding_big = true;
+    return std::optional<std::string>(e.encoding_big ? big_enc : small_enc);
+  };
   if (e.type() == ValueType::String) {
     if (e.string_force_raw) return "raw";
     if (is_int(e.str())) return "int";
-    return e.str().size() <= 39 ? "embstr" : "raw";
+    return e.str().size() <= 44 ? "embstr" : "raw";  // OBJ_ENCODING_EMBSTR_SIZE_LIMIT
   }
   if (e.type() == ValueType::List) {
-    bool small = e.list().size() <= 128;
-    for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
-    return small ? "listpack" : "quicklist";
+    const std::int64_t list_limit = lim.list_size < 0 ? 128 : lim.list_size;
+    bool small = within(e.list().size(), list_limit);
+    if (small) for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
+    return sticky(small, "listpack", "quicklist");
   }
   if (e.type() == ValueType::Set) {
     bool all_int = true;
     for (const auto& v : e.set()) if (!is_int(v)) { all_int = false; break; }
-    if (all_int && e.set().size() <= 512) return "intset";
-    bool small = e.set().size() <= 128;
-    for (const auto& v : e.set()) if (v.size() > 64) { small = false; break; }
-    return small ? "listpack" : "hashtable";
+    if (!e.encoding_big && !e.encoding_no_intset && all_int &&
+        within(e.set().size(), lim.set_intset)) return "intset";
+    bool small = within(e.set().size(), lim.set_entries);
+    if (small) for (const auto& v : e.set()) if (v.size() > static_cast<std::size_t>(lim.set_value)) { small = false; break; }
+    return sticky(small, "listpack", "hashtable");
   }
   if (e.type() == ValueType::Hash) {
-    bool small = e.hash().size() <= 128;
-    for (const auto& [f, v] : e.hash()) if (f.size() > 64 || v.size() > 64) { small = false; break; }
-    return small ? "listpack" : "hashtable";
+    bool small = within(e.hash().size(), lim.hash_entries);
+    if (small) for (const auto& [f, v] : e.hash()) {
+      if (f.size() > static_cast<std::size_t>(lim.hash_value) ||
+          v.size() > static_cast<std::size_t>(lim.hash_value)) { small = false; break; }
+    }
+    return sticky(small, "listpack", "hashtable");
   }
   if (e.type() == ValueType::ZSet) {
-    bool small = zset_max_ziplist_entries_ >= 0 &&
-                 e.zset().size() <= static_cast<std::size_t>(zset_max_ziplist_entries_);
-    for (const auto& [m, _] : e.zset()) if (m.size() > 64) { small = false; break; }
-    return small ? "listpack" : "skiplist";
+    bool small = within(e.zset().size(), lim.zset_entries);
+    if (small) for (const auto& [m, _] : e.zset()) {
+      if (m.size() > static_cast<std::size_t>(lim.zset_value)) { small = false; break; }
+    }
+    return sticky(small, "listpack", "skiplist");
   }
   if (e.type() == ValueType::Stream) return "stream";
   return "raw";
@@ -2098,11 +2142,11 @@ std::string DataStore::debug_digest() {
 }
 
 void DataStore::set_zset_max_ziplist_entries(std::int64_t v) {
-  zset_max_ziplist_entries_ = v;
+  encoding_limits_.zset_entries = v;
 }
 
 std::int64_t DataStore::zset_max_ziplist_entries() const {
-  return zset_max_ziplist_entries_;
+  return encoding_limits_.zset_entries;
 }
 
 

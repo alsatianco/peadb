@@ -1,0 +1,4 @@
+# Listpack-encoded hashes preserve insertion order in Redis; PeaDB's hashtable-grade
+# storage doesn't (compat/delta.md item 13, real listpack backends).
+Hash ziplist of various encodings
+Hash ziplist of various encodings - sanitize dump
