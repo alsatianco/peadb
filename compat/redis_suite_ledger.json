@@ -53,6 +53,15 @@
       "exclusion_reason": "TLS not implemented (deferred XL track); see compat/delta.md item 7.",
       "mode": "excluded"
     },
+    "unit/type/hash": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 3,
+        "ok": 70
+      },
+      "mode": "native",
+      "skipfile_lines": 2
+    },
     "unit/type/incr": {
       "last_counts": {
         "err": 0,
@@ -61,6 +70,15 @@
       },
       "mode": "native",
       "skipfile_lines": 0
+    },
+    "unit/type/set": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 2,
+        "ok": 118
+      },
+      "mode": "native",
+      "skipfile_lines": 1
     },
     "unit/type/string": {
       "last_counts": {

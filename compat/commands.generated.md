@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registered: 0
+Total: **226** commands — full: 9, upstream: 120, diff: 2, tested: 95, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -29,7 +29,7 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `CLIENT` | tested | test_b4_observability.py, test_p3_ecosystem_commands.py, test_p4_new_events_hello_object.py |
 | `CLUSTER` | tested | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py |
 | `COMMAND` | tested | test_b5_commands.py, test_m1_commands.py |
-| `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py |
+| `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py |
 | `COPY` | upstream | test_p1_copy_spop_time.py, test_p1_xinfo_stream_full.py |
 | `DBSIZE` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py, test_p1_expire_lazy_scan.py |
 | `DEBUG` | upstream | test_p1_expire_error_and_lazy_get.py, test_p1_expire_lazy_scan.py, test_p1_expiretime_debug_digest.py, test_p1_msetnx_debug_loadaof.py, test_p1_setnx_debug.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py, test_p4_debug_verbs.py |
@@ -50,7 +50,7 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `EXPIRETIME` | upstream | test_p1_expiretime_debug_digest.py |
 | `FCALL` | upstream | test_p2_function_basic.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py |
 | `FCALL_RO` | upstream | test_p3_sort_zmpop.py |
-| `FLUSHALL` | full | test_b14_lazyfree.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_list_moves.py, test_m4_lua.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_streams_x1.py, test_m4_streams_x2.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m7_migrate.py, test_m8_module_key_api.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_lazy_scan.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_getset.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_msetnx_debug_loadaof.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p1_publish.py, test_p1_randomkey.py, test_p1_set_get_option.py, test_p1_setex_psetex.py, test_p1_setnx_debug.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xgroup_setid.py, test_p1_xinfo_stream_full.py, test_p1_xread.py, test_p1_xreadgroup_propagation.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_limits_errors.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
+| `FLUSHALL` | full | test_b14_lazyfree.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_list_moves.py, test_m4_lua.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_streams_x1.py, test_m4_streams_x2.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m7_migrate.py, test_m8_module_key_api.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_lazy_scan.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_getset.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_msetnx_debug_loadaof.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p1_publish.py, test_p1_randomkey.py, test_p1_set_get_option.py, test_p1_setex_psetex.py, test_p1_setnx_debug.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xgroup_setid.py, test_p1_xinfo_stream_full.py, test_p1_xread.py, test_p1_xreadgroup_propagation.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
 | `FLUSHDB` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py |
 | `FUNCTION` | upstream | test_command_coverage_extras.py, test_p2_function_basic.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py |
 | `GEOADD` | upstream | test_b5_commands.py, test_m4_set.py, test_p3_ecosystem_commands.py |
@@ -69,22 +69,23 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `GETEX` | upstream | test_command_coverage_extras.py, test_p1_expire_replication_canonical.py |
 | `GETRANGE` | upstream | test_p1_string_range_ops.py |
 | `GETSET` | upstream | test_p1_getset.py |
-| `HDEL` | tested | test_m4_hash.py |
+| `HDEL` | upstream | test_m4_hash.py |
 | `HELLO` | upstream | test_b5_commands.py, test_m1_commands.py, test_p2_scripting_debug_protocol.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
-| `HEXISTS` | tested | test_m4_hash.py |
-| `HGET` | tested | test_m4_hash.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_p3_hash_extras.py |
+| `HEXISTS` | upstream | test_m4_hash.py |
+| `HGET` | upstream | test_m4_hash.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_p3_hash_extras.py |
 | `HGETALL` | upstream | test_b5_commands.py, test_m4_hash.py |
 | `HINCRBY` | upstream | test_p3_hash_extras.py |
-| `HINCRBYFLOAT` | tested | test_p3_hash_extras.py |
-| `HKEYS` | tested | test_p3_hash_extras.py |
-| `HLEN` | tested | test_m4_hash.py |
+| `HINCRBYFLOAT` | upstream | test_p3_hash_extras.py |
+| `HKEYS` | upstream | test_p3_hash_extras.py |
+| `HLEN` | upstream | test_m4_hash.py |
 | `HMGET` | upstream | test_p3_hash_extras.py |
-| `HMSET` | tested | test_p3_hash_extras.py |
-| `HRANDFIELD` | tested | test_p3_ecosystem_commands.py |
+| `HMSET` | upstream | test_p3_hash_extras.py |
+| `HRANDFIELD` | upstream | test_p3_ecosystem_commands.py |
 | `HSCAN` | tested | test_m4_hash.py |
-| `HSET` | upstream | test_b5_commands.py, test_m4_hash.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py |
-| `HSETNX` | tested | test_p3_hash_extras.py |
-| `HVALS` | tested | test_p3_hash_extras.py |
+| `HSET` | upstream | test_b5_commands.py, test_m4_hash.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
+| `HSETNX` | upstream | test_p3_hash_extras.py |
+| `HSTRLEN` | upstream | — |
+| `HVALS` | upstream | test_p3_hash_extras.py |
 | `INCR` | upstream | test_m2_strings_expire.py, test_m4_tx.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py |
 | `INCRBY` | upstream | test_m2_strings_expire.py |
 | `INCRBYFLOAT` | upstream | test_m2_strings_expire.py |
@@ -105,7 +106,7 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `LREM` | tested | test_p3_ecosystem_commands.py |
 | `LSET` | tested | test_p3_ecosystem_commands.py |
 | `LTRIM` | tested | test_p3_ecosystem_commands.py |
-| `MEMORY` | tested | test_p3_ecosystem_commands.py |
+| `MEMORY` | upstream | test_p3_ecosystem_commands.py |
 | `MGET` | upstream | test_m2_strings_expire.py |
 | `MIGRATE` | tested | test_m7_migrate.py |
 | `MODULE` | tested | test_m8_module_command_api.py, test_m8_module_key_api.py, test_m8_module_load.py |
@@ -114,7 +115,7 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `MSET` | upstream | test_m2_strings_expire.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py |
 | `MSETNX` | upstream | test_p1_msetnx_debug_loadaof.py |
 | `MULTI` | upstream | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py, test_p4_subscribe_mode_gate.py |
-| `OBJECT` | upstream | test_m3_object_encoding.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p4_new_events_hello_object.py |
+| `OBJECT` | upstream | test_m3_object_encoding.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p4_encoding_shim.py, test_p4_new_events_hello_object.py |
 | `PERSIST` | upstream | test_m2_strings_expire.py |
 | `PEXPIRE` | upstream | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py, test_p4_debug_verbs.py |
 | `PEXPIREAT` | upstream | test_command_coverage_extras.py |
@@ -141,46 +142,46 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `RESET` | tested | test_p3_ecosystem_commands.py |
 | `RESTORE` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
 | `ROLE` | tested | test_p3_ecosystem_commands.py |
-| `RPOP` | upstream | test_m4_list.py, test_p4_lpop_count_readonly.py |
+| `RPOP` | upstream | test_m4_list.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
 | `RPOPLPUSH` | tested | test_p3_ecosystem_commands.py |
-| `RPUSH` | upstream | test_b13_obuf_limit.py, test_b5_commands.py, test_m4_blpop_brpop.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_lpop_count_readonly.py |
+| `RPUSH` | upstream | test_b13_obuf_limit.py, test_b5_commands.py, test_m4_blpop_brpop.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
 | `RPUSHX` | tested | test_p3_ecosystem_commands.py |
-| `SADD` | upstream | test_b5_commands.py, test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py, test_p1_object_encoding_policies.py, test_p2_script_rewrite_ops.py, test_p2_sort_in_script.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py |
+| `SADD` | upstream | test_b5_commands.py, test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py, test_p1_object_encoding_policies.py, test_p2_script_rewrite_ops.py, test_p2_sort_in_script.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
 | `SAVE` | tested | test_b6_streams.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py |
 | `SCAN` | upstream | test_p1_expire_lazy_scan.py |
-| `SCARD` | tested | test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py |
+| `SCARD` | upstream | test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py |
 | `SCRIPT` | upstream | test_m4_lua.py, test_m4_lua2_atomic.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p2_evalsha_sha1.py, test_p2_script_cache_info.py |
-| `SDIFF` | tested | test_p3_ecosystem_commands.py |
-| `SDIFFSTORE` | tested | test_p3_ecosystem_commands.py |
+| `SDIFF` | upstream | test_p3_ecosystem_commands.py |
+| `SDIFFSTORE` | upstream | test_p3_ecosystem_commands.py |
 | `SELECT` | upstream | test_m2_strings_expire.py, test_p1_dbsize_flushdb.py, test_p1_move.py, test_p1_object_swapdb_sync.py |
-| `SET` | full | test_b14_lazyfree.py, test_b4_observability.py, test_b5_commands.py, test_b7_eviction.py, test_b8_repl_safety.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
+| `SET` | full | test_b14_lazyfree.py, test_b4_observability.py, test_b5_commands.py, test_b7_eviction.py, test_b8_repl_safety.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
 | `SETBIT` | upstream | test_p1_bitmap_xreadgroup.py, test_p4_limits_errors.py |
 | `SETEX` | full | test_p1_setex_psetex.py |
 | `SETNX` | upstream | test_p1_setnx_debug.py |
 | `SETRANGE` | upstream | test_p1_string_range_ops.py, test_p4_limits_errors.py |
 | `SHUTDOWN` | tested | test_p1_shutdown.py |
-| `SINTER` | tested | test_p3_ecosystem_commands.py |
-| `SINTERCARD` | tested | test_p3_ecosystem_commands.py, test_p4_limits_errors.py |
-| `SINTERSTORE` | tested | test_p3_ecosystem_commands.py |
-| `SISMEMBER` | tested | test_b5_commands.py, test_m4_set.py |
+| `SINTER` | upstream | test_p3_ecosystem_commands.py |
+| `SINTERCARD` | upstream | test_p3_ecosystem_commands.py, test_p4_limits_errors.py |
+| `SINTERSTORE` | upstream | test_p3_ecosystem_commands.py |
+| `SISMEMBER` | upstream | test_b5_commands.py, test_m4_set.py |
 | `SLAVEOF` | upstream | test_p3_repl_cluster_surface.py |
 | `SLOWLOG` | tested | test_b4_observability.py, test_p3_ecosystem_commands.py |
-| `SMEMBERS` | tested | test_m4_set.py |
-| `SMISMEMBER` | tested | test_p3_ecosystem_commands.py |
-| `SMOVE` | tested | test_b5_commands.py |
+| `SMEMBERS` | upstream | test_m4_set.py |
+| `SMISMEMBER` | upstream | test_p3_ecosystem_commands.py |
+| `SMOVE` | upstream | test_b5_commands.py |
 | `SORT` | upstream | test_p3_sort_zmpop.py |
 | `SORT_RO` | tested | test_b5_commands.py |
 | `SPOP` | upstream | test_p1_copy_spop_time.py |
 | `SPUBLISH` | tested | test_b5_commands.py |
-| `SRANDMEMBER` | tested | test_p3_ecosystem_commands.py |
-| `SREM` | tested | test_m4_set.py |
+| `SRANDMEMBER` | upstream | test_p3_ecosystem_commands.py |
+| `SREM` | upstream | test_m4_set.py |
 | `SSCAN` | tested | test_m4_set.py |
 | `SSUBSCRIBE` | tested | test_b5_commands.py |
 | `STRLEN` | upstream | test_m2_strings_expire.py |
 | `SUBSCRIBE` | tested | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b5_commands.py, test_p3_pubsub_surface.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
 | `SUBSTR` | upstream | test_p1_string_range_ops.py |
-| `SUNION` | tested | test_p3_ecosystem_commands.py |
-| `SUNIONSTORE` | tested | test_p3_ecosystem_commands.py |
+| `SUNION` | upstream | test_p3_ecosystem_commands.py |
+| `SUNIONSTORE` | upstream | test_p3_ecosystem_commands.py |
 | `SUNSUBSCRIBE` | tested | test_b5_commands.py |
 | `SWAPDB` | upstream | test_p1_object_swapdb_sync.py |
 | `SYNC` | upstream | — |
@@ -208,7 +209,7 @@ Total: **225** commands — full: 9, upstream: 94, diff: 2, tested: 120, registe
 | `XREVRANGE` | tested | test_m4_streams_x1.py |
 | `XSETID` | tested | test_b6_streams.py |
 | `XTRIM` | tested | test_b6_streams.py, test_p3_ecosystem_commands.py |
-| `ZADD` | upstream | test_b10_protocol.py, test_b5_commands.py, test_m4_zset.py, test_m5_snapshot_roundtrip.py, test_p1_object_encoding_policies.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py |
+| `ZADD` | upstream | test_b10_protocol.py, test_b5_commands.py, test_m4_zset.py, test_m5_snapshot_roundtrip.py, test_p1_object_encoding_policies.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
 | `ZCARD` | tested | test_b5_commands.py, test_p3_ecosystem_commands.py |
 | `ZCOUNT` | tested | test_p3_ecosystem_commands.py |
 | `ZDIFF` | tested | test_p3_ecosystem_commands.py |

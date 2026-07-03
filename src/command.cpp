@@ -150,6 +150,7 @@ MaxmemoryPolicy g_maxmemory_policy = MaxmemoryPolicy::NoEviction;
 int g_maxmemory_samples = 5;        // candidate keys sampled per eviction (Redis default 5)
 int g_config_timeout = 0;           // idle-client timeout in seconds; 0 = never reap
 int g_config_tcp_backlog = 511;     // listen(2) backlog, reported by CONFIG GET
+bool g_lazyfree_lazy_server_del = false;  // propagate server-side deletions as UNLINK
 // client-output-buffer-limit per class [normal, replica, pubsub]. Redis defaults: normal
 // unlimited; replica 256mb hard / 64mb soft / 60s; pubsub 32mb / 8mb / 60s.
 CoblLimit g_cobl[3] = {
@@ -1089,6 +1090,11 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
 
     if (removed.empty()) {
       emit = false;
+    } else if (args.size() >= 3 && store().type_of(args[1]) == "none") {
+      // SPOP <key> <count> that emptied the set: Redis propagates the deletion (UNLINK
+      // when lazyfree-lazy-server-del is on) instead of an SREM of every member. The
+      // single-member form still propagates SREM even when it removes the last member.
+      out = {g_lazyfree_lazy_server_del ? "UNLINK" : "DEL", args[1]};
     } else {
       out = {"SREM", args[1]};
       out.insert(out.end(), removed.begin(), removed.end());
@@ -1586,6 +1592,26 @@ bool parse_f64(const std::string& s, long double& out) {
     std::size_t idx = 0;
     out = std::stold(s, &idx);
     return idx == s.size();
+  } catch (...) {
+    return false;
+  }
+}
+
+// Redis string2ll semantics: optional '-', digits only, no whitespace, no '+' prefix,
+// no leading zeros (except "0"), must fit int64. Used where Redis demands a strictly
+// valid integer value (INCR/HINCRBY stored values).
+bool parse_strict_int(const std::string& s, std::int64_t& out) {
+  if (s.empty()) return false;
+  std::size_t i = (s[0] == '-' ? 1 : 0);
+  if (i >= s.size()) return false;
+  if (s[i] == '0' && s.size() - i > 1) return false;
+  for (std::size_t j = i; j < s.size(); ++j) {
+    if (!std::isdigit(static_cast<unsigned char>(s[j]))) return false;
+  }
+  try {
+    std::size_t consumed = 0;
+    out = std::stoll(s, &consumed);
+    return consumed == s.size();
   } catch (...) {
     return false;
   }
@@ -3123,8 +3149,17 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"min-replicas-to-write", std::to_string(g_config_min_replicas_to_write)},
               {"replica-serve-stale-data", g_config_replica_serve_stale_data ? "yes" : "no"},
               {"lua-time-limit", std::to_string(g_config_lua_time_limit)},
-              {"zset-max-ziplist-entries", std::to_string(store().zset_max_ziplist_entries())},
-              {"zset-max-listpack-entries", std::to_string(store().zset_max_ziplist_entries())},
+              {"zset-max-ziplist-entries", std::to_string(store().encoding_limits().zset_entries)},
+              {"zset-max-listpack-entries", std::to_string(store().encoding_limits().zset_entries)},
+              {"zset-max-ziplist-value", std::to_string(store().encoding_limits().zset_value)},
+              {"zset-max-listpack-value", std::to_string(store().encoding_limits().zset_value)},
+              {"hash-max-ziplist-entries", std::to_string(store().encoding_limits().hash_entries)},
+              {"hash-max-listpack-entries", std::to_string(store().encoding_limits().hash_entries)},
+              {"hash-max-ziplist-value", std::to_string(store().encoding_limits().hash_value)},
+              {"hash-max-listpack-value", std::to_string(store().encoding_limits().hash_value)},
+              {"set-max-listpack-entries", std::to_string(store().encoding_limits().set_entries)},
+              {"set-max-listpack-value", std::to_string(store().encoding_limits().set_value)},
+              {"list-max-listpack-size", std::to_string(store().encoding_limits().list_size)},
               {"dbfilename", g_snapshot_path.filename().string()},
               {"dir", std::filesystem::current_path().string()},
               {"bind", "0.0.0.0"},
@@ -3147,9 +3182,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"timeout", std::to_string(g_config_timeout)},
               {"tcp-keepalive", "300"},
               {"tcp-backlog", std::to_string(g_config_tcp_backlog)},
+              {"lazyfree-lazy-server-del", g_lazyfree_lazy_server_del ? "yes" : "no"},
               {"proto-max-bulk-len", std::to_string(kProtoMaxBulkLen)},
-              {"list-max-ziplist-size", "-2"},
-              {"set-max-intset-entries", "512"},
+              {"list-max-ziplist-size", std::to_string(store().encoding_limits().list_size)},
+              {"set-max-intset-entries", std::to_string(store().encoding_limits().set_intset)},
               {"maxclients", std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed))},
               {"appendfsync", g_appendfsync},
               {"appendfilename", g_aof_path.filename().string()},
@@ -3218,16 +3254,35 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
               g_config_lua_time_limit = v;
             }
-            if (k == "zset-max-ziplist-entries" || k == "zset-max-listpack-entries") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              store().set_zset_max_ziplist_entries(v);
+            {
+              // Encoding-transition thresholds (listpack/ziplist aliases share storage).
+              auto& lim = store().encoding_limits();
+              std::int64_t* slot = nullptr;
+              bool allow_negative = false;
+              if (k == "zset-max-ziplist-entries" || k == "zset-max-listpack-entries") slot = &lim.zset_entries;
+              else if (k == "zset-max-ziplist-value" || k == "zset-max-listpack-value") slot = &lim.zset_value;
+              else if (k == "hash-max-ziplist-entries" || k == "hash-max-listpack-entries") slot = &lim.hash_entries;
+              else if (k == "hash-max-ziplist-value" || k == "hash-max-listpack-value") slot = &lim.hash_value;
+              else if (k == "set-max-intset-entries") slot = &lim.set_intset;
+              else if (k == "set-max-listpack-entries") slot = &lim.set_entries;
+              else if (k == "set-max-listpack-value") slot = &lim.set_value;
+              else if (k == "list-max-ziplist-size" || k == "list-max-listpack-size") { slot = &lim.list_size; allow_negative = true; }
+              if (slot != nullptr) {
+                std::int64_t v = 0;
+                if (!parse_i64(args[3], v) || (v < 0 && !allow_negative)) {
+                  return encode_error("value is not an integer or out of range");
+                }
+                *slot = v;
+              }
             }
             if (k == "appendfsync") {
               const auto v = lower(args[3]);
               if (v != "always" && v != "everysec" && v != "no")
                 return encode_error("Invalid argument '" + args[3] + "' for CONFIG SET 'appendfsync'");
               g_appendfsync = v;
+            }
+            if (k == "lazyfree-lazy-server-del") {
+              g_lazyfree_lazy_server_del = (lower(args[3]) == "yes");
             }
             if (k == "requirepass") {
               // Setting to "" disables auth. Already-connected clients keep their state.
@@ -3526,13 +3581,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (nx && xx) return encode_error("syntax error");
 
-          return with_string_key(args[1], [&]() {
-            const auto old = store().get(args[1]);
-            const bool ok = store().set(args[1], args[2], nx, xx, expire_at, keepttl);
-            if (get_old) return old.has_value() ? encode_bulk(*old) : encode_null(RespVersion::Resp2);
-            if (!ok) return encode_null(RespVersion::Resp2);
-            return encode_simple("OK");
-          });
+          // Plain SET overwrites a key of ANY type (Redis semantics) — only the GET
+          // option demands the existing value be a string.
+          const bool existing_non_string = store().is_wrongtype_for_string(args[1]);
+          if (get_old && existing_non_string) return wrongtype_error_reply();
+          std::optional<std::string> old;
+          if (get_old) old = store().get(args[1]);
+          const bool ok = store().set(args[1], args[2], nx, xx, expire_at, keepttl);
+          if (get_old) return old.has_value() ? encode_bulk(*old) : encode_null(RespVersion::Resp2);
+          if (!ok) return encode_null(RespVersion::Resp2);
+          return encode_simple("OK");
         }});
 
     t.emplace("SETEX", CommandSpec{"SETEX", 4, {"write"}, 1, 1, 1,
@@ -3540,11 +3598,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t sec = 0;
           if (!parse_i64(args[2], sec)) return encode_error("value is not an integer or out of range");
           if (sec <= 0) return encode_error("invalid expire time in setex");
-          return with_string_key(args[1], [&]() {
-            const auto exp = now_ms() + sec * 1000;
-            const bool ok = store().set(args[1], args[3], false, false, exp, false);
-            return ok ? encode_simple("OK") : encode_null(RespVersion::Resp2);
-          });
+          // SETEX overwrites any existing type, like SET.
+          const auto exp = now_ms() + sec * 1000;
+          const bool ok = store().set(args[1], args[3], false, false, exp, false);
+          return ok ? encode_simple("OK") : encode_null(RespVersion::Resp2);
         }});
 
     t.emplace("PSETEX", CommandSpec{"PSETEX", 4, {"write"}, 1, 1, 1,
@@ -3552,19 +3609,17 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t ms = 0;
           if (!parse_i64(args[2], ms)) return encode_error("value is not an integer or out of range");
           if (ms <= 0) return encode_error("invalid expire time in psetex");
-          return with_string_key(args[1], [&]() {
-            const auto exp = now_ms() + ms;
-            const bool ok = store().set(args[1], args[3], false, false, exp, false);
-            return ok ? encode_simple("OK") : encode_null(RespVersion::Resp2);
-          });
+          // PSETEX overwrites any existing type, like SET.
+          const auto exp = now_ms() + ms;
+          const bool ok = store().set(args[1], args[3], false, false, exp, false);
+          return ok ? encode_simple("OK") : encode_null(RespVersion::Resp2);
         }});
 
     t.emplace("SETNX", CommandSpec{"SETNX", 3, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return with_string_key(args[1], [&]() {
-            const bool ok = store().set(args[1], args[2], true, false, std::nullopt, false);
-            return encode_integer(ok ? 1 : 0);
-          });
+          // SETNX on an existing key of any type returns 0 without a type error.
+          const bool ok = store().set(args[1], args[2], true, false, std::nullopt, false);
+          return encode_integer(ok ? 1 : 0);
         }});
 
     t.emplace("MGET", CommandSpec{"MGET", -2, {"readonly"}, 1, -1, 1,
@@ -4653,7 +4708,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (wrongtype) return wrongtype_error_reply();
             std::int64_t current = 0;
             if (existing.has_value()) {
-              if (!parse_i64(*existing, current)) return encode_error("hash value is not an integer");
+              if (!parse_strict_int(*existing, current)) return encode_error("hash value is not an integer");
+            }
+            if ((increment > 0 && current > std::numeric_limits<std::int64_t>::max() - increment) ||
+                (increment < 0 && current < std::numeric_limits<std::int64_t>::min() - increment)) {
+              return encode_error("increment or decrement would overflow");
             }
             current += increment;
             std::vector<std::pair<std::string, std::string>> fields{{args[2], std::to_string(current)}};
@@ -4666,19 +4725,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           return with_hash_key(args[1], [&]() {
             long double increment = 0;
-            if (!parse_f64(args[3], increment)) return encode_error("value is not a valid float");
+            if (!parse_strict_float(args[3], increment)) return encode_error("value is not a valid float");
             bool wrongtype = false;
             auto existing = store().hget(args[1], args[2], wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             long double current = 0;
             if (existing.has_value()) {
-              if (!parse_f64(*existing, current)) return encode_error("hash value is not a valid float");
+              if (!parse_strict_float(*existing, current)) return encode_error("hash value is not a valid float");
             }
             current += increment;
-            char buf[64];
-            std::snprintf(buf, sizeof(buf), "%.17Lg", current);
+            if (std::isnan(static_cast<double>(current)) || std::isinf(static_cast<double>(current))) {
+              return encode_error("value is NaN or Infinity");  // hash-specific Redis wording
+            }
+            // Redis ld2string: fixed %.17Lf notation with trailing zeros trimmed —
+            // never scientific notation.
+            char buf[5120];
+            std::snprintf(buf, sizeof(buf), "%.17Lf", current);
             std::string val(buf);
-            // Remove trailing zeros after decimal point
             if (val.find('.') != std::string::npos) {
               auto pos = val.find_last_not_of('0');
               if (pos != std::string::npos && val[pos] == '.') pos--;
@@ -4687,6 +4750,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::vector<std::pair<std::string, std::string>> fields{{args[2], val}};
             store().hset(args[1], fields, wrongtype);
             return encode_bulk(val);
+          });
+        }});
+
+    t.emplace("HSTRLEN", CommandSpec{"HSTRLEN", 3, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          return with_hash_key(args[1], [&]() {
+            bool wrongtype = false;
+            auto v = store().hget(args[1], args[2], wrongtype);
+            if (wrongtype) return wrongtype_error_reply();
+            return encode_integer(v.has_value() ? static_cast<long long>(v->size()) : 0);
           });
         }});
 
@@ -6962,12 +7035,26 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           std::int64_t count;
           if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
-          bool allow_dups = (count < 0);
-          std::int64_t abs_count = std::abs(count);
+          if (count == std::numeric_limits<std::int64_t>::min()) {
+            return encode_error("value is out of range");  // -INT64_MIN unrepresentable
+          }
+          // Positive count: distinct members, at most the set size. Negative: |count|
+          // members with repetition (Redis srandmemberWithCountCommand semantics).
           std::vector<std::string> enc;
-          for (std::int64_t i = 0; i < abs_count; ++i) {
-            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(members.size()));
-            enc.push_back(encode_bulk(members[idx]));
+          if (count >= 0) {
+            std::vector<std::size_t> idxs(members.size());
+            for (std::size_t i = 0; i < idxs.size(); ++i) idxs[i] = i;
+            static thread_local std::mt19937 rng{std::random_device{}()};
+            std::shuffle(idxs.begin(), idxs.end(), rng);
+            const std::size_t take = std::min<std::size_t>(idxs.size(), static_cast<std::size_t>(count));
+            enc.reserve(take);
+            for (std::size_t i = 0; i < take; ++i) enc.push_back(encode_bulk(members[idxs[i]]));
+          } else {
+            enc.reserve(static_cast<std::size_t>(-count));
+            for (std::int64_t i = 0; i < -count; ++i) {
+              auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(members.size()));
+              enc.push_back(encode_bulk(members[idx]));
+            }
           }
           return encode_array(enc);
         }});
@@ -6999,12 +7086,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           std::int64_t numkeys;
           if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("numkeys should be greater than 0");
-          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) {
+            return encode_error("Number of keys can't be greater than number of args");
+          }
           std::int64_t limit = 0;
           std::size_t opt_start = static_cast<std::size_t>(2 + numkeys);
           for (std::size_t i = opt_start; i < args.size(); i += 2) {
             if (upper(args[i]) == "LIMIT" && i + 1 < args.size()) {
-              if (!parse_i64(args[i + 1], limit) || limit < 0) return encode_error("value is not an integer or out of range");
+              if (!parse_i64(args[i + 1], limit) || limit < 0) {
+                return encode_error("LIMIT can't be negative");
+              }
             } else return encode_error("syntax error");
           }
           bool wt = false;
@@ -7142,27 +7233,54 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── HRANDFIELD ──────────────────────────────────────────────────────
     t.emplace("HRANDFIELD", CommandSpec{"HRANDFIELD", -2, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (args.size() > 4) return encode_error("syntax error");
           if (store().is_wrongtype_for_hash(args[1])) return wrongtype_error_reply();
           bool wt = false;
           auto all = store().hgetall(args[1], wt);
           if (wt) return wrongtype_error_reply();
-          if (all.empty()) {
-            if (args.size() >= 3) return encode_array({});
-            return encode_null(session.resp_version);
-          }
           if (args.size() == 2) {
+            if (all.empty()) return encode_null(session.resp_version);
             auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(all.size()));
             return encode_bulk(all[idx].first);
           }
           std::int64_t count;
           if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
-          bool withvalues = (args.size() >= 4 && upper(args[3]) == "WITHVALUES");
-          std::int64_t abs_count = std::abs(count);
+          // -INT64_MIN is unrepresentable; Redis rejects the magnitude as out of range.
+          if (count == std::numeric_limits<std::int64_t>::min()) {
+            return encode_error("value is out of range");
+          }
+          const bool withvalues = args.size() == 4;
+          if (withvalues && upper(args[3]) != "WITHVALUES") return encode_error("syntax error");
+          // WITHVALUES doubles the reply length — Redis bounds |count| at LONG_MAX/2.
+          if (withvalues && count < -(std::numeric_limits<std::int64_t>::max() / 2)) {
+            return encode_error("value is out of range");
+          }
+          const bool resp3_pairs = withvalues && session.resp_version == RespVersion::Resp3;
+          // Positive count: distinct fields, at most the hash size. Negative: |count|
+          // fields with repetition (Redis hrandfieldWithCountCommand semantics).
+          std::vector<std::size_t> picks;
+          if (count >= 0) {
+            std::vector<std::size_t> idxs(all.size());
+            for (std::size_t i = 0; i < idxs.size(); ++i) idxs[i] = i;
+            static thread_local std::mt19937 rng{std::random_device{}()};
+            std::shuffle(idxs.begin(), idxs.end(), rng);
+            const std::size_t take = std::min<std::size_t>(idxs.size(), static_cast<std::size_t>(count));
+            picks.assign(idxs.begin(), idxs.begin() + static_cast<std::ptrdiff_t>(take));
+          } else if (!all.empty()) {
+            picks.reserve(static_cast<std::size_t>(-count));
+            for (std::int64_t i = 0; i < -count; ++i) {
+              picks.push_back(static_cast<std::size_t>(std::rand() % static_cast<int>(all.size())));
+            }
+          }
           std::vector<std::string> enc;
-          for (std::int64_t i = 0; i < abs_count; ++i) {
-            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(all.size()));
-            enc.push_back(encode_bulk(all[idx].first));
-            if (withvalues) enc.push_back(encode_bulk(all[idx].second));
+          enc.reserve(picks.size() * (withvalues && !resp3_pairs ? 2 : 1));
+          for (const auto idx : picks) {
+            if (resp3_pairs) {
+              enc.push_back(encode_array({encode_bulk(all[idx].first), encode_bulk(all[idx].second)}));
+            } else {
+              enc.push_back(encode_bulk(all[idx].first));
+              if (withvalues) enc.push_back(encode_bulk(all[idx].second));
+            }
           }
           return encode_array(enc);
         }});
@@ -8325,6 +8443,30 @@ void init_replication_id() {
 
 void configure_tcp_backlog(int backlog) {
   if (backlog > 0) g_config_tcp_backlog = backlog;
+}
+
+void configure_encoding_limits(const std::unordered_map<std::string, std::string>& raw) {
+  auto& lim = store().encoding_limits();
+  auto apply = [&](const char* key, std::int64_t& slot, bool allow_negative) {
+    auto it = raw.find(key);
+    if (it == raw.end()) return;
+    std::int64_t v = 0;
+    if (parse_i64(it->second, v) && (v >= 0 || allow_negative)) slot = v;
+  };
+  // ziplist aliases first so the newer listpack spelling wins when both are present.
+  apply("hash-max-ziplist-entries", lim.hash_entries, false);
+  apply("hash-max-listpack-entries", lim.hash_entries, false);
+  apply("hash-max-ziplist-value", lim.hash_value, false);
+  apply("hash-max-listpack-value", lim.hash_value, false);
+  apply("list-max-ziplist-size", lim.list_size, true);
+  apply("list-max-listpack-size", lim.list_size, true);
+  apply("set-max-intset-entries", lim.set_intset, false);
+  apply("set-max-listpack-entries", lim.set_entries, false);
+  apply("set-max-listpack-value", lim.set_value, false);
+  apply("zset-max-ziplist-entries", lim.zset_entries, false);
+  apply("zset-max-listpack-entries", lim.zset_entries, false);
+  apply("zset-max-ziplist-value", lim.zset_value, false);
+  apply("zset-max-listpack-value", lim.zset_value, false);
 }
 
 void script_set_repl_flags(int flags) { g_script_repl_flags = flags; }

@@ -60,11 +60,11 @@ def cmd(s, *a):
 
 def main():
     p = subprocess.Popen(
-        [str(ROOT / "peadb-server"), "--port", "6479", "--bind", "127.0.0.1", "--loglevel", "error"]
+        [str(ROOT / "peadb-server"), "--port", "6549", "--bind", "127.0.0.1", "--loglevel", "error"]
     )
     try:
-        wait_until_ready(6479)
-        with socket.create_connection(("127.0.0.1", 6479), timeout=2) as s:
+        wait_until_ready(6549)
+        with socket.create_connection(("127.0.0.1", 6549), timeout=2) as s:
             assert cmd(s, "SET", "k", "v") == "OK"
             assert cmd(s, "GET", "k") == "v"
             resp = cmd(s, "SHUTDOWN", "NOSAVE")

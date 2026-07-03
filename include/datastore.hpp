@@ -85,6 +85,13 @@ struct Entry {
   std::optional<std::int64_t> expire_at_ms;
   std::uint32_t lru = 0;             // eviction metadata (LRU clock / LFU counter), Phase B
   bool string_force_raw = false;
+  // Sticky encoding conversion: once a collection is observed past its listpack/intset
+  // thresholds it reports the big encoding forever, like Redis's one-way conversions
+  // (set on OBJECT ENCODING computation — an approximation until real backends exist).
+  bool encoding_big = false;
+  // Sets only: permanently off the intset encoding (a non-integer member was added, or
+  // the set grew past set-max-intset-entries). Maintained at write time in sadd().
+  bool encoding_no_intset = false;
   Payload payload{std::string{}};
 
   ValueType type() const { return static_cast<ValueType>(payload.index()); }
@@ -127,10 +134,12 @@ struct Entry {
   Entry& operator=(Entry&&) = default;
   Entry(const Entry& o)
       : expire_at_ms(o.expire_at_ms), lru(o.lru), string_force_raw(o.string_force_raw),
+        encoding_big(o.encoding_big), encoding_no_intset(o.encoding_no_intset),
         payload(clone_payload(o.payload)) {}
   Entry& operator=(const Entry& o) {
     if (this != &o) {
       expire_at_ms = o.expire_at_ms; lru = o.lru; string_force_raw = o.string_force_raw;
+      encoding_big = o.encoding_big; encoding_no_intset = o.encoding_no_intset;
       payload = clone_payload(o.payload);
     }
     return *this;
@@ -335,6 +344,21 @@ class DataStore {
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);
   std::vector<std::vector<std::string>> export_aof_commands() const;
   std::optional<std::string> object_encoding(const std::string& key);
+  // Redis encoding-transition thresholds (the *-max-listpack-* / set-max-intset-entries
+  // config params). Storage stays hashtable-grade for now; OBJECT ENCODING honors these
+  // limits + the per-entry sticky conversion flag so assert_encoding tests behave like
+  // Redis. Real listpack/intset backends (Phase 6) will make the reporting honest.
+  struct EncodingLimits {
+    std::int64_t hash_entries = 128;
+    std::int64_t hash_value = 64;
+    std::int64_t list_size = 128;   // negative Redis size-classes are treated as 128
+    std::int64_t set_intset = 512;
+    std::int64_t set_entries = 128;
+    std::int64_t set_value = 64;
+    std::int64_t zset_entries = 128;
+    std::int64_t zset_value = 64;
+  };
+  EncodingLimits& encoding_limits() { return encoding_limits_; }
   std::optional<std::string> debug_digest_value(const std::string& key);
   std::string debug_digest();  // order-independent whole-dataset digest (DEBUG DIGEST)
   // Raw keyspace presence, ignoring logical expiry — DEBUG OBJECT peeks the dict like
@@ -343,6 +367,7 @@ class DataStore {
   // OBJECT IDLETIME/FREQ readers over Entry::lru (nullopt = missing/expired key).
   std::optional<std::int64_t> object_idletime_seconds(const std::string& key);
   std::optional<std::int64_t> object_freq(const std::string& key);
+  // Legacy accessors kept for existing callers; they delegate to encoding_limits().
   void set_zset_max_ziplist_entries(std::int64_t v);
   std::int64_t zset_max_ziplist_entries() const;
   static void freeze_time();
@@ -368,7 +393,7 @@ class DataStore {
   std::uint64_t mutation_epoch_ = 0;
   mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
-  std::int64_t zset_max_ziplist_entries_ = 128;
+  EncodingLimits encoding_limits_;
   bool eviction_lfu_ = false;   // touch_key_for_eviction uses LFU semantics when true
   // Lazyfree worker state.
   std::thread lazyfree_thread_;

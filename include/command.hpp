@@ -97,6 +97,9 @@ void configure_maxmemory_samples(const std::string& spec);  // eviction sample s
 void init_replication_id();   // randomize the replication id at startup (call once in main)
 void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
 void configure_tcp_backlog(int backlog);            // listen(2) backlog, for CONFIG GET reporting
+// Apply *-max-listpack-*/set-max-intset-entries thresholds from config-file directives
+// (the raw key/value map) — the upstream harness passes per-test overrides this way.
+void configure_encoding_limits(const std::unordered_map<std::string, std::string>& raw);
 void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
 int client_timeout_seconds();                       // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping
