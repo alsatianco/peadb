@@ -102,11 +102,13 @@ def main():
             assert enc("z2") == "listpack"
 
             # List: size threshold + sticky across shrink.
+            # Lists convert BOTH ways (Redis 7.2 listTypeTryConversion), unlike the
+            # sticky one-way hash/set/zset shims.
             assert cmd(s, "CONFIG", "SET", "list-max-listpack-size", "2") == "OK"
             assert cmd(s, "RPUSH", "l1", "a", "b", "c") == 3
             assert enc("l1") == "quicklist"
             assert cmd(s, "RPOP", "l1", "2") == ["c", "b"]
-            assert enc("l1") == "quicklist"
+            assert enc("l1") == "listpack"  # shrank back under the limit
 
             # String: embstr boundary at 44 bytes (Redis 7).
             assert cmd(s, "SET", "str44", "x" * 44) == "OK"

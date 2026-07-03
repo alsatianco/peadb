@@ -668,6 +668,7 @@ std::function<int(std::int64_t)> g_count_synced_replicas;
 std::function<int()> g_count_connected_replicas;
 std::function<int()> g_blocked_clients_cb;
 std::function<int(const std::string&, const std::string&, int)> g_client_kill_cb;
+std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
 std::function<std::string()> g_client_list_callback;
 std::function<bool(int fd, const std::string& data)> g_pubsub_send;
@@ -915,6 +916,8 @@ std::string format_score(double d) {
 }
 std::string encode_null(RespVersion version) { return version == RespVersion::Resp3 ? "_\r\n" : "$-1\r\n"; }
 std::string encode_null_array() { return "*-1\r\n"; }
+// RESP3 has a single null type; RESP2 distinguishes the null array (*-1).
+std::string encode_null_array(RespVersion v) { return v == RespVersion::Resp3 ? "_\r\n" : "*-1\r\n"; }
 
 // ── RESP3-aware type encoders (fall back to RESP2 shapes for RESP2 clients) ──
 std::string encode_double(double d, RespVersion v) {
@@ -1137,6 +1140,10 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
       out = {"RESTORE", args[1], std::to_string(abs), "{" + args[3] + "}", absttl};
     }
   } else if (cmd == "SCRIPT") {
+    emit = false;
+  } else if (cmd == "BLMPOP" || cmd == "BZMPOP" || cmd == "LMPOP" || cmd == "ZMPOP") {
+    // These handlers propagate their effect explicitly as deterministic LPOP/RPOP or
+    // ZPOPMIN/ZPOPMAX (both on the immediate and the unblock paths).
     emit = false;
   } else if (cmd == "XREADGROUP") {
     emit = false;
@@ -1597,6 +1604,19 @@ bool parse_f64(const std::string& s, long double& out) {
   }
 }
 
+// Parse a blocking-command timeout (seconds, float), mirroring Redis's
+// getTimeoutFromObjectOrReply: distinct errors for non-float, out-of-range (the ms
+// deadline would overflow int64), and negative. Returns "" on success (secs set).
+std::string parse_block_timeout_sec(const std::string& arg, long double& secs) {
+  if (!parse_f64(arg, secs) || std::isnan(static_cast<double>(secs))) {
+    return encode_error("timeout is not a float or out of range");
+  }
+  long double ftval = secs * 1000.0L;  // seconds -> ms
+  if (ftval > 9.0e18L) return encode_error("timeout is out of range");
+  if (secs < 0) return encode_error("timeout is negative");
+  return "";
+}
+
 // Redis string2ll semantics: optional '-', digits only, no whitespace, no '+' prefix,
 // no leading zeros (except "0"), must fit int64. Used where Redis demands a strictly
 // valid integer value (INCR/HINCRBY stored values).
@@ -2029,9 +2049,117 @@ std::string with_stream_key(const std::string& key, Fn&& fn) {
   return fn();
 }
 
+// Shared ZRANGE/ZRANGESTORE range selector (Redis 6.2 unified ZRANGE semantics):
+// index (default), BYSCORE or BYLEX modes, optional REV, LIMIT for the BY* modes,
+// WITHSCORES only where the caller allows it. Fills `items` in output order and
+// returns an empty string on success or a complete error reply.
+std::string zrange_select(const std::vector<std::string>& args, std::size_t key_idx,
+                          std::size_t min_idx, std::size_t opts_idx, bool allow_withscores,
+                          std::vector<std::pair<std::string, double>>& items,
+                          bool& withscores) {
+  const std::string& key = args[key_idx];
+  enum class Mode { Index, ByScore, ByLex };
+  Mode mode = Mode::Index;
+  bool rev = false, has_limit = false;
+  withscores = false;
+  std::int64_t lim_off = 0, lim_cnt = -1;
+  for (std::size_t i = opts_idx; i < args.size(); ++i) {
+    const auto o = upper(args[i]);
+    if (o == "BYSCORE") mode = Mode::ByScore;
+    else if (o == "BYLEX") mode = Mode::ByLex;
+    else if (o == "REV") rev = true;
+    else if (allow_withscores && o == "WITHSCORES") withscores = true;
+    else if (o == "LIMIT" && i + 2 < args.size()) {
+      if (!parse_i64(args[i + 1], lim_off) || !parse_i64(args[i + 2], lim_cnt))
+        return encode_error("value is not an integer or out of range");
+      has_limit = true; i += 2;
+    } else {
+      return encode_error("syntax error");
+    }
+  }
+  if (has_limit && mode == Mode::Index)
+    return encode_error("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
+  if (withscores && mode == Mode::ByLex)
+    return encode_error("syntax error, WITHSCORES not supported in combination with BYLEX");
+  if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+  bool wt = false;
+  auto all = store().zrange(key, 0, -1, true, wt);  // ascending {member,score}
+  if (wt) return wrongtype_error_reply();
+
+  if (mode == Mode::Index) {
+    std::int64_t start = 0, stop = 0;
+    if (!parse_i64(args[min_idx], start) || !parse_i64(args[min_idx + 1], stop))
+      return encode_error("value is not an integer or out of range");
+    if (rev) std::reverse(all.begin(), all.end());
+    const std::int64_t n = static_cast<std::int64_t>(all.size());
+    std::int64_t s = start < 0 ? n + start : start, e = stop < 0 ? n + stop : stop;
+    if (s < 0) s = 0;
+    if (e >= n) e = n - 1;
+    for (std::int64_t i = s; i <= e && i < n; ++i) items.push_back(all[i]);
+    return "";
+  }
+  if (mode == Mode::ByScore) {
+    // REV swaps bound order: ... max min BYSCORE REV.
+    const std::string& lo_s = rev ? args[min_idx + 1] : args[min_idx];
+    const std::string& hi_s = rev ? args[min_idx] : args[min_idx + 1];
+    auto parse_bound = [](const std::string& s, double& val, bool& ex) -> bool {
+      ex = false;
+      if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
+      if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
+      std::string v = s;
+      if (!v.empty() && v[0] == '(') { ex = true; v = v.substr(1); }
+      try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
+    };
+    double lo, hi;
+    bool lo_ex, hi_ex;
+    if (!parse_bound(lo_s, lo, lo_ex) || !parse_bound(hi_s, hi, hi_ex))
+      return encode_error("min or max is not a float");
+    for (const auto& [m, sc] : all) {
+      const bool above = lo_ex ? (sc > lo) : (sc >= lo);
+      const bool below = hi_ex ? (sc < hi) : (sc <= hi);
+      if (above && below) items.push_back({m, sc});
+    }
+    if (rev) std::reverse(items.begin(), items.end());
+  } else {  // ByLex — all members assumed same score; compare lexicographically.
+    const std::string& lo_s = rev ? args[min_idx + 1] : args[min_idx];
+    const std::string& hi_s = rev ? args[min_idx] : args[min_idx + 1];
+    // Bound forms: "-" (min), "+" (max), "[member" (inclusive), "(member" (exclusive).
+    auto lex_ge_lo = [&](const std::string& m) -> bool {
+      if (lo_s == "-") return true;
+      if (lo_s == "+") return false;
+      if (lo_s.empty()) return false;
+      const std::string b = lo_s.substr(1);
+      return lo_s[0] == '(' ? (m > b) : (m >= b);
+    };
+    auto lex_le_hi = [&](const std::string& m) -> bool {
+      if (hi_s == "+") return true;
+      if (hi_s == "-") return false;
+      if (hi_s.empty()) return false;
+      const std::string b = hi_s.substr(1);
+      return hi_s[0] == '(' ? (m < b) : (m <= b);
+    };
+    if ((!lo_s.empty() && lo_s[0] != '[' && lo_s[0] != '(' && lo_s != "-" && lo_s != "+") ||
+        (!hi_s.empty() && hi_s[0] != '[' && hi_s[0] != '(' && hi_s != "-" && hi_s != "+"))
+      return encode_error("min or max not valid string range item");
+    for (const auto& [m, sc] : all) if (lex_ge_lo(m) && lex_le_hi(m)) items.push_back({m, sc});
+    if (rev) std::reverse(items.begin(), items.end());
+  }
+
+  // LIMIT applies to BYSCORE/BYLEX, on the (possibly reversed) output order.
+  if (has_limit) {
+    if (lim_off > 0) {
+      if (static_cast<std::size_t>(lim_off) >= items.size()) items.clear();
+      else items.erase(items.begin(), items.begin() + lim_off);
+    }
+    if (lim_cnt >= 0 && static_cast<std::size_t>(lim_cnt) < items.size())
+      items.resize(static_cast<std::size_t>(lim_cnt));
+  }
+  return "";
+}
+
 // Shared LPOP/RPOP body: plain form returns a bulk (or nil), COUNT form returns an
 // array (or nil array for a missing key), matching Redis 6.2+ popGenericCommand.
-std::string list_pop_command(const std::vector<std::string>& args, bool left) {
+std::string list_pop_command(const std::vector<std::string>& args, bool left, RespVersion resp) {
   if (args.size() > 3) {
     return encode_error(std::string("wrong number of arguments for '") +
                         (left ? "lpop" : "rpop") + "' command");
@@ -2047,11 +2175,11 @@ std::string list_pop_command(const std::vector<std::string>& args, bool left) {
     if (!has_count) {
       auto v = left ? store().lpop(args[1], wrongtype) : store().rpop(args[1], wrongtype);
       if (wrongtype) return wrongtype_error_reply();
-      return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
+      return v.has_value() ? encode_bulk(*v) : encode_null(resp);
     }
     const auto len = store().llen(args[1], wrongtype);
     if (wrongtype) return wrongtype_error_reply();
-    if (len == 0) return encode_null_array();
+    if (len == 0) return encode_null_array(resp);
     std::vector<std::string> out;
     const auto n = std::min<std::int64_t>(count, len);
     out.reserve(static_cast<std::size_t>(n));
@@ -4867,13 +4995,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("LPOP", CommandSpec{"LPOP", -2, {"write", "fast"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return list_pop_command(args, /*left=*/true);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          return list_pop_command(args, /*left=*/true, session.resp_version);
         }});
 
     t.emplace("RPOP", CommandSpec{"RPOP", -2, {"write", "fast"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          return list_pop_command(args, /*left=*/false);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          return list_pop_command(args, /*left=*/false, session.resp_version);
         }});
 
     t.emplace("LLEN", CommandSpec{"LLEN", 2, {"readonly", "fast"}, 1, 1, 1,
@@ -4906,8 +5034,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("BLPOP", CommandSpec{"BLPOP", -3, {"write", "blocking"}, 1, -2, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           long double timeout_sec = 0;
-          if (!parse_f64(args.back(), timeout_sec) || timeout_sec < 0) {
-            return encode_error("timeout is not a float or out of range");
+          if (auto terr = parse_block_timeout_sec(args.back(), timeout_sec); !terr.empty()) {
+            return terr;
           }
           // Try immediate pop first
           for (std::size_t i = 1; i + 1 < args.size(); ++i) {
@@ -4940,8 +5068,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("BRPOP", CommandSpec{"BRPOP", -3, {"write", "blocking"}, 1, -2, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           long double timeout_sec = 0;
-          if (!parse_f64(args.back(), timeout_sec) || timeout_sec < 0) {
-            return encode_error("timeout is not a float or out of range");
+          if (auto terr = parse_block_timeout_sec(args.back(), timeout_sec); !terr.empty()) {
+            return terr;
           }
           for (std::size_t i = 1; i + 1 < args.size(); ++i) {
             const auto& key = args[i];
@@ -4997,8 +5125,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("BLMOVE", CommandSpec{"BLMOVE", 6, {"write", "blocking"}, 1, 2, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           long double timeout_sec = 0;
-          if (!parse_f64(args[5], timeout_sec) || timeout_sec < 0) {
-            return encode_error("timeout is not a float or out of range");
+          if (auto terr = parse_block_timeout_sec(args[5], timeout_sec); !terr.empty()) {
+            return terr;
           }
           const std::string src = args[1];
           const std::string dst = args[2];
@@ -5007,9 +5135,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if ((where_from != "LEFT" && where_from != "RIGHT") || (where_to != "LEFT" && where_to != "RIGHT")) {
             return encode_error("syntax error");
           }
-          if (store().is_wrongtype_for_list(src) || store().is_wrongtype_for_list(dst)) return wrongtype_error_reply();
+          // Only the source type is checked up front. The destination type is checked
+          // when an element is actually moved — an empty source blocks regardless of the
+          // dst type (Redis blmoveGenericCommand).
+          if (store().is_wrongtype_for_list(src)) return wrongtype_error_reply();
 
           bool wrongtype = false;
+          if (store().is_wrongtype_for_list(dst) && store().llen(src, wrongtype) > 0) {
+            return wrongtype_error_reply();  // src has data but dst is wrong type: source intact
+          }
           std::optional<std::string> popped;
           if (where_from == "LEFT") popped = store().lpop(src, wrongtype);
           else popped = store().rpop(src, wrongtype);
@@ -5018,7 +5152,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::vector<std::string> one{*popped};
             if (where_to == "LEFT") (void)store().lpush(dst, one, wrongtype);
             else (void)store().rpush(dst, one, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
             return encode_bulk(*popped);
           }
           // In Lua script or EXEC context: return nil immediately (no blocking)
@@ -5042,11 +5175,127 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return handle_command(proxy, session, close);
         }});
 
+    // BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT n] (Redis 7.0). The
+    // immediate path propagates its effect as a deterministic LPOP/RPOP (the dispatch
+    // propagation is suppressed in canonicalize_propagated_command).
+    t.emplace("BLMPOP", CommandSpec{"BLMPOP", -5, {"write", "blocking"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          long double timeout_sec = 0;
+          if (auto terr = parse_block_timeout_sec(args[1], timeout_sec); !terr.empty()) {
+            return terr;
+          }
+          std::int64_t numkeys = 0;
+          if (!parse_i64(args[2], numkeys) || numkeys <= 0) {
+            return encode_error("numkeys should be greater than 0");
+          }
+          if (args.size() < static_cast<std::size_t>(4 + numkeys)) {
+            return encode_error("syntax error");
+          }
+          const std::size_t pos = static_cast<std::size_t>(3 + numkeys);
+          const auto dir = upper(args[pos]);
+          if (dir != "LEFT" && dir != "RIGHT") return encode_error("syntax error");
+          const bool left = dir == "LEFT";
+          std::size_t count = 1;
+          if (pos + 1 < args.size()) {
+            if (pos + 3 != args.size() || upper(args[pos + 1]) != "COUNT") return encode_error("syntax error");
+            std::int64_t c = 0;
+            if (!parse_i64(args[pos + 2], c) || c <= 0) return encode_error("count should be greater than 0");
+            count = static_cast<std::size_t>(c);
+          }
+          // Immediate attempt: first non-empty key wins.
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(3 + i)];
+            bool wrongtype = false;
+            if (store().is_wrongtype_for_list(key)) return wrongtype_error_reply();
+            const auto len = store().llen(key, wrongtype);
+            if (len == 0) continue;
+            std::vector<std::string> enc;
+            std::size_t popped = 0;
+            for (std::size_t k = 0; k < count; ++k) {
+              auto v = left ? store().lpop(key, wrongtype) : store().rpop(key, wrongtype);
+              if (!v.has_value()) break;
+              enc.push_back(encode_bulk(*v));
+              ++popped;
+            }
+            const std::vector<std::string> eff{left ? "LPOP" : "RPOP", key, std::to_string(popped)};
+            append_replication_event(eff, session, nullptr);
+            append_aof_command(eff, session, nullptr);
+            return encode_array({encode_bulk(key), encode_array(enc)});
+          }
+          if (g_in_lua_script || g_executing_exec || g_block_disabled) return encode_null_array(session.resp_version);
+          session.blocked.type = BlockType::List;
+          session.blocked.pop_left = left;
+          session.blocked.keys.clear();
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            session.blocked.keys.push_back(args[static_cast<std::size_t>(3 + i)]);
+            register_key_waiter(args[static_cast<std::size_t>(3 + i)], session.fd);
+          }
+          session.blocked.original_args = args;
+          session.blocked.deadline_ms = timeout_sec > 0
+              ? now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L) : 0;
+          return std::string();
+        }});
+
+    // BZMPOP timeout numkeys key [key ...] MIN|MAX [COUNT n] (Redis 7.0).
+    t.emplace("BZMPOP", CommandSpec{"BZMPOP", -5, {"write", "blocking"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          long double timeout_sec = 0;
+          if (auto terr = parse_block_timeout_sec(args[1], timeout_sec); !terr.empty()) {
+            return terr;
+          }
+          std::int64_t numkeys = 0;
+          if (!parse_i64(args[2], numkeys) || numkeys <= 0) {
+            return encode_error("numkeys should be greater than 0");
+          }
+          if (args.size() < static_cast<std::size_t>(4 + numkeys)) {
+            return encode_error("syntax error");
+          }
+          const std::size_t pos = static_cast<std::size_t>(3 + numkeys);
+          const auto dir = upper(args[pos]);
+          if (dir != "MIN" && dir != "MAX") return encode_error("syntax error");
+          const bool max = dir == "MAX";
+          std::size_t count = 1;
+          if (pos + 1 < args.size()) {
+            if (pos + 3 != args.size() || upper(args[pos + 1]) != "COUNT") return encode_error("syntax error");
+            std::int64_t c = 0;
+            if (!parse_i64(args[pos + 2], c) || c <= 0) return encode_error("count should be greater than 0");
+            count = static_cast<std::size_t>(c);
+          }
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            const auto& key = args[static_cast<std::size_t>(3 + i)];
+            bool wrongtype = false;
+            auto vals = store().zpop(key, count, max, wrongtype);
+            if (wrongtype) return wrongtype_error_reply();
+            if (vals.empty()) continue;
+            const std::vector<std::string> eff{max ? "ZPOPMAX" : "ZPOPMIN", key,
+                                               std::to_string(vals.size())};
+            append_replication_event(eff, session, nullptr);
+            append_aof_command(eff, session, nullptr);
+            std::vector<std::string> pairs;
+            for (const auto& [m, s] : vals) {
+              pairs.push_back(encode_array({encode_bulk(m), encode_double(s, session.resp_version)}));
+            }
+            return encode_array({encode_bulk(key), encode_array(pairs)});
+          }
+          if (g_in_lua_script || g_executing_exec || g_block_disabled) return encode_null_array(session.resp_version);
+          session.blocked.type = BlockType::ZSet;
+          session.blocked.zpop_max = max;
+          session.blocked.keys.clear();
+          for (std::int64_t i = 0; i < numkeys; ++i) {
+            session.blocked.keys.push_back(args[static_cast<std::size_t>(3 + i)]);
+            register_key_waiter(args[static_cast<std::size_t>(3 + i)], session.fd);
+          }
+          session.blocked.original_args = args;
+          session.blocked.deadline_ms = timeout_sec > 0
+              ? now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L) : 0;
+          return std::string();
+        }});
+
     t.emplace("BZPOPMIN", CommandSpec{"BZPOPMIN", -3, {"write", "blocking"}, 1, -2, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           long double timeout_sec = 0;
-          if (!parse_f64(args.back(), timeout_sec) || timeout_sec < 0) {
-            return encode_error("timeout is not a float or out of range");
+          if (auto terr = parse_block_timeout_sec(args.back(), timeout_sec); !terr.empty()) {
+            return terr;
           }
           for (std::size_t i = 1; i + 1 < args.size(); ++i) {
             const auto tp = store().type_of(args[i]);
@@ -5055,7 +5304,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             auto vals = store().zpop(args[i], 1, false, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             if (!vals.empty()) {
-              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(format_score(vals[0].second))});
+              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first),
+                                   encode_double(vals[0].second, session.resp_version)});
             }
           }
           // In Lua script or EXEC context: return nil immediately (no blocking)
@@ -5076,8 +5326,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("BZPOPMAX", CommandSpec{"BZPOPMAX", -3, {"write", "blocking"}, 1, -2, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           long double timeout_sec = 0;
-          if (!parse_f64(args.back(), timeout_sec) || timeout_sec < 0) {
-            return encode_error("timeout is not a float or out of range");
+          if (auto terr = parse_block_timeout_sec(args.back(), timeout_sec); !terr.empty()) {
+            return terr;
           }
           for (std::size_t i = 1; i + 1 < args.size(); ++i) {
             const auto tp = store().type_of(args[i]);
@@ -5086,7 +5336,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             auto vals = store().zpop(args[i], 1, true, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             if (!vals.empty()) {
-              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first), encode_bulk(format_score(vals[0].second))});
+              return encode_array({encode_bulk(args[i]), encode_bulk(vals[0].first),
+                                   encode_double(vals[0].second, session.resp_version)});
             }
           }
           // In Lua script or EXEC context: return nil immediately (no blocking)
@@ -5223,23 +5474,45 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (pos >= args.size() || ((args.size() - pos) % 2) != 0) return encode_error("syntax error");
           if (incr && (args.size() - pos) != 2) return encode_error("INCR option supports a single increment-element pair");
+          if (nx && xx) return encode_error("XX and NX options at the same time are not compatible");
+          if ((gt && nx) || (lt && nx) || (gt && lt)) {
+            return encode_error("GT, LT, and/or NX options at the same time are not compatible");
+          }
 
           return with_zset_key(args[1], [&]() {
-            int added = 0, changed = 0;
-            std::string incr_out;
+            // Validate every score before applying anything (Redis parses all pairs
+            // first, so a bad later pair leaves the zset untouched). NaN is invalid.
+            std::vector<double> scores;
+            scores.reserve((args.size() - pos) / 2);
             for (std::size_t i = pos; i < args.size(); i += 2) {
               long double score = 0;
-              if (!parse_f64(args[i], score)) return encode_error("value is not a valid float");
-              auto r = store().zadd_one(args[1], static_cast<double>(score), args[i + 1], nx, xx, gt, lt, incr);
+              if (!parse_f64(args[i], score) || std::isnan(static_cast<double>(score))) {
+                return encode_error("value is not a valid float");
+              }
+              scores.push_back(static_cast<double>(score));
+            }
+            // XX never creates the key: bail before zadd_one materializes an empty zset.
+            if (xx && store().type_of(args[1]) == "none") {
+              if (incr) return encode_null(RespVersion::Resp2);
+              return encode_integer(0);
+            }
+            int added = 0, changed = 0;
+            std::string incr_out;
+            bool incr_nil = false;
+            for (std::size_t i = pos; i < args.size(); i += 2) {
+              auto r = store().zadd_one(args[1], scores[(i - pos) / 2], args[i + 1], nx, xx, gt, lt, incr);
               if (r.wrongtype) return wrongtype_error_reply();
               if (!r.valid) return encode_error("syntax error");
               if (r.added) ++added;
               if (r.changed) ++changed;
               if (incr) {
+                if (std::isnan(r.score)) return encode_error("resulting score is not a number (NaN)");
+                // NX/XX/GT/LT can suppress the INCR: Redis replies nil then.
+                if (!r.added && !r.changed && (nx || xx || gt || lt)) incr_nil = true;
                 incr_out = format_score(r.score);
               }
             }
-            if (incr) return encode_bulk(incr_out);
+            if (incr) return incr_nil ? encode_null(RespVersion::Resp2) : encode_bulk(incr_out);
             return encode_integer(ch ? changed : added);
           });
         }});
@@ -5292,27 +5565,25 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("ZRANGE", CommandSpec{"ZRANGE", -4, {"readonly"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::int64_t start = 0, stop = 0;
-          if (!parse_i64(args[2], start) || !parse_i64(args[3], stop)) return encode_error("value is not an integer or out of range");
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          // Unified Redis 6.2 ZRANGE: index/BYSCORE/BYLEX + REV + LIMIT + WITHSCORES,
+          // sharing the selector with ZRANGESTORE.
+          std::vector<std::pair<std::string, double>> items;
           bool withscores = false;
-          for (std::size_t i = 4; i < args.size(); ++i) {
-            if (upper(args[i]) == "WITHSCORES") { withscores = true; continue; }
-            return encode_error("syntax error");
-          }
-          return with_zset_key(args[1], [&]() {
-            bool wrongtype = false;
-            auto vals = store().zrange(args[1], start, stop, withscores, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> out;
-            for (const auto& [m, s] : vals) {
+          auto err = zrange_select(args, 1, 2, 4, /*allow_withscores=*/true, items, withscores);
+          if (!err.empty()) return err;
+          std::vector<std::string> out;
+          const bool resp3_pairs = withscores && session.resp_version == RespVersion::Resp3;
+          out.reserve(items.size() * (withscores && !resp3_pairs ? 2 : 1));
+          for (const auto& [m, s] : items) {
+            if (resp3_pairs) {
+              out.push_back(encode_array({encode_bulk(m), encode_double(s, RespVersion::Resp3)}));
+            } else {
               out.push_back(encode_bulk(m));
-              if (withscores) {
-                out.push_back(encode_bulk(format_score(s)));
-              }
+              if (withscores) out.push_back(encode_bulk(format_score(s)));
             }
-            return encode_array(out);
-          });
+          }
+          return encode_array(out);
         }});
 
     t.emplace("ZSCAN", CommandSpec{"ZSCAN", -3, {"readonly"}, 1, 1, 1,
@@ -5341,45 +5612,67 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("ZPOPMIN", CommandSpec{"ZPOPMIN", -2, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          const bool has_count = args.size() == 3;
           std::size_t count = 1;
-          if (args.size() == 3) {
-            try { count = static_cast<std::size_t>(std::stoull(args[2])); } catch (...) { return encode_error("value is not an integer or out of range"); }
+          if (has_count) {
+            std::int64_t c = 0;
+            if (!parse_i64(args[2], c)) return encode_error("value is not an integer or out of range");
+            if (c < 0) return encode_error("value is out of range, must be positive");
+            count = static_cast<std::size_t>(c);
           }
+          if (args.size() > 3) return encode_error("syntax error");
           return with_zset_key(args[1], [&]() {
             bool wrongtype = false;
             auto vals = store().zpop(args[1], count, false, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
+            const bool r3 = session.resp_version == RespVersion::Resp3;
             std::vector<std::string> out;
             for (const auto& [m, s] : vals) {
-              out.push_back(encode_bulk(m));
-              out.push_back(encode_bulk(format_score(s)));
+              if (r3 && has_count) {
+                // RESP3 count form: array of [member, double] pairs.
+                out.push_back(encode_array({encode_bulk(m), encode_double(s, RespVersion::Resp3)}));
+              } else {
+                out.push_back(encode_bulk(m));
+                out.push_back(r3 ? encode_double(s, RespVersion::Resp3) : encode_bulk(format_score(s)));
+              }
             }
             return encode_array(out);
           });
         }});
 
     t.emplace("ZPOPMAX", CommandSpec{"ZPOPMAX", -2, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          const bool has_count = args.size() == 3;
           std::size_t count = 1;
-          if (args.size() == 3) {
-            try { count = static_cast<std::size_t>(std::stoull(args[2])); } catch (...) { return encode_error("value is not an integer or out of range"); }
+          if (has_count) {
+            std::int64_t c = 0;
+            if (!parse_i64(args[2], c)) return encode_error("value is not an integer or out of range");
+            if (c < 0) return encode_error("value is out of range, must be positive");
+            count = static_cast<std::size_t>(c);
           }
+          if (args.size() > 3) return encode_error("syntax error");
           return with_zset_key(args[1], [&]() {
             bool wrongtype = false;
             auto vals = store().zpop(args[1], count, true, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
+            const bool r3 = session.resp_version == RespVersion::Resp3;
             std::vector<std::string> out;
             for (const auto& [m, s] : vals) {
-              out.push_back(encode_bulk(m));
-              out.push_back(encode_bulk(format_score(s)));
+              if (r3 && has_count) {
+                // RESP3 count form: array of [member, double] pairs.
+                out.push_back(encode_array({encode_bulk(m), encode_double(s, RespVersion::Resp3)}));
+              } else {
+                out.push_back(encode_bulk(m));
+                out.push_back(r3 ? encode_double(s, RespVersion::Resp3) : encode_bulk(format_score(s)));
+              }
             }
             return encode_array(out);
           });
         }});
 
     t.emplace("ZMPOP", CommandSpec{"ZMPOP", -4, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           std::int64_t numkeys = 0;
           if (!parse_i64(args[1], numkeys) || numkeys <= 0) {
             return encode_error("numkeys should be greater than 0");
@@ -5402,14 +5695,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             auto vals = store().zpop(key, count, max, wrongtype);
             if (wrongtype) return wrongtype_error_reply();
             if (vals.empty()) continue;
-            std::vector<std::string> flat;
+            const std::vector<std::string> eff{max ? "ZPOPMAX" : "ZPOPMIN", key,
+                                               std::to_string(vals.size())};
+            append_replication_event(eff, session, nullptr);
+            append_aof_command(eff, session, nullptr);
+            // Redis replies [key, [[member, score], ...]] — nested pairs, not flat;
+            // scores are RESP3 doubles for RESP3 clients.
+            std::vector<std::string> pairs;
             for (const auto& [m, s] : vals) {
-              flat.push_back(encode_bulk(m));
-              flat.push_back(encode_bulk(format_score(s)));
+              pairs.push_back(encode_array({encode_bulk(m), encode_double(s, session.resp_version)}));
             }
-            return encode_array({encode_bulk(key), encode_array(flat)});
+            return encode_array({encode_bulk(key), encode_array(pairs)});
           }
-          return encode_null(RespVersion::Resp2);
+          return encode_null_array(session.resp_version);  // nothing popped anywhere
         }});
 
     t.emplace("XINFO", CommandSpec{"XINFO", -3, {"readonly"}, 0, 0, 0,
@@ -6005,6 +6303,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "NO-EVICT" || sub == "NO-TOUCH") {
             return encode_simple("OK");
           }
+          if (sub == "UNBLOCK" && (args.size() == 3 || args.size() == 4)) {
+            std::int64_t cid = 0;
+            if (!parse_i64(args[2], cid) || cid < 0) return encode_error("value is not an integer or out of range");
+            bool error = false;
+            if (args.size() == 4) {
+              const auto mode = upper(args[3]);
+              if (mode == "ERROR") error = true;
+              else if (mode != "TIMEOUT") return encode_error("CLIENT UNBLOCK reason should be TIMEOUT or ERROR");
+            }
+            const int n = g_client_unblock_cb ? g_client_unblock_cb(static_cast<std::uint64_t>(cid), error) : 0;
+            return encode_integer(n);
+          }
           if (sub == "PAUSE" || sub == "UNPAUSE") {
             return encode_simple("OK");
           }
@@ -6306,7 +6616,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           for (std::size_t i = 3; i < args.size(); i += 2) {
             if (i + 1 >= args.size()) return encode_error("syntax error");
             const auto opt = upper(args[i]);
-            if (opt == "RANK") { if (!parse_i64(args[i + 1], rank)) return encode_error("value is not an integer or out of range"); if (rank == 0) return encode_error("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative values meaning the same but counting from the end of the list."); }
+            if (opt == "RANK") {
+              if (!parse_i64(args[i + 1], rank)) return encode_error("value is not an integer or out of range");
+              if (rank == std::numeric_limits<std::int64_t>::min()) return encode_error("value is out of range");
+              if (rank == 0) return encode_error("RANK can't be zero: use 1 to start from the first match, 2 from the second ... or use negative to start from the end of the list");
+            }
             else if (opt == "COUNT") { if (!parse_i64(args[i + 1], count_opt)) return encode_error("value is not an integer or out of range"); if (count_opt < 0) return encode_error("COUNT can't be negative"); }
             else if (opt == "MAXLEN") { if (!parse_i64(args[i + 1], maxlen)) return encode_error("value is not an integer or out of range"); if (maxlen < 0) return encode_error("MAXLEN can't be negative"); }
             else return encode_error("syntax error");
@@ -6437,10 +6751,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const auto dir = upper(args[dir_idx]);
           if (dir != "LEFT" && dir != "RIGHT") return encode_error("syntax error");
           std::int64_t count = 1;
+          bool count_seen = false;
           for (std::size_t i = dir_idx + 1; i < args.size(); i += 2) {
             if (i + 1 >= args.size()) return encode_error("syntax error");
-            if (upper(args[i]) == "COUNT") {
-              if (!parse_i64(args[i + 1], count) || count <= 0) return encode_error("value is not an integer or out of range");
+            if (upper(args[i]) == "COUNT" && !count_seen) {
+              if (!parse_i64(args[i + 1], count) || count <= 0) return encode_error("count should be greater than 0");
+              count_seen = true;
             } else return encode_error("syntax error");
           }
           for (std::int64_t k = 0; k < numkeys; ++k) {
@@ -6455,11 +6771,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               popped.push_back(*val);
             }
             if (popped.empty()) continue;
+            const std::vector<std::string> eff{dir == "LEFT" ? "LPOP" : "RPOP", key,
+                                               std::to_string(popped.size())};
+            append_replication_event(eff, session, nullptr);
+            append_aof_command(eff, session, nullptr);
             std::vector<std::string> enc;
             for (const auto& v : popped) enc.push_back(encode_bulk(v));
             return encode_array({encode_bulk(key), encode_array(enc)});
           }
-          return encode_null_array();
+          return encode_null_array(session.resp_version);
         }});
 
     // ─── ZCARD ───────────────────────────────────────────────────────────
@@ -6518,7 +6838,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
             std::string v = s;
             if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return true; } catch (...) { return false; }
+            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
           };
           double min_val, max_val;
           bool min_ex, max_ex;
@@ -6539,33 +6859,35 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── ZRANK ───────────────────────────────────────────────────────────
     t.emplace("ZRANK", CommandSpec{"ZRANK", -3, {"readonly", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          const bool withscore = args.size() == 4 && upper(args[3]) == "WITHSCORE";
+          if (args.size() > 4 || (args.size() == 4 && !withscore)) return encode_error("syntax error");
           if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
-          // Sort by score ascending (zrange should already be sorted)
           for (std::size_t i = 0; i < items.size(); ++i) {
             if (items[i].first == args[2]) {
-              bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
               if (withscore) {
                 return encode_array({encode_integer(static_cast<long long>(i)), encode_bulk(format_score(items[i].second))});
               }
               return encode_integer(static_cast<long long>(i));
             }
           }
-          return encode_null(session.resp_version);
+          // Missing member: nil bulk for the plain form, nil ARRAY for WITHSCORE.
+          return withscore ? encode_null_array() : encode_null(session.resp_version);
         }});
 
     // ─── ZREVRANK ────────────────────────────────────────────────────────
     t.emplace("ZREVRANK", CommandSpec{"ZREVRANK", -3, {"readonly", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          const bool withscore = args.size() == 4 && upper(args[3]) == "WITHSCORE";
+          if (args.size() > 4 || (args.size() == 4 && !withscore)) return encode_error("syntax error");
           if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
           for (std::size_t i = 0; i < items.size(); ++i) {
             if (items[i].first == args[2]) {
-              bool withscore = (args.size() >= 4 && upper(args[3]) == "WITHSCORE");
               long long rev_rank = static_cast<long long>(items.size() - 1 - i);
               if (withscore) {
                 return encode_array({encode_integer(rev_rank), encode_bulk(format_score(items[i].second))});
@@ -6573,7 +6895,124 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_integer(rev_rank);
             }
           }
-          return encode_null(session.resp_version);
+          return withscore ? encode_null_array() : encode_null(session.resp_version);
+        }});
+
+    // ─── ZRANGEBYLEX / ZREVRANGEBYLEX / ZLEXCOUNT (legacy forms of ZRANGE BYLEX) ───
+    t.emplace("ZRANGEBYLEX", CommandSpec{"ZRANGEBYLEX", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::vector<std::string> proxy{"ZRANGE", args[1], args[2], args[3], "BYLEX"};
+          proxy.insert(proxy.end(), args.begin() + 4, args.end());  // optional LIMIT
+          std::vector<std::pair<std::string, double>> items;
+          bool ws = false;
+          auto err = zrange_select(proxy, 1, 2, 4, false, items, ws);
+          if (!err.empty()) return err;
+          std::vector<std::string> out;
+          for (const auto& [m, s] : items) out.push_back(encode_bulk(m));
+          return encode_array(out);
+        }});
+
+    t.emplace("ZREVRANGEBYLEX", CommandSpec{"ZREVRANGEBYLEX", -4, {"readonly"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          // args are max min (reversed); zrange_select's REV handles the bound swap.
+          std::vector<std::string> proxy{"ZRANGE", args[1], args[2], args[3], "BYLEX", "REV"};
+          proxy.insert(proxy.end(), args.begin() + 4, args.end());
+          std::vector<std::pair<std::string, double>> items;
+          bool ws = false;
+          auto err = zrange_select(proxy, 1, 2, 4, false, items, ws);
+          if (!err.empty()) return err;
+          std::vector<std::string> out;
+          for (const auto& [m, s] : items) out.push_back(encode_bulk(m));
+          return encode_array(out);
+        }});
+
+    t.emplace("ZLEXCOUNT", CommandSpec{"ZLEXCOUNT", 4, {"readonly", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          const std::vector<std::string> proxy{"ZRANGE", args[1], args[2], args[3], "BYLEX"};
+          std::vector<std::pair<std::string, double>> items;
+          bool ws = false;
+          auto err = zrange_select(proxy, 1, 2, 4, false, items, ws);
+          if (!err.empty()) return err;
+          return encode_integer(static_cast<long long>(items.size()));
+        }});
+
+    // ─── ZREMRANGEBYSCORE / ZREMRANGEBYRANK / ZREMRANGEBYLEX ─────────────
+    // Each selects victims with the shared unified-range selector, then rebuilds the
+    // zset without them (same delete/re-add mechanics as ZREM).
+    {
+      auto make_remrange = [](const char* mode) {
+        const std::string mode_s = mode;  // "" = index, "BYSCORE", "BYLEX"
+        return [mode_s](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::vector<std::string> proxy{"ZRANGE", args[1], args[2], args[3]};
+          if (!mode_s.empty()) proxy.push_back(mode_s);
+          std::vector<std::pair<std::string, double>> victims;
+          bool ws = false;
+          auto err = zrange_select(proxy, 1, 2, 4, false, victims, ws);
+          if (!err.empty()) return err;
+          if (victims.empty()) return encode_integer(0);
+          std::unordered_set<std::string> gone;
+          for (const auto& [m, sc] : victims) gone.insert(m);
+          bool wt = false;
+          auto all = store().zrange(args[1], 0, -1, true, wt);
+          if (wt) return wrongtype_error_reply();
+          store().del(args[1]);
+          for (const auto& [m, sc] : all) {
+            if (!gone.count(m)) store().zadd_one(args[1], sc, m, false, false, false, false, false);
+          }
+          return encode_integer(static_cast<long long>(gone.size()));
+        };
+      };
+      t.emplace("ZREMRANGEBYSCORE", CommandSpec{"ZREMRANGEBYSCORE", 4, {"write"}, 1, 1, 1, make_remrange("BYSCORE")});
+      t.emplace("ZREMRANGEBYRANK", CommandSpec{"ZREMRANGEBYRANK", 4, {"write"}, 1, 1, 1, make_remrange("")});
+      t.emplace("ZREMRANGEBYLEX", CommandSpec{"ZREMRANGEBYLEX", 4, {"write"}, 1, 1, 1, make_remrange("BYLEX")});
+    }
+
+    // ─── ZINTERCARD numkeys key [key ...] [LIMIT n] ──────────────────────
+    t.emplace("ZINTERCARD", CommandSpec{"ZINTERCARD", -3, {"readonly"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+          std::int64_t numkeys = 0;
+          if (!parse_i64(args[1], numkeys)) {
+            return encode_error("numkeys should be greater than 0");
+          }
+          if (numkeys <= 0) {
+            return encode_error("at least 1 input key is needed for 'zintercard' command");
+          }
+          if (static_cast<std::size_t>(2 + numkeys) > args.size()) {
+            return encode_error("Number of keys can't be greater than number of args");
+          }
+          std::int64_t limit = 0;
+          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); i += 2) {
+            if (upper(args[i]) == "LIMIT" && i + 1 < args.size()) {
+              if (!parse_i64(args[i + 1], limit) || limit < 0) {
+                return encode_error("LIMIT can't be negative");
+              }
+            } else {
+              return encode_error("syntax error");
+            }
+          }
+          // Members from either a zset (ignore scores) or a plain set.
+          auto members_of = [](const std::string& key, std::vector<std::string>& out) -> bool {
+            const auto t = store().type_of(key);
+            if (t == "none") return true;
+            bool wt = false;
+            if (t == "zset") { for (const auto& [m, sc] : store().zrange(key, 0, -1, true, wt)) out.push_back(m); return !wt; }
+            if (t == "set")  { for (const auto& m : store().smembers(key, wt)) out.push_back(m); return !wt; }
+            return false;
+          };
+          std::vector<std::string> first;
+          if (!members_of(args[2], first)) return wrongtype_error_reply();
+          std::unordered_set<std::string> current(first.begin(), first.end());
+          for (std::int64_t k = 1; k < numkeys && !current.empty(); ++k) {
+            std::vector<std::string> next;
+            if (!members_of(args[static_cast<std::size_t>(2 + k)], next)) return wrongtype_error_reply();
+            std::unordered_set<std::string> nextset(next.begin(), next.end());
+            std::unordered_set<std::string> keep;
+            for (const auto& m : current) if (nextset.count(m)) keep.insert(m);
+            current.swap(keep);
+          }
+          long long card = static_cast<long long>(current.size());
+          if (limit > 0 && card > limit) card = limit;
+          return encode_integer(card);
         }});
 
     // ─── ZREM ────────────────────────────────────────────────────────────
@@ -6604,9 +7043,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("ZINCRBY", CommandSpec{"ZINCRBY", 4, {"write", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          double incr;
-          try { incr = std::stod(args[2]); } catch (...) { return encode_error("value is not a valid float"); }
-          auto result = store().zadd_one(args[1], incr, args[3], false, false, false, false, true);
+          long double incr = 0;
+          if (!parse_strict_float(args[2], incr)) return encode_error("value is not a valid float");
+          // Pre-check the NaN case (inf + -inf) so the zset is never mutated on error.
+          {
+            bool wt = false;
+            auto items = store().zrange(args[1], 0, -1, true, wt);
+            if (wt) return wrongtype_error_reply();
+            for (const auto& [m, s] : items) {
+              if (m == args[3] && std::isnan(s + static_cast<double>(incr))) {
+                return encode_error("resulting score is not a number (NaN)");
+              }
+            }
+          }
+          auto result = store().zadd_one(args[1], static_cast<double>(incr), args[3], false, false, false, false, true);
           if (result.wrongtype) return wrongtype_error_reply();
           return encode_bulk(format_score(result.score));
         }});
@@ -6621,7 +7071,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
             std::string v = s;
             if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return true; } catch (...) { return false; }
+            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
           };
           double min_val, max_val;
           bool min_ex, max_ex;
@@ -6635,6 +7085,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!parse_i64(args[i + 1], offset) || !parse_i64(args[i + 2], limit_count))
                 return encode_error("value is not an integer or out of range");
               i += 2;
+            }
+            else {
+              return encode_error("syntax error");  // e.g. REV is invalid for ZRANGEBYSCORE
             }
           }
           bool wt = false;
@@ -6672,7 +7125,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
             std::string v = s;
             if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return true; } catch (...) { return false; }
+            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
           };
           // Note: for ZREVRANGEBYSCORE, args[2] is max, args[3] is min (reversed)
           double max_val, min_val;
@@ -6687,6 +7140,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (!parse_i64(args[i + 1], offset) || !parse_i64(args[i + 2], limit_count))
                 return encode_error("value is not an integer or out of range");
               i += 2;
+            }
+            else {
+              return encode_error("syntax error");  // e.g. REV is invalid for ZRANGEBYSCORE
             }
           }
           bool wt = false;
@@ -6720,7 +7176,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           std::int64_t start, stop;
           if (!parse_i64(args[2], start) || !parse_i64(args[3], stop))
             return encode_error("value is not an integer or out of range");
-          bool withscores = (args.size() >= 5 && upper(args[4]) == "WITHSCORES");
+          // The only valid 5th token is WITHSCORES; BYSCORE/BYLEX/etc. are a syntax error.
+          if (args.size() > 5 || (args.size() == 5 && upper(args[4]) != "WITHSCORES")) {
+            return encode_error("syntax error");
+          }
+          const bool withscores = args.size() == 5;
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
@@ -6791,232 +7251,198 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           std::int64_t count;
           if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
-          bool withscores = (args.size() >= 4 && upper(args[3]) == "WITHSCORES");
-          bool allow_dups = (count < 0);
-          std::int64_t abs_count = std::abs(count);
+          if (count == std::numeric_limits<std::int64_t>::min()) {
+            return encode_error("value is out of range");  // -INT64_MIN unrepresentable
+          }
+          const bool withscores = args.size() == 4;
+          if (args.size() > 4 || (withscores && upper(args[3]) != "WITHSCORES")) {
+            return encode_error("syntax error");
+          }
+          if (withscores && count < -(std::numeric_limits<std::int64_t>::max() / 2)) {
+            return encode_error("value is out of range");  // WITHSCORES doubles the reply
+          }
+          const bool resp3_pairs = withscores && session.resp_version == RespVersion::Resp3;
+          // Positive count: distinct members (at most the zset size); negative: |count|
+          // members with repetition (Redis zrandmemberWithCountCommand semantics).
+          std::vector<std::size_t> picks;
+          if (count >= 0) {
+            std::vector<std::size_t> idxs(items.size());
+            for (std::size_t i = 0; i < idxs.size(); ++i) idxs[i] = i;
+            static thread_local std::mt19937 rng{std::random_device{}()};
+            std::shuffle(idxs.begin(), idxs.end(), rng);
+            const std::size_t take = std::min<std::size_t>(idxs.size(), static_cast<std::size_t>(count));
+            picks.assign(idxs.begin(), idxs.begin() + static_cast<std::ptrdiff_t>(take));
+          } else {
+            picks.reserve(static_cast<std::size_t>(-count));
+            for (std::int64_t i = 0; i < -count; ++i) {
+              picks.push_back(static_cast<std::size_t>(std::rand() % static_cast<int>(items.size())));
+            }
+          }
           std::vector<std::string> enc;
-          for (std::int64_t i = 0; i < abs_count; ++i) {
-            auto idx = static_cast<std::size_t>(std::rand() % static_cast<int>(items.size()));
-            enc.push_back(encode_bulk(items[idx].first));
-            if (withscores) { enc.push_back(encode_bulk(format_score(items[idx].second))); }
+          for (const auto idx : picks) {
+            if (resp3_pairs) {
+              enc.push_back(encode_array({encode_bulk(items[idx].first), encode_double(items[idx].second, RespVersion::Resp3)}));
+            } else {
+              enc.push_back(encode_bulk(items[idx].first));
+              if (withscores) enc.push_back(encode_bulk(format_score(items[idx].second)));
+            }
           }
           return encode_array(enc);
         }});
 
     // ─── ZUNIONSTORE / ZINTERSTORE / ZDIFFSTORE ─────────────────────────
-    t.emplace("ZUNIONSTORE", CommandSpec{"ZUNIONSTORE", -4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
-          // Collect all scores from all keys
-          std::unordered_map<std::string, double> result;
-          for (std::int64_t i = 0; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(3 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) {
-              auto it = result.find(m);
-              if (it != result.end()) it->second += s; // default AGGREGATE SUM
-              else result[m] = s;
-            }
-          }
-          store().del(args[1]);
-          for (const auto& [m, s] : result) {
-            store().zadd_one(args[1], s, m, false, false, false, false, false);
-          }
-          return encode_integer(static_cast<long long>(result.size()));
-        }});
+    // ─── ZUNION / ZINTER / ZDIFF (+STORE): one generic engine ───────────
+    // Redis zunionInterDiffGenericCommand semantics: WEIGHTS + AGGREGATE SUM|MIN|MAX
+    // (not for ZDIFF), plain sets accepted as sources (implicit score 1), the STORE
+    // destination is overwritten regardless of its type, NaN sums collapse to 0,
+    // non-store forms support WITHSCORES and order by score then member.
+    {
+      enum class ZOp { Union, Inter, Diff };
+      auto zsetop = [](const std::vector<std::string>& args, ZOp op, bool store_form,
+                       SessionState& session) -> std::string {
+        const std::size_t nk_idx = store_form ? 2 : 1;
+        std::int64_t numkeys = 0;
+        if (!parse_i64(args[nk_idx], numkeys)) return encode_error("value is not an integer or out of range");
+        if (numkeys <= 0) {
+          return encode_error("at least 1 input key is needed for '" + lower(args[0]) + "' command");
+        }
+        const std::size_t keys_start = nk_idx + 1;
+        if (keys_start + static_cast<std::size_t>(numkeys) > args.size()) return encode_error("syntax error");
 
-    t.emplace("ZINTERSTORE", CommandSpec{"ZINTERSTORE", -4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
-          // Start with first key's members
-          std::unordered_map<std::string, double> result;
-          {
-            const auto& key = args[3];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) result[m] = s;
-          }
-          for (std::int64_t i = 1; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(3 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            std::unordered_set<std::string> members_in_key;
-            for (const auto& [m, s] : items) {
-              members_in_key.insert(m);
-              if (result.count(m)) result[m] += s;
+        std::vector<double> weights(static_cast<std::size_t>(numkeys), 1.0);
+        enum class Agg { Sum, Min, Max };
+        Agg agg = Agg::Sum;
+        bool withscores = false;
+        for (std::size_t i = keys_start + static_cast<std::size_t>(numkeys); i < args.size();) {
+          const auto o = upper(args[i]);
+          if (o == "WEIGHTS" && op != ZOp::Diff) {
+            if (i + static_cast<std::size_t>(numkeys) >= args.size()) return encode_error("syntax error");
+            for (std::int64_t w = 0; w < numkeys; ++w) {
+              long double wv = 0;
+              if (!parse_strict_float(args[i + 1 + static_cast<std::size_t>(w)], wv)) {
+                return encode_error("weight value is not a float");
+              }
+              weights[static_cast<std::size_t>(w)] = static_cast<double>(wv);
             }
-            // Remove members not in this key
+            i += 1 + static_cast<std::size_t>(numkeys);
+          } else if (o == "AGGREGATE" && op != ZOp::Diff && i + 1 < args.size()) {
+            const auto a = upper(args[i + 1]);
+            if (a == "SUM") agg = Agg::Sum;
+            else if (a == "MIN") agg = Agg::Min;
+            else if (a == "MAX") agg = Agg::Max;
+            else return encode_error("syntax error");
+            i += 2;
+          } else if (o == "WITHSCORES" && !store_form) {
+            withscores = true;
+            ++i;
+          } else {
+            return encode_error("syntax error");
+          }
+        }
+
+        // Fetch one source as {member,score}: zsets keep scores, plain sets score 1.
+        auto fetch = [](const std::string& key,
+                        std::vector<std::pair<std::string, double>>& out) -> bool {
+          const auto t = store().type_of(key);
+          if (t == "none") return true;
+          if (t == "zset") {
+            bool wt = false;
+            out = store().zrange(key, 0, -1, true, wt);
+            return !wt;
+          }
+          if (t == "set") {
+            bool wt = false;
+            for (const auto& m : store().smembers(key, wt)) out.push_back({m, 1.0});
+            return !wt;
+          }
+          return false;
+        };
+        auto aggregate = [&](double acc, double v) -> double {
+          switch (agg) {
+            case Agg::Min: return std::min(acc, v);
+            case Agg::Max: return std::max(acc, v);
+            default: {
+              const double sum = acc + v;
+              return std::isnan(sum) ? 0.0 : sum;  // inf + -inf → 0 like Redis
+            }
+          }
+        };
+
+        std::unordered_map<std::string, double> result;
+        if (op == ZOp::Diff) {
+          std::vector<std::pair<std::string, double>> first;
+          if (!fetch(args[keys_start], first)) return wrongtype_error_reply();
+          for (const auto& [m, sc] : first) result[m] = sc;
+          for (std::int64_t k = 1; k < numkeys && !result.empty(); ++k) {
+            std::vector<std::pair<std::string, double>> src;
+            if (!fetch(args[keys_start + static_cast<std::size_t>(k)], src)) return wrongtype_error_reply();
+            for (const auto& [m, sc] : src) result.erase(m);
+          }
+        } else {
+          std::unordered_map<std::string, int> seen_in;
+          for (std::int64_t k = 0; k < numkeys; ++k) {
+            std::vector<std::pair<std::string, double>> src;
+            if (!fetch(args[keys_start + static_cast<std::size_t>(k)], src)) return wrongtype_error_reply();
+            const double w = weights[static_cast<std::size_t>(k)];
+            for (const auto& [m, sc] : src) {
+              double ws = w * sc;
+              if (std::isnan(ws)) ws = 0.0;  // 0 * inf
+              auto it = result.find(m);
+              if (it == result.end()) {
+                result[m] = ws;
+                seen_in[m] = 1;
+              } else {
+                it->second = aggregate(it->second, ws);
+                ++seen_in[m];
+              }
+            }
+          }
+          if (op == ZOp::Inter) {
             for (auto it = result.begin(); it != result.end();) {
-              if (!members_in_key.count(it->first)) it = result.erase(it);
+              if (seen_in[it->first] < numkeys) it = result.erase(it);
               else ++it;
             }
           }
+        }
+
+        if (store_form) {
           store().del(args[1]);
-          for (const auto& [m, s] : result) {
-            store().zadd_one(args[1], s, m, false, false, false, false, false);
+          for (const auto& [m, sc] : result) {
+            store().zadd_one(args[1], sc, m, false, false, false, false, false);
           }
           return encode_integer(static_cast<long long>(result.size()));
-        }});
-
-    t.emplace("ZDIFFSTORE", CommandSpec{"ZDIFFSTORE", -4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[2], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(3 + numkeys) > args.size()) return encode_error("syntax error");
-          std::unordered_map<std::string, double> result;
-          {
-            const auto& key = args[3];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) result[m] = s;
-          }
-          for (std::int64_t i = 1; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(3 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, _] : items) result.erase(m);
-          }
-          store().del(args[1]);
-          for (const auto& [m, s] : result) {
-            store().zadd_one(args[1], s, m, false, false, false, false, false);
-          }
-          return encode_integer(static_cast<long long>(result.size()));
-        }});
-
-    // ─── ZUNION / ZINTER / ZDIFF (read-only) ────────────────────────────
-    t.emplace("ZUNION", CommandSpec{"ZUNION", -3, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
-          bool withscores = false;
-          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
-            if (upper(args[i]) == "WITHSCORES") withscores = true;
-          }
-          std::unordered_map<std::string, double> result;
-          for (std::int64_t i = 0; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(2 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) {
-              auto it = result.find(m);
-              if (it != result.end()) it->second += s;
-              else result[m] = s;
-            }
-          }
-          // Sort by score, then by member
-          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
-          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
-          });
-          std::vector<std::string> enc;
-          for (const auto& [m, s] : sorted) {
+        }
+        std::vector<std::pair<std::string, double>> ordered(result.begin(), result.end());
+        std::sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) {
+          if (a.second != b.second) return a.second < b.second;
+          return a.first < b.first;
+        });
+        const bool resp3_pairs = withscores && session.resp_version == RespVersion::Resp3;
+        std::vector<std::string> enc;
+        for (const auto& [m, sc] : ordered) {
+          if (resp3_pairs) {
+            enc.push_back(encode_array({encode_bulk(m), encode_double(sc, RespVersion::Resp3)}));
+          } else {
             enc.push_back(encode_bulk(m));
-            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
+            if (withscores) enc.push_back(encode_bulk(format_score(sc)));
           }
-          return encode_array(enc);
-        }});
+        }
+        return encode_array(enc);
+      };
 
-    t.emplace("ZINTER", CommandSpec{"ZINTER", -3, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
-          bool withscores = false;
-          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
-            if (upper(args[i]) == "WITHSCORES") withscores = true;
-          }
-          std::unordered_map<std::string, double> result;
-          {
-            const auto& key = args[2];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) result[m] = s;
-          }
-          for (std::int64_t i = 1; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(2 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            std::unordered_set<std::string> members_in_key;
-            for (const auto& [m, s] : items) {
-              members_in_key.insert(m);
-              if (result.count(m)) result[m] += s;
-            }
-            for (auto it = result.begin(); it != result.end();) {
-              if (!members_in_key.count(it->first)) it = result.erase(it);
-              else ++it;
-            }
-          }
-          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
-          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
-          });
-          std::vector<std::string> enc;
-          for (const auto& [m, s] : sorted) {
-            enc.push_back(encode_bulk(m));
-            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
-          }
-          return encode_array(enc);
-        }});
-
-    t.emplace("ZDIFF", CommandSpec{"ZDIFF", -3, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          std::int64_t numkeys;
-          if (!parse_i64(args[1], numkeys) || numkeys <= 0) return encode_error("value is not an integer or out of range");
-          if (static_cast<std::size_t>(2 + numkeys) > args.size()) return encode_error("syntax error");
-          bool withscores = false;
-          for (std::size_t i = static_cast<std::size_t>(2 + numkeys); i < args.size(); ++i) {
-            if (upper(args[i]) == "WITHSCORES") withscores = true;
-          }
-          std::unordered_map<std::string, double> result;
-          {
-            const auto& key = args[2];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, s] : items) result[m] = s;
-          }
-          for (std::int64_t i = 1; i < numkeys; ++i) {
-            const auto& key = args[static_cast<std::size_t>(2 + i)];
-            if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
-            bool wt = false;
-            auto items = store().zrange(key, 0, -1, true, wt);
-            if (wt) return wrongtype_error_reply();
-            for (const auto& [m, _] : items) result.erase(m);
-          }
-          std::vector<std::pair<std::string, double>> sorted(result.begin(), result.end());
-          std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) {
-            return a.second < b.second || (a.second == b.second && a.first < b.first);
-          });
-          std::vector<std::string> enc;
-          for (const auto& [m, s] : sorted) {
-            enc.push_back(encode_bulk(m));
-            if (withscores) { enc.push_back(encode_bulk(format_score(s))); }
-          }
-          return encode_array(enc);
-        }});
+      t.emplace("ZUNIONSTORE", CommandSpec{"ZUNIONSTORE", -4, {"write"}, 1, 1, 1,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Union, true, se); }});
+      t.emplace("ZINTERSTORE", CommandSpec{"ZINTERSTORE", -4, {"write"}, 1, 1, 1,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Inter, true, se); }});
+      t.emplace("ZDIFFSTORE", CommandSpec{"ZDIFFSTORE", -4, {"write"}, 1, 1, 1,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Diff, true, se); }});
+      t.emplace("ZUNION", CommandSpec{"ZUNION", -3, {"readonly"}, 0, 0, 0,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Union, false, se); }});
+      t.emplace("ZINTER", CommandSpec{"ZINTER", -3, {"readonly"}, 0, 0, 0,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Inter, false, se); }});
+      t.emplace("ZDIFF", CommandSpec{"ZDIFF", -3, {"readonly"}, 0, 0, 0,
+          [zsetop](const std::vector<std::string>& a, SessionState& se, bool&) { return zsetop(a, ZOp::Diff, false, se); }});
+    }
 
     // ─── SRANDMEMBER ─────────────────────────────────────────────────────
     t.emplace("SRANDMEMBER", CommandSpec{"SRANDMEMBER", -2, {"readonly"}, 1, 1, 1,
@@ -7901,100 +8327,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_integer(1);
         }});
 
-    // ─── ZRANGESTORE — index (default), BYSCORE, or BYLEX; optional REV + LIMIT ───
+    // ─── ZRANGESTORE — shares the unified range selector with ZRANGE ───
     t.emplace("ZRANGESTORE", CommandSpec{"ZRANGESTORE", -5, {"write"}, 1, 2, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          const std::string& dst = args[1]; const std::string& src = args[2];
-          enum class Mode { Index, ByScore, ByLex };
-          Mode mode = Mode::Index;
-          bool rev = false;
-          bool has_limit = false;
-          std::int64_t lim_off = 0, lim_cnt = -1;
-          for (std::size_t i = 5; i < args.size(); ++i) {
-            const auto o = upper(args[i]);
-            if (o == "BYSCORE") mode = Mode::ByScore;
-            else if (o == "BYLEX") mode = Mode::ByLex;
-            else if (o == "REV") rev = true;
-            else if (o == "LIMIT" && i + 2 < args.size()) {
-              if (!parse_i64(args[i + 1], lim_off) || !parse_i64(args[i + 2], lim_cnt))
-                return encode_error("value is not an integer or out of range");
-              has_limit = true; i += 2;
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          if (has_limit && mode == Mode::Index)
-            return encode_error("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
-          if (store().is_wrongtype_for_zset(src) || store().is_wrongtype_for_zset(dst)) return wrongtype_error_reply();
-          bool wt = false;
-          auto all = store().zrange(src, 0, -1, true, wt);  // ascending {member,score}
-          if (wt) return wrongtype_error_reply();
+          const std::string& dst = args[1];
+          if (store().is_wrongtype_for_zset(dst)) return wrongtype_error_reply();
           std::vector<std::pair<std::string, double>> items;
-
-          if (mode == Mode::Index) {
-            if (rev) std::reverse(all.begin(), all.end());
-            std::int64_t start = 0, stop = 0;
-            if (!parse_i64(args[3], start) || !parse_i64(args[4], stop))
-              return encode_error("value is not an integer or out of range");
-            const std::int64_t n = static_cast<std::int64_t>(all.size());
-            std::int64_t s = start < 0 ? n + start : start, e = stop < 0 ? n + stop : stop;
-            if (s < 0) s = 0; if (e >= n) e = n - 1;
-            for (std::int64_t i = s; i <= e && i < n; ++i) items.push_back(all[i]);
-          } else if (mode == Mode::ByScore) {
-            // REV swaps bound order: ZRANGESTORE d s max min BYSCORE REV.
-            const std::string& lo_s = rev ? args[4] : args[3];
-            const std::string& hi_s = rev ? args[3] : args[4];
-            auto parse_bound = [](const std::string& s, double& val, bool& ex) -> bool {
-              ex = false;
-              if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
-              if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
-              std::string v = s; if (!v.empty() && v[0] == '(') { ex = true; v = v.substr(1); }
-              try { val = std::stod(v); return true; } catch (...) { return false; }
-            };
-            double lo, hi; bool lo_ex, hi_ex;
-            if (!parse_bound(lo_s, lo, lo_ex) || !parse_bound(hi_s, hi, hi_ex))
-              return encode_error("min or max is not a float");
-            for (const auto& [m, sc] : all) {
-              bool above = lo_ex ? (sc > lo) : (sc >= lo);
-              bool below = hi_ex ? (sc < hi) : (sc <= hi);
-              if (above && below) items.push_back({m, sc});
-            }
-            if (rev) std::reverse(items.begin(), items.end());
-          } else {  // ByLex — all members assumed same score; compare lexicographically.
-            const std::string& lo_s = rev ? args[4] : args[3];
-            const std::string& hi_s = rev ? args[3] : args[4];
-            // Bound forms: "-" (min), "+" (max), "[member" (inclusive), "(member" (exclusive).
-            auto lex_ge_lo = [&](const std::string& m) -> bool {
-              if (lo_s == "-") return true;
-              if (lo_s == "+") return false;
-              if (lo_s.empty()) return false;
-              const std::string b = lo_s.substr(1);
-              return lo_s[0] == '(' ? (m > b) : (m >= b);
-            };
-            auto lex_le_hi = [&](const std::string& m) -> bool {
-              if (hi_s == "+") return true;
-              if (hi_s == "-") return false;
-              if (hi_s.empty()) return false;
-              const std::string b = hi_s.substr(1);
-              return hi_s[0] == '(' ? (m < b) : (m <= b);
-            };
-            if ((!lo_s.empty() && lo_s[0] != '[' && lo_s[0] != '(' && lo_s != "-" && lo_s != "+") ||
-                (!hi_s.empty() && hi_s[0] != '[' && hi_s[0] != '(' && hi_s != "-" && hi_s != "+"))
-              return encode_error("min or max not valid string range item");
-            for (const auto& [m, sc] : all) if (lex_ge_lo(m) && lex_le_hi(m)) items.push_back({m, sc});
-            if (rev) std::reverse(items.begin(), items.end());
-          }
-
-          // LIMIT applies to BYSCORE/BYLEX, on the (possibly reversed) output order.
-          if (has_limit) {
-            if (lim_off > 0) {
-              if (static_cast<std::size_t>(lim_off) >= items.size()) items.clear();
-              else items.erase(items.begin(), items.begin() + lim_off);
-            }
-            if (lim_cnt >= 0 && static_cast<std::size_t>(lim_cnt) < items.size())
-              items.resize(static_cast<std::size_t>(lim_cnt));
-          }
-
+          bool withscores = false;
+          auto err = zrange_select(args, 2, 3, 5, /*allow_withscores=*/false, items, withscores);
+          if (!err.empty()) return err;
           store().del(dst);
           for (const auto& [mem, sc] : items) store().zadd_one(dst, sc, mem, false, false, false, false, false);
           return encode_integer(static_cast<long long>(items.size()));
@@ -8707,19 +9048,73 @@ std::string try_unblock_client(SessionState& session) {
 
   const auto current = now_ms();
 
-  // Check timeout
+  // Check timeout. The multi-key blockers (BLPOP/BRPOP/BZPOPMIN/BZPOPMAX/BLMPOP/BZMPOP)
+  // time out with a null ARRAY; the move forms (BLMOVE/BRPOPLPUSH) with a null bulk.
   if (session.blocked.deadline_ms > 0 && current >= session.blocked.deadline_ms) {
+    const auto& torig = session.blocked.original_args;
+    const std::string tcmd = torig.empty() ? std::string() : upper(torig[0]);
+    const bool null_bulk = tcmd == "BLMOVE" || tcmd == "BRPOPLPUSH";
     unregister_key_waiter(session.fd);
     session.blocked.type = BlockType::None;
     session.blocked.keys.clear();
     session.blocked.original_args.clear();
-    return encode_null(RespVersion::Resp2);
+    return null_bulk ? encode_null(session.resp_version)
+                     : encode_null_array(session.resp_version);
   }
 
+  // Mutations applied on wakeup happen outside the dispatch chokepoint, so they must
+  // propagate to the replication backlog and AOF explicitly (deterministic pop form).
+  auto propagate = [&session](std::vector<std::string> cmd_args) {
+    store().increment_mutation_epoch();
+    append_replication_event(cmd_args, session, nullptr);
+    append_aof_command(cmd_args, session, nullptr);
+  };
+  auto clear_block = [&session]() {
+    unregister_key_waiter(session.fd);
+    session.blocked.type = BlockType::None;
+    session.blocked.keys.clear();
+    session.blocked.original_args.clear();
+  };
+  // COUNT option shared by BLMPOP/BZMPOP original args.
+  auto parse_orig_count = [](const std::vector<std::string>& orig) -> std::size_t {
+    for (std::size_t i = 3; i + 1 < orig.size(); ++i) {
+      if (upper(orig[i]) == "COUNT") {
+        std::int64_t c = 0;
+        if (parse_i64(orig[i + 1], c) && c > 0) return static_cast<std::size_t>(c);
+      }
+    }
+    return 1;
+  };
+
   if (session.blocked.type == BlockType::List) {
-    // Check if this is a BLMOVE-style command
     const auto& orig = session.blocked.original_args;
-    bool is_blmove = (!orig.empty() && upper(orig[0]) == "BLMOVE");
+    const std::string cmd0 = orig.empty() ? std::string() : upper(orig[0]);
+    const bool is_blmove = cmd0 == "BLMOVE" || cmd0 == "BRPOPLPUSH";
+
+    if (cmd0 == "BLMPOP") {
+      const std::size_t count = parse_orig_count(orig);
+      for (const auto& key : session.blocked.keys) {
+        bool wrongtype = false;
+        const auto len = store().llen(key, wrongtype);
+        if (wrongtype) continue;  // wrong-type key: stay blocked, like Redis
+        if (len == 0) continue;
+        const std::string captured_key = key;
+        std::vector<std::string> popped;
+        for (std::size_t i = 0; i < count; ++i) {
+          auto v = session.blocked.pop_left ? store().lpop(captured_key, wrongtype)
+                                            : store().rpop(captured_key, wrongtype);
+          if (!v.has_value()) break;
+          popped.push_back(*v);
+        }
+        propagate({session.blocked.pop_left ? "LPOP" : "RPOP", captured_key,
+                   std::to_string(popped.size())});
+        clear_block();
+        std::vector<std::string> enc;
+        for (const auto& v : popped) enc.push_back(encode_bulk(v));
+        return encode_array({encode_bulk(captured_key), encode_array(enc)});
+      }
+      return {};
+    }
 
     for (const auto& key : session.blocked.keys) {
       bool wrongtype = false;
@@ -8730,57 +9125,77 @@ std::string try_unblock_client(SessionState& session) {
         val = store().rpop(key, wrongtype);
       }
       if (wrongtype) {
-        unregister_key_waiter(session.fd);
-        session.blocked.type = BlockType::None;
-        session.blocked.keys.clear();
-        session.blocked.original_args.clear();
-        return wrongtype_error_reply();
+        continue;  // wrong-type key: stay blocked, like Redis
       }
       if (val.has_value()) {
         // Copy key before clearing the vector — `key` is a reference into
         // session.blocked.keys, which clear() would invalidate.
         const std::string captured_key = key;
-        unregister_key_waiter(session.fd);
-        session.blocked.type = BlockType::None;
-        session.blocked.keys.clear();
 
         if (is_blmove && orig.size() >= 5) {
-          // BLMOVE src dst wherefrom whereto timeout
+          // BLMOVE src dst wherefrom whereto timeout / BRPOPLPUSH src dst timeout
           const std::string dst = orig[2];
-          const std::string where_to = upper(orig[4]);
+          const std::string where_to = cmd0 == "BRPOPLPUSH" ? "LEFT" : upper(orig[4]);
           std::vector<std::string> one{*val};
           bool wt = false;
+          if (store().is_wrongtype_for_list(dst)) {
+            // Dst is the wrong type: restore the just-popped element (source order intact)
+            // and deliver WRONGTYPE to the woken client (Redis unblocks with the error).
+            if (session.blocked.pop_left) (void)store().lpush(captured_key, one, wt);
+            else (void)store().rpush(captured_key, one, wt);
+            clear_block();
+            return wrongtype_error_reply();
+          }
           if (where_to == "LEFT") (void)store().lpush(dst, one, wt);
           else (void)store().rpush(dst, one, wt);
-          session.blocked.original_args.clear();
+          propagate({"LMOVE", captured_key, dst,
+                     session.blocked.pop_left ? "LEFT" : "RIGHT", where_to});
+          clear_block();
           return encode_bulk(*val);
         }
 
-        session.blocked.original_args.clear();
+        propagate({session.blocked.pop_left ? "LPOP" : "RPOP", captured_key});
+        clear_block();
         return encode_array({encode_bulk(captured_key), encode_bulk(*val)});
       }
     }
   } else if (session.blocked.type == BlockType::ZSet) {
+    const auto& orig = session.blocked.original_args;
+    const std::string cmd0 = orig.empty() ? std::string() : upper(orig[0]);
+
+    if (cmd0 == "BZMPOP") {
+      const std::size_t count = parse_orig_count(orig);
+      for (const auto& key : session.blocked.keys) {
+        bool wrongtype = false;
+        auto vals = store().zpop(key, count, session.blocked.zpop_max, wrongtype);
+        if (wrongtype) continue;  // wrong-type key: stay blocked, like Redis
+        if (vals.empty()) continue;
+        const std::string captured_key = key;
+        propagate({session.blocked.zpop_max ? "ZPOPMAX" : "ZPOPMIN", captured_key,
+                   std::to_string(vals.size())});
+        clear_block();
+        std::vector<std::string> pairs;
+        for (const auto& [m, s] : vals) {
+          pairs.push_back(encode_array({encode_bulk(m), encode_double(s, session.resp_version)}));
+        }
+        return encode_array({encode_bulk(captured_key), encode_array(pairs)});
+      }
+      return {};
+    }
+
     for (const auto& key : session.blocked.keys) {
       bool wrongtype = false;
       auto vals = store().zpop(key, 1, session.blocked.zpop_max, wrongtype);
       if (wrongtype) {
-        unregister_key_waiter(session.fd);
-        session.blocked.type = BlockType::None;
-        session.blocked.keys.clear();
-        session.blocked.original_args.clear();
-        return wrongtype_error_reply();
+        continue;  // wrong-type key: stay blocked, like Redis
       }
       if (!vals.empty()) {
         // Copy key before clearing — same reasoning as the List branch above.
         const std::string captured_key = key;
-        unregister_key_waiter(session.fd);
-        session.blocked.type = BlockType::None;
-        session.blocked.keys.clear();
-        session.blocked.original_args.clear();
-        std::ostringstream oss;
-        oss << vals[0].second;
-        return encode_array({encode_bulk(captured_key), encode_bulk(vals[0].first), encode_bulk(oss.str())});
+        propagate({session.blocked.zpop_max ? "ZPOPMAX" : "ZPOPMIN", captured_key});
+        clear_block();
+        return encode_array({encode_bulk(captured_key), encode_bulk(vals[0].first),
+                             encode_double(vals[0].second, session.resp_version)});
       }
     }
   } else if (session.blocked.type == BlockType::Stream) {

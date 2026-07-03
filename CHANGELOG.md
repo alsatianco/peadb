@@ -9,6 +9,31 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 2): list + zset suites adopted
+
+- **`unit/type/zset` (320 ok) and `unit/type/list` (264 ok) adopted natively at 0 errors**
+  — all four data-type suites now green (10 suites total). Major command work:
+  - **Unified `ZRANGE`** (REV/BYSCORE/BYLEX/LIMIT/WITHSCORES via a shared selector reused
+    by `ZRANGESTORE`); strict option validation on `ZREVRANGE`/`ZRANGEBYSCORE`.
+  - **New commands**: `BLMPOP`, `BZMPOP`, `ZLEXCOUNT`, `ZRANGEBYLEX`, `ZREVRANGEBYLEX`,
+    `ZREMRANGEBYSCORE`, `ZREMRANGEBYRANK`, `ZREMRANGEBYLEX`, `ZINTERCARD`, `HSTRLEN`,
+    `CLIENT UNBLOCK`.
+  - **`ZUNION`/`ZINTER`/`ZDIFF`(+`STORE`)** rewritten as one engine with `WEIGHTS` +
+    `AGGREGATE SUM|MIN|MAX`, plain-set sources (implicit score 1), and NaN→0 collapse.
+  - **`ZADD`** flag-incompatibility errors (NX+XX, GT/LT+NX, GT+LT), NaN-score rejection,
+    XX-never-creates, INCR-suppressed→nil; **`ZINCRBY`** NaN-result error without mutation.
+  - **`ZRANK`/`ZREVRANK` `WITHSCORE`** + correct nil-array-for-missing; **`ZMPOP`/`ZPOPMIN`/
+    `ZPOPMAX`** nested-pair replies with RESP3 doubles + negative-count errors.
+  - **`ZRANDMEMBER`/`HRANDFIELD`/`SRANDMEMBER`**: distinct positive counts, RESP3 pair
+    shape, `-INT64_MIN`/WITHSCORES-overflow guards.
+  - **Lists**: `LPOP`/`RPOP` RESP3 nil shapes, `LPOS` RANK bounds/wording, `LMPOP`
+    double-`COUNT` rejection, `BLMOVE`/`BRPOPLPUSH` block-regardless-of-dst-type +
+    wrong-dst handling, negative `list-max-listpack-size` size-classes (0→1, clamp <-5).
+  - Blocking infra: **millisecond-precise timeouts** (poll clamps to the nearest
+    deadline; huge timeouts rejected instead of blocking forever), **FIFO wakeup order**,
+    correct nil-array vs nil-bulk timeout replies, and deterministic effect propagation
+    for all blocking pops.
+
 ### Added — parity roadmap Phase 1 (wave 1): encoding shim + hash/set suites adopted
 
 - **Encoding-transition thresholds.** All eight `*-max-listpack-*` / `set-max-intset-entries`

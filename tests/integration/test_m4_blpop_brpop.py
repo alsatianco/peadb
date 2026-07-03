@@ -29,7 +29,9 @@ def recv(s):
   if n==-1: return None
   v=rx(s,n); rx(s,2); return v.decode()
  if p==b'*':
-  n=int(rl(s)); return [recv(s) for _ in range(n)]
+  n=int(rl(s))
+  if n==-1: return None  # nil array (BLPOP/BRPOP timeout)
+  return [recv(s) for _ in range(n)]
  raise RuntimeError(p)
 
 def cmd(s,*a):
