@@ -117,6 +117,9 @@ SUITES=(
   "unit/expire"
   "unit/multi"
   "unit/scripting"
+  "unit/quit"
+  "unit/auth"
+  "unit/bitops"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

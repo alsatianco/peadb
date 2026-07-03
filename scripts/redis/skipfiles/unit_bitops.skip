@@ -1,0 +1,5 @@
+# rdb_changes_since_last_save (server.dirty) is command-granular in PeaDB — one increment per
+# write command — whereas Redis increments it per actual value change, so a SETBIT/BITFIELD
+# that writes the same value adds 0. Matching this needs per-command dirty deltas.
+# Tracked in compat/delta.md item 18.
+SETBIT/BITFIELD only increase dirty when the value changed

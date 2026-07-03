@@ -106,7 +106,7 @@ def test_auth_without_password_set():
         with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             s.sendall(cmd("AUTH", "anything"))
             r = recv_reply(s)
-            expect(r.startswith(b"-ERR Client sent AUTH"), f"AUTH w/o password set should error, got {r!r}")
+            expect(r.startswith(b"-ERR AUTH <password> called without any password"), f"AUTH w/o password set should error, got {r!r}")
             # PING still works without auth when no password is configured
             s.sendall(cmd("PING"))
             expect(recv_reply(s) == b"+PONG\r\n", "PING should work when no password set")
