@@ -31,9 +31,9 @@ void set_log_level(LogLevel level) { g_level = level; }
 
 LogLevel parse_log_level(const std::string& level) {
   if (level == "error") return LogLevel::Error;
-  if (level == "warn") return LogLevel::Warn;
-  if (level == "info") return LogLevel::Info;
-  if (level == "debug") return LogLevel::Debug;
+  if (level == "warn" || level == "warning") return LogLevel::Warn;
+  if (level == "info" || level == "notice") return LogLevel::Info;    // redis.conf "notice"
+  if (level == "debug" || level == "verbose") return LogLevel::Debug; // redis.conf "verbose"
   return LogLevel::Info;
 }
 
@@ -51,7 +51,10 @@ void log(LogLevel level, const std::string& message) {
   ts << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
 
   std::lock_guard<std::mutex> lock(g_log_mutex);
-  std::cerr << "[" << ts.str() << "] [" << to_string(level) << "] " << message << '\n';
+  // stdout + explicit flush, like Redis with an empty `logfile`: the upstream test
+  // harness polls the captured stdout file for the startup log contract, so lines
+  // must hit the fd immediately even when stdout is not a tty.
+  std::cout << "[" << ts.str() << "] [" << to_string(level) << "] " << message << std::endl;
 }
 
 }  // namespace peadb

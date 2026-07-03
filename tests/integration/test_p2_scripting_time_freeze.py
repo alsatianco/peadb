@@ -109,8 +109,10 @@ def main() -> int:
             assert cmd(s, "DEBUG", "SET-ACTIVE-EXPIRE", "0") == "OK"
             assert cmd(s, "SET", "key", "value", "PX", "1") == "OK"
             time.sleep(0.005)
+            # Like Redis, DEBUG OBJECT peeks the raw dict: a logically-expired-but-unreaped
+            # key still reports its object info (upstream "Script delete the expired key").
             obj = cmd(s, "DEBUG", "OBJECT", "key")
-            assert isinstance(obj, str) and "encoding" in obj
+            assert isinstance(obj, str) and "encoding" in obj, obj
             load_one_function(s, "  return redis.call('EXISTS', 'key')")
             assert fcall(s, 1, "key") == 0
             assert cmd(s, "EXISTS", "key") == 0

@@ -10,7 +10,8 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 
 - **Full RESP2 / partial RESP3 protocol** — works with existing Redis clients and tools, zero changes required.
 - **220+ commands** — strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo, bitmaps, pub/sub (incl. introspection + sharded aliases), transactions, Lua scripting, and more. (Authoritative per-command status: [`compat/commands.generated.md`](compat/commands.generated.md).)
-- **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`.
+- **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`. RDB loads verify their CRC64 and refuse a corrupt dump.
+- **Memory & eviction** — enforced `maxmemory` with all eight `maxmemory-policy` modes (LRU/LFU/random/TTL, approximate sampling) so PeaDB works as a cache, a compact tagged-union value layout, per-class `client-output-buffer-limit` (slow-consumer/lagging-replica protection), and background `UNLINK` / `FLUSH ASYNC` (lazyfree).
 - **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and correct replica expiry (the master propagates `DEL` so clocks can't diverge). Automatic failover/Sentinel is not yet implemented.
 - **Cluster** — 16 384 hash-slot routing, `CLUSTER KEYSLOT`/`INFO`/`NODES`/`SLOTS`, `MEET` peer discovery, and `MOVED`/`ASK` redirection (surface-level; full gossip and slot migration in progress).
 - **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries.
@@ -24,12 +25,13 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 
 - C++20 compiler (GCC 11+ or Clang 14+)
 - CMake ≥ 3.16
-- Lua 5.1 development libraries
+
+Lua 5.1.5 is bundled (`third_party/lua-5.1.5`) — the exact interpreter Redis 7.2.5 embeds — so no Lua dev package is needed and script semantics match Redis byte-for-byte.
 
 On Ubuntu/Debian:
 
 ```bash
-sudo apt-get install build-essential cmake g++ liblua5.1-0-dev
+sudo apt-get install build-essential cmake g++
 ```
 
 Or use the provided helper:
@@ -89,7 +91,7 @@ The container exposes port `6379` (configurable via `PEADB_PORT`) and persists d
 
 ## Configuration
 
-PeaDB accepts Redis-style configuration via CLI flags or a config file (`--config <path>`, using redis.conf `key value` syntax). CLI flags override config-file values.
+PeaDB accepts Redis-style configuration via CLI flags or a config file — either redis-server style (`peadb-server /path/peadb.conf`, first positional argument) or `--config <path>` — using redis.conf `key value` syntax. CLI flags override config-file values.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -111,6 +113,8 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file (`--confi
 | `--maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
 | `--maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
 | `--timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
+| `--tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
+| `unixsocket` | — | Also listen on an AF_UNIX socket path (config-file key) |
 | `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` |
 
 `appendonly`, `appendfilename`, `appendfsync`, `masterauth`, and `repl-backlog-size` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys).
@@ -158,9 +162,15 @@ Recognized redis.conf keys are a subset of Redis's; unknown directives are accep
 
 PeaDB has a comprehensive suite spanning unit, integration, fuzz, and differential testing.
 
+Parity against real Redis is measured by the **upstream Redis 7.2.5 TCL suite running in native mode** (the official harness spawns `peadb-server` as a redis-server stand-in). Adopted suites, per-suite baselines, and the monotonic no-regression ratchet live in [`compat/redis_suite_ledger.json`](compat/redis_suite_ledger.json); every skipped upstream test is a tracked debt in `scripts/redis/skipfiles/` tied to a [`compat/delta.md`](compat/delta.md) entry.
+
 ```bash
-# Run all tests (unit + integration, 9 stages)
+# Run all tests (10 stages: unit, integration, coverage, compat, fuzz, stability, perf, sentinel, redis, diff)
 scripts/run_all_tests.sh
+
+# Upstream Redis TCL suite, native mode + pass-rate report
+SUITE_MODE=native scripts/redis/run_redis_tests.sh
+python3 scripts/redis/parse_tcl_results.py artifacts/redis-native
 
 # Unit tests only (via CTest)
 cd build && ctest --output-on-failure
@@ -179,7 +189,7 @@ python3 tests/diff/run_diff_tests.py
 scripts/redis/run_redis_tests.sh
 ```
 
-Integration tests are organized by milestone (m0–m9 and polish stages p0–p3), covering ~95+ Python test files across all data types, persistence modes, replication, scripting, modules, and edge cases.
+Integration tests are organized by milestone (m0–m9), polish stages (p0–p3), and hardening batches (b*), covering 100+ Python test files across all data types, persistence modes, replication, scripting, modules, and edge cases.
 
 ### ASAN Build
 
@@ -229,7 +239,7 @@ include/          C++ headers (command, config, datastore, protocol, server, …
 src/              Implementation files + main entry point
 tests/
   unit/           C++ unit tests (CTest)
-  integration/    Python integration tests (~95+ files)
+  integration/    Python integration tests (100+ files)
   fuzz/           RESP parser and command dispatcher fuzz tests
   diff/           Differential tests (PeaDB vs Redis)
 scripts/

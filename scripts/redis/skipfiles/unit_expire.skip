@@ -1,0 +1,4 @@
+# Needs multi-part AOF (appenddirname + manifest) — compat/delta.md item 3, Phase-3 persistence workstream.
+All time-to-live(TTL) in commands are propagated as absolute timestamp in milliseconds in AOF
+# Writable replicas (replica-read-only no) + replica self-expiry unsupported — delta.md item 8 note.
+expired key which is created in writeable replicas should be deleted by active expiry

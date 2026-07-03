@@ -1,6 +1,6 @@
 # Compatibility Delta
 
-Date: 2026-05-10
+Date: 2026-07-03
 Redis pin: 7.2.5 (`f60370ce28b946c1146dcea77c9c399d39601aaa`)
 
 This file is the **canonical status registry** for PeaDB compatibility gaps.
@@ -12,6 +12,31 @@ Feature status labels:
 - `surface` — command is registered and returns plausible output; no test coverage
 - `stub` — command is registered but not implemented or returns hardcoded response
 - `experimental` — implemented but not validated against Redis test suite
+
+## Verification (the parity ratchet)
+
+Parity is measured by two CI-gated, monotonically-improving numbers:
+
+- **Upstream TCL pass-rate** — the official Redis 7.2.5 test suite runs in *native
+  mode* (the harness spawns `peadb-server` as a redis-server stand-in via
+  `SUITE_MODE=native scripts/redis/run_redis_tests.sh`). Per-suite results are parsed
+  by `scripts/redis/parse_tcl_results.py` into `artifacts/redis-parity/pass_rate.json`;
+  the rate is `Σok / Σ(ok + err + skipfile-lines)`, so skipping a test never improves
+  the number. Adopted suites and their baselines live in
+  `compat/redis_suite_ledger.json`.
+- **Scoreboard `full` count** — `compat/commands.generated.md` statuses are
+  proof-based (`full` = exercised by a green upstream suite AND differentially
+  covered; see the generator header).
+
+Ratchet rules (`scripts/ci/check_suite_ratchet.py`): any `[err]` in an adopted suite
+fails; lowering a ledger count or growing a skipfile fails unless the same change
+touches this file. Every skipfile line under `scripts/redis/skipfiles/` is a tracked
+debt with a comment naming its delta item. Current tracked skipfile debts:
+multi-part-AOF manifest tests (item 3), writable replicas + replica script gating
+(item 8 note), ACL-dependent scripting (item 1), Lua debugger LDB protocol,
+SCRIPT KILL UNKILLABLE semantics, blocked-client-pop replication, in-script SELECT
+replication, busy-script event-loop I/O, and a macOS `leaks` report on the Lua path
+(items 14–15 below).
 
 ## Known Deltas
 
@@ -186,8 +211,11 @@ Feature status labels:
 - Owner: protocol-compat
 - Severity: medium
 - Target milestone: P4
-- Implemented: `HELLO 2`/`3` negotiation; RESP3 type encoders (`encode_map`/`encode_set`/
-  `encode_double`/`encode_bool`, plus RESP3 null `_`); `HGETALL` returns a RESP3 map.
+- Implemented: `HELLO 2`/`3` negotiation with a dynamic reply (real proto/id/role);
+  RESP3 type encoders (`encode_map`/`encode_set`/`encode_double`/`encode_bool`, plus
+  RESP3 null `_`); `HGETALL` returns a RESP3 map. The RESP2 subscribe-mode command
+  gate is now enforced (only (P|S)SUBSCRIBE/(P|S)UNSUBSCRIBE/PING/QUIT/RESET while
+  subscribed; PING replies as a 2-element array), closing the old unenforced-gate gap.
 - Missing: routing the remaining map/double/set/push replies through the RESP3 encoders
   (`CONFIG GET`, `XPENDING`, `XINFO`, `CLIENT INFO`, `ZSCORE`/`ZADD INCR`, etc.) and
   RESP3 push frames for client-side caching invalidation.
@@ -228,3 +256,36 @@ Feature status labels:
   maps), a skiplist zset with O(log N) rank, and a jemalloc + `activedefrag` allocator.
   These are L/XL and architecturally invasive; deferred to protect the green baseline.
 - Tracking: see the "Deferred" section of `CHANGELOG.md`.
+
+14. Scripting semantics beyond the green baseline
+- Status: `partial` (unit/scripting passes natively at 301 ok / 0 err with 12 tracked skips)
+- Owner: scripting-compat
+- Severity: medium
+- Target milestone: P1 suite burn-down
+- Implemented: bundled Lua 5.1.5 on every platform (float tostring, table hash order,
+  cjson/cmsgpack byte-parity with Redis — the interpreter Redis embeds);
+  `redis.replicate_commands()` (no-op true), `redis.set_repl()` + `REPL_*` constants
+  honored by both the replica and AOF propagation paths; `SCRIPT DEBUG yes|sync|no`
+  accepted (LDB itself not implemented); HELLO/AUTH/RESET/QUIT allowed while a script
+  is BUSY.
+- Missing: each of these is a skipfile line in `scripts/redis/skipfiles/unit_scripting.skip` —
+  the LDB debugger session protocol; SCRIPT KILL's UNKILLABLE distinction for scripts
+  that already wrote; timed-out pure-Lua scripts staying BUSY instead of aborting;
+  CLIENT LIST from inside a running script observing concurrent sessions; replica
+  handshakes completing while a script blocks the loop; MASTERDOWN gating for EVAL and
+  the no-writes/allow-stale shebang flags on replicas; a macOS `leaks` report on the
+  Lua path (Linux CI unaffected; needs a leak hunt).
+- Tracking: burn down the skipfile; each removed line is a ratchet win.
+
+15. Blocked-client pops and in-script SELECT are not propagated
+- Status: known replication gaps (found by the native unit/scripting suite)
+- Owner: replication-compat
+- Severity: medium
+- Target milestone: P1
+- Implemented: n/a — this item registers two propagation bugs, not a feature.
+- Missing: a BLPOP served by the unblock path does not propagate the pop to
+  replicas/AOF (master and replica lists diverge), and SELECT issued inside a script
+  is not reflected in captured effects replication. Both are skipfile-tracked
+  (`Replication of script multiple pushes to list with BLPOP`,
+  `Lua scripts using SELECT are replicated correctly`).
+- Tracking: fix in the Phase-1 scripting/replication pass, then drop the skips.

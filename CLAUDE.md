@@ -9,9 +9,9 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build -j$(nproc)
 ```
 
-Requires: `cmake`, `g++` (C++20), `liblua5.1-0-dev` (Lua 5.1 headers + library).
+Requires: `cmake`, `g++` (C++20). Lua 5.1.5 is **bundled** (`third_party/lua-5.1.5`) on every platform — the exact interpreter Redis 7.2.5 embeds — so scripting semantics (float tostring, table hash order, cjson/cmsgpack bytes) match Redis; no system Lua is used.
 
-On macOS `-O2` is enforced for Release builds because the non-bundled system Lua (5.2+) miscompiles at `-O3` (see `CMakeLists.txt`).
+On macOS `-O2` is kept for Release builds so benchmark baselines stay comparable (see `CMakeLists.txt`).
 
 ## Tests
 
@@ -24,7 +24,15 @@ cd build && ../scripts/ci/run_integration_tests.sh
 
 # Single integration test
 python3 tests/integration/test_m2_strings_expire.py
+
+# Upstream Redis 7.2.5 TCL suite in native mode (the harness spawns peadb-server as a
+# redis-server stand-in). Adopted suites + ratchet baselines: compat/redis_suite_ledger.json.
+SUITE_MODE=native scripts/redis/run_redis_tests.sh
+python3 scripts/redis/parse_tcl_results.py artifacts/redis-native   # per-suite pass counts
+python3 scripts/ci/check_suite_ratchet.py                           # monotonic ratchet gate
 ```
+
+**The parity ratchet**: adopted upstream suites must stay at 0 `[err]`; growing a skipfile (`scripts/redis/skipfiles/`) or lowering a ledger count requires updating `compat/delta.md` in the same change. See the "Verification" section of `compat/delta.md`.
 
 ## MANDATORY pre-commit checks
 
@@ -56,7 +64,7 @@ Don't restate in prose what the code or `compat/delta.md` already owns (command 
 
 PeaDB is a Redis 7.2.5-compatible server written in C++20. For a fuller contributor-facing overview (execution model, data structures, persistence, replication, roadmap), see [`docs/architecture.md`](docs/architecture.md).
 
-- **`src/command.cpp`** — All Redis command handlers in one file (~7.7k LoC; count is authoritative in `compat/commands.generated.md`). The command table is built once in `command_table()` (a static local). `handle_command()` is the main dispatcher.
+- **`src/command.cpp`** — All Redis command handlers in one file (authoritative command list/count: `compat/commands.generated.md`). The command table is built once in `command_table()` (a static local). `handle_command()` is the main dispatcher.
 - **`src/server.cpp`** — Single-threaded epoll/kqueue event loop. Manages client sessions (`SessionState`), write buffers (`WriteBuf`), blocked clients, and deferred WAIT replies. Calls into command.cpp for every client command.
 - **`src/datastore.cpp`** — In-memory key-value store (`DataStore`), 16 independent databases, all standard Redis data types (string, hash, list, set, zset, stream). Bucket-based SCAN cursor, random-start active expiry, O(1) RANDOMKEY.
 - **`src/rdb.cpp`** — RDB binary format reader/writer. Non-stream types use real Redis type bytes (Redis-loadable). Streams are encoded under a **PeaDB-specific type byte (200)** via `DataStore::dump_stream`/`restore_stream` (entries + last-id + consumer groups + full PEL), so `SAVE`/`BGSAVE`/PSYNC handle stream datasets — but a PeaDB RDB containing streams is NOT loadable by real Redis (cross-engine stream migration uses AOF/bridge). See `compat/delta.md` items 2 & 5.

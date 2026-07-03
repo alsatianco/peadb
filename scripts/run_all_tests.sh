@@ -225,9 +225,9 @@ run_stage perf "Performance baseline" \
 run_stage sentinel "Sentinel / replication validation" \
     scripts/qa/run_sentinel_validation.sh
 
-# ── 9. Upstream Redis Tcl tests ─────────────────────────────────────────
+# ── 9. Upstream Redis Tcl tests (native mode: the harness spawns peadb-server) ──
 run_stage redis "Upstream Redis Tcl tests" \
-    scripts/redis/run_redis_tests.sh
+    env SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
 
 # ── 10. Differential tests (PeaDB vs real Redis) ────────────────────────
 run_stage diff "Differential tests (PeaDB vs Redis)" \

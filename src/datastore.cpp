@@ -345,16 +345,30 @@ std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok
   auto val = get(key);
   long long base = 0;
   if (val.has_value()) {
-    try {
-      base = std::stoll(*val);
-    } catch (...) {
+    // Redis string2ll strictness: no whitespace anywhere, no '+' prefix, no embedded
+    // NUL, whole string must parse, range-checked.
+    const std::string& s = *val;
+    char* end = nullptr;
+    errno = 0;
+    if (s.empty() ||
+        (!std::isdigit(static_cast<unsigned char>(s.front())) && s.front() != '-') ||
+        s.find('\0') != std::string::npos ||
+        (base = std::strtoll(s.c_str(), &end, 10), end != s.c_str() + s.size()) ||
+        errno == ERANGE) {
       err = "value is not an integer or out of range";
       return 0;
     }
   }
 
+  if ((by > 0 && base > std::numeric_limits<long long>::max() - by) ||
+      (by < 0 && base < std::numeric_limits<long long>::min() - by)) {
+    err = "increment or decrement would overflow";
+    return 0;
+  }
   const long long out = base + by;
-  set(key, std::to_string(out), false, false, std::nullopt, false);
+  // In-place value update preserves the key's TTL (Redis INCR/DECR semantics),
+  // unlike a plain SET which clears it.
+  set(key, std::to_string(out), false, false, std::nullopt, /*keep_ttl=*/true);
   ok = true;
   return out;
 }
@@ -366,15 +380,24 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
   auto val = get(key);
   long double base = 0.0;
   if (val.has_value()) {
-    try {
-      base = std::stold(*val);
-    } catch (...) {
+    // Redis string2ld strictness: whole-string parse, no leading whitespace, no
+    // embedded NUL, NaN rejected ("value is not a valid float").
+    const std::string& s = *val;
+    char* end = nullptr;
+    if (s.empty() || std::isspace(static_cast<unsigned char>(s.front())) ||
+        s.find('\0') != std::string::npos ||
+        (base = std::strtold(s.c_str(), &end), end != s.c_str() + s.size()) ||
+        std::isnan(static_cast<double>(base))) {
       err = "value is not a valid float";
       return "";
     }
   }
 
   long double out = base + by;
+  if (std::isnan(static_cast<double>(out)) || std::isinf(static_cast<double>(out))) {
+    err = "increment would produce NaN or Infinity";
+    return "";
+  }
   char buf[256];
   std::snprintf(buf, sizeof(buf), "%.17Lg", out);
   std::string s(buf);
@@ -1798,6 +1821,24 @@ void DataStore::touch_key_for_eviction(const std::string& key) {
   if (it != db.end()) touch_lru(it->second, eviction_lfu_);
 }
 
+std::optional<std::int64_t> DataStore::object_idletime_seconds(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return std::nullopt;
+  const auto now = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
+  const std::uint32_t last = it->second.lru;
+  return static_cast<std::int64_t>(now >= last ? now - last : 0) / 1000;
+}
+
+std::optional<std::int64_t> DataStore::object_freq(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return std::nullopt;
+  return static_cast<std::int64_t>(it->second.lru & 0xFF);
+}
+
 std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy policy, int samples) {
   if (policy == MaxmemoryPolicy::NoEviction) return std::nullopt;
   const bool volatile_only = policy == MaxmemoryPolicy::VolatileLru ||
@@ -1986,12 +2027,10 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
   return "raw";
 }
 
-std::optional<std::string> DataStore::debug_digest_value(const std::string& key) {
-  auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
-  auto it = db.find(key);
-  if (it == db.end()) return std::nullopt;
-  const auto& e = it->second;
+namespace {
+// Canonical, order-independent textual form of an Entry, shared by DEBUG
+// DIGEST-VALUE and the whole-dataset DEBUG DIGEST.
+std::string entry_digest_payload(const Entry& e) {
   std::ostringstream oss;
   oss << static_cast<int>(e.type()) << "|";
   if (e.expire_at_ms.has_value()) oss << "ttl=" << *e.expire_at_ms << "|";
@@ -2019,11 +2058,43 @@ std::optional<std::string> DataStore::debug_digest_value(const std::string& key)
       oss << "}";
     }
   }
-  const auto payload = oss.str();
-  const auto h = std::hash<std::string>{}(payload);
+  return oss.str();
+}
+}  // namespace
+
+std::optional<std::string> DataStore::debug_digest_value(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return std::nullopt;
+  const auto h = std::hash<std::string>{}(entry_digest_payload(it->second));
   std::ostringstream out;
   out << std::hex << h;
   return out.str();
+}
+
+bool DataStore::key_exists_raw(const std::string& key) const {
+  return dbs_[current_db_].count(key) > 0;
+}
+
+std::string DataStore::debug_digest() {
+  // Order-independent whole-dataset digest: XOR of per-key hashes over a canonical
+  // payload (db index + key + typed value + ttl). Only ever compared PeaDB-vs-PeaDB
+  // (pre/post DEBUG RELOAD, master vs replica), so no Redis byte parity is needed —
+  // but it must be stable across processes of the same build, which std::hash is.
+  // 40 hex chars like Redis; all-zeros for an empty dataset.
+  std::uint64_t acc = 0;
+  const auto now = now_ms();
+  for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
+    for (const auto& [key, e] : dbs_[dbi]) {
+      if (e.expire_at_ms.has_value() && *e.expire_at_ms <= now) continue;  // lazily expired
+      const auto payload = std::to_string(dbi) + "|" + key + "|" + entry_digest_payload(e);
+      acc ^= std::hash<std::string>{}(payload);
+    }
+  }
+  char buf[17];
+  std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(acc));
+  return std::string(24, '0') + buf;
 }
 
 void DataStore::set_zset_max_ziplist_entries(std::int64_t v) {

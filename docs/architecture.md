@@ -12,7 +12,7 @@ Besides the event-loop thread there are two helper threads: a short-lived detach
 
 | File | Responsibility |
 |------|----------------|
-| `src/command.cpp` | All 207 command handlers + the `command_table()` registry and `handle_command()` dispatcher (~7.3k LoC) |
+| `src/command.cpp` | All command handlers + the `command_table()` registry and `handle_command()` dispatcher (authoritative command list/count: [`../compat/commands.generated.md`](../compat/commands.generated.md)) |
 | `src/server.cpp` | Event loop, client sessions (`SessionState`), output buffering (`WriteBuf`), pub/sub delivery, blocked clients, deferred `WAIT` |
 | `src/datastore.cpp` | In-memory store: 16 databases, all data types, expiry, SCAN cursors |
 | `src/rdb.cpp` | RDB binary reader/writer |
@@ -63,3 +63,5 @@ The parser slices the per-client input buffer as `string_view`. All replies for 
 PeaDB treats **Redis as the executable specification**: where behavior is undocumented, Redis source defines truth, and deviations are tracked as explicit deltas in [`../compat/delta.md`](../compat/delta.md). Guiding rules: compatibility over elegance, determinism over cleverness, and continuous differential validation against a real Redis (`tests/diff/`).
 
 The current implementation is the single-threaded baseline. The **target architecture** (not yet built) is a sharded, single-thread-per-shard model with lock-free inter-shard communication, io_uring-based async persistence, and locality-friendly custom allocators — preserving identical external semantics while scaling across cores. The `shard_loop.cpp` scaffolding (`crc16`, `key_hash_slot`, `ShardLoop`) is the first step.
+
+Foundational decision records are archived under [`decisions/`](decisions/): the [Redis compatibility pin](decisions/d0-decisions.md) (7.2.5, auth/ACL scope, io_uring baseline, certification matrix) and the [module ABI boundary](decisions/m8-modules-abi.md).

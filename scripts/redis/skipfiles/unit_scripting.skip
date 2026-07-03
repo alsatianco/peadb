@@ -1,0 +1,24 @@
+# Requires the multi-user ACL engine (compat/delta.md item 1, deferred to the ACL workstream).
+Script ACL check
+# macOS `leaks` reports allocations retained by the Lua scripting path — tracked as debt in
+# compat/delta.md (scripting-leak note); Linux CI does not run this check.
+Check for memory leaks
+# CLIENT LIST polled from inside a running script cannot observe concurrent session changes yet.
+Timedout scripts and unblocked command
+# SCRIPT KILL lacks the UNKILLABLE distinction for scripts that already wrote.
+Timedout scripts that modified data can't be killed by SCRIPT KILL
+# Script-timeout BUSY semantics: PeaDB aborts a pure-Lua timed-out script instead of staying BUSY.
+SHUTDOWN NOSAVE can kill a timedout script anyway
+# Blocked-client pops served by the unblock path are not yet propagated to replicas.
+Replication of script multiple pushes to list with BLPOP
+# SELECT inside a script is not reflected in captured effects replication.
+Lua scripts using SELECT are replicated correctly
+# The LDB (Lua debugger) session protocol is not implemented (SCRIPT DEBUG is accepted as a no-op).
+Test scripting debug protocol parsing
+Test scripting debug lua stack overflow
+# Replica-mode script gating (MASTERDOWN for EVAL under replica-serve-stale-data no,
+# no-writes shebang on replicas) not implemented yet — replication/scripting workstream.
+allow-stale shebang flag
+no-writes shebang flag on replica
+# Replica handshake cannot complete while a script blocks the event loop (busy-script I/O semantics).
+not enough good replicas state change during long script

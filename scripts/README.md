@@ -17,7 +17,7 @@ Every script includes a detailed header comment (shell) or docstring (Python) at
 
 | Folder | Purpose | Scripts |
 |--------|---------|---------|
-| `scripts/ci/` | CI gates and local CI helpers | `check_compat_delta.py`, `check_command_test_coverage.py`, `run_integration_tests.sh` |
+| `scripts/ci/` | CI gates and local CI helpers | `check_compat_delta.py`, `check_command_test_coverage.py`, `generate_compat_scoreboard.py`, `run_integration_tests.sh` |
 | `scripts/redis/` | Redis-harness helpers and bridge utilities | `run_redis_tests.sh`, `sync_from_redis.py`, `export_rdb_via_redis.py`, `import_rdb_via_redis.py` |
 | `scripts/qa/` | Quality assurance: fuzz, perf, stability, replication | `run_fuzz_sanity.sh`, `run_perf_baseline.sh`, `run_stability_checks.sh`, `run_sentinel_validation.sh` |
 | `scripts/dev/` | Local development helpers | `quick_start.sh`, `install_deps_ubuntu.sh` |
