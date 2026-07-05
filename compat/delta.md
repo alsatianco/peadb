@@ -142,12 +142,16 @@ storage until real listpack/intset backends land).
   for unauthenticated clients (commands flagged `no_auth` — AUTH/HELLO/QUIT/RESET — are exempt);
   `AUTH` and `HELLO <proto> AUTH <user> <pass>` perform a constant-time compare and return
   `-WRONGPASS` on mismatch and the "no password is set" error when `requirepass` is empty.
-  protected-mode (default on) refuses non-loopback clients when no password is set. Hardening:
+  protected-mode (default on) refuses non-loopback clients when no password is set. Auth state
+  follows Redis's `clientSetDefaultAuth`: a client is authenticated at connect time iff no
+  password is set, so a later `CONFIG SET requirepass` never retroactively de-authenticates
+  open connections, and `RESET` re-derives the flag from the current password. Hardening:
   `MODULE LOAD` is gated behind `enable-module-command` (default off, blocks the dlopen RCE
   vector); `rename-command FROM TO` (TO empty disables) lets operators neutralise dangerous
   verbs; `proto-max-bulk-len` (512 MB) + 1M-element multibulk caps and a 1 GB per-client
-  query-buffer cap close the unbounded-allocation / OOM DoS; the Lua sandbox now removes
-  `os`/`io`. ACL SETUSER/GETUSER/LIST/LOG/CAT remain registered stubs.
+  query-buffer cap close the unbounded-allocation / OOM DoS; unauthenticated clients get Redis's
+  tighter pre-auth caps (>10 multibulk elements or >16 KB bulk are refused before buffering);
+  the Lua sandbox now removes `os`/`io`. ACL SETUSER/GETUSER/LIST/LOG/CAT remain registered stubs.
 - Missing: full multi-user ACL rule evaluation (users, key patterns, command categories,
   pub/sub channels) and TLS — both deferred as dedicated XL tracks.
 - Tracking: security hardening milestone.
@@ -238,7 +242,10 @@ storage until real listpack/intset backends land).
   `-random`, `volatile-lru`/`-lfu`/`-random`/`-ttl` — via `DataStore::evict_one()` +
   `evict_to_fit()` at the OOM write gate. Approximate sampling (`maxmemory-samples`,
   default 5) over the `randomkey()` bucket walk across all DBs (or TTL-only for
-  `volatile-*`). Per-key LRU/LFU metadata in the inline `Entry::lru` word, touched on
+  `volatile-*`). Eviction runs both at the OOM write gate and from the event-loop cron
+  (`run_eviction_cycle`, mirroring Redis's `startEvictionTimeProc`), so lowering `maxmemory`
+  below usage via `CONFIG SET` evicts in the background without waiting for the next write.
+  Per-key LRU/LFU metadata in the inline `Entry::lru` word, touched on
   `get()` + the dispatch chokepoint (first key). Each eviction propagates `DEL` to the
   backlog + AOF, emits an `evicted` keyspace notification, and increments `evicted_keys`.
   Eviction runs on the master only, never during AOF replay; the loop keeps the cached
@@ -370,3 +377,20 @@ storage until real listpack/intset backends land).
   target-connection caching/idle-release. 9 `unit/dump` MIGRATE tests are skipfile-tracked
   (`scripts/redis/skipfiles/unit_dump.skip`).
 - Tracking: cluster/migration hardening in Phase 4.
+
+20. Unsorted GEORADIUS/GEOSEARCH result ordering (geohash-score order, not cell-scan order)
+- Status: `partial` (result set + all sorted/ANY/STORE forms are exact; only the unsorted tie order differs)
+- Owner: geo-compat
+- Severity: low
+- Target milestone: P6
+- Implemented: GEO search brute-forces the zset and filters every candidate by true haversine
+  distance, so the returned *set* is byte-identical to Redis for `GEORADIUS`, `GEORADIUSBYMEMBER`,
+  `GEOSEARCH`, and `GEOSEARCHSTORE` across `BYRADIUS`/`BYBOX`, `ASC`/`DESC`, `COUNT`/`ANY`,
+  `WITHCOORD`/`WITHDIST`/`WITHHASH`, and `STORE`/`STOREDIST`. Sorted queries match Redis exactly.
+- Missing: when no `ASC`/`DESC` is given, PeaDB emits results in global geohash-score order, while
+  Redis emits them in geohash-neighbor cell-scan order (center box, then N/S/E/W, then diagonals;
+  each box in score order). Redis documents unsorted GEORADIUS order as unspecified; one
+  `unit/geo` test pins the cell-scan order and is skipfile-tracked
+  (`scripts/redis/skipfiles/unit_geo.skip`).
+- Tracking: exact cell-scan ordering rides with the geohash-neighbor scan optimization in the
+  Phase 6 performance work (the same code that replaces the brute-force scan).

@@ -12,6 +12,10 @@ namespace {
 // header (e.g. "*2000000000\r\n") cannot trigger a huge reservation / OOM crash.
 constexpr int kMaxMultibulk = 1024 * 1024;            // 1M elements
 constexpr int kMaxBulkLen   = 512 * 1024 * 1024;      // 512 MB (proto-max-bulk-len)
+// Tighter caps for clients that have not authenticated when a password is required
+// (Redis processMultibulkBuffer): >10 elements or >16 KB per bulk is refused up front.
+constexpr int kUnauthMaxMultibulk = 10;
+constexpr int kUnauthMaxBulkLen   = 16 * 1024;
 
 bool parse_i32(std::string_view sv, int& out) {
   if (sv.empty()) return false;
@@ -34,7 +38,7 @@ bool parse_i32(std::string_view sv, int& out) {
   return true;
 }
 
-std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
+std::optional<ParsedCommand> parse_resp_array(std::string_view buffer, bool unauthenticated) {
   if (buffer.empty() || buffer[0] != '*') return std::nullopt;
 
   const auto line_end = buffer.find("\r\n");
@@ -47,6 +51,8 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
 
   if (count < 0) return ParsedCommand{{"__parse_error__"}, line_end + 2};
   if (count > kMaxMultibulk) return ParsedCommand{{"__err_multibulk__"}, line_end + 2};
+  if (unauthenticated && count > kUnauthMaxMultibulk)
+    return ParsedCommand{{"__err_unauth_multibulk__"}, line_end + 2};
 
   std::size_t pos = line_end + 2;
   std::vector<std::string> args;
@@ -64,6 +70,8 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer) {
 
     if (len < 0) return ParsedCommand{{"__parse_error__"}, bulk_end + 2};
     if (len > kMaxBulkLen) return ParsedCommand{{"__err_bulklen__"}, bulk_end + 2};
+    if (unauthenticated && len > kUnauthMaxBulkLen)
+      return ParsedCommand{{"__err_unauth_bulklen__"}, bulk_end + 2};
 
     const std::size_t data_start = bulk_end + 2;
     const std::size_t required = data_start + static_cast<std::size_t>(len) + 2;
@@ -161,9 +169,9 @@ std::optional<ParsedCommand> parse_inline(std::string_view buffer) {
 
 }  // namespace
 
-std::optional<ParsedCommand> parse_one_command(std::string_view buffer) {
+std::optional<ParsedCommand> parse_one_command(std::string_view buffer, bool unauthenticated) {
   if (buffer.empty()) return std::nullopt;
-  if (buffer[0] == '*') return parse_resp_array(buffer);
+  if (buffer[0] == '*') return parse_resp_array(buffer, unauthenticated);
   if (std::isprint(static_cast<unsigned char>(buffer[0]))) return parse_inline(buffer);
   return std::nullopt;
 }

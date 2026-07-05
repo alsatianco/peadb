@@ -9,6 +9,54 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Fixed — unit/auth and unit/pubsub now complete without hangs (full adoption)
+
+Both suites were previously recorded green only up to the first test that hung the harness; the
+hangs masked real gaps. All are now fixed and the suites run to completion (auth 6→10 ok,
+pubsub 28→34 ok):
+
+- **Unauthenticated protocol limits**: when a password is required and the client has not
+  authenticated, a multibulk header of >10 elements or a bulk length of >16 KB is rejected at
+  the protocol-parse layer with `Protocol error: unauthenticated multibulk/bulk length` and the
+  connection is closed — before any buffering — matching Redis's pre-auth memory-safety valve
+  (`processMultibulkBuffer`). Previously PeaDB waited for the promised elements, hanging the client.
+- **Connect-time authentication state** (`clientSetDefaultAuth`): a client is now marked
+  authenticated at connect time iff no password is set, captured once rather than recomputed per
+  command. A later `CONFIG SET requirepass` no longer retroactively de-authenticates connections
+  that joined while the server was open; `RESET` likewise re-derives auth state from the current
+  password instead of always clearing it.
+- **Replica AUTH handshake**: the replica now tolerates `-NOAUTH`/`-NOPERM` replies to its
+  pre-AUTH `PING` (the master is alive → proceed to AUTH, per `syncWithMaster`) and logs the
+  Redis-exact `Unable to AUTH to MASTER: <err>` on a rejected `masterauth`. Fixes replication
+  against a password-protected master (including binary/NUL passwords).
+- **Background eviction** (`startEvictionTimeProc`): lowering `maxmemory` below current usage now
+  evicts in the event-loop cron, firing `evicted` keyspace events and `DEL` propagation without
+  waiting for the next write command.
+- **Self-published message ordering**: a client that publishes (or triggers a keyspace event) on
+  a channel it is itself subscribed to now receives the message *after* the triggering command's
+  reply — including after a whole `EXEC` array or script reply (RESP3), matching Redis's
+  reply-then-push ordering. Previously the push frame jumped ahead of the reply, desyncing RESP3
+  clients.
+
+### Added — parity roadmap Phase 1 (wave 11): geo suite adopted (geohash rewrite)
+
+- **`unit/geo` adopted natively at 0 errors** (22 suites total). The GEO command family was
+  reworked to Redis's exact 52-bit interleaved-geohash contract via a shared `geoutil` namespace:
+  - **Bit-exact scoring/decoding**: `GEOADD` encodes the score with the Redis latitude range
+    (±85.05112878) and step-26 interleave; `GEOPOS`/`GEODIST`/`GEOSEARCH` decode to the cell
+    center and measure haversine distance with Redis's constants (earth radius 6372797.560856 m).
+  - **`GEOHASH`** returns the standard 11-char base32 hash, forcing the final char to `0` (the low
+    3 geohash bits are zero-padding, matching `geohashCommand`).
+  - **Edge-case parity**: `GEOADD` rejects out-of-range coordinates and folds `XX`+`NX` into the
+    generic `syntax error` (as Redis does); a wrong-type source key returns `WRONGTYPE`; a missing
+    source key on `GEORADIUSBYMEMBER`/`GEOSEARCH FROMMEMBER` yields an empty reply (`0` for `STORE`)
+    while a present-but-absent member is the `could not decode requested zset member` error — the
+    member center is resolved only after the type check, exactly as Redis orders it.
+  - **`GEOHASH`/`GEOPOS`** arity relaxed to `-2` (key-only invocation returns an empty array).
+- 1 test is skipfile-tracked: unsorted `GEORADIUS` result ordering follows geohash-score order
+  rather than Redis's geohash-neighbor cell-scan order (the result set is identical; Redis
+  documents unsorted order as unspecified) — delta 20.
+
 ### Added — parity roadmap Phase 1 (wave 10): sort suite adopted (full SORT rewrite)
 
 - **`unit/sort` adopted natively at 0 errors, with no skips** (21 suites total). `SORT`/`SORT_RO`

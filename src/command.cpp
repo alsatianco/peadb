@@ -2283,6 +2283,75 @@ std::string list_pop_command(const std::vector<std::string>& args, bool left, Re
   });
 }
 
+// ── Geospatial helpers (bit-exact with Redis geohash.c / geohash_helper.c) ──
+namespace geoutil {
+constexpr double LAT_MIN = -85.05112878, LAT_MAX = 85.05112878;
+constexpr double LON_MIN = -180.0, LON_MAX = 180.0;
+constexpr double EARTH_R = 6372797.560856;      // GEO_EARTH_RADIUS_IN_METERS
+constexpr double DEG_RAD = 0.017453292519943295769236907684886;
+constexpr double STEP_POW = 67108864.0;         // 2^26
+
+inline std::uint64_t interleave64(std::uint32_t xlo, std::uint32_t ylo) {
+  static const std::uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+      0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL, 0x0000FFFF0000FFFFULL};
+  static const unsigned S[] = {1, 2, 4, 8, 16};
+  std::uint64_t x = xlo, y = ylo;
+  x = (x | (x << S[4])) & B[4]; y = (y | (y << S[4])) & B[4];
+  x = (x | (x << S[3])) & B[3]; y = (y | (y << S[3])) & B[3];
+  x = (x | (x << S[2])) & B[2]; y = (y | (y << S[2])) & B[2];
+  x = (x | (x << S[1])) & B[1]; y = (y | (y << S[1])) & B[1];
+  x = (x | (x << S[0])) & B[0]; y = (y | (y << S[0])) & B[0];
+  return x | (y << 1);
+}
+inline std::uint64_t deinterleave64(std::uint64_t v) {
+  static const std::uint64_t B[] = {0x5555555555555555ULL, 0x3333333333333333ULL,
+      0x0F0F0F0F0F0F0F0FULL, 0x00FF00FF00FF00FFULL, 0x0000FFFF0000FFFFULL, 0x00000000FFFFFFFFULL};
+  static const unsigned S[] = {0, 1, 2, 4, 8, 16};
+  std::uint64_t x = v, y = v >> 1;
+  x = (x | (x >> S[0])) & B[0]; y = (y | (y >> S[0])) & B[0];
+  x = (x | (x >> S[1])) & B[1]; y = (y | (y >> S[1])) & B[1];
+  x = (x | (x >> S[2])) & B[2]; y = (y | (y >> S[2])) & B[2];
+  x = (x | (x >> S[3])) & B[3]; y = (y | (y >> S[3])) & B[3];
+  x = (x | (x >> S[4])) & B[4]; y = (y | (y >> S[4])) & B[4];
+  x = (x | (x >> S[5])) & B[5]; y = (y | (y >> S[5])) & B[5];
+  return x | (y << 32);
+}
+// 52-bit geohash score: latitude bits in even positions, longitude in odd (step 26).
+inline std::uint64_t encode(double lon, double lat) {
+  double lat_off = (lat - LAT_MIN) / (LAT_MAX - LAT_MIN) * STEP_POW;
+  double lon_off = (lon - LON_MIN) / (LON_MAX - LON_MIN) * STEP_POW;
+  return interleave64(static_cast<std::uint32_t>(lat_off), static_cast<std::uint32_t>(lon_off));
+}
+// Decode to the CENTER of the geohash cell (what GEOPOS/GEODIST report).
+inline void decode(std::uint64_t bits, double& lon, double& lat) {
+  std::uint64_t sep = deinterleave64(bits);
+  std::uint32_t ilat = static_cast<std::uint32_t>(sep), ilon = static_cast<std::uint32_t>(sep >> 32);
+  double lat_lo = LAT_MIN + (ilat / STEP_POW) * (LAT_MAX - LAT_MIN);
+  double lat_hi = LAT_MIN + ((ilat + 1) / STEP_POW) * (LAT_MAX - LAT_MIN);
+  double lon_lo = LON_MIN + (ilon / STEP_POW) * (LON_MAX - LON_MIN);
+  double lon_hi = LON_MIN + ((ilon + 1) / STEP_POW) * (LON_MAX - LON_MIN);
+  lat = (lat_lo + lat_hi) / 2;
+  lon = (lon_lo + lon_hi) / 2;
+}
+inline double lat_dist(double lat1, double lat2) { return EARTH_R * std::fabs((lat2 - lat1) * DEG_RAD); }
+inline double dist(double lon1, double lat1, double lon2, double lat2) {  // haversine (metres)
+  double lon1r = lon1 * DEG_RAD, lon2r = lon2 * DEG_RAD;
+  double v = std::sin((lon2r - lon1r) / 2);
+  if (v == 0.0) return lat_dist(lat1, lat2);
+  double lat1r = lat1 * DEG_RAD, lat2r = lat2 * DEG_RAD;
+  double u = std::sin((lat2r - lat1r) / 2);
+  double a = u * u + std::cos(lat1r) * std::cos(lat2r) * v * v;
+  return 2.0 * EARTH_R * std::asin(std::sqrt(a));
+}
+// Unit → metres multiplier (m/km/mi/ft); returns false on an unknown unit.
+inline bool unit_to_m(const std::string& u, double& mul) {
+  if (u == "m") mul = 1.0; else if (u == "km") mul = 1000.0;
+  else if (u == "mi") mul = 1609.34; else if (u == "ft") mul = 0.3048;
+  else return false;
+  return true;
+}
+}  // namespace geoutil
+
 // Full SORT / SORT_RO implementation (shared; readonly rejects STORE). Mirrors Redis sort.c:
 // BY/GET support key-pattern and hash-field (key_*->field) lookups; a BY pattern without '*'
 // means "don't sort" (retain native list/zset order, reversed for DESC); numeric sorting
@@ -2432,6 +2501,168 @@ std::string do_sort(const std::vector<std::string>& args, RespVersion resp, bool
         else { auto got = lookup(pat, v); out.push_back(got ? encode_bulk(*got) : encode_null(resp)); }
       }
     }
+  }
+  return encode_array(out);
+}
+
+// Shared engine for GEORADIUS / GEORADIUSBYMEMBER / GEOSEARCH / GEOSEARCHSTORE. `form`:
+//   0 GEORADIUS, 1 GEORADIUSBYMEMBER, 2 GEOSEARCH, 3 GEOSEARCHSTORE.
+// readonly rejects STORE (the *_RO variants). Brute-forces the geo zset (identical results to
+// Redis's geohash-neighbour scan, just O(n)), matching distances/scores bit-for-bit.
+bool parse_double(const std::string& s, double& out) {
+  long double v;
+  if (!parse_f64(s, v)) return false;
+  out = static_cast<double>(v);
+  return true;
+}
+
+std::string do_geo_search(const std::vector<std::string>& args, RespVersion resp, int form, bool readonly) {
+  std::size_t i;
+  std::string key, store_key; bool have_store = false, storedist = false;
+  double clon = 0, clat = 0; bool have_center = false;
+  bool bybox = false; double radius_m = 0, width_m = 0, height_m = 0; bool have_shape = false;
+  double unit_mul = 1.0;
+  int sort = 0;  // 0 none, 1 asc, 2 desc
+  long count = 0; bool any = false;
+  bool withcoord = false, withdist = false, withhash = false;
+  std::string center_member; bool center_from_member = false;  // resolved after the type check
+
+  if (form == 3) {  // GEOSEARCHSTORE dest src ...
+    store_key = args[1]; have_store = true; key = args[2]; i = 3;
+  } else {
+    key = args[1]; i = 2;
+  }
+
+  if (form == 0) {  // GEORADIUS key lon lat radius unit
+    if (i + 3 >= args.size()) return encode_error("syntax error");
+    if (!parse_double(args[i], clon) || !parse_double(args[i + 1], clat)) return encode_error("value is not a valid float");
+    double r; if (!parse_double(args[i + 2], r)) return encode_error("value is not a valid float");
+    if (!geoutil::unit_to_m(args[i + 3], unit_mul)) return encode_error("unsupported unit provided. please use M, KM, FT, MI");
+    radius_m = r * unit_mul; have_center = true; have_shape = true; i += 4;
+  } else if (form == 1) {  // GEORADIUSBYMEMBER key member radius unit
+    if (i + 2 >= args.size()) return encode_error("syntax error");
+    center_member = args[i]; center_from_member = true; have_center = true;
+    double r; if (!parse_double(args[i + 1], r)) return encode_error("value is not a valid float");
+    if (!geoutil::unit_to_m(args[i + 2], unit_mul)) return encode_error("unsupported unit provided. please use M, KM, FT, MI");
+    radius_m = r * unit_mul; have_shape = true; i += 3;
+  }
+
+  for (; i < args.size(); ++i) {
+    const auto o = upper(args[i]);
+    if (o == "WITHCOORD") withcoord = true;
+    else if (o == "WITHDIST") withdist = true;
+    else if (o == "WITHHASH") withhash = true;
+    else if (o == "ASC") sort = 1;
+    else if (o == "DESC") sort = 2;
+    else if (o == "ANY") any = true;
+    else if (o == "COUNT" && i + 1 < args.size()) {
+      std::int64_t c; if (!parse_i64(args[i + 1], c) || c <= 0) return encode_error("COUNT must be > 0");
+      count = static_cast<long>(c); ++i;
+      if (i + 1 < args.size() && upper(args[i + 1]) == "ANY") { any = true; ++i; }
+    }
+    else if ((o == "STORE" || o == "STOREDIST") && (form == 0 || form == 1) && i + 1 < args.size()) {
+      if (readonly) return encode_error("syntax error");
+      store_key = args[++i]; have_store = true; storedist = (o == "STOREDIST");
+    }
+    else if (o == "STOREDIST" && form == 3) { storedist = true; }
+    else if (o == "FROMMEMBER" && (form == 2 || form == 3) && i + 1 < args.size()) {
+      if (have_center) return encode_error("syntax error");
+      center_member = args[i + 1]; center_from_member = true; have_center = true; ++i;
+    }
+    else if (o == "FROMLONLAT" && (form == 2 || form == 3) && i + 2 < args.size()) {
+      if (have_center) return encode_error("syntax error");
+      if (!parse_double(args[i + 1], clon) || !parse_double(args[i + 2], clat)) return encode_error("value is not a valid float");
+      have_center = true; i += 2;
+    }
+    else if (o == "BYRADIUS" && (form == 2 || form == 3) && i + 2 < args.size()) {
+      if (have_shape) return encode_error("syntax error");
+      double r; if (!parse_double(args[i + 1], r)) return encode_error("value is not a valid float");
+      if (!geoutil::unit_to_m(args[i + 2], unit_mul)) return encode_error("unsupported unit provided. please use M, KM, FT, MI");
+      radius_m = r * unit_mul; bybox = false; have_shape = true; i += 2;
+    }
+    else if (o == "BYBOX" && (form == 2 || form == 3) && i + 3 < args.size()) {
+      if (have_shape) return encode_error("syntax error");
+      double w, h; if (!parse_double(args[i + 1], w) || !parse_double(args[i + 2], h)) return encode_error("value is not a valid float");
+      if (!geoutil::unit_to_m(args[i + 3], unit_mul)) return encode_error("unsupported unit provided. please use M, KM, FT, MI");
+      width_m = w * unit_mul; height_m = h * unit_mul; bybox = true; have_shape = true; i += 3;
+    }
+    else return encode_error("syntax error");
+  }
+
+  if (form == 2 || form == 3) {
+    if (!have_center) return encode_error("exactly one of FROMMEMBER or FROMLONLAT can be specified for GEOSEARCH");
+    if (!have_shape) return encode_error("exactly one of BYRADIUS and BYBOX can be specified for GEOSEARCH");
+  }
+  if (any && count == 0) return encode_error("the ANY argument requires COUNT argument");
+  if (have_store && (withcoord || withdist || withhash))
+    return encode_error("STORE option in GEORADIUS is not compatible with WITHCOORD, WITHDIST and WITHHASH options");
+  // COUNT without ANY and without an explicit sort defaults to ascending (nearest-first).
+  if (count != 0 && sort == 0 && !any) sort = 1;
+
+  bool wt = false;
+  auto members = store().zrange(key, 0, -1, false, wt);
+  if (wt) return wrongtype_error_reply();
+  // Redis resolves the FROMMEMBER/BYMEMBER center only after the type check. A missing
+  // source key yields an empty result (0 for STORE) rather than a decode error; an
+  // existing zset lacking the member is the "could not decode" error case.
+  if (center_from_member) {
+    bool resolved = false;
+    for (const auto& [m, score] : members) {
+      if (m == center_member) { geoutil::decode(static_cast<std::uint64_t>(score), clon, clat); resolved = true; break; }
+    }
+    if (!resolved) {
+      if (members.empty()) {
+        // Missing source key: empty reply, or 0 for STORE (deleting any stale destination
+        // key, mirroring georadiusGeneric's dbDelete-on-empty).
+        if (have_store) { store().del(store_key); return encode_integer(0); }
+        return encode_array({});
+      }
+      return encode_error("could not decode requested zset member");
+    }
+  }
+
+  struct GP { std::string member; double dist_m; std::uint64_t bits; double lon, lat; };
+  std::vector<GP> found;
+  for (const auto& [m, score] : members) {
+    const std::uint64_t bits = static_cast<std::uint64_t>(score);
+    double plon, plat; geoutil::decode(bits, plon, plat);
+    double d;
+    if (bybox) {
+      if (geoutil::lat_dist(plat, clat) > height_m / 2) continue;
+      if (geoutil::dist(plon, plat, clon, plat) > width_m / 2) continue;
+      d = geoutil::dist(clon, clat, plon, plat);
+    } else {
+      d = geoutil::dist(clon, clat, plon, plat);
+      if (d > radius_m) continue;
+    }
+    found.push_back({m, d, bits, plon, plat});
+    if (any && static_cast<long>(found.size()) >= count) break;
+  }
+  if (sort == 1) std::stable_sort(found.begin(), found.end(), [](const GP& a, const GP& b) { return a.dist_m < b.dist_m; });
+  else if (sort == 2) std::stable_sort(found.begin(), found.end(), [](const GP& a, const GP& b) { return a.dist_m > b.dist_m; });
+  if (count != 0 && static_cast<long>(found.size()) > count) found.resize(count);
+
+  if (have_store) {
+    store().del(store_key);
+    for (const auto& g : found) {
+      const double s = storedist ? (g.dist_m / unit_mul) : static_cast<double>(g.bits);
+      store().zadd_one(store_key, s, g.member, false, false, false, false, false);
+    }
+    return encode_integer(static_cast<long long>(found.size()));
+  }
+  std::vector<std::string> out;
+  for (const auto& g : found) {
+    if (!withcoord && !withdist && !withhash) { out.push_back(encode_bulk(g.member)); continue; }
+    std::vector<std::string> item;
+    item.push_back(encode_bulk(g.member));
+    if (withdist) { char b[64]; std::snprintf(b, sizeof(b), "%.4f", g.dist_m / unit_mul); item.push_back(encode_bulk(b)); }
+    if (withhash) item.push_back(encode_integer(static_cast<long long>(g.bits)));
+    if (withcoord) {
+      char lb[64], tb[64];
+      std::snprintf(lb, sizeof(lb), "%.17g", g.lon); std::snprintf(tb, sizeof(tb), "%.17g", g.lat);
+      item.push_back(encode_array({encode_bulk(lb), encode_bulk(tb)}));
+    }
+    out.push_back(encode_array(item));
   }
   return encode_array(out);
 }
@@ -5683,32 +5914,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (o == "CH") { ch = true; continue; }
             break;
           }
-          if (pos >= args.size() || ((args.size() - pos) % 3) != 0) return encode_error("syntax error");
+          // Redis GEOADD folds XX+NX into the generic syntax error (geoaddCommand: one
+          // shared.syntaxerr for both the odd-triple and the XX&&NX cases).
+          if ((nx && xx) || pos >= args.size() || ((args.size() - pos) % 3) != 0) return encode_error("syntax error");
           return with_zset_key(args[1], [&]() {
             int added = 0, changed = 0;
             for (std::size_t i = pos; i < args.size(); i += 3) {
               long double lon = 0;
               long double lat = 0;
               if (!parse_f64(args[i], lon) || !parse_f64(args[i + 1], lat)) return encode_error("value is not a valid float");
-              // Encode lon/lat as a 52-bit interleaved geohash (matching Redis).
-              auto geohash_encode = [](double longitude, double latitude) -> double {
-                constexpr int BITS = 26;
-                double lon_min = -180, lon_max = 180;
-                double lat_min = -90, lat_max = 90;
-                std::uint64_t bits = 0;
-                for (int i = 0; i < BITS; ++i) {
-                  double mid;
-                  // Interleave: even bits = longitude, odd bits = latitude
-                  mid = (lon_min + lon_max) / 2;
-                  if (longitude >= mid) { bits = (bits << 1) | 1; lon_min = mid; }
-                  else { bits <<= 1; lon_max = mid; }
-                  mid = (lat_min + lat_max) / 2;
-                  if (latitude >= mid) { bits = (bits << 1) | 1; lat_min = mid; }
-                  else { bits <<= 1; lat_max = mid; }
-                }
-                return static_cast<double>(bits);
-              };
-              const double score = geohash_encode(static_cast<double>(lon), static_cast<double>(lat));
+              if (lon < geoutil::LON_MIN || lon > geoutil::LON_MAX ||
+                  lat < geoutil::LAT_MIN || lat > geoutil::LAT_MAX) {
+                return encode_error("invalid longitude,latitude pair " + args[i] + "," + args[i + 1]);
+              }
+              // 52-bit interleaved geohash score (bit-exact with Redis; see geoutil::encode).
+              const double score = static_cast<double>(
+                  geoutil::encode(static_cast<double>(lon), static_cast<double>(lat)));
               auto r = store().zadd_one(args[1], score, args[i + 2], nx, xx, false, false, false);
               if (r.wrongtype) return wrongtype_error_reply();
               if (!r.valid) return encode_error("syntax error");
@@ -6979,9 +7200,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.watched_digests.clear();
           session.client_name.clear();
           session.resp_version = RespVersion::Resp2;
-          // Per Redis, RESET returns the client to the unauthenticated state when a
-          // password is configured (no-op when auth is open).
-          session.authenticated = false;
+          // Per Redis, RESET re-runs clientSetDefaultAuth: the client is authenticated iff
+          // the default user is nopass (no requirepass), and de-authenticated otherwise.
+          session.authenticated = g_requirepass.empty();
           session.user = "default";
           return "+RESET\r\n";
         }});
@@ -8501,21 +8722,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (wt) return wrongtype_error_reply();
           // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            auto bits = static_cast<std::uint64_t>(score);
-            double lon_min = -180, lon_max = 180;
-            double lat_min = -90, lat_max = 90;
-            for (int i = 51; i >= 0; --i) {
-              int b = (bits >> i) & 1;
-              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
-                double mid = (lon_min + lon_max) / 2;
-                if (b) lon_min = mid; else lon_max = mid;
-              } else { // latitude bits
-                double mid = (lat_min + lat_max) / 2;
-                if (b) lat_min = mid; else lat_max = mid;
-              }
-            }
-            lon = (lon_min + lon_max) / 2;
-            lat = (lat_min + lat_max) / 2;
+            geoutil::decode(static_cast<std::uint64_t>(score), lon, lat);
           };
           double lon1 = 0, lat1 = 0, lon2 = 0, lat2 = 0;
           bool found1 = false, found2 = false;
@@ -8524,28 +8731,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (m == args[3]) { decode_geohash(s, lon2, lat2); found2 = true; }
           }
           if (!found1 || !found2) return encode_null(session.resp_version);
-          // Haversine distance
-          constexpr double kEarthRadius = 6372797.560856;
-          constexpr double kPi = 3.14159265358979323846;
-          double lat1r = lat1 * kPi / 180.0, lat2r = lat2 * kPi / 180.0;
-          double dlat = (lat2 - lat1) * kPi / 180.0;
-          double dlon = (lon2 - lon1) * kPi / 180.0;
-          double a = std::sin(dlat / 2) * std::sin(dlat / 2) + std::cos(lat1r) * std::cos(lat2r) * std::sin(dlon / 2) * std::sin(dlon / 2);
-          double c = 2 * std::atan2(std::sqrt(a), std::sqrt(1 - a));
-          double dist = kEarthRadius * c;
-          // Unit conversion
-          std::string unit = "m";
-          if (args.size() >= 5) unit = lower(args[4]);
-          if (unit == "km") dist /= 1000.0;
-          else if (unit == "mi") dist /= 1609.34;
-          else if (unit == "ft") dist /= 0.3048;
-          std::ostringstream oss;
-          oss << std::fixed << std::setprecision(4) << dist;
-          return encode_bulk(oss.str());
+          double dist = geoutil::dist(lon1, lat1, lon2, lat2);
+          double mul = 1.0;
+          if (args.size() >= 5 && !geoutil::unit_to_m(lower(args[4]), mul))
+            return encode_error("unsupported unit provided. please use M, KM, FT, MI");
+          char buf[64]; std::snprintf(buf, sizeof(buf), "%.4f", dist / mul);
+          return encode_bulk(buf);
         }});
 
     // ─── GEOPOS ──────────────────────────────────────────────────────────
-    t.emplace("GEOPOS", CommandSpec{"GEOPOS", -3, {"readonly"}, 1, 1, 1,
+    t.emplace("GEOPOS", CommandSpec{"GEOPOS", -2, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
           bool wt = false;
@@ -8553,21 +8748,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (wt) return wrongtype_error_reply();
           // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            auto bits = static_cast<std::uint64_t>(score);
-            double lon_min = -180, lon_max = 180;
-            double lat_min = -90, lat_max = 90;
-            for (int i = 51; i >= 0; --i) {
-              int b = (bits >> i) & 1;
-              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
-                double mid = (lon_min + lon_max) / 2;
-                if (b) lon_min = mid; else lon_max = mid;
-              } else { // latitude bits
-                double mid = (lat_min + lat_max) / 2;
-                if (b) lat_min = mid; else lat_max = mid;
-              }
-            }
-            lon = (lon_min + lon_max) / 2;
-            lat = (lat_min + lat_max) / 2;
+            geoutil::decode(static_cast<std::uint64_t>(score), lon, lat);
           };
           std::unordered_map<std::string, std::pair<double, double>> coords;
           for (const auto& [m, s] : items) {
@@ -8591,7 +8772,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     // ─── GEOHASH ─────────────────────────────────────────────────────────
-    t.emplace("GEOHASH", CommandSpec{"GEOHASH", -3, {"readonly"}, 1, 1, 1,
+    t.emplace("GEOHASH", CommandSpec{"GEOHASH", -2, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
           bool wt = false;
@@ -8599,21 +8780,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (wt) return wrongtype_error_reply();
           // Decode 52-bit interleaved geohash back to lon/lat.
           auto decode_geohash = [](double score, double& lon, double& lat) {
-            auto bits = static_cast<std::uint64_t>(score);
-            double lon_min = -180, lon_max = 180;
-            double lat_min = -90, lat_max = 90;
-            for (int i = 51; i >= 0; --i) {
-              int b = (bits >> i) & 1;
-              if (i % 2 == 1) { // longitude bits (even positions from MSB = odd i)
-                double mid = (lon_min + lon_max) / 2;
-                if (b) lon_min = mid; else lon_max = mid;
-              } else { // latitude bits
-                double mid = (lat_min + lat_max) / 2;
-                if (b) lat_min = mid; else lat_max = mid;
-              }
-            }
-            lon = (lon_min + lon_max) / 2;
-            lat = (lat_min + lat_max) / 2;
+            geoutil::decode(static_cast<std::uint64_t>(score), lon, lat);
           };
           constexpr const char* kBase32 = "0123456789bcdefghjkmnpqrstuvwxyz";
           auto encode_geohash_str = [&](double lon, double lat) -> std::string {
@@ -8623,7 +8790,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::uint64_t bits = 0;
             int num_bits = 0;
             std::string hash;
-            while (hash.size() < 11) {
+            // Redis derives 52 geohash bits (11 standard chars = 55 bits), then forces the
+            // 11th char to '0' since the low 3 bits are zero-padding (geohashCommand). We
+            // subdivide the first 10 chars (50 bits) and append the fixed final '0'.
+            while (hash.size() < 10) {
               if (is_lon) {
                 double mid = (lon_min + lon_max) / 2;
                 if (lon >= mid) { bits = (bits << 1) | 1; lon_min = mid; }
@@ -8641,6 +8811,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 num_bits = 0;
               }
             }
+            hash += kBase32[0];  // 11th char: low 3 geohash bits are zero-padding
             return hash;
           };
           std::unordered_map<std::string, double> score_map;
@@ -8661,31 +8832,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── GEORADIUS (deprecated but widely used) ──────────────────────────
     t.emplace("GEORADIUS", CommandSpec{"GEORADIUS", -6, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          // Simplified: return empty array for now (no actual geo computation)
-          // Full implementation would need geohash search
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          return encode_array({});
+        [](const std::vector<std::string>& args, SessionState& s, bool&) -> std::string {
+          return do_geo_search(args, s.resp_version, /*form=*/0, /*readonly=*/false);
         }});
 
     t.emplace("GEORADIUSBYMEMBER", CommandSpec{"GEORADIUSBYMEMBER", -5, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          return encode_array({});
+        [](const std::vector<std::string>& args, SessionState& s, bool&) -> std::string {
+          return do_geo_search(args, s.resp_version, /*form=*/1, /*readonly=*/false);
         }});
 
     // ─── GEOSEARCH ───────────────────────────────────────────────────────
     t.emplace("GEOSEARCH", CommandSpec{"GEOSEARCH", -7, {"readonly"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          // Simplified stub — full implementation requires geohash range scan
-          return encode_array({});
+        [](const std::vector<std::string>& args, SessionState& s, bool&) -> std::string {
+          return do_geo_search(args, s.resp_version, /*form=*/2, /*readonly=*/true);
         }});
 
     t.emplace("GEOSEARCHSTORE", CommandSpec{"GEOSEARCHSTORE", -8, {"write"}, 1, 2, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[2])) return wrongtype_error_reply();
-          return encode_integer(0);
+        [](const std::vector<std::string>& args, SessionState& s, bool&) -> std::string {
+          return do_geo_search(args, s.resp_version, /*form=*/3, /*readonly=*/false);
         }});
 
     // ─── XTRIM ───────────────────────────────────────────────────────────
@@ -9023,14 +9187,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return delegate("BITFIELD", a, s, c);
         }});
     t.emplace("GEORADIUS_RO", CommandSpec{"GEORADIUS_RO", -6, {"readonly"}, 1, 1, 1,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
-          for (const auto& x : a) { const auto o = upper(x); if (o == "STORE" || o == "STOREDIST") return encode_error("GEORADIUS_RO does not support STORE"); }
-          return delegate("GEORADIUS", a, s, c);
+        [](const std::vector<std::string>& a, SessionState& s, bool&) -> std::string {
+          return do_geo_search(a, s.resp_version, /*form=*/0, /*readonly=*/true);
         }});
     t.emplace("GEORADIUSBYMEMBER_RO", CommandSpec{"GEORADIUSBYMEMBER_RO", -5, {"readonly"}, 1, 1, 1,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
-          for (const auto& x : a) { const auto o = upper(x); if (o == "STORE" || o == "STOREDIST") return encode_error("GEORADIUSBYMEMBER_RO does not support STORE"); }
-          return delegate("GEORADIUSBYMEMBER", a, s, c);
+        [](const std::vector<std::string>& a, SessionState& s, bool&) -> std::string {
+          return do_geo_search(a, s.resp_version, /*form=*/1, /*readonly=*/true);
         }});
 
     // Pre-compute flag bitmasks for fast checking
@@ -9090,6 +9252,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   if (args[0] == "__err_bulklen__") {
     should_close = true;
     return encode_error("Protocol error: invalid bulk length");
+  }
+  if (args[0] == "__err_unauth_multibulk__") {
+    should_close = true;
+    return encode_error("Protocol error: unauthenticated multibulk length");
+  }
+  if (args[0] == "__err_unauth_bulklen__") {
+    should_close = true;
+    return encode_error("Protocol error: unauthenticated bulk length");
   }
 
   auto& ds = store();
@@ -9538,6 +9708,19 @@ void run_active_expire_cycle() {
     backlog_append(encode_command_resp({"DEL", key}));
     notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, dbidx);
   }
+}
+
+// Eviction cron: triggered from the event loop. Mirrors Redis's startEvictionTimeProc —
+// once maxmemory is exceeded (e.g. lowered below usage via CONFIG SET) under an eviction
+// policy, evict keys in the background so the 'evicted' keyspace event and DEL propagation
+// fire without waiting for the next write command. Cheap O(1) when under budget
+// (used_memory() is a bounded-staleness cache), and a no-op on replicas / during AOF replay.
+void run_eviction_cycle() {
+  if (g_pause_cron) return;  // DEBUG PAUSE-CRON
+  if (g_config_maxmemory <= 0 || g_maxmemory_policy == MaxmemoryPolicy::NoEviction) return;
+  if (g_replication_role == "slave" || g_replaying_aof) return;
+  if (store().used_memory() <= g_config_maxmemory) return;
+  evict_to_fit();
 }
 
 // Save-point cron: triggered from the event loop. Fires BGSAVE when any configured
@@ -10012,9 +10195,15 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     std::string line;
 
     // PING
-    if (!repl_send(fd, "*1\r\n$4\r\nPING\r\n") ||
-        !repl_readline(fd, line) ||
-        (line != "+PONG" && line.rfind("+PONG", 0) != 0)) {
+    if (!repl_send(fd, "*1\r\n$4\r\nPING\r\n") || !repl_readline(fd, line)) {
+        log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
+        ::close(fd);
+        return false;
+    }
+    // Redis's syncWithMaster tolerates -NOAUTH / -NOPERM / "operation not permitted" replies
+    // to the pre-AUTH PING: the master is alive, so replication continues to the AUTH step.
+    if (line.rfind("+PONG", 0) != 0 && line.rfind("-NOAUTH", 0) != 0 &&
+        line.rfind("-NOPERM", 0) != 0 && line.rfind("-ERR operation not permitted", 0) != 0) {
         log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
         ::close(fd);
         return false;
@@ -10024,7 +10213,9 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     if (!g_masterauth.empty()) {
         if (!repl_send(fd, repl_encode_cmd({"AUTH", g_masterauth})) ||
             !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
-            log(LogLevel::Error, "REPLICAOF: AUTH to master failed: " + line);
+            // Redis's syncWithMaster logs exactly this on a rejected AUTH; tooling and tests
+            // (unit/auth MASTERAUTH) match on the "Unable to AUTH to MASTER" phrasing.
+            log(LogLevel::Error, "Unable to AUTH to MASTER: " + line);
             ::close(fd);
             return false;
         }
