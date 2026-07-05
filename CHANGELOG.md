@@ -9,6 +9,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 10): sort suite adopted (full SORT rewrite)
+
+- **`unit/sort` adopted natively at 0 errors, with no skips** (21 suites total). `SORT`/`SORT_RO`
+  were rewritten to match Redis's full contract:
+  - **`BY`/`GET` hash-field patterns** (`key_*->field`) in addition to key patterns; `GET #`.
+  - **"Don't sort"** when the `BY` pattern has no `*` — retains native list/sorted-set order
+    (score order for zsets), reversed for `DESC`, with `LIMIT` applied.
+  - **Numeric validation**: every score must parse fully as a double or the command errors
+    (`One or more scores can't be converted into double`); a missing `BY` key scores 0.
+  - **Deterministic ordering**: equal numeric scores break ties lexicographically by element;
+    sets are alpha-sorted under `STORE`/scripts.
+  - **`SORT_RO`** rejects `STORE` as a syntax error; **`COMMAND GETKEYS`** now extracts the
+    (last) `STORE` destination key; and the `LIMIT` offset/count arithmetic is overflow-safe
+    (fixes a UBSan signed-overflow).
+
 ### Added — parity roadmap Phase 1 (wave 9): dump suite adopted
 
 - **`unit/dump` adopted natively at 0 errors** (20 suites total). `RESTORE` now matches Redis:

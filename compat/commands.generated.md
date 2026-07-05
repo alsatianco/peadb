@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 194, diff: 1, tested: 29, registered: 0
+Total: **234** commands — full: 10, upstream: 196, diff: 1, tested: 27, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -30,7 +30,7 @@ Total: **234** commands — full: 10, upstream: 194, diff: 1, tested: 29, regist
 | `BZPOPMIN` | upstream | test_p1_bzpop.py |
 | `CLIENT` | upstream | test_b4_observability.py, test_p3_ecosystem_commands.py, test_p4_new_events_hello_object.py |
 | `CLUSTER` | tested | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py |
-| `COMMAND` | tested | test_b5_commands.py, test_m1_commands.py |
+| `COMMAND` | upstream | test_b5_commands.py, test_m1_commands.py |
 | `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py |
 | `COPY` | upstream | test_p1_copy_spop_time.py, test_p1_xinfo_stream_full.py |
 | `DBSIZE` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py, test_p1_expire_lazy_scan.py |
@@ -172,7 +172,7 @@ Total: **234** commands — full: 10, upstream: 194, diff: 1, tested: 29, regist
 | `SMISMEMBER` | upstream | test_p3_ecosystem_commands.py |
 | `SMOVE` | upstream | test_b5_commands.py |
 | `SORT` | upstream | test_p3_sort_zmpop.py |
-| `SORT_RO` | tested | test_b5_commands.py |
+| `SORT_RO` | upstream | test_b5_commands.py |
 | `SPOP` | upstream | test_p1_copy_spop_time.py |
 | `SPUBLISH` | upstream | test_b5_commands.py |
 | `SRANDMEMBER` | upstream | test_p3_ecosystem_commands.py |
