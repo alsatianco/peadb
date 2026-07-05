@@ -10,6 +10,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "unit/bitfield": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 4,
+        "ok": 21
+      },
+      "mode": "native",
+      "skipfile_lines": 1
+    },
     "unit/bitops": {
       "last_counts": {
         "err": 0,

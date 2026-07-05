@@ -122,6 +122,7 @@ SUITES=(
   "unit/bitops"
   "unit/pubsub"
   "unit/pubsubshard"
+  "unit/bitfield"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

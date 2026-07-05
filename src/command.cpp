@@ -8264,8 +8264,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── BITFIELD ────────────────────────────────────────────────────────
     t.emplace("BITFIELD", CommandSpec{"BITFIELD", -2, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          // Simplified BITFIELD: supports GET, SET, INCRBY with unsigned/signed integer types
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          // BITFIELD: GET/SET/INCRBY on signed/unsigned integer bitfields with OVERFLOW modes.
           if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
           auto val = store().get(args[1]);
           std::string s = val ? *val : "";
@@ -8314,46 +8314,123 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               set_bit_fn(offset + static_cast<std::size_t>(bits - 1 - i), static_cast<int>((v >> i) & 1));
             }
           };
+          // Overflow handling mirrors Redis check{Signed,Unsigned}BitfieldOverflow (bitops.c):
+          // owtype 0=WRAP (default), 1=SAT, 2=FAIL. Returns 0 (no overflow) / ±1 (overflow),
+          // and on WRAP/SAT sets `limit` to the value to store.
+          enum { OW_WRAP = 0, OW_SAT = 1, OW_FAIL = 2 };
+          auto check_signed = [](std::int64_t value, std::int64_t incr, int bits, int owtype,
+                                 std::int64_t& limit) -> int {
+            const std::int64_t max = (bits == 64) ? INT64_MAX : ((std::int64_t{1} << (bits - 1)) - 1);
+            const std::int64_t min = (-max) - 1;
+            const std::int64_t maxincr = static_cast<std::int64_t>(static_cast<std::uint64_t>(max) - static_cast<std::uint64_t>(value));
+            const std::int64_t minincr = min - value;
+            auto wrap = [&]() {
+              const std::uint64_t msb = std::uint64_t{1} << (bits - 1);
+              std::uint64_t c = static_cast<std::uint64_t>(value) + static_cast<std::uint64_t>(incr);
+              if (bits < 64) {
+                const std::uint64_t mask = ~std::uint64_t{0} << bits;
+                if (c & msb) c |= mask; else c &= ~mask;
+              }
+              limit = static_cast<std::int64_t>(c);
+            };
+            if (value > max || (bits != 64 && incr > maxincr) || (value >= 0 && incr > 0 && incr > maxincr)) {
+              if (owtype == OW_WRAP) wrap(); else if (owtype == OW_SAT) limit = max;
+              return 1;
+            } else if (value < min || (bits != 64 && incr < minincr) || (value < 0 && incr < 0 && incr < minincr)) {
+              if (owtype == OW_WRAP) wrap(); else if (owtype == OW_SAT) limit = min;
+              return -1;
+            }
+            return 0;
+          };
+          auto check_unsigned = [](std::uint64_t value, std::int64_t incr, int bits, int owtype,
+                                   std::uint64_t& limit) -> int {
+            const std::uint64_t max = (bits == 64) ? UINT64_MAX : ((std::uint64_t{1} << bits) - 1);
+            const std::int64_t maxincr = static_cast<std::int64_t>(max - value);
+            const std::int64_t minincr = -static_cast<std::int64_t>(value);
+            auto wrap = [&]() {
+              const std::uint64_t mask = ~std::uint64_t{0} << bits;
+              limit = (value + static_cast<std::uint64_t>(incr)) & ~mask;
+            };
+            if (value > max || (incr > 0 && incr > maxincr)) {
+              if (owtype == OW_WRAP) wrap(); else if (owtype == OW_SAT) limit = max;
+              return 1;
+            } else if (incr < 0 && incr < minincr) {
+              if (owtype == OW_WRAP) wrap(); else if (owtype == OW_SAT) limit = 0;
+              return -1;
+            }
+            return 0;
+          };
           bool modified = false;
+          int owtype = OW_WRAP;
           std::vector<std::string> results;
           std::size_t i = 2;
           while (i < args.size()) {
             auto subcmd = upper(args[i]);
-            if (subcmd == "OVERFLOW") { ++i; if (i < args.size()) ++i; continue; } // skip overflow mode
+            if (subcmd == "OVERFLOW") {
+              if (i + 1 >= args.size()) return encode_error("syntax error");
+              const auto m = upper(args[i + 1]);
+              if (m == "WRAP") owtype = OW_WRAP;
+              else if (m == "SAT") owtype = OW_SAT;
+              else if (m == "FAIL") owtype = OW_FAIL;
+              else return encode_error("Invalid OVERFLOW type specified");
+              i += 2;
+              continue;
+            }
             if (subcmd == "GET") {
               if (i + 2 >= args.size()) return encode_error("syntax error");
               bool is_signed; int bits;
-              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
+              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
               std::size_t off;
               if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
               results.push_back(encode_integer(read_field(off, bits, is_signed)));
               i += 3;
-            } else if (subcmd == "SET") {
+            } else if (subcmd == "SET" || subcmd == "INCRBY") {
+              const bool is_incr = subcmd == "INCRBY";
               if (i + 3 >= args.size()) return encode_error("syntax error");
               bool is_signed; int bits;
-              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
+              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type. Use something like i16 u8. Note that u64 is not supported but i64 is.");
               std::size_t off;
               if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
-              std::int64_t new_val;
-              if (!parse_i64(args[i + 3], new_val)) return encode_error("value is not an integer or out of range");
-              results.push_back(encode_integer(read_field(off, bits, is_signed)));
-              write_field(off, bits, new_val);
-              modified = true;
+              std::int64_t arg;
+              if (!parse_i64(args[i + 3], arg)) return encode_error("value is not an integer or out of range");
               i += 4;
-            } else if (subcmd == "INCRBY") {
-              if (i + 3 >= args.size()) return encode_error("syntax error");
-              bool is_signed; int bits;
-              if (!parse_type(args[i + 1], is_signed, bits)) return encode_error("Invalid bitfield type");
-              std::size_t off;
-              if (!parse_offset(args[i + 2], bits, off)) return encode_error("bit offset is not an integer or out of range");
-              std::int64_t incr;
-              if (!parse_i64(args[i + 3], incr)) return encode_error("value is not an integer or out of range");
-              std::int64_t old_val = read_field(off, bits, is_signed);
-              std::int64_t new_val = old_val + incr;
-              write_field(off, bits, new_val);
-              results.push_back(encode_integer(read_field(off, bits, is_signed)));
-              modified = true;
-              i += 4;
+              const std::int64_t oldv = read_field(off, bits, is_signed);
+              std::int64_t newval, retval;
+              int overflow;
+              if (is_signed) {
+                std::int64_t wrapped = 0;
+                if (is_incr) {
+                  overflow = check_signed(oldv, arg, bits, owtype, wrapped);
+                  newval = overflow ? wrapped : oldv + arg;
+                  retval = newval;
+                } else {
+                  newval = arg;
+                  overflow = check_signed(newval, 0, bits, owtype, wrapped);
+                  if (overflow) newval = wrapped;
+                  retval = oldv;
+                }
+              } else {
+                std::uint64_t wrapped = 0;
+                const std::uint64_t oldu = static_cast<std::uint64_t>(oldv);
+                if (is_incr) {
+                  overflow = check_unsigned(oldu, arg, bits, owtype, wrapped);
+                  newval = static_cast<std::int64_t>(overflow ? wrapped : oldu + static_cast<std::uint64_t>(arg));
+                  retval = newval;
+                } else {
+                  const std::uint64_t nv = static_cast<std::uint64_t>(arg);
+                  overflow = check_unsigned(nv, 0, bits, owtype, wrapped);
+                  newval = static_cast<std::int64_t>(overflow ? wrapped : nv);
+                  retval = oldv;
+                }
+              }
+              // OVERFLOW FAIL: on overflow, write nothing and reply nil for this op.
+              if (overflow && owtype == OW_FAIL) {
+                results.push_back(encode_null(session.resp_version));
+              } else {
+                write_field(off, bits, newval);
+                modified = true;
+                results.push_back(encode_integer(retval));
+              }
             } else {
               return encode_error("syntax error");
             }

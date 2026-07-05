@@ -1,0 +1,5 @@
+# Uses wait_for_ofs_sync, which needs a replica to report the master's byte offset as
+# master_repl_offset. PeaDB's in-process streaming replica applies commands correctly but
+# does not yet track the master replication byte offset (always reports 0), so offset sync
+# times out. Precise replica offset tracking is a Phase-4 item — compat/delta.md item 8.
+BITFIELD: write on master, read on slave
