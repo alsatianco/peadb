@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 196, diff: 1, tested: 27, registered: 0
+Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -56,15 +56,15 @@ Total: **234** commands — full: 10, upstream: 196, diff: 1, tested: 27, regist
 | `FLUSHDB` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py |
 | `FUNCTION` | upstream | test_command_coverage_extras.py, test_p2_function_basic.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py |
 | `GEOADD` | upstream | test_b5_commands.py, test_m4_set.py, test_p3_ecosystem_commands.py |
-| `GEODIST` | tested | test_p3_ecosystem_commands.py |
-| `GEOHASH` | tested | test_p3_ecosystem_commands.py |
-| `GEOPOS` | tested | test_p3_ecosystem_commands.py |
-| `GEORADIUS` | tested | test_p3_ecosystem_commands.py |
-| `GEORADIUSBYMEMBER` | tested | test_p3_ecosystem_commands.py |
-| `GEORADIUSBYMEMBER_RO` | tested | test_b5_commands.py |
-| `GEORADIUS_RO` | tested | test_b5_commands.py |
-| `GEOSEARCH` | tested | test_p3_ecosystem_commands.py |
-| `GEOSEARCHSTORE` | tested | test_p3_ecosystem_commands.py |
+| `GEODIST` | upstream | test_p3_ecosystem_commands.py |
+| `GEOHASH` | upstream | test_p3_ecosystem_commands.py |
+| `GEOPOS` | upstream | test_p3_ecosystem_commands.py |
+| `GEORADIUS` | upstream | test_p3_ecosystem_commands.py |
+| `GEORADIUSBYMEMBER` | upstream | test_p3_ecosystem_commands.py |
+| `GEORADIUSBYMEMBER_RO` | upstream | test_b5_commands.py |
+| `GEORADIUS_RO` | upstream | test_b5_commands.py |
+| `GEOSEARCH` | upstream | test_p3_ecosystem_commands.py |
+| `GEOSEARCHSTORE` | upstream | test_p3_ecosystem_commands.py |
 | `GET` | full | test_b10_protocol.py, test_b14_lazyfree.py, test_b7_eviction.py, test_b8_repl_safety.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m4_lua2_atomic.py, test_m4_tx.py, test_m5_aof.py, test_m5_snapshot_roundtrip.py, test_m7_migrate.py, test_m7_redirection.py, test_m8_module_key_api.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_copy_spop_time.py, test_p1_expire_error_and_lazy_get.py, test_p1_getset.py, test_p1_move.py, test_p1_msetnx_debug_loadaof.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_set_get_option.py, test_p1_setnx_debug.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p2_script_rewrite_ops.py, test_p4_debug_verbs.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
 | `GETBIT` | upstream | test_p1_bitmap_xreadgroup.py, test_p4_limits_errors.py |
 | `GETDEL` | upstream | test_command_coverage_extras.py |

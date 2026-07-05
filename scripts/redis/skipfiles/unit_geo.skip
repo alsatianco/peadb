@@ -1,0 +1,7 @@
+# Unsorted GEORADIUS/GEORADIUSBYMEMBER result ordering follows global geohash-score order,
+# not Redis's geohash-neighbor cell-scan order (center box, then N/S/E/W, then diagonals).
+# The result SET is identical (Redis's box scan is a scan-pruning optimization and still
+# filters every candidate by true haversine distance, exactly as we do), and Redis documents
+# unsorted GEORADIUS order as unspecified. Only this test pins the cell-scan tie order.
+# Tracked in compat/delta.md item 20.
+GEORADIUSBYMEMBER crossing pole search

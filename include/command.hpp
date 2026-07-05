@@ -120,6 +120,7 @@ void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb" (sta
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
 void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
 void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)
+void run_eviction_cycle();       // event-loop background eviction when over maxmemory (master only)
 void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
 std::size_t replication_event_count();

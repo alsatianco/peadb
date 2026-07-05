@@ -457,8 +457,17 @@ int run_server(const ServerConfig& config) {
     return true;
   };
 
+  // Self-published messages (a client PUBLISHing/keyspace-notifying a channel it is itself
+  // subscribed to) must be delivered AFTER that command's own reply — including after the
+  // whole EXEC array or script reply. Redis buffers them onto the executing client's reply;
+  // we do the same by capturing frames destined for the currently-dispatching fd here and
+  // appending them to the reply once the top-level command returns (see the dispatch loop).
+  int self_dispatch_fd = -1;
+  std::string self_pubsub_pending;
+
   // Wire up the pub/sub send callback (must be after enqueue_output is defined)
   g_pubsub_send = [&](int fd, const std::string& data) -> bool {
+    if (fd == self_dispatch_fd) { self_pubsub_pending += data; return true; }
     if (!sessions.count(fd)) return false;
     return enqueue_output(fd, data);
   };
@@ -519,10 +528,14 @@ int run_server(const ServerConfig& config) {
       std::size_t consumed = 0;
       while (true) {
         const std::string_view rem(input.data() + consumed, input.size() - consumed);
-        auto parsed = parse_one_command(rem);
+        auto parsed = parse_one_command(rem, requirepass_is_set() && !session.authenticated);
         if (!parsed.has_value()) break;
         g_total_commands_processed.fetch_add(1);
+        self_dispatch_fd = session.fd;
         batch += safe_handle_command(parsed->args, session, sc);
+        batch += self_pubsub_pending;  // self-directed messages come after the reply
+        self_pubsub_pending.clear();
+        self_dispatch_fd = -1;
         consumed += parsed->consumed;
         if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
@@ -676,6 +689,7 @@ int run_server(const ServerConfig& config) {
     }
     aof_fsync_if_needed(loop_now_ms);
     background_save_cron();
+    run_eviction_cycle();  // background eviction when over maxmemory (e.g. lowered via CONFIG SET)
     reap_background_children();
     drain_replica_cmd_queue();
 
@@ -799,6 +813,11 @@ int run_server(const ServerConfig& config) {
           {
             auto& sess = sessions[client_fd];
             sess = SessionState{};
+            // clientSetDefaultAuth: a client is authenticated at connect time iff the
+            // default user is nopass (no requirepass). This must be captured now, not
+            // recomputed per command, so a later CONFIG SET requirepass does not retroactively
+            // de-authenticate connections that joined while the server was open.
+            sess.authenticated = !requirepass_is_set();
             sess.client_id = g_next_client_id.fetch_add(1);
             sess.fd = client_fd;
             if (is_unix) {
@@ -901,12 +920,16 @@ int run_server(const ServerConfig& config) {
       std::size_t consumed_total = 0;
       while (true) {
         const std::string_view remaining(input.data() + consumed_total, input.size() - consumed_total);
-        auto parsed = parse_one_command(remaining);
+        auto parsed = parse_one_command(remaining, requirepass_is_set() && !session.authenticated);
         if (!parsed.has_value()) break;
 
         g_total_commands_processed.fetch_add(1);
+        self_dispatch_fd = session.fd;
         const std::string reply = safe_handle_command(parsed->args, session, should_close);
         batch_reply += reply;
+        batch_reply += self_pubsub_pending;  // self-directed messages come after the reply
+        self_pubsub_pending.clear();
+        self_dispatch_fd = -1;
         consumed_total += parsed->consumed;
 
         if (should_close) break;

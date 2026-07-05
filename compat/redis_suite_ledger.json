@@ -4,8 +4,8 @@
     "unit/auth": {
       "last_counts": {
         "err": 0,
-        "ignored": 1,
-        "ok": 6
+        "ignored": 4,
+        "ok": 10
       },
       "mode": "native",
       "skipfile_lines": 0
@@ -50,6 +50,15 @@
       "mode": "native",
       "skipfile_lines": 3
     },
+    "unit/geo": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 2,
+        "ok": 63
+      },
+      "mode": "native",
+      "skipfile_lines": 1
+    },
     "unit/keyspace": {
       "last_counts": {
         "err": 0,
@@ -79,8 +88,8 @@
     "unit/pubsub": {
       "last_counts": {
         "err": 0,
-        "ignored": 0,
-        "ok": 28
+        "ignored": 1,
+        "ok": 34
       },
       "mode": "native",
       "skipfile_lines": 0
