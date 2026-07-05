@@ -2283,6 +2283,159 @@ std::string list_pop_command(const std::vector<std::string>& args, bool left, Re
   });
 }
 
+// Full SORT / SORT_RO implementation (shared; readonly rejects STORE). Mirrors Redis sort.c:
+// BY/GET support key-pattern and hash-field (key_*->field) lookups; a BY pattern without '*'
+// means "don't sort" (retain native list/zset order, reversed for DESC); numeric sorting
+// requires every score to parse fully as a double; ties break lexicographically by element.
+std::string do_sort(const std::vector<std::string>& args, RespVersion resp, bool readonly) {
+  std::string store_key; bool have_store = false;
+  bool desc = false, alpha = false, have_by = false;
+  std::string by_pattern;
+  std::vector<std::string> get_patterns;
+  std::int64_t limit_offset = 0, limit_count = -1; bool have_limit = false;
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const auto opt = upper(args[i]);
+    if (opt == "STORE" && i + 1 < args.size()) {
+      if (readonly) return encode_error("syntax error");
+      store_key = args[++i]; have_store = true;
+    } else if (opt == "DESC") { desc = true; }
+    else if (opt == "ASC") { desc = false; }
+    else if (opt == "ALPHA") { alpha = true; }
+    else if (opt == "BY" && i + 1 < args.size()) { by_pattern = args[++i]; have_by = true; }
+    else if (opt == "GET" && i + 1 < args.size()) { get_patterns.push_back(args[++i]); }
+    else if (opt == "LIMIT" && i + 2 < args.size()) {
+      if (!parse_i64(args[i + 1], limit_offset) || !parse_i64(args[i + 2], limit_count))
+        return encode_error("value is not an integer or out of range");
+      have_limit = true; i += 2;
+    } else {
+      return encode_error("syntax error");
+    }
+  }
+  // "Don't sort" when a BY pattern has no '*' (a constant) — retain native order.
+  bool dontsort = have_by && by_pattern.find('*') == std::string::npos;
+
+  const auto type = store().type_of(args[1]);
+  const bool is_set = (type == "set");
+  std::vector<std::string> vals;
+  if (type == "none") {
+    // empty
+  } else if (type == "list") {
+    bool wt = false; vals = store().lrange(args[1], 0, -1, wt); if (wt) return wrongtype_error_reply();
+  } else if (type == "set") {
+    bool wt = false; vals = store().smembers(args[1], wt); if (wt) return wrongtype_error_reply();
+  } else if (type == "zset") {
+    bool wt = false; auto pr = store().zrange(args[1], 0, -1, false, wt); if (wt) return wrongtype_error_reply();
+    for (auto& p : pr) vals.push_back(p.first);
+  } else {
+    return wrongtype_error_reply();
+  }
+
+  // A set has no native order, so when the result must be deterministic (STORE or from a
+  // script) Redis forces an ALPHA sort instead of "don't sort".
+  if (dontsort && is_set && (have_store || in_lua_script_context())) {
+    dontsort = false; alpha = true; have_by = false;
+  }
+
+  // Substitute '*' with the element; a "->field" suffix (non-empty field) is a hash lookup.
+  auto lookup = [&](const std::string& pattern, const std::string& elem) -> std::optional<std::string> {
+    auto star = pattern.find('*');
+    if (star == std::string::npos) return std::nullopt;
+    std::string sub = pattern; sub.replace(star, 1, elem);
+    auto arrow = sub.find("->");
+    if (arrow != std::string::npos && arrow + 2 < sub.size()) {
+      bool wt = false; return store().hget(sub.substr(0, arrow), sub.substr(arrow + 2), wt);
+    }
+    return store().get(sub);
+  };
+
+  if (!dontsort) {
+    struct Item { std::string elem; std::string cmp; bool has_cmp; double score; };
+    std::vector<Item> items; items.reserve(vals.size());
+    for (auto& v : vals) {
+      Item it; it.elem = v; it.has_cmp = true; it.cmp.clear(); it.score = 0;
+      std::optional<std::string> byval = have_by ? lookup(by_pattern, v) : std::optional<std::string>(v);
+      if (alpha) {
+        // Missing BY value → NULL compare object (sorts before present ones).
+        it.has_cmp = byval.has_value();
+        if (byval) it.cmp = *byval;
+      } else if (byval) {
+        // Numeric: the score must parse fully as a double (Redis strtod semantics).
+        const std::string& s = *byval;
+        errno = 0; char* eptr = nullptr;
+        const double d = std::strtod(s.c_str(), &eptr);
+        if (s.empty() || *eptr != '\0' || errno == ERANGE || std::isnan(d))
+          return encode_error("One or more scores can't be converted into double");
+        it.score = d;
+      }
+      // else numeric + missing BY value → score stays 0.
+      items.push_back(std::move(it));
+    }
+    std::stable_sort(items.begin(), items.end(), [&](const Item& a, const Item& b) {
+      int cmp;
+      if (!alpha) {
+        cmp = (a.score < b.score) ? -1 : (a.score > b.score) ? 1
+              : (a.elem < b.elem ? -1 : a.elem > b.elem ? 1 : 0);  // tie → lexicographic
+      } else if (have_by) {
+        if (!a.has_cmp || !b.has_cmp) cmp = (a.has_cmp == b.has_cmp) ? 0 : (!a.has_cmp ? -1 : 1);
+        else cmp = (a.cmp < b.cmp) ? -1 : (a.cmp > b.cmp) ? 1 : 0;
+      } else {
+        cmp = (a.elem < b.elem) ? -1 : (a.elem > b.elem) ? 1 : 0;
+      }
+      return (desc ? -cmp : cmp) < 0;
+    });
+    vals.clear();
+    for (auto& it : items) vals.push_back(std::move(it.elem));
+  } else if (desc) {
+    std::reverse(vals.begin(), vals.end());  // dontsort + DESC → reverse native order
+  }
+
+  // LIMIT offset count (overflow-safe): clamp a negative offset to 0, negative count to "all".
+  if (have_limit) {
+    std::int64_t n = static_cast<std::int64_t>(vals.size());
+    std::int64_t start = limit_offset < 0 ? 0 : limit_offset;
+    if (start > n) start = n;
+    std::int64_t remain = n - start;
+    std::int64_t take = (limit_count < 0) ? remain : std::min(limit_count, remain);
+    vals = std::vector<std::string>(vals.begin() + start, vals.begin() + start + take);
+  }
+
+  // Materialize GET projections (# = element, pattern lookup otherwise; nil if missing).
+  std::vector<std::string> results;
+  if (get_patterns.empty()) {
+    results = vals;
+  } else {
+    for (const auto& v : vals) {
+      for (const auto& pat : get_patterns) {
+        if (pat == "#") results.push_back(v);
+        else {
+          auto got = lookup(pat, v);
+          results.push_back(got.value_or(std::string()));  // sentinel; nil-encoded below
+        }
+      }
+    }
+  }
+
+  if (have_store) {
+    store().del(store_key);
+    // GET-missing entries are stored as empty strings (Redis behavior for SORT ... STORE).
+    if (!results.empty()) { bool wt = false; (void)store().rpush(store_key, results, wt); }
+    return encode_integer(static_cast<long long>(results.size()));
+  }
+  std::vector<std::string> out; out.reserve(results.size());
+  if (get_patterns.empty()) {
+    for (const auto& v : results) out.push_back(encode_bulk(v));
+  } else {
+    // Re-derive nil vs value for GET projections: a missing lookup is a RESP nil.
+    for (const auto& v : vals) {
+      for (const auto& pat : get_patterns) {
+        if (pat == "#") out.push_back(encode_bulk(v));
+        else { auto got = lookup(pat, v); out.push_back(got ? encode_bulk(*got) : encode_null(resp)); }
+      }
+    }
+  }
+  return encode_array(out);
+}
+
 const std::unordered_map<std::string, CommandSpec>& command_table() {
   static const std::unordered_map<std::string, CommandSpec> table = [] {
     std::unordered_map<std::string, CommandSpec> t;
@@ -3337,6 +3490,22 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it == table.end()) return encode_error("Invalid command specified");
             const auto& s = it->second;
             const std::vector<std::string> cmdline(args.begin() + 2, args.end());
+            // SORT/SORT_RO: the source key plus (for SORT) the optional STORE destination.
+            const auto gk_cmd = upper(cmdline[0]);
+            if ((gk_cmd == "SORT" || gk_cmd == "SORT_RO") && cmdline.size() >= 2) {
+              std::vector<std::string> keys;
+              auto emit = [&](const std::string& k) {
+                keys.push_back(sub == "GETKEYSANDFLAGS"
+                                   ? encode_array({encode_bulk(k), encode_array({})}) : encode_bulk(k));
+              };
+              emit(cmdline[1]);
+              // Multiple STORE clauses are allowed; the LAST destination wins (matches do_sort).
+              std::string store_dest; bool have_store = false;
+              for (std::size_t i = 2; i + 1 < cmdline.size(); ++i)
+                if (upper(cmdline[i]) == "STORE") { store_dest = cmdline[i + 1]; have_store = true; ++i; }
+              if (have_store) emit(store_dest);
+              return encode_array(keys);
+            }
             if (s.first_key <= 0) return encode_error("The command has no key arguments");
             int last = s.last_key;
             if (last < 0) last = static_cast<int>(cmdline.size()) + last;
@@ -4350,145 +4519,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("SORT", CommandSpec{"SORT", -2, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::string store_key;
-          bool desc = false;
-          bool alpha = false;
-          std::string by_pattern;
-          std::vector<std::string> get_patterns;
-          std::int64_t limit_offset = 0, limit_count = -1;
-          for (std::size_t i = 2; i < args.size(); ++i) {
-            const auto opt = upper(args[i]);
-            if (opt == "STORE" && i + 1 < args.size()) {
-              store_key = args[++i];
-            } else if (opt == "DESC") {
-              desc = true;
-            } else if (opt == "ASC") {
-              desc = false;
-            } else if (opt == "ALPHA") {
-              alpha = true;
-            } else if (opt == "BY" && i + 1 < args.size()) {
-              by_pattern = args[++i];
-            } else if (opt == "GET" && i + 1 < args.size()) {
-              get_patterns.push_back(args[++i]);
-            } else if (opt == "LIMIT" && i + 2 < args.size()) {
-              if (!parse_i64(args[i+1], limit_offset) || !parse_i64(args[i+2], limit_count))
-                return encode_error("value is not an integer or out of range");
-              i += 2;
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          const auto type = store().type_of(args[1]);
-          std::vector<std::string> vals;
-          if (type == "none") {
-            vals.clear();
-          } else if (type == "list") {
-            bool wrongtype = false;
-            vals = store().lrange(args[1], 0, -1, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-          } else if (type == "set") {
-            bool wrongtype = false;
-            vals = store().smembers(args[1], wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-          } else if (type == "zset") {
-            bool wrongtype = false;
-            auto pairs = store().zrange(args[1], 0, -1, false, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            for (const auto& p : pairs) vals.push_back(p.first);
-          } else {
-            return wrongtype_error_reply();
-          }
-          // BY _ means "no sort" (natural/alphabetical order from iteration)
-          if (by_pattern != "_") {
-            if (!by_pattern.empty()) {
-              // Sort by external key pattern
-              // Replace * in pattern with val to get the sort key
-              auto get_by_key = [&](const std::string& val) -> std::string {
-                std::string key = by_pattern;
-                auto pos = key.find('*');
-                if (pos != std::string::npos) key.replace(pos, 1, val);
-                auto v = store().get(key);
-                return v.value_or("0");
-              };
-              if (alpha) {
-                std::sort(vals.begin(), vals.end(), [&](const std::string& a, const std::string& b) {
-                  const auto va = get_by_key(a), vb = get_by_key(b);
-                  if (desc) return va > vb;
-                  return va < vb;
-                });
-              } else {
-                auto to_num = [](const std::string& s) -> double {
-                  try { return std::stod(s); } catch (...) { return 0; }
-                };
-                std::sort(vals.begin(), vals.end(), [&](const std::string& a, const std::string& b) {
-                  const auto va = to_num(get_by_key(a)), vb = to_num(get_by_key(b));
-                  if (desc) return va > vb;
-                  return va < vb;
-                });
-              }
-            } else if (alpha) {
-              // Alphabetical sort
-              if (desc)
-                std::sort(vals.begin(), vals.end(), std::greater<std::string>());
-              else
-                std::sort(vals.begin(), vals.end());
-            } else {
-              // Numeric sort (default)
-              auto to_num = [](const std::string& s) -> double {
-                try { return std::stod(s); } catch (...) { return 0; }
-              };
-              if (desc)
-                std::sort(vals.begin(), vals.end(), [&](const std::string& a, const std::string& b) { return to_num(a) > to_num(b); });
-              else
-                std::sort(vals.begin(), vals.end(), [&](const std::string& a, const std::string& b) { return to_num(a) < to_num(b); });
-            }
-          } else {
-            // BY _ : alphabetical/natural order
-            std::sort(vals.begin(), vals.end());
-          }
-          // Apply LIMIT
-          if (limit_count >= 0) {
-            if (static_cast<std::size_t>(limit_offset) >= vals.size()) {
-              vals.clear();
-            } else {
-              auto end = std::min(vals.size(), static_cast<std::size_t>(limit_offset + limit_count));
-              vals = std::vector<std::string>(vals.begin() + limit_offset, vals.begin() + static_cast<std::ptrdiff_t>(end));
-            }
-          }
-          if (!store_key.empty()) {
-            store().del(store_key);
-            if (!vals.empty()) {
-              bool wrongtype = false;
-              (void)store().rpush(store_key, vals, wrongtype);
-            }
-            return encode_integer(static_cast<long long>(vals.size()));
-          }
-          // Build output
-          std::vector<std::string> out;
-          if (get_patterns.empty()) {
-            out.reserve(vals.size());
-            for (const auto& v : vals) out.push_back(encode_bulk(v));
-          } else {
-            for (const auto& v : vals) {
-              for (const auto& pat : get_patterns) {
-                if (pat == "#") {
-                  out.push_back(encode_bulk(v));
-                } else {
-                  std::string key = pat;
-                  auto pos = key.find('*');
-                  if (pos != std::string::npos) key.replace(pos, 1, v);
-                  auto got = store().get(key);
-                  if (got.has_value()) {
-                    out.push_back(encode_bulk(*got));
-                  } else {
-                    out.push_back(encode_null(RespVersion::Resp2));
-                  }
-                }
-              }
-            }
-          }
-          return encode_array(out);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          return do_sort(args, session.resp_version, /*readonly=*/false);
         }});
 
     t.emplace("RENAME", CommandSpec{"RENAME", 3, {"write"}, 1, 2, 1,
@@ -8978,9 +9010,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── Read-only command variants (reject the write/STORE options) ─────
     t.emplace("SORT_RO", CommandSpec{"SORT_RO", -2, {"readonly"}, 1, 1, 1,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
-          for (const auto& x : a) if (upper(x) == "STORE") return encode_error("SORT_RO does not support STORE");
-          return delegate("SORT", a, s, c);
+        [](const std::vector<std::string>& a, SessionState& s, bool&) -> std::string {
+          return do_sort(a, s.resp_version, /*readonly=*/true);
         }});
     t.emplace("BITFIELD_RO", CommandSpec{"BITFIELD_RO", -2, {"readonly", "fast"}, 1, 1, 1,
         [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) -> std::string {
