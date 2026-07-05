@@ -9,6 +9,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 7): pubsub + pubsubshard suites adopted
+
+- **`unit/pubsub` and `unit/pubsubshard` adopted natively at 0 errors** (18 suites total).
+  - **`CLIENT REPLY ON/OFF/SKIP`** now actually suppress normal command replies (previously a
+    stub that always returned `+OK`), enforced at the `safe_handle_command` chokepoint; pub/sub
+    (un)subscribe confirmations bypass suppression, matching Redis.
+  - **Keyspace notifications fire only on real mutations**: a no-op `SADD`/`SREM`/`ZREM`/`HDEL`/
+    `LREM` (integer reply `0`) publishes nothing, and the stream consumer-group events
+    (`xgroup-create`, `xgroup-createconsumer`, `xgroup-delconsumer`) are now emitted — including
+    the implicit consumer creation by `XREADGROUP`/`XCLAIM`/`XAUTOCLAIM`.
+  - **Sharded pub/sub** (`SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH`, previously thin aliases of the
+    regular commands) is now a real separate channel namespace with `ssubscribe`/`sunsubscribe`/
+    `smessage` reply types, an independent per-client subscription count, `PUBSUB SHARDCHANNELS`/
+    `SHARDNUMSUB`, and replication of `SPUBLISH` to replicas.
+
 ### Added — parity roadmap Phase 1 (wave 6): quit + auth + bitops suites adopted
 
 - **`unit/quit`, `unit/auth`, and `unit/bitops` adopted natively at 0 errors** (16 suites total).

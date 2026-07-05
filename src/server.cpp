@@ -46,14 +46,30 @@ void set_cloexec(int fd) {
 // loop and take down every connection.
 std::string safe_handle_command(const std::vector<std::string>& args,
                                 SessionState& session, bool& should_close) {
+  std::string reply;
   try {
-    return handle_command(args, session, should_close);
+    reply = handle_command(args, session, should_close);
   } catch (const std::exception& ex) {
     log(LogLevel::Error, std::string("command handler exception: ") + ex.what());
+    reply = "-ERR internal error\r\n";
   } catch (...) {
     log(LogLevel::Error, "command handler exception (unknown)");
+    reply = "-ERR internal error\r\n";
   }
-  return std::string("-ERR internal error\r\n");
+  // CLIENT REPLY OFF/SKIP: suppress normal command replies. Pub/sub (un)subscribe
+  // confirmations are push-like and must always reach the client, so they bypass this.
+  std::string cmd0;
+  if (!args.empty()) { cmd0 = args[0]; for (auto& c : cmd0) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+  const bool subscribe_family = cmd0 == "SUBSCRIBE" || cmd0 == "UNSUBSCRIBE" ||
+                                cmd0 == "PSUBSCRIBE" || cmd0 == "PUNSUBSCRIBE" ||
+                                cmd0 == "SSUBSCRIBE" || cmd0 == "SUNSUBSCRIBE";
+  const bool suppress = (session.reply_off || session.reply_skip) && !subscribe_family;
+  // Advance the skip state: consume the armed skip for this command, then arm it for the
+  // next command if a CLIENT REPLY SKIP just ran.
+  session.reply_skip = false;
+  if (session.reply_skip_next) { session.reply_skip = true; session.reply_skip_next = false; }
+  if (suppress) return std::string();
+  return reply;
 }
 
 bool set_tcp_nodelay(int fd) {

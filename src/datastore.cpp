@@ -1863,8 +1863,9 @@ int DataStore::xgroup_createconsumer(const std::string& key, const std::string& 
 }
 
 std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::string& group, const std::string& consumer,
-                                           bool& wrongtype, std::string& err) {
+                                           bool& wrongtype, std::string& err, bool* existed) {
   wrongtype = false; err.clear();
+  if (existed) *existed = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
@@ -1875,6 +1876,7 @@ std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::st
     err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0;
   }
   auto& g = git->second;
+  if (existed) *existed = g.consumers.count(consumer) > 0;
   std::int64_t removed = 0;
   for (auto pit = g.pending_to_consumer.begin(); pit != g.pending_to_consumer.end();) {
     if (pit->second == consumer) {
@@ -2133,8 +2135,9 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
 std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xclaim(
     const std::string& key, const std::string& group, const std::string& consumer,
     std::int64_t min_idle_ms, const std::vector<std::string>& ids_in, bool justid, bool force,
-    bool& wrongtype, std::string& err, const std::string* last_id) {
+    bool& wrongtype, std::string& err, const std::string* last_id, bool* consumer_created) {
   wrongtype = false; err.clear();
+  if (consumer_created) *consumer_created = false;
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -2146,6 +2149,7 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   auto& g = git->second;
   // XCLAIM creates the target consumer as a side effect (needed so a replayed XCLAIM restores
   // the consumer even when the read that produced it was propagated as bare XCLAIMs).
+  if (consumer_created && g.consumers.find(consumer) == g.consumers.end()) *consumer_created = true;
   g.consumers[consumer].seen_time = now_ms();
   // LASTID advances the group cursor (used by XREADGROUP-effect propagation for ACK reads).
   if (last_id) {
@@ -2208,8 +2212,9 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
 DataStore::AutoClaimResult DataStore::xautoclaim(
     const std::string& key, const std::string& group, const std::string& consumer,
     std::int64_t min_idle_ms, const std::string& start, std::int64_t count, bool justid,
-    bool& wrongtype, std::string& err) {
+    bool& wrongtype, std::string& err, bool* consumer_created) {
   wrongtype = false; err.clear();
+  if (consumer_created) *consumer_created = false;
   AutoClaimResult res;
   res.next_cursor = "0-0";
   auto& db = dbs_[current_db_];
@@ -2223,6 +2228,7 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
   const std::int64_t now = now_ms();
   if (count <= 0) count = 100;
   // Ensure the target consumer exists (XAUTOCLAIM creates it as a side effect).
+  if (consumer_created && g.consumers.find(consumer) == g.consumers.end()) *consumer_created = true;
   { auto& c = g.consumers[consumer]; c.seen_time = now; }
   StreamID startk{0, 0};
   stream_id_parse_strict(start == "-" ? "0-0" : start, startk);

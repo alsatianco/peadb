@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 182, diff: 1, tested: 41, registered: 0
+Total: **234** commands — full: 10, upstream: 190, diff: 1, tested: 33, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -127,12 +127,12 @@ Total: **234** commands — full: 10, upstream: 182, diff: 1, tested: 41, regist
 | `PFMERGE` | tested | test_b5_commands.py |
 | `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p4_subscribe_mode_gate.py |
 | `PSETEX` | full | test_p1_expire_lazy_scan.py, test_p1_setex_psetex.py |
-| `PSUBSCRIBE` | tested | test_b4_observability.py, test_b7_eviction.py, test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
+| `PSUBSCRIBE` | upstream | test_b4_observability.py, test_b7_eviction.py, test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `PSYNC` | upstream | — |
 | `PTTL` | upstream | test_m2_strings_expire.py, test_m7_migrate.py, test_p1_setex_psetex.py, test_p4_debug_verbs.py |
 | `PUBLISH` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_p1_publish.py, test_p4_subscribe_mode_gate.py |
-| `PUBSUB` | tested | test_b5_commands.py |
-| `PUNSUBSCRIBE` | tested | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
+| `PUBSUB` | upstream | test_b5_commands.py |
+| `PUNSUBSCRIBE` | upstream | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `QUIT` | full | test_m1_commands.py |
 | `RANDOMKEY` | upstream | test_p1_randomkey.py |
 | `READONLY` | tested | test_p4_lpop_count_readonly.py |
@@ -174,17 +174,17 @@ Total: **234** commands — full: 10, upstream: 182, diff: 1, tested: 41, regist
 | `SORT` | upstream | test_p3_sort_zmpop.py |
 | `SORT_RO` | tested | test_b5_commands.py |
 | `SPOP` | upstream | test_p1_copy_spop_time.py |
-| `SPUBLISH` | tested | test_b5_commands.py |
+| `SPUBLISH` | upstream | test_b5_commands.py |
 | `SRANDMEMBER` | upstream | test_p3_ecosystem_commands.py |
 | `SREM` | upstream | test_m4_set.py |
 | `SSCAN` | upstream | test_m4_set.py |
-| `SSUBSCRIBE` | tested | test_b5_commands.py |
+| `SSUBSCRIBE` | upstream | test_b5_commands.py |
 | `STRLEN` | upstream | test_m2_strings_expire.py |
-| `SUBSCRIBE` | tested | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b5_commands.py, test_p3_pubsub_surface.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
+| `SUBSCRIBE` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b5_commands.py, test_p3_pubsub_surface.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py |
 | `SUBSTR` | upstream | test_p1_string_range_ops.py |
 | `SUNION` | upstream | test_p3_ecosystem_commands.py |
 | `SUNIONSTORE` | upstream | test_p3_ecosystem_commands.py |
-| `SUNSUBSCRIBE` | tested | test_b5_commands.py |
+| `SUNSUBSCRIBE` | upstream | test_b5_commands.py |
 | `SWAPDB` | upstream | test_p1_object_swapdb_sync.py |
 | `SYNC` | upstream | — |
 | `TIME` | upstream | test_p1_copy_spop_time.py |
@@ -192,7 +192,7 @@ Total: **234** commands — full: 10, upstream: 182, diff: 1, tested: 41, regist
 | `TTL` | upstream | test_m2_strings_expire.py, test_p1_expire_options.py, test_p1_move.py, test_p1_setex_psetex.py |
 | `TYPE` | upstream | test_m2_strings_expire.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py |
 | `UNLINK` | tested | test_b14_lazyfree.py, test_command_coverage_extras.py |
-| `UNSUBSCRIBE` | tested | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
+| `UNSUBSCRIBE` | upstream | test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `UNWATCH` | upstream | test_m4_tx.py |
 | `WAIT` | upstream | test_b8_repl_safety.py, test_m6_wait.py |
 | `WATCH` | upstream | test_m4_tx.py |

@@ -309,7 +309,7 @@ class DataStore {
   int xgroup_createconsumer(const std::string& key, const std::string& group, const std::string& consumer,
                             bool& wrongtype, std::string& err);
   std::int64_t xgroup_delconsumer(const std::string& key, const std::string& group, const std::string& consumer,
-                                  bool& wrongtype, std::string& err);
+                                  bool& wrongtype, std::string& err, bool* existed = nullptr);
 
   // ── XINFO ──
   // entries_read == -1 means "unknown" (reported as nil). lag_valid=false → lag is nil.
@@ -353,7 +353,8 @@ class DataStore {
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> xclaim(
       const std::string& key, const std::string& group, const std::string& consumer,
       std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
-      bool& wrongtype, std::string& err, const std::string* last_id = nullptr);
+      bool& wrongtype, std::string& err, const std::string* last_id = nullptr,
+      bool* consumer_created = nullptr);
   // XAUTOCLAIM: from start cursor, claim up to count idle entries; returns {next_cursor, entries, deleted}.
   struct AutoClaimResult {
     std::string next_cursor;
@@ -362,7 +363,7 @@ class DataStore {
   };
   AutoClaimResult xautoclaim(const std::string& key, const std::string& group, const std::string& consumer,
                              std::int64_t min_idle_ms, const std::string& start, std::int64_t count,
-                             bool justid, bool& wrongtype, std::string& err);
+                             bool justid, bool& wrongtype, std::string& err, bool* consumer_created = nullptr);
 
   void flushall();
   void flushdb();
