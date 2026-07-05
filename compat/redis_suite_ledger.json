@@ -32,6 +32,15 @@
       "exclusion_reason": "Full Redis Cluster is out of scope (single node + replication); see compat/delta.md item 6.",
       "mode": "excluded"
     },
+    "unit/dump": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 10,
+        "ok": 18
+      },
+      "mode": "native",
+      "skipfile_lines": 9
+    },
     "unit/expire": {
       "last_counts": {
         "err": 0,

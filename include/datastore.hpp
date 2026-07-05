@@ -444,6 +444,9 @@ class DataStore {
   // OBJECT IDLETIME/FREQ readers over Entry::lru (nullopt = missing/expired key).
   std::optional<std::int64_t> object_idletime_seconds(const std::string& key);
   std::optional<std::int64_t> object_freq(const std::string& key);
+  // RESTORE IDLETIME/FREQ: seed a key's LRU idle time (seconds) or LFU frequency counter.
+  bool set_object_idle(const std::string& key, std::int64_t idle_seconds);
+  bool set_object_freq(const std::string& key, std::int64_t freq);
   // Legacy accessors kept for existing callers; they delegate to encoding_limits().
   void set_zset_max_ziplist_entries(std::int64_t v);
   std::int64_t zset_max_ziplist_entries() const;

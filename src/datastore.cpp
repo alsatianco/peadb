@@ -2561,6 +2561,24 @@ std::optional<std::int64_t> DataStore::object_freq(const std::string& key) {
   return static_cast<std::int64_t>(it->second.lru & 0xFF);
 }
 
+bool DataStore::set_object_idle(const std::string& key, std::int64_t idle_seconds) {
+  auto& db = dbs_[current_db_];
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  // idletime reads back as (now_low32 - lru)/1000, so store lru = now - idle*1000.
+  const auto now = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
+  it->second.lru = now - static_cast<std::uint32_t>(idle_seconds * 1000);
+  return true;
+}
+
+bool DataStore::set_object_freq(const std::string& key, std::int64_t freq) {
+  auto& db = dbs_[current_db_];
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  it->second.lru = static_cast<std::uint32_t>(freq & 0xFF);
+  return true;
+}
+
 std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy policy, int samples) {
   if (policy == MaxmemoryPolicy::NoEviction) return std::nullopt;
   const bool volatile_only = policy == MaxmemoryPolicy::VolatileLru ||

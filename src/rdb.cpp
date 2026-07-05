@@ -1279,6 +1279,14 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
                      int64_t ttl_ms, bool replace, bool absttl,
                      std::string& err) {
   err.clear();
+  auto& ds = store();
+
+  // Key-existence check comes FIRST (Redis restoreCommand): RESTORE onto an existing key
+  // without REPLACE is BUSYKEY regardless of whether the payload is even well-formed.
+  if (!replace && ds.type_of(key) != "none") {
+    err = "Target key name already exists.";
+    return false;
+  }
 
   // DUMP format: <type+data> <rdb-ver:u16 LE> <crc64:u64 LE>
   if (payload.size() < 10) {
@@ -1304,22 +1312,8 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
   size_t data_len = payload.size() - 10;
   RdbReader r(payload.data(), data_len);
 
-  auto& ds = store();
-
-  // Check if key exists (for REPLACE)
-  if (!replace && ds.type_of(key) != "none") {
-    err = "Target key name already exists.";
-    return false;
-  }
-
   // Delete existing key if replacing
   if (replace) ds.del(key);
-
-  uint8_t type;
-  if (!r.read_u8(type)) {
-    err = "DUMP payload is not valid";
-    return false;
-  }
 
   std::optional<int64_t> expire_at;
   if (ttl_ms != 0) {
@@ -1328,6 +1322,15 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
     } else {
       expire_at = DataStore::now_ms() + ttl_ms;
     }
+  }
+  // An already-expired absolute TTL means the key must NOT be stored (Redis restoreCommand):
+  // any existing key was already removed above by REPLACE; return OK without recreating it.
+  if (expire_at && *expire_at <= DataStore::now_ms()) return true;
+
+  uint8_t type;
+  if (!r.read_u8(type)) {
+    err = "DUMP payload is not valid";
+    return false;
   }
 
   if (type == RDB_TYPE_STRING) {

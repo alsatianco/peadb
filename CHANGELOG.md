@@ -9,6 +9,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 9): dump suite adopted
+
+- **`unit/dump` adopted natively at 0 errors** (20 suites total). `RESTORE` now matches Redis:
+  the `BUSYKEY` "target key exists" check runs before payload validation; an already-expired
+  absolute TTL (`ABSTTL` in the past) is not stored and, when `REPLACE` removed an existing key,
+  propagates as `DEL`/`UNLINK` (per `lazyfree-lazy-server-del`); `IDLETIME`/`FREQ` seed the key's
+  LRU idle time / LFU counter (and `RESTORE` is exempt from the dispatch-time access-touch that
+  would otherwise reset them); invalid `IDLETIME`/`FREQ` values are rejected.
+- 9 tests are skipfile-tracked: advanced `MIGRATE` (multi-key `KEYS`, `AUTH`, and target
+  connection caching) — single-key `MIGRATE`/`COPY`/`REPLACE` with TTL, large values, hashes,
+  and timeouts all work (delta 19).
+
 ### Added — parity roadmap Phase 1 (wave 8): bitfield suite adopted
 
 - **`unit/bitfield` adopted natively at 0 errors** (19 suites total). `BITFIELD` previously

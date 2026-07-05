@@ -357,3 +357,16 @@ storage until real listpack/intset backends land).
   (`scripts/redis/skipfiles/unit_bitops.skip`).
 - Tracking: needs per-command dirty deltas (handlers report how much they changed); folded into
   the persistence-hardening work in Phase 4.
+
+19. MIGRATE advanced options (multi-key KEYS, AUTH, target-connection caching)
+- Status: `partial` (single-key MIGRATE works; advanced forms are deferred)
+- Owner: replication-compat
+- Severity: low
+- Target milestone: P4
+- Implemented: single-key `MIGRATE host port key db timeout [COPY] [REPLACE]` — DUMPs the key,
+  opens a socket to the target, SELECT + RESTORE, and (unless COPY) deletes the source; TTL,
+  large values, hashes, and timeouts are handled.
+- Missing: the multi-key `KEYS k1 k2 …` form, `AUTH`/`AUTH2` to the target, and Redis's
+  target-connection caching/idle-release. 9 `unit/dump` MIGRATE tests are skipfile-tracked
+  (`scripts/redis/skipfiles/unit_dump.skip`).
+- Tracking: cluster/migration hardening in Phase 4.
