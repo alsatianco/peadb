@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 190, diff: 1, tested: 33, registered: 0
+Total: **234** commands — full: 10, upstream: 192, diff: 1, tested: 31, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -16,8 +16,8 @@ Total: **234** commands — full: 10, upstream: 190, diff: 1, tested: 33, regist
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
 | `BGSAVE` | tested | test_m5_persistence_commands.py |
 | `BITCOUNT` | upstream | test_p3_ecosystem_commands.py |
-| `BITFIELD` | tested | test_p3_ecosystem_commands.py |
-| `BITFIELD_RO` | tested | test_b5_commands.py |
+| `BITFIELD` | upstream | test_p3_ecosystem_commands.py |
+| `BITFIELD_RO` | upstream | test_b5_commands.py |
 | `BITOP` | upstream | test_p3_ecosystem_commands.py |
 | `BITPOS` | upstream | test_p3_ecosystem_commands.py |
 | `BLMOVE` | upstream | test_m4_list_moves.py |

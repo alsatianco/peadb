@@ -9,6 +9,17 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 8): bitfield suite adopted
+
+- **`unit/bitfield` adopted natively at 0 errors** (19 suites total). `BITFIELD` previously
+  ignored the `OVERFLOW` clause entirely — `SAT`/`FAIL` behaved like `WRAP` and `INCRBY` did a
+  raw signed 64-bit addition (undefined behavior on `INT64_MIN + INT64_MIN`). Now ports Redis's
+  signed/unsigned overflow checks: `OVERFLOW SAT` clamps to the type's min/max, `OVERFLOW FAIL`
+  returns nil and writes nothing, and the addition is computed in unsigned space so the signed
+  add only runs when it cannot overflow. `SET` also applies overflow handling.
+- 1 test is skipfile-tracked: `wait_for_ofs_sync` on a master/replica pair (delta 8, the replica
+  master-offset-tracking gap).
+
 ### Added — parity roadmap Phase 1 (wave 7): pubsub + pubsubshard suites adopted
 
 - **`unit/pubsub` and `unit/pubsubshard` adopted natively at 0 errors** (18 suites total).
