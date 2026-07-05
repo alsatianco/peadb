@@ -67,6 +67,10 @@ struct SessionState {
   // exactly like Redis with no password set.
   bool authenticated = false;
   std::string user = "default";
+  // ── CLIENT REPLY OFF/SKIP ── suppress normal command replies (never pub/sub confirmations).
+  bool reply_off = false;        // CLIENT REPLY OFF until CLIENT REPLY ON
+  bool reply_skip = false;       // suppress THIS command's reply (CLIENT REPLY SKIP, armed)
+  bool reply_skip_next = false;  // CLIENT REPLY SKIP just ran; arm skip for the next command
   // ── Introspection (CLIENT LIST / MONITOR / CLIENT KILL) ──
   std::string addr;                       // peer "ip:port", set at accept
   std::int64_t created_ms = 0;            // connection creation time

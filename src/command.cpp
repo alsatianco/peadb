@@ -506,8 +506,13 @@ void notify_keyspace_event(std::uint32_t cls, const std::string& event, const st
 // Centralised emission for write commands (avoids hand-instrumenting ~40 handlers).
 // Covers the most-subscribed events; class is per-command (mirrors the key's type).
 void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::string>& args,
-                                 int first_key, int db) {
+                                 int first_key, int db, const std::string* reply = nullptr) {
   if (g_notify_flags == 0) return;
+  // Redis emits these events only when the command actually changed the key; a no-op
+  // (e.g. SREM of a non-member, SADD of existing members) returns 0 and fires nothing.
+  static const std::unordered_set<std::string> count_gated = {
+      "SADD", "SREM", "ZREM", "HDEL", "LREM"};
+  if (reply && count_gated.count(cmd) && reply->rfind(":0\r\n", 0) == 0) return;
   if (cmd == "DEL" || cmd == "UNLINK") {
     for (std::size_t i = 1; i < args.size(); ++i) notify_keyspace_event(NOTIFY_GENERIC, "del", args[i], db);
     return;
@@ -683,6 +688,10 @@ std::unordered_map<std::string, std::unordered_set<int>> g_pattern_subscribers;
 std::unordered_map<int, std::unordered_set<std::string>> g_fd_channels;
 // fd -> set of subscribed patterns
 std::unordered_map<int, std::unordered_set<std::string>> g_fd_patterns;
+// Sharded pub/sub lives in a SEPARATE namespace from regular channels (SSUBSCRIBE/SPUBLISH):
+// shard channel -> subscriber fds, and fd -> subscribed shard channels.
+std::unordered_map<std::string, std::unordered_set<int>> g_shard_channel_subscribers;
+std::unordered_map<int, std::unordered_set<std::string>> g_fd_shard_channels;
 } // anonymous
 
 void pubsub_subscribe(int fd, const std::string& channel) {
@@ -717,7 +726,38 @@ void pubsub_punsubscribe(int fd, const std::string& pattern) {
     if (fit->second.empty()) g_fd_patterns.erase(fit);
   }
 }
+void pubsub_ssubscribe(int fd, const std::string& channel) {
+  g_shard_channel_subscribers[channel].insert(fd);
+  g_fd_shard_channels[fd].insert(channel);
+}
+void pubsub_sunsubscribe(int fd, const std::string& channel) {
+  auto it = g_shard_channel_subscribers.find(channel);
+  if (it != g_shard_channel_subscribers.end()) {
+    it->second.erase(fd);
+    if (it->second.empty()) g_shard_channel_subscribers.erase(it);
+  }
+  auto fit = g_fd_shard_channels.find(fd);
+  if (fit != g_fd_shard_channels.end()) {
+    fit->second.erase(channel);
+    if (fit->second.empty()) g_fd_shard_channels.erase(fit);
+  }
+}
+std::size_t shard_channel_count(int fd) {
+  auto it = g_fd_shard_channels.find(fd);
+  return it != g_fd_shard_channels.end() ? it->second.size() : 0;
+}
 void pubsub_unsubscribe_all(int fd) {
+  auto scit = g_fd_shard_channels.find(fd);
+  if (scit != g_fd_shard_channels.end()) {
+    for (const auto& ch : scit->second) {
+      auto sit = g_shard_channel_subscribers.find(ch);
+      if (sit != g_shard_channel_subscribers.end()) {
+        sit->second.erase(fd);
+        if (sit->second.empty()) g_shard_channel_subscribers.erase(sit);
+      }
+    }
+    g_fd_shard_channels.erase(scit);
+  }
   auto cit = g_fd_channels.find(fd);
   if (cit != g_fd_channels.end()) {
     for (const auto& ch : cit->second) {
@@ -778,6 +818,21 @@ std::int64_t pubsub_publish(const std::string& channel, const std::string& messa
       for (int fd : fds) {
         if (g_pubsub_send(fd, msg)) ++receivers;
       }
+    }
+  }
+  return receivers;
+}
+
+// Sharded publish: delivers an "smessage" only to shard subscribers of the exact channel
+// (no pattern matching — sharded pub/sub has no pattern support).
+std::int64_t pubsub_spublish(const std::string& channel, const std::string& message) {
+  std::int64_t receivers = 0;
+  if (!g_pubsub_send) return 0;
+  auto it = g_shard_channel_subscribers.find(channel);
+  if (it != g_shard_channel_subscribers.end()) {
+    std::string msg = encode_pubsub_message("smessage", channel, message);
+    for (int fd : it->second) {
+      if (g_pubsub_send(fd, msg)) ++receivers;
     }
   }
   return receivers;
@@ -6073,6 +6128,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                                     have_er ? &entries_read : nullptr);
               if (wrongtype) return wrongtype_error_reply();
               if (!ok) return err.empty() ? encode_error("ERR") : encode_stream_error(err);
+              notify_keyspace_event(NOTIFY_STREAM, "xgroup-create", args[2], session.db_index);
               return encode_simple("OK");
             });
           }
@@ -6114,16 +6170,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               const int n = store().xgroup_createconsumer(args[2], args[3], args[4], wrongtype, err);
               if (wrongtype) return wrongtype_error_reply();
               if (!err.empty()) return encode_stream_error(err);
+              if (n > 0) notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[2], session.db_index);
               return encode_integer(n);
             });
           }
           if (sub == "DELCONSUMER") {
             if (args.size() != 5) return encode_error("wrong number of arguments for 'xgroup|delconsumer' command");
             return with_stream_key(args[2], [&]() {
-              bool wrongtype = false; std::string err;
-              const std::int64_t n = store().xgroup_delconsumer(args[2], args[3], args[4], wrongtype, err);
+              bool wrongtype = false; std::string err; bool existed = false;
+              const std::int64_t n = store().xgroup_delconsumer(args[2], args[3], args[4], wrongtype, err, &existed);
               if (wrongtype) return wrongtype_error_reply();
               if (!err.empty()) return encode_stream_error(err);
+              if (existed) notify_keyspace_event(NOTIFY_STREAM, "xgroup-delconsumer", args[2], session.db_index);
               return encode_integer(n);
             });
           }
@@ -6216,6 +6274,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (consumer_created && noack) {
             for (const auto& s : streams)
               if (s.second == ">") propagate({"XGROUP", "CREATECONSUMER", s.first, group, consumer});
+          }
+          // A freshly-created consumer fires an "xgroup-createconsumer" keyspace event
+          // (ACK or NOACK), on each stream whose group it was created in.
+          if (consumer_created) {
+            for (const auto& s : streams)
+              if (s.second == ">") notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", s.first, session.db_index);
           }
 
           if (rows.empty()) {
@@ -6651,7 +6715,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_simple("OK");
           }
           if (sub == "REPLY") {
-            return encode_simple("OK");
+            if (args.size() != 3) return encode_error("wrong number of arguments for 'client|reply' command");
+            const auto mode = upper(args[2]);
+            if (mode == "ON") { session.reply_off = false; return encode_simple("OK"); }
+            if (mode == "OFF") { session.reply_off = true; return std::string(); }  // no reply
+            if (mode == "SKIP") {
+              // Skip the NEXT command's reply (no-op if replies are already off). No reply now.
+              if (!session.reply_off) session.reply_skip_next = true;
+              return std::string();
+            }
+            return encode_error("syntax error");
           }
           return encode_error("unknown subcommand or wrong number of arguments for 'client|" + lower(args[1]) + "' command");
         }});
@@ -8563,7 +8636,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     };
 
     t.emplace("XAUTOCLAIM", CommandSpec{"XAUTOCLAIM", -6, {"write"}, 1, 1, 1,
-        [encode_stream_entry](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+        [encode_stream_entry](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
           std::int64_t min_idle = 0;
           if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XAUTOCLAIM");
@@ -8578,10 +8651,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             else if (o == "JUSTID") justid = true;
             else return encode_error("syntax error");
           }
-          bool wt = false; std::string err;
-          auto res = store().xautoclaim(args[1], args[2], args[3], min_idle, args[5], count, justid, wt, err);
+          bool wt = false; std::string err; bool consumer_created = false;
+          auto res = store().xautoclaim(args[1], args[2], args[3], min_idle, args[5], count, justid, wt, err, &consumer_created);
           if (wt) return wrongtype_error_reply();
           if (!err.empty()) return encode_stream_error(err);
+          if (consumer_created) notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1], session.db_index);
           std::vector<std::string> ents;
           for (const auto& [id, fields] : res.claimed) ents.push_back(encode_stream_entry(id, fields, justid));
           std::vector<std::string> del;
@@ -8590,7 +8664,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("XCLAIM", CommandSpec{"XCLAIM", -6, {"write", "fast"}, 1, 1, 1,
-        [encode_stream_entry](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+        [encode_stream_entry](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           // XCLAIM key group consumer min-idle-time id [id...] [IDLE ms][TIME ms][RETRYCOUNT n][FORCE][JUSTID][LASTID id]
           std::int64_t min_idle = 0;
           if (!parse_i64(args[4], min_idle) || min_idle < 0) return encode_error("Invalid min-idle-time argument for XCLAIM");
@@ -8605,11 +8679,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             else ids.push_back(args[i]);
           }
           if (ids.empty()) return encode_error("wrong number of arguments for 'xclaim' command");
-          bool wt = false; std::string err;
+          bool wt = false; std::string err; bool consumer_created = false;
           auto claimed = store().xclaim(args[1], args[2], args[3], min_idle, ids, justid, force, wt, err,
-                                        have_last_id ? &last_id : nullptr);
+                                        have_last_id ? &last_id : nullptr, &consumer_created);
           if (wt) return wrongtype_error_reply();
           if (!err.empty()) return "-" + err + "\r\n";
+          if (consumer_created) notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1], session.db_index);
           std::vector<std::string> out;
           for (const auto& [id, fields] : claimed) out.push_back(encode_stream_entry(id, fields, justid));
           return encode_array(out);
@@ -8728,10 +8803,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("PUBSUB", CommandSpec{"PUBSUB", -2, {"pubsub", "fast", "loading", "stale"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           const auto sub = upper(args[1]);
+          // SHARDCHANNELS/SHARDNUMSUB query the separate sharded namespace.
+          const bool shard = sub == "SHARDCHANNELS" || sub == "SHARDNUMSUB";
+          const auto& subscribers = shard ? g_shard_channel_subscribers : g_channel_subscribers;
           if (sub == "CHANNELS" || sub == "SHARDCHANNELS") {
             const std::string pat = args.size() >= 3 ? args[2] : "*";
             std::vector<std::string> out;
-            for (const auto& [ch, subs] : g_channel_subscribers) {
+            for (const auto& [ch, subs] : subscribers) {
               if (!subs.empty() && fnmatch(pat.c_str(), ch.c_str(), 0) == 0) out.push_back(encode_bulk(ch));
             }
             return encode_array(out);
@@ -8739,9 +8817,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "NUMSUB" || sub == "SHARDNUMSUB") {
             std::vector<std::string> out;
             for (std::size_t i = 2; i < args.size(); ++i) {
-              auto it = g_channel_subscribers.find(args[i]);
+              auto it = subscribers.find(args[i]);
               out.push_back(encode_bulk(args[i]));
-              out.push_back(encode_integer(it == g_channel_subscribers.end() ? 0 : static_cast<long long>(it->second.size())));
+              out.push_back(encode_integer(it == subscribers.end() ? 0 : static_cast<long long>(it->second.size())));
             }
             return encode_array(out);
           }
@@ -8761,12 +8839,47 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
       auto it = tbl.find(base);
       return it == tbl.end() ? encode_error("unknown command") : it->second.handler(proxy, session, close);
     };
+    // Sharded pub/sub — a separate channel namespace with ssubscribe/sunsubscribe/smessage
+    // reply types; the client's shard-subscription count is independent of regular channels.
     t.emplace("SSUBSCRIBE", CommandSpec{"SSUBSCRIBE", -2, {"pubsub"}, 0, 0, 0,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("SUBSCRIBE", a, s, c); }});
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          std::string out;
+          for (std::size_t i = 1; i < args.size(); ++i) {
+            pubsub_ssubscribe(session.fd, args[i]);
+            out += encode_array({encode_bulk("ssubscribe"), encode_bulk(args[i]),
+                                 encode_integer(static_cast<long long>(shard_channel_count(session.fd)))});
+          }
+          return out;
+        }});
     t.emplace("SUNSUBSCRIBE", CommandSpec{"SUNSUBSCRIBE", -1, {"pubsub"}, 0, 0, 0,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("UNSUBSCRIBE", a, s, c); }});
-    t.emplace("SPUBLISH", CommandSpec{"SPUBLISH", 3, {"pubsub", "fast"}, 0, 0, 0,
-        [delegate](const std::vector<std::string>& a, SessionState& s, bool& c) { return delegate("PUBLISH", a, s, c); }});
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          std::string out;
+          if (args.size() == 1) {
+            auto cit = g_fd_shard_channels.find(session.fd);
+            std::vector<std::string> chans;
+            if (cit != g_fd_shard_channels.end()) chans.assign(cit->second.begin(), cit->second.end());
+            if (chans.empty()) {
+              out = encode_array({encode_bulk("sunsubscribe"), encode_null(RespVersion::Resp2), encode_integer(0)});
+            } else {
+              for (const auto& ch : chans) {
+                pubsub_sunsubscribe(session.fd, ch);
+                out += encode_array({encode_bulk("sunsubscribe"), encode_bulk(ch),
+                                     encode_integer(static_cast<long long>(shard_channel_count(session.fd)))});
+              }
+            }
+          } else {
+            for (std::size_t i = 1; i < args.size(); ++i) {
+              pubsub_sunsubscribe(session.fd, args[i]);
+              out += encode_array({encode_bulk("sunsubscribe"), encode_bulk(args[i]),
+                                   encode_integer(static_cast<long long>(shard_channel_count(session.fd)))});
+            }
+          }
+          return out;
+        }});
+    t.emplace("SPUBLISH", CommandSpec{"SPUBLISH", 3, {"write", "pubsub", "fast"}, 1, 1, 1,
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          return encode_integer(static_cast<long long>(pubsub_spublish(args[1], args[2])));
+        }});
 
     // ─── Read-only command variants (reject the write/STORE options) ─────
     t.emplace("SORT_RO", CommandSpec{"SORT_RO", -2, {"readonly"}, 1, 1, 1,
@@ -8985,7 +9098,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   if (spec_is_write && g_replication_role == "slave" && !g_executing_exec &&
       !g_replaying_aof &&
-      cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH") {
+      cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH" && cmd != "SPUBLISH") {
     ++top_stat.rejected_calls;
     record_error_stat("READONLY");
     if (in_lua_script_context()) g_script_inner_error_seen = true;
@@ -9108,7 +9221,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     for (const auto& k : notify_new_candidates) {
       if (store().type_of(k) != "none") notify_keyspace_event(NOTIFY_NEW, "new", k, session.db_index);
     }
-    emit_keyspace_notifications(cmd_after, args, spec.first_key, session.db_index);
+    emit_keyspace_notifications(cmd_after, args, spec.first_key, session.db_index, &reply);
     // Any write may satisfy a blocked client (BLPOP/BZPOPMIN/BLMOVE/XREAD…). Flag a
     // wakeup so the event loop rechecks blocked clients in THIS iteration instead of on
     // the next ~100ms poll. Cheap: the recheck early-returns when nothing is blocked.
@@ -9250,7 +9363,9 @@ bool client_has_subscriptions(int fd) {
   auto cit = g_fd_channels.find(fd);
   if (cit != g_fd_channels.end() && !cit->second.empty()) return true;
   auto pit = g_fd_patterns.find(fd);
-  return pit != g_fd_patterns.end() && !pit->second.empty();
+  if (pit != g_fd_patterns.end() && !pit->second.empty()) return true;
+  auto sit = g_fd_shard_channels.find(fd);
+  return sit != g_fd_shard_channels.end() && !sit->second.empty();
 }
 
 void configure_notify_keyspace_events(const std::string& spec) {
