@@ -5,13 +5,13 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 192, diff: 1, tested: 31, registered: 0
+Total: **234** commands — full: 10, upstream: 194, diff: 1, tested: 29, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
 | `ACL` | tested | test_p3_repl_cluster_surface.py |
 | `APPEND` | upstream | test_m2_strings_expire.py |
-| `ASKING` | tested | test_p3_repl_cluster_surface.py |
+| `ASKING` | upstream | test_p3_repl_cluster_surface.py |
 | `AUTH` | upstream | test_command_coverage_extras.py |
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
 | `BGSAVE` | tested | test_m5_persistence_commands.py |
@@ -110,7 +110,7 @@ Total: **234** commands — full: 10, upstream: 192, diff: 1, tested: 31, regist
 | `LTRIM` | upstream | test_p3_ecosystem_commands.py |
 | `MEMORY` | upstream | test_p3_ecosystem_commands.py |
 | `MGET` | upstream | test_m2_strings_expire.py |
-| `MIGRATE` | tested | test_m7_migrate.py |
+| `MIGRATE` | upstream | test_m7_migrate.py |
 | `MODULE` | tested | test_m8_module_command_api.py, test_m8_module_key_api.py, test_m8_module_load.py |
 | `MONITOR` | tested | test_b4_observability.py |
 | `MOVE` | upstream | test_p1_move.py |

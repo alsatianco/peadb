@@ -1186,13 +1186,19 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     else if (abs >= 0) out = {"PEXPIREAT", args[1], std::to_string(abs)};
     else emit = false;
   } else if (cmd == "RESTORE" && args.size() >= 4) {
-    const auto abs = abs_ttl(args[1]);
-    if (abs >= 0) {
-      std::string absttl = "ABSTTL";
-      for (std::size_t i = 4; i < args.size(); ++i) {
-        if (upper(args[i]) == "ABSTTL") { absttl = args[i]; break; }
+    if (!key_exists(args[1])) {
+      // The key wasn't stored (already-expired absolute TTL); if REPLACE removed an existing
+      // key, Redis propagates the deletion as DEL/UNLINK instead of the RESTORE.
+      out = {g_lazyfree_lazy_server_del ? "UNLINK" : "DEL", args[1]};
+    } else {
+      const auto abs = abs_ttl(args[1]);
+      if (abs >= 0) {
+        std::string absttl = "ABSTTL";
+        for (std::size_t i = 4; i < args.size(); ++i) {
+          if (upper(args[i]) == "ABSTTL") { absttl = args[i]; break; }
+        }
+        out = {"RESTORE", args[1], std::to_string(abs), "{" + args[3] + "}", absttl};
       }
-      out = {"RESTORE", args[1], std::to_string(abs), "{" + args[3] + "}", absttl};
     }
   } else if (cmd == "SCRIPT") {
     emit = false;
@@ -4546,6 +4552,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
           bool replace = false;
           bool absttl = false;
+          std::int64_t idletime = -1, freq = -1;
           for (std::size_t i = 4; i < args.size(); ++i) {
             const std::string opt = upper(args[i]);
             if (opt == "REPLACE") {
@@ -4556,8 +4563,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               absttl = true;
               continue;
             }
-            if (opt == "IDLETIME" || opt == "FREQ") {
-              if (i + 1 >= args.size()) return encode_error("syntax error");
+            if (opt == "IDLETIME") {
+              if (i + 1 >= args.size() || !parse_i64(args[i + 1], idletime) || idletime < 0)
+                return encode_error("Invalid IDLETIME value, must be >= 0");
+              ++i;
+              continue;
+            }
+            if (opt == "FREQ") {
+              if (i + 1 >= args.size() || !parse_i64(args[i + 1], freq) || freq < 0 || freq > 255)
+                return encode_error("Invalid FREQ value, must be >= 0 and <= 255");
               ++i;
               continue;
             }
@@ -4571,6 +4585,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             return encode_error(err);
           }
+          // Seed LRU/LFU metadata if requested (no-op when the key was already-expired and
+          // therefore not stored).
+          if (idletime >= 0) store().set_object_idle(args[1], idletime);
+          if (freq >= 0) store().set_object_freq(args[1], freq);
           return encode_simple("OK");
         }});
 
@@ -9311,7 +9329,9 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // every policy (like Redis, which maintains the lru clock unconditionally) so that
   // OBJECT IDLETIME is honest even before an eviction policy is configured; the cost is
   // one hash find on the first key. Single-key/first-key approximation.
-  if (!is_error_reply(reply) &&
+  // RESTORE is exempt: it explicitly seeds the LRU/LFU (IDLETIME/FREQ) and, like Redis's
+  // dbAdd path, must not have that immediately overwritten by an access-time touch.
+  if (!is_error_reply(reply) && cmd != "RESTORE" &&
       spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
     store().touch_key_for_eviction(args[static_cast<std::size_t>(spec.first_key)]);
   }
