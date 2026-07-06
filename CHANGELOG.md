@@ -9,6 +9,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Fixed — RDB/DUMP listpack encoding corrupted collection elements ≥ 64 bytes (data loss)
+
+- **Any list/hash/set/zset element of 64 bytes or more was silently corrupted across an RDB
+  save/load (`SAVE`/`BGSAVE`/`DEBUG RELOAD`), `DUMP`/`RESTORE`, and replication full-sync.** The
+  listpack writer used a home-grown string header whose `0x40–0x7F` prefix (used for lengths
+  64–16383) collided with the reader's 6-bit-length branch (`enc & 0x80 == 0`), so a ≥64-byte
+  string was decoded as a zero-length string and the rest of the container desynced (elements
+  truncated/scrambled). Rewrote the listpack writer and reader to the **real Redis listpack
+  encoding** (6-bit / 12-bit / 32-bit string headers, 7-bit / 13-bit / 16/24/32/64-bit int
+  headers, size-derived backlen skip), so all collection types now round-trip losslessly at
+  every element size — and PeaDB's listpack-encoded RDB payloads are genuinely Redis-loadable.
+
+### Added — parity roadmap Phase 1 (wave 14): other suite adopted (HELP/RESET/CONFIG parity)
+
+- **`unit/other` adopted natively at 0 errors** (26 suites total). Fixes:
+  - **`HELP` subcommands** added for `PUBSUB`, `COMMAND`, `CONFIG`, `MODULE`, `CLIENT`, and
+    `FUNCTION` (each returns the Redis `<CMD> <subcommand> …. Subcommands are:` array).
+  - **`RESET`** now exits pub/sub and MONITOR mode (previously left the client subscribed /
+    monitoring), and is executed immediately inside `MULTI` instead of being queued (so a
+    subsequent `EXEC` correctly reports `EXEC without MULTI`).
+  - **`CONFIG <unknown>`** returns Redis's lowercase `unknown subcommand or wrong number of
+    arguments for '…'. Try CONFIG HELP.` instead of a generic arity error.
+  - **`INFO` `rdb_changes_since_last_save`** now reports the delta since the last save (Redis's
+    `server.dirty`), dropping to 0 after a save, rather than the absolute mutation count.
+- 5 tests are skipfile-tracked: `RESET clears client state` (needs CLIENT TRACKING, Phase 5),
+  `RESET clears authenticated state` (needs multi-user ACL, Phase 5), `Don't rehash if redis has
+  child process` (needs Redis dict internals + `DEBUG HTSTATS`), `Process title set as expected`
+  (needs `setproctitle`), and `FLUSHALL should reset the dirty counter to 0 …` (dirty-counter
+  granularity, delta 18).
+
 ### Added — parity roadmap Phase 1 (wave 13): printver + type/list-3 suites adopted
 
 - **`unit/type/list-3` adopted natively at 0 errors, no skips** (11 tests — large-list / quicklist

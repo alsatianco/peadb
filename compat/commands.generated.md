@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, registered: 0
+Total: **234** commands — full: 10, upstream: 211, diff: 1, tested: 12, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -14,7 +14,7 @@ Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, regist
 | `ASKING` | upstream | test_p3_repl_cluster_surface.py |
 | `AUTH` | upstream | test_command_coverage_extras.py |
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
-| `BGSAVE` | tested | test_m5_persistence_commands.py |
+| `BGSAVE` | upstream | test_m5_persistence_commands.py |
 | `BITCOUNT` | upstream | test_p3_ecosystem_commands.py |
 | `BITFIELD` | upstream | test_p3_ecosystem_commands.py |
 | `BITFIELD_RO` | upstream | test_b5_commands.py |
@@ -111,8 +111,8 @@ Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, regist
 | `MEMORY` | upstream | test_p3_ecosystem_commands.py |
 | `MGET` | upstream | test_m2_strings_expire.py |
 | `MIGRATE` | upstream | test_m7_migrate.py |
-| `MODULE` | tested | test_m8_module_command_api.py, test_m8_module_key_api.py, test_m8_module_load.py |
-| `MONITOR` | tested | test_b4_observability.py |
+| `MODULE` | upstream | test_m8_module_command_api.py, test_m8_module_key_api.py, test_m8_module_load.py |
+| `MONITOR` | upstream | test_b4_observability.py |
 | `MOVE` | upstream | test_p1_move.py |
 | `MSET` | upstream | test_m2_strings_expire.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py |
 | `MSETNX` | upstream | test_p1_msetnx_debug_loadaof.py |
@@ -141,7 +141,7 @@ Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, regist
 | `RENAMENX` | upstream | test_m2_strings_expire.py |
 | `REPLCONF` | upstream | test_p3_repl_cluster_surface.py |
 | `REPLICAOF` | upstream | test_b8_repl_safety.py, test_m9_failover_promotion.py, test_p1_multi_state_abort.py, test_p1_replicaof_readonly.py |
-| `RESET` | tested | test_p3_ecosystem_commands.py |
+| `RESET` | upstream | test_p3_ecosystem_commands.py |
 | `RESTORE` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
 | `ROLE` | tested | test_p3_ecosystem_commands.py |
 | `RPOP` | upstream | test_m4_list.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
@@ -149,7 +149,7 @@ Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, regist
 | `RPUSH` | upstream | test_b13_obuf_limit.py, test_b5_commands.py, test_m4_blpop_brpop.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
 | `RPUSHX` | upstream | test_p3_ecosystem_commands.py |
 | `SADD` | upstream | test_b5_commands.py, test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py, test_p1_object_encoding_policies.py, test_p2_script_rewrite_ops.py, test_p2_sort_in_script.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py |
-| `SAVE` | tested | test_b6_streams.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py |
+| `SAVE` | upstream | test_b6_streams.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py |
 | `SCAN` | upstream | test_p1_expire_lazy_scan.py |
 | `SCARD` | upstream | test_m4_set.py, test_m5_snapshot_roundtrip.py, test_p1_copy_spop_time.py |
 | `SCRIPT` | upstream | test_m4_lua.py, test_m4_lua2_atomic.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p2_evalsha_sha1.py, test_p2_script_cache_info.py |
@@ -167,7 +167,7 @@ Total: **234** commands — full: 10, upstream: 205, diff: 1, tested: 18, regist
 | `SINTERSTORE` | upstream | test_p3_ecosystem_commands.py |
 | `SISMEMBER` | upstream | test_b5_commands.py, test_m4_set.py |
 | `SLAVEOF` | upstream | test_p3_repl_cluster_surface.py |
-| `SLOWLOG` | tested | test_b4_observability.py, test_p3_ecosystem_commands.py |
+| `SLOWLOG` | upstream | test_b4_observability.py, test_p3_ecosystem_commands.py |
 | `SMEMBERS` | upstream | test_m4_set.py |
 | `SMISMEMBER` | upstream | test_p3_ecosystem_commands.py |
 | `SMOVE` | upstream | test_b5_commands.py |

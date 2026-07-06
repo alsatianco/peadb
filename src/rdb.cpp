@@ -430,29 +430,28 @@ class RdbReader {
 class ListpackWriter {
  public:
   void add_string(const std::string& s) {
-    if (s.size() <= 63) {
-      // Small string: |0|length(6bit)| then data, then backlen
-      entries_.push_back(static_cast<char>(static_cast<uint8_t>(s.size())));
-      entries_.append(s);
-      uint32_t entry_len = 1 + static_cast<uint32_t>(s.size());
-      encode_backlen(entry_len);
-    } else if (s.size() <= 16383) {
-      entries_.push_back(static_cast<char>(0x40 | ((s.size() >> 8) & 0x3f)));
-      entries_.push_back(static_cast<char>(s.size() & 0xff));
-      entries_.append(s);
-      uint32_t entry_len = 2 + static_cast<uint32_t>(s.size());
-      encode_backlen(entry_len);
+    // Real Redis listpack string encodings (listpack.c LP_ENCODING_*_STR): the header MUST
+    // be self-describing without colliding with the 7-bit-uint / int encodings, so the reader
+    // can round-trip any length AND a genuine Redis RDB is loadable.
+    const std::size_t n = s.size();
+    std::size_t hdr;
+    if (n <= 63) {
+      entries_.push_back(static_cast<char>(0x80 | n));  // 10xxxxxx : 6-bit length
+      hdr = 1;
+    } else if (n <= 4095) {
+      entries_.push_back(static_cast<char>(0xE0 | ((n >> 8) & 0x0f)));  // 1110xxxx xxxxxxxx
+      entries_.push_back(static_cast<char>(n & 0xff));
+      hdr = 2;
     } else {
-      entries_.push_back(static_cast<char>(0x80));
-      uint32_t len = static_cast<uint32_t>(s.size());
-      entries_.push_back(static_cast<char>((len >> 24) & 0xff));
-      entries_.push_back(static_cast<char>((len >> 16) & 0xff));
-      entries_.push_back(static_cast<char>((len >> 8) & 0xff));
-      entries_.push_back(static_cast<char>(len & 0xff));
-      entries_.append(s);
-      uint32_t entry_len = 5 + static_cast<uint32_t>(s.size());
-      encode_backlen(entry_len);
+      entries_.push_back(static_cast<char>(0xF0));  // 11110000 : 32-bit little-endian length
+      entries_.push_back(static_cast<char>(n & 0xff));
+      entries_.push_back(static_cast<char>((n >> 8) & 0xff));
+      entries_.push_back(static_cast<char>((n >> 16) & 0xff));
+      entries_.push_back(static_cast<char>((n >> 24) & 0xff));
+      hdr = 5;
     }
+    entries_.append(s);
+    encode_backlen(static_cast<uint32_t>(hdr + n));
     ++count_;
   }
 
@@ -480,24 +479,30 @@ class ListpackWriter {
   }
 
  private:
-  void encode_backlen(uint32_t len) {
-    if (len <= 127) {
-      entries_.push_back(static_cast<char>(len));
-    } else if (len < 16383) {
-      entries_.push_back(static_cast<char>((len >> 7) | 0x80));
-      entries_.push_back(static_cast<char>(len & 0x7f));
+  // Redis lpEncodeBacklen: encodes the entry length (encoding header + data) so it can be read
+  // backwards. The first byte (forward) carries the high bits with NO continuation flag; every
+  // following byte sets 0x80. The byte COUNT is a pure function of the length.
+  void encode_backlen(uint32_t l) {
+    if (l <= 127) {
+      entries_.push_back(static_cast<char>(l));
+    } else if (l < 16384) {
+      entries_.push_back(static_cast<char>(l >> 7));
+      entries_.push_back(static_cast<char>((l & 127) | 128));
+    } else if (l < 2097152) {
+      entries_.push_back(static_cast<char>(l >> 14));
+      entries_.push_back(static_cast<char>(((l >> 7) & 127) | 128));
+      entries_.push_back(static_cast<char>((l & 127) | 128));
+    } else if (l < 268435456) {
+      entries_.push_back(static_cast<char>(l >> 21));
+      entries_.push_back(static_cast<char>(((l >> 14) & 127) | 128));
+      entries_.push_back(static_cast<char>(((l >> 7) & 127) | 128));
+      entries_.push_back(static_cast<char>((l & 127) | 128));
     } else {
-      // Up to 5 bytes
-      uint8_t buf[5];
-      int n = 0;
-      do {
-        buf[n] = static_cast<uint8_t>(len & 0x7f);
-        if (n > 0) buf[n] |= 0x80;
-        len >>= 7;
-        ++n;
-      } while (len > 0);
-      // Reverse to write MSB first
-      for (int i = n - 1; i >= 0; --i) entries_.push_back(static_cast<char>(buf[i]));
+      entries_.push_back(static_cast<char>(l >> 28));
+      entries_.push_back(static_cast<char>(((l >> 21) & 127) | 128));
+      entries_.push_back(static_cast<char>(((l >> 14) & 127) | 128));
+      entries_.push_back(static_cast<char>(((l >> 7) & 127) | 128));
+      entries_.push_back(static_cast<char>((l & 127) | 128));
     }
   }
 
@@ -539,88 +544,91 @@ class ListpackReader {
            (static_cast<uint16_t>(static_cast<uint8_t>(data_[offset + 1])) << 8);
   }
 
+  // Number of bytes lpEncodeBacklen uses for an entry of the given length.
+  static size_t backlen_bytes(size_t entry_len) {
+    if (entry_len <= 127) return 1;
+    if (entry_len < 16384) return 2;
+    if (entry_len < 2097152) return 3;
+    if (entry_len < 268435456) return 4;
+    return 5;
+  }
+
   bool read_entry(std::string& val) {
     if (pos_ >= data_.size()) return false;
     uint8_t enc = static_cast<uint8_t>(data_[pos_]);
+    if (enc == 0xFF) return false;  // end marker
 
-    if (enc == 0xFF) return false; // end marker
+    // Decode one listpack element per the real Redis encodings (listpack.c). entry_len is the
+    // encoding header + data (excluding the trailing backlen), which then determines how many
+    // backlen bytes to skip to reach the next element.
+    size_t entry_len;
+    auto need = [&](size_t nbytes) { return pos_ + nbytes <= data_.size(); };
 
-    // Small integer encodings (0xC0..0xF0 ranges, 0xF1..0xFE ranges)
-    if ((enc & 0x80) == 0) {
-      // 0xxxxxxx — string with length in lower 6 bits
+    if ((enc & 0x80) == 0) {                       // 0xxxxxxx : 7-bit unsigned int
+      val = std::to_string(enc & 0x7f);
+      entry_len = 1;
+    } else if ((enc & 0xC0) == 0x80) {             // 10xxxxxx : 6-bit string
       uint32_t slen = enc & 0x3f;
-      pos_ += 1;
-      if (pos_ + slen > data_.size()) return false;
-      val.assign(data_, pos_, slen);
-      pos_ += slen;
-      skip_backlen();
-      return true;
-    }
-    if ((enc & 0xC0) == 0x40) {
-      // 01xxxxxx — string 64..16383
-      if (pos_ + 1 >= data_.size()) return false;
-      uint32_t slen = ((static_cast<uint32_t>(enc) & 0x3f) << 8) |
-                       static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 1]));
-      pos_ += 2;
-      if (pos_ + slen > data_.size()) return false;
-      val.assign(data_, pos_, slen);
-      pos_ += slen;
-      skip_backlen();
-      return true;
-    }
-    if ((enc & 0xE0) == 0x80) {
-      // 100xxxxx — large string
-      if (pos_ + 4 >= data_.size()) return false;
-      uint32_t slen = (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 1])) << 24) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 16) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 8) |
-                       static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 4]));
-      pos_ += 5;
-      if (pos_ + slen > data_.size()) return false;
-      val.assign(data_, pos_, slen);
-      pos_ += slen;
-      skip_backlen();
-      return true;
-    }
-    if ((enc >= 0xC1) && (enc <= 0xFD)) {
-      // Small integer: 0xC1..0xFD  → value = enc - 0xC1 - 64 = enc - 0xC1 + (-64)
-      // In Redis listpack: 1100xxxx xxxxxxxx = 13-bit signed int
-      // 1111xxxx = 4-bit uint (0..12)
-      if ((enc & 0xF0) == 0xF0) {
-        // 1111xxxx — small unsigned (0..12)
-        int v = (enc & 0x0F) - 1;
-        val = std::to_string(v);
-        pos_ += 1;
-        skip_backlen();
-        return true;
-      }
-      if ((enc & 0xE0) == 0xC0) {
-        // 110xxxxx xxxxxxxx — 13-bit signed int
-        if (pos_ + 1 >= data_.size()) return false;
-        int16_t v = static_cast<int16_t>(((static_cast<uint16_t>(enc & 0x1F)) << 8) |
-                 static_cast<uint8_t>(data_[pos_ + 1]));
-        // Sign extend from 13 bits
-        if (v & 0x1000) v |= static_cast<int16_t>(0xE000);
-        val = std::to_string(v);
-        pos_ += 2;
-        skip_backlen();
-        return true;
-      }
+      if (!need(1 + slen)) return false;
+      val.assign(data_, pos_ + 1, slen);
+      entry_len = 1 + slen;
+    } else if ((enc & 0xE0) == 0xC0) {             // 110xxxxx xxxxxxxx : 13-bit signed int
+      if (!need(2)) return false;
+      int16_t v = static_cast<int16_t>(((static_cast<uint16_t>(enc & 0x1f)) << 8) |
+                                       static_cast<uint8_t>(data_[pos_ + 1]));
+      if (v & 0x1000) v |= static_cast<int16_t>(0xE000);  // sign-extend from 13 bits
+      val = std::to_string(v);
+      entry_len = 2;
+    } else if ((enc & 0xF0) == 0xE0) {             // 1110xxxx xxxxxxxx : 12-bit string
+      if (!need(2)) return false;
+      uint32_t slen = ((static_cast<uint32_t>(enc & 0x0f)) << 8) |
+                      static_cast<uint8_t>(data_[pos_ + 1]);
+      if (!need(2 + slen)) return false;
+      val.assign(data_, pos_ + 2, slen);
+      entry_len = 2 + slen;
+    } else if (enc == 0xF0) {                      // 11110000 : 32-bit LE length string
+      if (!need(5)) return false;
+      uint32_t slen = static_cast<uint8_t>(data_[pos_ + 1]) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 16) |
+                      (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 4])) << 24);
+      if (!need(static_cast<size_t>(5) + slen)) return false;
+      val.assign(data_, pos_ + 5, slen);
+      entry_len = 5 + slen;
+    } else if (enc == 0xF1) {                      // 16-bit signed int (LE)
+      if (!need(3)) return false;
+      int16_t v = static_cast<int16_t>(static_cast<uint8_t>(data_[pos_ + 1]) |
+                                       (static_cast<uint16_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8));
+      val = std::to_string(v);
+      entry_len = 3;
+    } else if (enc == 0xF2) {                      // 24-bit signed int (LE)
+      if (!need(4)) return false;
+      int32_t v = static_cast<uint8_t>(data_[pos_ + 1]) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 16);
+      if (v & 0x800000) v |= static_cast<int32_t>(0xFF000000u);  // sign-extend from 24 bits
+      val = std::to_string(v);
+      entry_len = 4;
+    } else if (enc == 0xF3) {                      // 32-bit signed int (LE)
+      if (!need(5)) return false;
+      int32_t v = static_cast<int32_t>(static_cast<uint8_t>(data_[pos_ + 1]) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 16) |
+                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 4])) << 24));
+      val = std::to_string(v);
+      entry_len = 5;
+    } else if (enc == 0xF4) {                      // 64-bit signed int (LE)
+      if (!need(9)) return false;
+      uint64_t u = 0;
+      for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<uint8_t>(data_[pos_ + 1 + i])) << (8 * i);
+      val = std::to_string(static_cast<int64_t>(u));
+      entry_len = 9;
+    } else {
+      return false;  // unknown encoding
     }
 
-    // Fallback: treat as 0-length string entry
-    val.clear();
-    pos_ += 1;
-    skip_backlen();
-    return true;
-  }
-
-  void skip_backlen() {
-    // Backlen is variable-length. Each byte has MSB=1 for continuation.
-    while (pos_ < data_.size()) {
-      uint8_t b = static_cast<uint8_t>(data_[pos_++]);
-      if ((b & 0x80) == 0) break;
-    }
+    pos_ += entry_len + backlen_bytes(entry_len);
+    return pos_ <= data_.size();
   }
 
   std::string data_;

@@ -85,6 +85,15 @@
       "exclusion_reason": "Linux-specific oom-score-adj not implemented; revisit with the ops/config sweep.",
       "mode": "excluded"
     },
+    "unit/other": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 7,
+        "ok": 24
+      },
+      "mode": "native",
+      "skipfile_lines": 5
+    },
     "unit/printver": {
       "last_counts": {
         "err": 0,

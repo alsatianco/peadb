@@ -3329,9 +3329,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "number_of_cached_scripts:" + std::to_string(g_script_cache.size()) + "\r\n\r\n";
           }
           if (want("PERSISTENCE")) {
+            // Redis's rdb_changes_since_last_save is the DELTA since the last save baseline
+            // (server.dirty), not the absolute mutation count — it drops to 0 right after a save.
+            const std::int64_t changes_since_save = std::max<std::int64_t>(
+                0, static_cast<std::int64_t>(store().mutation_epoch()) - g_dirty_at_last_save);
             out += "# Persistence\r\n"
                    "loading:" + std::to_string(g_loading_replication.load() ? 1 : 0) + "\r\n"
-                   "rdb_changes_since_last_save:" + std::to_string(store().mutation_epoch()) + "\r\n"
+                   "rdb_changes_since_last_save:" + std::to_string(changes_since_save) + "\r\n"
                    "rdb_bgsave_in_progress:" + std::to_string(g_bgsave_in_progress.load() ? 1 : 0) + "\r\n"
                    "rdb_last_save_time:" + std::to_string(g_last_save_time) + "\r\n"
                    "rdb_last_bgsave_status:" + g_last_bgsave_status + "\r\n"
@@ -3689,6 +3693,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("COMMAND", CommandSpec{"COMMAND", -1, {"loading", "stale"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          if (args.size() >= 2 && upper(args[1]) == "HELP") {
+            return encode_array({
+                encode_bulk("COMMAND <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("(no subcommand)"), encode_bulk("COUNT"),
+                encode_bulk("DOCS [<command-name> ...]"), encode_bulk("GETKEYS <full-command>"),
+                encode_bulk("INFO [<command-name> ...]"), encode_bulk("LIST"), encode_bulk("HELP")});
+          }
           const auto& table = command_table();
           auto info = [](const CommandSpec& s) -> std::string {
             std::vector<std::string> flags;
@@ -3759,6 +3770,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("CONFIG", CommandSpec{"CONFIG", -2, {"admin", "loading"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
+          if (upper(args[1]) == "HELP") {
+            return encode_array({
+                encode_bulk("CONFIG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("GET <pattern>"), encode_bulk("SET <directive> <value>"),
+                encode_bulk("RESETSTAT"), encode_bulk("REWRITE"), encode_bulk("HELP")});
+          }
           if (args.size() >= 3 && upper(args[1]) == "GET") {
             const auto& pattern = args[2];
             // Build config parameter table
@@ -3969,7 +3986,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_total_error_replies = 0;
             return encode_simple("OK");
           }
-          return encode_error("wrong number of arguments for 'config' command");
+          // Redis's addReplySubcommandSyntaxError (lowercase, networking.c): an unrecognized
+          // CONFIG subcommand (e.g. `CONFIG GET_XX`) is "unknown subcommand", not an arity error.
+          return encode_error("unknown subcommand or wrong number of arguments for '" + args[1] +
+                              "'. Try CONFIG HELP.");
         }});
 
     t.emplace("DEBUG", CommandSpec{"DEBUG", -2, {"admin"}, 0, 0, 0,
@@ -4115,6 +4135,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("MODULE", CommandSpec{"MODULE", -2, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           const auto sub = upper(args[1]);
+          if (sub == "HELP") {
+            return encode_array({
+                encode_bulk("MODULE <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("LIST"), encode_bulk("LOAD <path> [<arg> ...]"),
+                encode_bulk("LOADEX <path> [[CONFIG NAME VALUE] [ARGS ...]]"),
+                encode_bulk("UNLOAD <name>"), encode_bulk("HELP")});
+          }
           if (sub == "LOAD" && args.size() >= 3) {
             // MODULE LOAD dlopen()s arbitrary code; gate it behind explicit opt-in
             // (default off) so an authenticated-but-untrusted or misconfigured server
@@ -5039,6 +5066,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_script_kill_requested.store(true);
             g_busy_script_session = nullptr;
             return encode_simple("OK");
+          }
+          if (sub == "HELP") {
+            return encode_array({
+                encode_bulk("FUNCTION <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("LOAD [REPLACE] <code>"), encode_bulk("DELETE <library-name>"),
+                encode_bulk("LIST [LIBRARYNAME <name>] [WITHCODE]"), encode_bulk("DUMP"),
+                encode_bulk("RESTORE <payload> [FLUSH|APPEND|REPLACE]"), encode_bulk("FLUSH [ASYNC|SYNC]"),
+                encode_bulk("STATS"), encode_bulk("KILL"), encode_bulk("HELP")});
           }
           return encode_error("unknown subcommand for FUNCTION");
         }});
@@ -7012,6 +7047,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             return encode_error("syntax error");
           }
+          if (sub == "HELP") {
+            return encode_array({
+                encode_bulk("CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("ID"), encode_bulk("INFO"), encode_bulk("GETNAME"),
+                encode_bulk("SETNAME <name>"), encode_bulk("SETINFO <attr> <value>"),
+                encode_bulk("LIST [options ...]"), encode_bulk("KILL <ip:port> | <option> <value> ..."),
+                encode_bulk("UNBLOCK <clientid> [TIMEOUT|ERROR]"), encode_bulk("NO-EVICT ON|OFF"),
+                encode_bulk("NO-TOUCH ON|OFF"), encode_bulk("PAUSE <timeout> [WRITE|ALL]"),
+                encode_bulk("UNPAUSE"), encode_bulk("REPLY ON|OFF|SKIP"), encode_bulk("HELP")});
+          }
           return encode_error("unknown subcommand or wrong number of arguments for 'client|" + lower(args[1]) + "' command");
         }});
 
@@ -7215,6 +7260,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.watched_digests.clear();
           session.client_name.clear();
           session.resp_version = RespVersion::Resp2;
+          // RESET exits pub/sub (all channel + pattern + shard subscriptions) and MONITOR mode,
+          // per Redis's resetCommand, so the client returns to a clean interactive state.
+          if (session.fd >= 0) {
+            pubsub_unsubscribe_all(session.fd);
+            g_monitor_fds.erase(session.fd);
+          }
           // Per Redis, RESET re-runs clientSetDefaultAuth: the client is authenticated iff
           // the default user is nopass (no requirepass), and de-authenticated otherwise.
           session.authenticated = g_requirepass.empty();
@@ -9109,6 +9160,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("PUBSUB", CommandSpec{"PUBSUB", -2, {"pubsub", "fast", "loading", "stale"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
           const auto sub = upper(args[1]);
+          if (sub == "HELP") {
+            return encode_array({
+                encode_bulk("PUBSUB <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("CHANNELS [<pattern>]"), encode_bulk("NUMSUB [<channel> ...]"),
+                encode_bulk("NUMPAT"), encode_bulk("SHARDCHANNELS [<pattern>]"),
+                encode_bulk("SHARDNUMSUB [<shardchannel> ...]"), encode_bulk("HELP")});
+          }
           // SHARDCHANNELS/SHARDNUMSUB query the separate sharded namespace.
           const bool shard = sub == "SHARDCHANNELS" || sub == "SHARDNUMSUB";
           const auto& subscribers = shard ? g_shard_channel_subscribers : g_channel_subscribers;
@@ -9331,7 +9389,8 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return busy_script_error_reply();
     }
   }
-  if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "QUIT") {
+  if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "QUIT" &&
+      cmd != "RESET") {
     if (cmd == "WATCH") return encode_error("WATCH inside MULTI is not allowed");
     if (cmd == "SAVE" || cmd == "SHUTDOWN") {
       session.multi_dirty = true;
