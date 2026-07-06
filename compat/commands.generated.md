@@ -5,11 +5,11 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 211, diff: 1, tested: 12, registered: 0
+Total: **234** commands — full: 10, upstream: 212, diff: 1, tested: 11, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
-| `ACL` | tested | test_p3_repl_cluster_surface.py |
+| `ACL` | upstream | test_p3_repl_cluster_surface.py |
 | `APPEND` | upstream | test_m2_strings_expire.py |
 | `ASKING` | upstream | test_p3_repl_cluster_surface.py |
 | `AUTH` | upstream | test_command_coverage_extras.py |
