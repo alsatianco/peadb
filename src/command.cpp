@@ -291,9 +291,22 @@ std::int64_t g_slowlog_next_id = 0;
 std::int64_t g_slowlog_threshold_us = 10000;   // slowlog-log-slower-than (<0 disables)
 std::size_t g_slowlog_max_len = 128;
 
-struct LatencyEvent { std::int64_t time_s; std::int64_t latest_ms; std::int64_t max_ms; };
+struct LatencyEvent {
+  std::int64_t time_s = 0;
+  std::int64_t latest_ms = 0;
+  std::int64_t max_ms = 0;
+  std::deque<std::pair<std::int64_t, std::int64_t>> history;  // (time_s, latency_ms), capped at 160
+};
 std::unordered_map<std::string, LatencyEvent> g_latency_events;
 std::int64_t g_latency_monitor_threshold_ms = 0;   // latency-monitor-threshold (0 disables)
+
+// Per-command latency histogram for LATENCY HISTOGRAM (keyed by full command name, i.e. the
+// container form "parent|sub" for subcommands). Log2 buckets over microseconds.
+struct CmdLatencyHist {
+  std::uint64_t calls = 0;
+  std::array<std::uint64_t, 64> buckets{};  // buckets[i] = count of samples with floor(log2 usec)==i
+};
+std::unordered_map<std::string, CmdLatencyHist> g_cmd_latency_hist;
 
 std::int64_t g_used_memory_peak = 0;
 std::int64_t g_latest_fork_usec = 0;
@@ -508,6 +521,29 @@ void latency_add(const std::string& event, std::int64_t ms) {
   ev.time_s = now_ms() / 1000;
   ev.latest_ms = ms;
   if (ms > ev.max_ms) ev.max_ms = ms;
+  ev.history.emplace_back(ev.time_s, ms);
+  while (ev.history.size() > 160) ev.history.pop_front();  // LATENCY_TS_LEN
+}
+
+// Full command name for LATENCY HISTOGRAM / commandstats keying: container commands use the
+// "parent|sub" form (matching Redis's per-subcommand stats). Only a handful of verbs nest.
+bool is_container_command(const std::string& upper_cmd) {
+  static const std::unordered_set<std::string> kContainers = {
+      "CONFIG", "CLIENT", "COMMAND", "OBJECT", "MEMORY", "SLOWLOG", "LATENCY", "ACL",
+      "FUNCTION", "CLUSTER", "PUBSUB", "XINFO", "XGROUP", "SCRIPT", "DEBUG"};
+  return kContainers.count(upper_cmd) != 0;
+}
+std::string full_command_name(const std::string& upper_cmd, const std::vector<std::string>& args) {
+  std::string full = lower(upper_cmd);
+  if (args.size() >= 2 && is_container_command(upper_cmd)) full += "|" + lower(args[1]);
+  return full;
+}
+void record_cmd_latency(const std::string& full, std::int64_t usec) {
+  auto& h = g_cmd_latency_hist[full];
+  ++h.calls;
+  const std::uint64_t u = usec <= 0 ? 0 : static_cast<std::uint64_t>(usec);
+  const int b = u < 2 ? 0 : (63 - __builtin_clzll(u));  // floor(log2 usec)
+  ++h.buckets[b];
 }
 
 // ── Keyspace notifications ──
@@ -4027,6 +4063,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (args.size() == 2 && upper(args[1]) == "RESETSTAT") {
             g_cmdstats.clear();
+            g_cmd_latency_hist.clear();  // LATENCY HISTOGRAM resets with commandstats
             g_errorstats.clear();
             g_total_error_replies = 0;
             return encode_simple("OK");
@@ -7236,7 +7273,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── LATENCY ─────────────────────────────────────────────────────────
     t.emplace("LATENCY", CommandSpec{"LATENCY", -2, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           const auto sub = upper(args[1]);
           if (sub == "LATEST") {
             // Each: [event, timestamp, latest-ms, max-ms]
@@ -7250,11 +7287,54 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "HISTORY" && args.size() >= 3) {
             auto it = g_latency_events.find(args[2]);
             if (it == g_latency_events.end()) return encode_array({});
-            return encode_array({encode_array({encode_integer(it->second.time_s),
-                                               encode_integer(it->second.latest_ms)})});
+            std::vector<std::string> out;
+            for (const auto& [t, l] : it->second.history)
+              out.push_back(encode_array({encode_integer(t), encode_integer(l)}));
+            return encode_array(out);
           }
-          if (sub == "HISTORY" || sub == "GRAPH" || sub == "HISTOGRAM") {
-            return encode_array({});
+          if (sub == "GRAPH" && args.size() >= 3) {
+            auto it = g_latency_events.find(args[2]);
+            if (it == g_latency_events.end() || it->second.history.empty()) return encode_bulk("");
+            std::int64_t hi = 0, lo = std::numeric_limits<std::int64_t>::max();
+            for (const auto& [t, l] : it->second.history) { hi = std::max(hi, l); lo = std::min(lo, l); }
+            // Minimal graph: the legend line tooling / the suite match on.
+            std::string g = args[2] + " - high " + std::to_string(hi) + " ms, low " +
+                            std::to_string(lo) + " ms (all time high " +
+                            std::to_string(it->second.max_ms) + " ms)\n";
+            return encode_bulk(g);
+          }
+          if (sub == "HISTOGRAM") {
+            // Per-command latency histograms, optionally filtered by command / parent name.
+            std::vector<std::string> filters;
+            for (std::size_t i = 2; i < args.size(); ++i) filters.push_back(lower(args[i]));
+            auto matches = [&](const std::string& k) -> bool {
+              if (filters.empty()) return true;
+              for (const auto& f : filters) {
+                if (k == f) return true;
+                if (f.find('|') == std::string::npos && k.rfind(f + "|", 0) == 0) return true;  // parent
+              }
+              return false;
+            };
+            std::vector<std::string> names;
+            for (const auto& [k, h] : g_cmd_latency_hist)
+              if (h.calls > 0 && matches(k)) names.push_back(k);
+            std::sort(names.begin(), names.end());  // deterministic order
+            std::vector<std::string> kv;
+            for (const auto& k : names) {
+              const auto& h = g_cmd_latency_hist[k];
+              std::vector<std::string> buckets;
+              for (int i = 0; i < 64; ++i)
+                if (h.buckets[i]) {
+                  buckets.push_back(encode_integer(1LL << (i + 1)));  // bucket upper bound (usec)
+                  buckets.push_back(encode_integer(static_cast<long long>(h.buckets[i])));
+                }
+              std::vector<std::string> val = {
+                  encode_bulk("calls"), encode_integer(static_cast<long long>(h.calls)),
+                  encode_bulk("histogram_usec"), encode_map(buckets, session.resp_version)};
+              kv.push_back(encode_bulk(k));
+              kv.push_back(encode_map(val, session.resp_version));
+            }
+            return encode_map(kv, session.resp_version);
           }
           if (sub == "RESET") {
             std::int64_t n = static_cast<std::int64_t>(g_latency_events.size());
@@ -7275,10 +7355,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_bulk(rep);
           }
           if (sub == "HELP") {
+            if (args.size() != 2)
+              return encode_error("wrong number of arguments for 'latency|help' command");
             std::vector<std::string> items;
             items.push_back(encode_bulk("LATENCY <subcommand> [<arg> ...]. Subcommands are:"));
             items.push_back(encode_bulk("DOCTOR"));
             items.push_back(encode_bulk("GRAPH <event>"));
+            items.push_back(encode_bulk("HISTOGRAM [<command> ...]"));
             items.push_back(encode_bulk("LATEST"));
             items.push_back(encode_bulk("HISTORY <event>"));
             items.push_back(encode_bulk("RESET [<event> ...]"));
@@ -9643,10 +9726,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       // The command just blocked — Redis logs a blocking command only when it unblocks, with
       // the whole span. Record when it started; try_unblock_client logs it on completion.
       if (session.blocked.block_start_ms == 0) session.blocked.block_start_ms = now_ms();
-    } else if (upper(cmd_after) != "EXEC") {
-      // EXEC itself is not logged (Redis flags it CMD_SKIP_SLOWLOG); its queued commands are
-      // logged individually as they run through handle_command during EXEC.
-      slowlog_add(args, exec_usec, session.addr, session.client_name);
+    } else {
+      if (upper(cmd_after) != "EXEC") {
+        // EXEC itself is not logged (Redis flags it CMD_SKIP_SLOWLOG); its queued commands are
+        // logged individually as they run through handle_command during EXEC.
+        slowlog_add(args, exec_usec, session.addr, session.client_name);
+      }
+      // Per-command latency histogram (LATENCY HISTOGRAM), keyed like commandstats.
+      record_cmd_latency(full_command_name(upper(cmd_after), args), exec_usec);
     }
     latency_add("command", exec_usec / 1000);
   }
@@ -9854,7 +9941,12 @@ void on_client_disconnect(int fd) {
 void run_active_expire_cycle() {
   if (g_pause_cron) return;  // DEBUG PAUSE-CRON
   if (g_replication_role == "slave") return;
+  const auto t0 = std::chrono::steady_clock::now();
   auto expired = store().active_expire_cycle();
+  // Record the cycle's wall time as an "expire-cycle" latency event (LATENCY monitor).
+  const auto cycle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - t0).count();
+  latency_add("expire-cycle", cycle_ms);
   if (expired.empty()) return;
   for (const auto& [dbidx, key] : expired) {
     if (dbidx != g_last_repl_db) {
