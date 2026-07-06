@@ -3291,8 +3291,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (want("SERVER")) {
             out += "# Server\r\n"
                    "redis_version:7.2.5\r\n"
-                   "peadb_git_sha1:00000000\r\n"
-                   "peadb_git_dirty:0\r\n"
+                   // Redis-standard field names so drop-in tooling (redis_exporter, redis-cli
+                   // --version probes, the printver harness) can parse them.
+                   "redis_git_sha1:00000000\r\n"
+                   "redis_git_dirty:0\r\n"
                    "redis_build_id:peadb-dev\r\n"
                    "peadb_version:0.1.0\r\n"
                    "redis_mode:standalone\r\n"

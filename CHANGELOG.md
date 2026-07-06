@@ -9,6 +9,14 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 13): printver + type/list-3 suites adopted
+
+- **`unit/type/list-3` adopted natively at 0 errors, no skips** (11 tests — large-list / quicklist
+  fuzz and conversion coverage; already conformant, now ratcheted).
+- **`unit/printver` adopted** — INFO now reports the Redis-standard `redis_git_sha1:00000000` and
+  `redis_git_dirty:0` fields (previously PeaDB emitted `peadb_git_sha1`/`peadb_git_dirty`, which
+  broke drop-in tooling such as redis_exporter and the version-probe harness).
+
 ### Added — parity roadmap Phase 1 (wave 12): protocol suite adopted (RESP parser alignment)
 
 - **`unit/protocol` adopted natively at 0 errors, no skips** (23 suites total). The RESP request
