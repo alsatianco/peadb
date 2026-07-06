@@ -126,6 +126,7 @@ SUITES=(
   "unit/dump"
   "unit/sort"
   "unit/geo"
+  "unit/protocol"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -3971,7 +3971,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("DEBUG", CommandSpec{"DEBUG", -2, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           if (args.size() == 3 && upper(args[1]) == "SET-ACTIVE-EXPIRE") {
             std::int64_t v = 0;
             if (!parse_i64(args[2], v) || (v != 0 && v != 1)) return encode_error("value is not an integer or out of range");
@@ -4064,35 +4064,48 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_simple("OK");
           }
           if (args.size() == 3 && upper(args[1]) == "PROTOCOL") {
+            // Mirror Redis debug.c: the addReply* helpers downgrade automatically in RESP2,
+            // so every type has a distinct RESP2 vs RESP3 wire form.
+            const bool r3 = session.resp_version == RespVersion::Resp3;
             const auto ptype = lower(args[2]);
+            if (ptype == "string") return encode_bulk("Hello World");
+            if (ptype == "integer") return encode_integer(12345);
+            if (ptype == "double") return encode_double(3.141, session.resp_version);
             if (ptype == "bignum") {
-              return std::string("(1234567999999999999999999999999999999\r\n");
+              const std::string n = "1234567999999999999999999999999999999";
+              return r3 ? ("(" + n + "\r\n") : encode_bulk(n);
             }
-            if (ptype == "map") {
-              return std::string("%3\r\n$10\r\nkeyone-key\r\n$8\r\nvalue-01\r\n$10\r\nkeytwo-key\r\n$8\r\nvalue-02\r\n$12\r\nkeythree-key\r\n$8\r\nvalue-03\r\n");
-            }
-            if (ptype == "set") {
-              return std::string("~3\r\n$7\r\norange1\r\n$7\r\norange2\r\n$7\r\norange3\r\n");
-            }
-            if (ptype == "double") {
-              return std::string(",3.141\r\n");
-            }
-            if (ptype == "null") {
-              return std::string("_\r\n");
-            }
+            if (ptype == "null") return encode_null(session.resp_version);
+            if (ptype == "array") return std::string("*3\r\n:0\r\n:1\r\n:2\r\n");
+            if (ptype == "set")
+              return std::string(r3 ? "~3\r\n" : "*3\r\n") + ":0\r\n:1\r\n:2\r\n";
+            if (ptype == "map")
+              return r3 ? std::string("%3\r\n:0\r\n#f\r\n:1\r\n#t\r\n:2\r\n#f\r\n")
+                        : std::string("*6\r\n:0\r\n:0\r\n:1\r\n:1\r\n:2\r\n:0\r\n");
             if (ptype == "verbatim") {
-              return std::string("=29\r\ntxt:This is a verbatim\nstring\r\n");
+              const std::string s = "This is a verbatim\nstring";  // 25 bytes
+              return r3 ? ("=29\r\ntxt:" + s + "\r\n") : encode_bulk(s);
             }
-            if (ptype == "true") {
-              return std::string("#t\r\n");
-            }
-            if (ptype == "false") {
-              return std::string("#f\r\n");
-            }
+            if (ptype == "true") return std::string(r3 ? "#t\r\n" : ":1\r\n");
+            if (ptype == "false") return std::string(r3 ? "#f\r\n" : ":0\r\n");
             if (ptype == "attrib") {
-              return std::string("|1\r\n+key-popularity\r\n%2\r\n$1\r\na\r\n,0.1923\r\n$1\r\nb\r\n,0.0012\r\n$39\r\nSome real reply following the attribute\r\n");
+              // The attribute prefix is emitted only in RESP3; the trailing real reply
+              // (a normal bulk string) is always sent so RESP2 clients get a valid reply.
+              std::string out;
+              if (r3) out += "|1\r\n$14\r\nkey-popularity\r\n*2\r\n$7\r\nkey:123\r\n:90\r\n";
+              out += encode_bulk("Some real reply following the attribute");
+              return out;
             }
-            return encode_error("Unknown protocol type");
+            if (ptype == "push") {
+              if (!r3) return encode_error("RESP2 is not supported by this command");
+              std::string out = ">2\r\n";
+              out += encode_bulk("server-cpu-usage");
+              out += encode_integer(42);
+              out += encode_bulk("Some real reply following the push reply");
+              return out;
+            }
+            return encode_error("Wrong protocol type name. Please use one of the following: "
+                                "string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
           }
           return encode_error("unknown subcommand or wrong number of arguments for 'DEBUG'. Try DEBUG HELP.");
         }});
@@ -9236,14 +9249,23 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 } // namespace
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close) {
+  // Empty inline lines and non-positive multibulk counts are no-ops in Redis: consumed
+  // silently with no reply and no close (the parser emits __empty__ for both).
   if (args.empty() || args[0] == "__empty__") {
-    return encode_error("Protocol error");
+    return std::string();
   }
   // Real protocol errors desync the byte stream — reply, then close the connection
   // (matching Redis) so a malformed frame cannot corrupt subsequent commands.
   if (args[0] == "__parse_error__") {
     should_close = true;
     return encode_error("Protocol error");
+  }
+  // Redis-exact protocol errors: the specific suffix is carried in args[1]
+  // (e.g. "invalid bulk length", "expected '$', got 'x'", "unbalanced quotes in request",
+  // "too big inline request", "too big mbulk count string").
+  if (args[0] == "__err_proto__") {
+    should_close = true;
+    return encode_error("Protocol error: " + (args.size() > 1 ? args[1] : std::string()));
   }
   if (args[0] == "__err_multibulk__") {
     should_close = true;
