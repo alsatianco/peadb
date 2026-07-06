@@ -130,6 +130,7 @@ SUITES=(
   "unit/printver"
   "unit/type/list-3"
   "unit/other"
+  "unit/slowlog"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

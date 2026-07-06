@@ -9,6 +9,25 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 15): slowlog suite adopted (entry parity + redaction)
+
+- **`unit/slowlog` adopted natively at 0 errors, no skips** (27 suites total). The slow log was
+  brought to Redis parity:
+  - **Entry fields**: each `SLOWLOG GET` entry now carries the real client address and client
+    name (fields 4 and 5), captured from the session.
+  - **Argument trimming**: argv is capped at 31 elements + a `... (N more arguments)` sentinel
+    (was 32+sentinel), and long arguments are truncated to 128 bytes + `... (N more bytes)`
+    (previously reported the full length with the wrong wording).
+  - **Sensitive-argument redaction**: `ACL SETUSER`/`GETUSER` args, `CONFIG SET` values for
+    `requirepass`/`masterauth`/`masteruser`, `MIGRATE … AUTH`/`AUTH2` credentials, and `AUTH`/
+    `HELLO … AUTH` passwords are logged as `(redacted)`.
+  - **Blocking commands** are logged only when they unblock (served or timed out), with the full
+    block span and their original argv — not at block time and not as the rewritten pop form.
+  - **`EXEC` is no longer logged** (its queued commands are logged individually); `SLOWLOG GET`
+    rejects a count `< -1` with `ERR count should be greater than or equal to -1`.
+- **`MIGRATE … AUTH <pass>` / `AUTH2 <user> <pass>`** are now parsed and sent to the target
+  (previously rejected with `Unsupported MIGRATE option`); single-key MIGRATE auth works (delta 19).
+
 ### Fixed — RDB/DUMP listpack encoding corrupted collection elements ≥ 64 bytes (data loss)
 
 - **Any list/hash/set/zset element of 64 bytes or more was silently corrupted across an RDB

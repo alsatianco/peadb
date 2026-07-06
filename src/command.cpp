@@ -282,7 +282,9 @@ struct SlowlogEntry {
   std::int64_t id;
   std::int64_t time_s;
   std::int64_t usec;
-  std::vector<std::string> argv;   // truncated argv (<=32 args, each <=128 bytes)
+  std::vector<std::string> argv;   // redacted + truncated argv (<=32 elements, each <=128 bytes)
+  std::string peer;                // client address ip:port
+  std::string name;                // client name (CLIENT SETNAME)
 };
 std::deque<SlowlogEntry> g_slowlog;
 std::int64_t g_slowlog_next_id = 0;
@@ -339,6 +341,7 @@ inline bool parse_memory(const std::string& s, std::int64_t& out) {
   return out >= 0;
 }
 std::string lower(std::string s);  // defined below; needed by parse_maxmemory_policy
+std::string upper(std::string s);  // defined below; needed by redact_slowlog_args
 
 // Maxmemory-policy string ↔ enum. Returns nullopt for an unrecognised name.
 inline std::optional<MaxmemoryPolicy> parse_maxmemory_policy(const std::string& s) {
@@ -438,21 +441,63 @@ bool do_bgsave_fork() {
 }
 
 // ── SLOWLOG / LATENCY recording ──
-void slowlog_add(const std::vector<std::string>& args, std::int64_t usec) {
+// Redact sensitive arguments before they are stored in the slow log (and MONITOR), matching
+// Redis's redactClientCommandArgument sites: passwords and secrets become "(redacted)".
+std::vector<std::string> redact_slowlog_args(const std::vector<std::string>& args) {
+  std::vector<std::string> out = args;
+  if (args.empty()) return out;
+  const std::string cmd = upper(args[0]);
+  auto redact_after = [&](const std::string& kw, std::size_t n) {
+    for (std::size_t i = 1; i < out.size(); ++i) {
+      if (upper(args[i]) == kw) {
+        for (std::size_t j = 1; j <= n && i + j < out.size(); ++j) out[i + j] = "(redacted)";
+      }
+    }
+  };
+  if (cmd == "ACL" && args.size() >= 2) {
+    const std::string sub = upper(args[1]);
+    if (sub == "SETUSER" || sub == "GETUSER")
+      for (std::size_t i = 2; i < out.size(); ++i) out[i] = "(redacted)";
+  } else if (cmd == "CONFIG" && args.size() >= 2 && upper(args[1]) == "SET") {
+    // CONFIG SET <key> <value> [<key> <value> ...] — redact the value of any sensitive key.
+    for (std::size_t i = 2; i + 1 < out.size(); i += 2) {
+      const std::string k = lower(args[i]);
+      if (k == "requirepass" || k == "masterauth" || k == "masteruser") out[i + 1] = "(redacted)";
+    }
+  } else if (cmd == "MIGRATE") {
+    redact_after("AUTH", 1);   // AUTH <password>
+    redact_after("AUTH2", 2);  // AUTH2 <username> <password>
+  } else if (cmd == "AUTH") {
+    for (std::size_t i = 1; i < out.size(); ++i) out[i] = "(redacted)";
+  } else if (cmd == "HELLO") {
+    redact_after("AUTH", 2);   // HELLO [proto] AUTH <username> <password>
+  }
+  return out;
+}
+
+void slowlog_add(const std::vector<std::string>& args, std::int64_t usec,
+                 const std::string& peer, const std::string& name) {
   if (g_slowlog_threshold_us < 0 || usec < g_slowlog_threshold_us || args.empty()) return;
   SlowlogEntry e;
   e.id = g_slowlog_next_id++;
   e.time_s = now_ms() / 1000;
   e.usec = usec;
-  constexpr std::size_t kMaxArgs = 32;
-  for (std::size_t i = 0; i < args.size() && i < kMaxArgs; ++i) {
-    if (args[i].size() > 128)
-      e.argv.push_back(args[i].substr(0, 128) + "... (" + std::to_string(args[i].size()) + " bytes)");
-    else
-      e.argv.push_back(args[i]);
+  e.peer = peer;
+  e.name = name;
+  const std::vector<std::string> red = redact_slowlog_args(args);
+  // Redis SLOWLOG_ENTRY_MAX_ARGC = 32: keep at most 31 real args, then a sentinel; each kept
+  // string is truncated to 128 bytes with a "(N more bytes)" suffix.
+  constexpr std::size_t kMaxArgc = 32;
+  const std::size_t slargc = std::min(red.size(), kMaxArgc);
+  for (std::size_t j = 0; j < slargc; ++j) {
+    if (slargc != red.size() && j == slargc - 1) {
+      e.argv.push_back("... (" + std::to_string(red.size() - slargc + 1) + " more arguments)");
+    } else if (red[j].size() > 128) {
+      e.argv.push_back(red[j].substr(0, 128) + "... (" + std::to_string(red[j].size() - 128) + " more bytes)");
+    } else {
+      e.argv.push_back(red[j]);
+    }
   }
-  if (args.size() > kMaxArgs)
-    e.argv.push_back("... (" + std::to_string(args.size() - kMaxArgs) + " more arguments)");
   g_slowlog.push_front(std::move(e));
   while (g_slowlog.size() > g_slowlog_max_len) g_slowlog.pop_back();
 }
@@ -4915,13 +4960,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           bool copy = false;
           bool replace = false;
+          bool has_auth = false;
+          std::string auth_user, auth_pass;
           for (std::size_t i = 6; i < args.size(); ++i) {
             const auto opt = upper(args[i]);
             if (opt == "COPY") { copy = true; continue; }
             if (opt == "REPLACE") { replace = true; continue; }
-            if (opt == "AUTH" || opt == "AUTH2" || opt == "KEYS") {
-              return encode_error("Unsupported MIGRATE option");
+            if (opt == "AUTH" && i + 1 < args.size()) {   // AUTH <password>
+              auth_pass = args[i + 1]; has_auth = true; i += 1; continue;
             }
+            if (opt == "AUTH2" && i + 2 < args.size()) {   // AUTH2 <username> <password>
+              auth_user = args[i + 1]; auth_pass = args[i + 2]; has_auth = true; i += 2; continue;
+            }
+            if (opt == "KEYS") return encode_error("Unsupported MIGRATE option");  // multi-key form (delta 19)
             return encode_error("syntax error");
           }
 
@@ -4954,6 +5005,17 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
           std::string payload_reply;
           bool is_err = false;
+          if (has_auth) {
+            std::vector<std::string> auth_args = auth_user.empty()
+                ? std::vector<std::string>{"AUTH", auth_pass}
+                : std::vector<std::string>{"AUTH", auth_user, auth_pass};
+            const auto auth_wire = encode_command_resp(auth_args);
+            if (!write_all(fd, auth_wire.data(), auth_wire.size()) ||
+                !read_resp_reply(fd, payload_reply, is_err) || is_err) {
+              close(fd);
+              return std::string("-IOERR Authentication to the target instance failed.\r\n");
+            }
+          }
           std::vector<std::string> select_args = {"SELECT", std::to_string(db)};
           const auto select_wire = encode_command_resp(select_args);
           if (!write_all(fd, select_wire.data(), select_wire.size()) || !read_resp_reply(fd, payload_reply, is_err) || is_err) {
@@ -7136,7 +7198,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const auto sub = upper(args[1]);
           if (sub == "GET") {
             std::int64_t count = 10;
-            if (args.size() >= 3) { if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range"); }
+            if (args.size() >= 3) {
+              if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
+              if (count < -1) return encode_error("count should be greater than or equal to -1");
+            }
             std::vector<std::string> entries;
             std::size_t n = 0;
             for (const auto& e : g_slowlog) {
@@ -7146,7 +7211,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               // Each entry: [id, timestamp, usec, [argv...], client-addr, client-name]
               entries.push_back(encode_array({
                   encode_integer(e.id), encode_integer(e.time_s), encode_integer(e.usec),
-                  encode_array(argv), encode_bulk(""), encode_bulk("")}));
+                  encode_array(argv), encode_bulk(e.peer), encode_bulk(e.name)}));
               ++n;
             }
             return encode_array(entries);
@@ -9574,7 +9639,15 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   auto& post_stat = g_cmdstats[lower(cmd_after)];
   post_stat.usec_total += exec_usec;
   if (!in_lua_script_context()) {
-    slowlog_add(args, exec_usec);
+    if (session.blocked.type != BlockType::None) {
+      // The command just blocked — Redis logs a blocking command only when it unblocks, with
+      // the whole span. Record when it started; try_unblock_client logs it on completion.
+      if (session.blocked.block_start_ms == 0) session.blocked.block_start_ms = now_ms();
+    } else if (upper(cmd_after) != "EXEC") {
+      // EXEC itself is not logged (Redis flags it CMD_SKIP_SLOWLOG); its queued commands are
+      // logged individually as they run through handle_command during EXEC.
+      slowlog_add(args, exec_usec, session.addr, session.client_name);
+    }
     latency_add("command", exec_usec / 1000);
   }
   if (is_error_reply(reply)) {
@@ -9935,7 +10008,7 @@ std::string replication_event_at(std::size_t from) {
 
 // ─── Blocking client support ──────────────────────────────────────────────
 
-std::string try_unblock_client(SessionState& session) {
+std::string try_unblock_client_impl(SessionState& session) {
   if (session.blocked.type == BlockType::None) return {};
 
   const auto current = now_ms();
@@ -10130,6 +10203,25 @@ std::string try_unblock_client(SessionState& session) {
   }
 
   return {}; // still blocked
+}
+
+std::string try_unblock_client(SessionState& session) {
+  if (session.blocked.type == BlockType::None) return {};
+  // Capture the block context before try_unblock_client_impl clears it on serve/timeout.
+  const std::vector<std::string> orig = session.blocked.original_args;
+  const std::int64_t start_ms = session.blocked.block_start_ms;
+  std::string reply = try_unblock_client_impl(session);
+  // A non-empty reply means the blocking command finally completed (served or timed out):
+  // Redis logs it to the slow log now, with the full block span and its original argv (not the
+  // deterministic pop form it propagates as).
+  if (!reply.empty()) {
+    if (!orig.empty()) {
+      const std::int64_t dur_us = start_ms > 0 ? (now_ms() - start_ms) * 1000 : 0;
+      slowlog_add(orig, dur_us, session.addr, session.client_name);
+    }
+    session.blocked.block_start_ms = 0;  // completed — reset for the next block on this client
+  }
+  return reply;
 }
 
 // Signals that a key was written — the server loop checks this flag to know

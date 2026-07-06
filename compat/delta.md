@@ -372,11 +372,12 @@ storage until real listpack/intset backends land).
 - Owner: replication-compat
 - Severity: low
 - Target milestone: P4
-- Implemented: single-key `MIGRATE host port key db timeout [COPY] [REPLACE]` — DUMPs the key,
-  opens a socket to the target, SELECT + RESTORE, and (unless COPY) deletes the source; TTL,
-  large values, hashes, and timeouts are handled.
-- Missing: the multi-key `KEYS k1 k2 …` form, `AUTH`/`AUTH2` to the target, and Redis's
-  target-connection caching/idle-release. 9 `unit/dump` MIGRATE tests are skipfile-tracked
+- Implemented: single-key `MIGRATE host port key db timeout [COPY] [REPLACE] [AUTH pass] [AUTH2
+  user pass]` — DUMPs the key, opens a socket to the target, authenticates (AUTH/AUTH2) when
+  requested, SELECT + RESTORE, and (unless COPY) deletes the source; TTL, large values, hashes,
+  and timeouts are handled. AUTH/AUTH2 credentials are redacted in the slow log / MONITOR.
+- Missing: the multi-key `KEYS k1 k2 …` form and Redis's target-connection caching/idle-release.
+  The `unit/dump` multi-key + connection-caching MIGRATE tests remain skipfile-tracked
   (`scripts/redis/skipfiles/unit_dump.skip`).
 - Tracking: cluster/migration hardening in Phase 4.
 

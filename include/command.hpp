@@ -32,6 +32,8 @@ struct BlockedState {
   std::int64_t deadline_ms = 0;      // 0 = infinite
   std::uint64_t seq = 0;             // FIFO serving order (set when the block registers)
   std::vector<std::string> original_args; // original command args for context
+  std::int64_t block_start_ms = 0;   // wall-clock when the command first blocked (0 = unset);
+                                      // slowlog logs the command only on unblock, with this span
 };
 
 struct WaitState {
