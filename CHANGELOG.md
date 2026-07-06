@@ -9,6 +9,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 16): latency-monitor + type/list-2 suites adopted
+
+- **`unit/latency-monitor` adopted natively at 0 errors** (29 suites total), which required
+  building out `LATENCY`:
+  - **`LATENCY HISTOGRAM [command ...]`** — per-command latency histograms (log2 `histogram_usec`
+    buckets + call counts), keyed like Redis's commandstats including the `parent|sub` form
+    (`config|resetstat`, `client|id`); filtering by a plain name expands to all its subcommands,
+    by a full `parent|sub` returns just one, unknown/never-called names are skipped, and it resets
+    with `CONFIG RESETSTAT`.
+  - **`LATENCY HISTORY <event>`** now returns the full sample series (previously only the latest),
+    **`LATENCY GRAPH <event>`** outputs the `high/low ms` summary, `expire-cycle` latency events
+    are recorded from the active-expiry cron, and `LATENCY HELP` rejects extra arguments.
+- **`unit/type/list-2` adopted** (large-list conversion coverage; already conformant, now ratcheted).
+
 ### Added — parity roadmap Phase 1 (wave 15): slowlog suite adopted (entry parity + redaction)
 
 - **`unit/slowlog` adopted natively at 0 errors, no skips** (27 suites total). The slow log was

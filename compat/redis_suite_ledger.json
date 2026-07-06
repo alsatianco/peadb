@@ -68,6 +68,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "unit/latency-monitor": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 16
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "unit/moduleapi": {
       "exclusion_reason": "Module certification out of scope; see compat/delta.md item 4.",
       "mode": "excluded"
@@ -205,6 +214,15 @@
       },
       "mode": "native",
       "skipfile_lines": 9
+    },
+    "unit/type/list-2": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 2
+      },
+      "mode": "native",
+      "skipfile_lines": 0
     },
     "unit/type/list-3": {
       "last_counts": {

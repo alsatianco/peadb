@@ -131,6 +131,8 @@ SUITES=(
   "unit/type/list-3"
   "unit/other"
   "unit/slowlog"
+  "unit/latency-monitor"
+  "unit/type/list-2"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
