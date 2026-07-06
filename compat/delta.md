@@ -396,3 +396,19 @@ storage until real listpack/intset backends land).
   (`scripts/redis/skipfiles/unit_geo.skip`).
 - Tracking: exact cell-scan ordering rides with the geohash-neighbor scan optimization in the
   Phase 6 performance work (the same code that replaces the brute-force scan).
+
+21. Server introspection/ops verbs used by unit/other (DEBUG HTSTATS, proc-title-template)
+- Status: `partial` (the suite is adopted; a few ops-only introspection verbs are stubbed/absent)
+- Owner: ops-compat
+- Severity: low
+- Target milestone: P4
+- Implemented: `unit/other` is adopted green — `OBJECT`/`MEMORY`/`PUBSUB`/`SLOWLOG`/`CLIENT`/
+  `COMMAND`/`CONFIG`/`FUNCTION`/`MODULE` all answer `HELP`; `RESET` clears pub/sub, MONITOR, and
+  MULTI state and runs immediately inside a transaction; `CONFIG <unknown>` returns the Redis
+  `unknown subcommand …` error; `INFO rdb_changes_since_last_save` reports the dirty delta.
+- Missing: `DEBUG HTSTATS` and Redis's incremental-dict rehash suppression during a save child
+  (PeaDB uses `std::unordered_map`, which has no table-size introspection or rehash knob); and
+  `proc-title-template` / `setproctitle` (process-title rewriting). All skipfile-tracked in
+  `scripts/redis/skipfiles/unit_other.skip`; the two RESET tests needing CLIENT TRACKING and
+  multi-user ACL are tracked under item 7; the FLUSHALL dirty-counter reset under item 18.
+- Tracking: folds into the introspection/ops hardening in Phase 4 (DEBUG verbs, process title).
