@@ -148,10 +148,12 @@ storage until real listpack/intset backends land).
   open connections, and `RESET` re-derives the flag from the current password. Hardening:
   `MODULE LOAD` is gated behind `enable-module-command` (default off, blocks the dlopen RCE
   vector); `rename-command FROM TO` (TO empty disables) lets operators neutralise dangerous
-  verbs; `proto-max-bulk-len` (512 MB) + 1M-element multibulk caps and a 1 GB per-client
-  query-buffer cap close the unbounded-allocation / OOM DoS; unauthenticated clients get Redis's
-  tighter pre-auth caps (>10 multibulk elements or >16 KB bulk are refused before buffering);
-  the Lua sandbox now removes `os`/`io`. ACL SETUSER/GETUSER/LIST/LOG/CAT remain registered stubs.
+  verbs; the RESP parser matches Redis framing byte-for-byte (`proto-max-bulk-len` 512 MB bulk
+  cap, `INT_MAX` multibulk cap with incremental arg reads, a 64 KB single-line desync limit, and
+  a 1 GB per-client query-buffer cap close the unbounded-allocation / OOM DoS); unauthenticated
+  clients get Redis's tighter pre-auth caps (>10 multibulk elements or >16 KB bulk are refused
+  before buffering); the Lua sandbox now removes `os`/`io`. ACL SETUSER/GETUSER/LIST/LOG/CAT
+  remain registered stubs.
 - Missing: full multi-user ACL rule evaluation (users, key patterns, command categories,
   pub/sub channels) and TLS — both deferred as dedicated XL tracks.
 - Tracking: security hardening milestone.

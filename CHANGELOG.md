@@ -9,6 +9,28 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 12): protocol suite adopted (RESP parser alignment)
+
+- **`unit/protocol` adopted natively at 0 errors, no skips** (23 suites total). The RESP request
+  parser and `DEBUG PROTOCOL` were aligned to Redis 7.2.5's exact wire semantics:
+  - **Framing errors now match Redis verbatim and close the connection**: `expected '$', got 'X'`
+    for a mis-framed bulk header, `invalid multibulk length` (non-numeric or `> INT_MAX` count),
+    `invalid bulk length` (non-numeric / negative / over `proto-max-bulk-len`), and
+    `unbalanced quotes in request` (a closing quote must be followed by whitespace, so
+    `"""x"""` is rejected). Previously these produced a generic `Protocol error` or, worse,
+    silently stalled the connection.
+  - **No-ops match Redis**: an empty inline line and a non-positive multibulk count (`*-10`,
+    `*0`) are consumed silently with no reply; any non-`*` first byte is treated as an inline
+    command (a bare `\r\n`/`\n` line no longer hangs the connection).
+  - **Desync protection**: a single unterminated line (inline, multibulk count, or bulk length)
+    exceeding 64 KB (`PROTO_INLINE_MAX_SIZE`) is rejected with `too big inline/mbulk count/bulk
+    count string` and the connection closed, so a garbage flood can't grow the buffer unbounded.
+  - **`DEBUG PROTOCOL` is now RESP2/RESP3 aware** (mirroring Redis's `addReply*` downgrades):
+    `bignum`/`verbatim`/`double`/`null` fall back to bulk strings in RESP2, `true`/`false` to
+    `:1`/`:0`, `map`/`set` to flat arrays, and the `attrib` block is emitted only in RESP3 with
+    the correct `key-popularity → [key:123, 90]` shape; added `string`/`integer`/`array`/`push`
+    types and the exact unknown-type error.
+
 ### Fixed — unit/auth and unit/pubsub now complete without hangs (full adoption)
 
 Both suites were previously recorded green only up to the first test that hung the harness; the
