@@ -135,6 +135,7 @@ SUITES=(
   "unit/type/list-2"
   "unit/limits"
   "unit/violations"
+  "unit/functions"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

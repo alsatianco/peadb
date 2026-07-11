@@ -102,6 +102,7 @@ void configure_maxmemory(const std::string& spec);   // "100mb"/bytes; "" = unli
 void configure_maxmemory_policy(const std::string& spec);   // e.g. "allkeys-lru"; "" = noeviction
 void configure_maxmemory_samples(const std::string& spec);  // eviction sample size; "" = 5
 void init_replication_id();   // randomize the replication id at startup (call once in main)
+void functions_register_rdb_hooks();   // wire RDB save/load to the function-library registry (call once in main)
 void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
 void configure_tcp_backlog(int backlog);            // listen(2) backlog, for CONFIG GET reporting
 // Apply *-max-listpack-*/set-max-intset-entries thresholds from config-file directives

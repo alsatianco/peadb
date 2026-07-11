@@ -274,8 +274,9 @@ storage until real listpack/intset backends land).
   These are L/XL and architecturally invasive; deferred to protect the green baseline.
 - Tracking: see the "Deferred" section of `CHANGELOG.md`.
 
-14. Scripting semantics beyond the green baseline
-- Status: `partial` (unit/scripting passes natively at 301 ok / 0 err with 12 tracked skips)
+14. Scripting + functions semantics beyond the green baseline
+- Status: `partial` (unit/scripting passes natively at 301 ok / 0 err with 12 tracked skips;
+  unit/functions passes natively at 109 ok / 0 err with 1 tracked skip)
 - Owner: scripting-compat
 - Severity: medium
 - Target milestone: P1 suite burn-down
@@ -284,14 +285,27 @@ storage until real listpack/intset backends land).
   `redis.replicate_commands()` (no-op true), `redis.set_repl()` + `REPL_*` constants
   honored by both the replica and AOF propagation paths; `SCRIPT DEBUG yes|sync|no`
   accepted (LDB itself not implemented); HELLO/AUTH/RESET/QUIT allowed while a script
-  is BUSY.
-- Missing: each of these is a skipfile line in `scripts/redis/skipfiles/unit_scripting.skip` —
-  the LDB debugger session protocol; SCRIPT KILL's UNKILLABLE distinction for scripts
-  that already wrote; timed-out pure-Lua scripts staying BUSY instead of aborting;
-  CLIENT LIST from inside a running script observing concurrent sessions; replica
-  handshakes completing while a script blocks the loop; MASTERDOWN gating for EVAL and
-  the no-writes/allow-stale shebang flags on replicas; a macOS `leaks` report on the
-  Lua path (Linux CI unaffected; needs a leak hunt).
+  is BUSY. Full Lua function libraries: `FUNCTION LOAD [REPLACE]/DELETE/FLUSH/LIST
+  [LIBRARYNAME][WITHCODE]/STATS/DUMP/RESTORE/KILL/HELP`, `FCALL`/`FCALL_RO`, the shebang
+  metadata parser, `redis.register_function` (positional + named args) with the
+  no-writes/allow-oom/allow-stale/no-cluster/allow-cross-slot-keys flag matrix and C-level
+  global-protection on the load environment; libraries persist through RDB (opcode 245 /
+  FUNCTION2) and replicate to replicas (LOAD/DELETE/FLUSH/RESTORE propagated; function
+  effects replicated); FCALL of a no-writes function runs on a read-only replica while a
+  write function is rejected; OOM/allow-oom gating; `COMMAND GETKEYS` on FCALL/FCALL_RO.
+- Missing: each of these is a skipfile line in `scripts/redis/skipfiles/unit_scripting.skip`
+  or `unit_functions.skip` — the LDB debugger session protocol; SCRIPT KILL's UNKILLABLE
+  distinction for scripts that already wrote; timed-out pure-Lua scripts staying BUSY
+  instead of aborting; CLIENT LIST from inside a running script observing concurrent
+  sessions; replica handshakes completing while a script blocks the loop; MASTERDOWN
+  gating for EVAL and the no-writes/allow-stale shebang flags on replicas (the same gap
+  that skips `FUNCTION - allow stale` — per-inner-command stale-flag enforcement inside a
+  running function); a macOS `leaks` report on the Lua path (Linux CI unaffected; needs a
+  leak hunt).
+- Note: a trivially-infinite script/function (`while true do`) is advertised BUSY
+  cooperatively (both EVAL and FCALL) rather than actually looping, since the
+  single-threaded event loop cannot otherwise be interrupted — this satisfies the
+  SCRIPT/FUNCTION KILL tests without a preemption thread.
 - Tracking: burn down the skipfile; each removed line is a ratchet win.
 
 15. Blocked-client serving order + expiry/SELECT propagation edges
