@@ -73,6 +73,9 @@ struct SessionState {
   bool reply_off = false;        // CLIENT REPLY OFF until CLIENT REPLY ON
   bool reply_skip = false;       // suppress THIS command's reply (CLIENT REPLY SKIP, armed)
   bool reply_skip_next = false;  // CLIENT REPLY SKIP just ran; arm skip for the next command
+  // ── CLIENT NO-TOUCH ── when on, this client's commands don't bump keys' LRU/LFU access
+  // time (except an explicit TOUCH), so OBJECT IDLETIME/FREQ stay stable for observation.
+  bool no_touch = false;
   // ── Introspection (CLIENT LIST / MONITOR / CLIENT KILL) ──
   std::string addr;                       // peer "ip:port", set at accept
   std::int64_t created_ms = 0;            // connection creation time

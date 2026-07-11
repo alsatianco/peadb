@@ -9,6 +9,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Changed — parity groundwork toward unit/introspection-2 (LRU access-time, CLIENT NO-TOUCH, COMMAND GETKEYS)
+
+- **LRU access-time fidelity**: read-only introspection commands (`TTL`/`PTTL`/`TYPE`/`EXISTS`/
+  `OBJECT`/`EXPIRETIME`/`PEXPIRETIME`/`DEBUG`/`DUMP`) no longer reset a key's last-access time, so
+  `OBJECT IDLETIME` reflects real idleness; `DEBUG OBJECT` now reports the actual `lru` clock
+  (was hardcoded `lru:0`).
+- **`CLIENT NO-TOUCH ON|OFF`** is now functional (was an accepted no-op): while on, the client's
+  commands don't bump a key's LRU/LFU access time (except an explicit `TOUCH`). `CLIENT NO-EVICT`
+  now validates its `ON|OFF` argument.
+- **`COMMAND GETKEYS`/`GETKEYSANDFLAGS`**: per-key key-spec flags for `SET`/`MSET`/`LMOVE`/`SORT`
+  (e.g. `{k1 {OW update}}`, `{k1 {RW access delete}}`); key extraction for `MEMORY USAGE`,
+  `XGROUP`, and the `ZUNIONSTORE`/`ZINTERSTORE`/`ZDIFFSTORE` numkeys form; `EVAL`/`FCALL` with 0
+  keys returns an empty array instead of erroring.
+- These flip 9 additional `unit/introspection-2` tests green (11→20). Full adoption additionally
+  needs `COMMAND LIST [FILTERBY MODULE|ACLCAT|PATTERN]`, per-command `movablekeys` flags, and ACL
+  categories — best delivered via the planned COMMAND-metadata codegen from upstream
+  `redis/src/commands/*.json` rather than hand-listed subcommand tables.
+
 ### Added — parity roadmap Phase 1 (wave 19): unit/info-command adopted — multi-section INFO
 
 - **`unit/info-command` adopted natively at 0 errors** (33 suites total), which required bringing
