@@ -9,6 +9,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 17): limits + violations suites adopted
+
+- **`unit/limits` and `unit/violations` adopted natively at 0 errors** (31 suites total) — both were
+  already conformant (maxclients connection-limit behavior and large-value/edge boundary handling);
+  now ratcheted.
+
 ### Added — parity roadmap Phase 1 (wave 16): latency-monitor + type/list-2 suites adopted
 
 - **`unit/latency-monitor` adopted natively at 0 errors** (29 suites total), which required
