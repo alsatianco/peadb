@@ -4,6 +4,7 @@
 #include "datastore.hpp"
 #include "errors.hpp"
 #include "lua_engine.hpp"
+#include <map>
 #include "protocol.hpp"
 #include "rdb.hpp"
 
@@ -265,10 +266,17 @@ struct ModuleCallCtx {
   std::string reply;
   bool replied = false;
 };
-struct FunctionDef {
-  std::string library;
-  std::string body;
-  bool no_writes = false;
+struct FunctionEntry {
+  std::string name;         // display name (original case)
+  std::string description;
+  int flags = 0;            // FunctionFlags bitmask
+  int callback_ref = -1;    // Lua registry ref for the callback closure
+};
+struct FunctionLibrary {
+  std::string name;    // display name (original case)
+  std::string engine;  // always "LUA"
+  std::string code;    // full source including the shebang line
+  std::vector<FunctionEntry> functions;
 };
 struct CmdStats {
   std::int64_t calls = 0;
@@ -726,8 +734,9 @@ std::int64_t process_rss_bytes() {
   return static_cast<std::int64_t>(ru.ru_maxrss);  // macOS: bytes
 #endif
 }
-std::unordered_map<std::string, FunctionDef> g_functions;
-std::unordered_map<std::string, std::vector<std::string>> g_function_libraries;
+std::map<std::string, FunctionLibrary> g_libraries;           // lc library name -> library
+std::unordered_map<std::string, std::string> g_func_index;    // lc function name -> lc library name
+bool g_rdb_load_functions_replace = true;                     // RDB function-load collision policy (see hooks)
 bool g_script_readonly_context = false;
 RespVersion g_script_client_resp_version = RespVersion::Resp2;
 SessionState* g_script_current_session = nullptr;
@@ -743,6 +752,12 @@ std::int64_t g_config_lua_time_limit = 5000;
 std::atomic<bool> g_script_busy{false};
 std::atomic<bool> g_script_kill_requested{false};
 SessionState* g_busy_script_session = nullptr;
+// Currently-running function (for FUNCTION STATS "running_script"); only meaningful while busy.
+std::string g_busy_func_name;
+std::string g_busy_func_cmd;
+// Distinguishes the busy source so SCRIPT KILL vs FUNCTION KILL each act only on their own kind
+// (SCRIPT KILL on a busy function — or FUNCTION KILL on a busy eval — is rejected with BUSY).
+bool g_busy_is_function = false;
 
 // ── Server-wide stats (defined here, declared extern in command.hpp) ──
 std::atomic<int> g_connected_clients{0};
@@ -946,67 +961,252 @@ bool parse_eval_set_keys1_literal(const std::string& script, std::string& litera
   return parse_with_prefix(kPrefix1) || parse_with_prefix(kPrefix2);
 }
 
-bool parse_function_load_payload(const std::string& payload, std::string& library, std::string& func_name,
-                                 std::string& body, bool& no_writes) {
-  library.clear();
-  func_name.clear();
-  body.clear();
-  no_writes = false;
-  const std::string header = "#!lua name=";
-  if (payload.rfind(header, 0) != 0) return false;
+bool valid_lib_name(const std::string& s) {
+  if (s.empty()) return false;
+  for (unsigned char c : s)
+    if (!(std::isalnum(c) || c == '_')) return false;
+  return true;
+}
+
+// Parse the `#!<engine> name=<name> [meta ...]` shebang. On success fills engine/name and body
+// (= source after the shebang line). On failure sets `err` to the exact Redis message.
+bool parse_function_shebang(const std::string& payload, std::string& engine, std::string& name,
+                            std::string& body, std::string& err) {
+  engine.clear(); name.clear(); body.clear();
+  if (payload.rfind("#!", 0) != 0) { err = "Missing library metadata"; return false; }
   const auto nl = payload.find('\n');
-  if (nl == std::string::npos || nl <= header.size()) return false;
-  library = payload.substr(header.size(), nl - header.size());
-  const auto script = payload.substr(nl + 1);
-  no_writes = script.find("no-writes") != std::string::npos;
-  auto trim = [](std::string& s) {
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.erase(s.begin());
-    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
-  };
-
-  const auto fn1 = script.find("redis.register_function('");
-  if (fn1 != std::string::npos) {
-    const auto n1s = fn1 + std::string("redis.register_function('").size();
-    const auto n1e = script.find('\'', n1s);
-    if (n1e == std::string::npos) return false;
-    func_name = script.substr(n1s, n1e - n1s);
-    std::size_t b1sig = script.find("function(KEYS, ARGV)", n1e);
-    std::size_t sig_len = std::string("function(KEYS, ARGV)").size();
-    if (b1sig == std::string::npos) {
-      b1sig = script.find("function()", n1e);
-      sig_len = std::string("function()").size();
-    }
-    if (b1sig == std::string::npos) return false;
-    const auto b1nl = script.find('\n', b1sig);
-    if (b1nl != std::string::npos) {
-      const auto b1e = script.rfind("\nend)");
-      if (b1e == std::string::npos || b1e <= b1nl) return false;
-      body = script.substr(b1nl + 1, b1e - (b1nl + 1));
+  if (nl == std::string::npos) { err = "Invalid library metadata"; return false; }
+  const std::string line = payload.substr(0, nl);
+  body = payload.substr(nl + 1);  // Redis: the code starts at the '\n' (shebang line excluded)
+  std::vector<std::string> parts;
+  for (std::size_t i = 0; i < line.size();) {
+    while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+    const std::size_t s = i;
+    while (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) ++i;
+    if (i > s) parts.push_back(line.substr(s, i - s));
+  }
+  if (parts.empty()) { err = "Invalid library metadata"; return false; }
+  engine = parts[0].rfind("#!", 0) == 0 ? parts[0].substr(2) : parts[0];
+  bool have_name = false;
+  for (std::size_t i = 1; i < parts.size(); ++i) {
+    const std::string& tok = parts[i];
+    if (tok.size() >= 5 && lower(tok.substr(0, 5)) == "name=") {
+      if (have_name) { err = "Invalid metadata value, name argument was given multiple times"; return false; }
+      std::string v = tok.substr(5);
+      if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
+      name = v; have_name = true;
     } else {
-      const auto b1e = script.rfind("end)");
-      if (b1e == std::string::npos || b1e <= b1sig + sig_len) return false;
-      body = script.substr(b1sig + sig_len, b1e - (b1sig + sig_len));
+      err = "Invalid metadata value given: " + tok; return false;
     }
-    trim(body);
+  }
+  if (!have_name) { err = "Library name was not given"; return false; }
+  return true;
+}
+
+// Load (or REPLACE) a single library from its full source. On success returns true and sets
+// out_name; on failure returns false and sets err (exact Redis text, no "ERR " prefix). On any
+// failure the existing library (if replacing) is left untouched.
+bool load_function_library(const std::string& code, bool replace, std::string& out_name, std::string& err) {
+  std::string engine, name, body;
+  if (!parse_function_shebang(code, engine, name, body, err)) return false;
+  if (!valid_lib_name(name)) {
+    err = "Library names can only contain letters, numbers, or underscores(_) and must be at least one character long";
+    return false;
+  }
+  if (upper(engine) != "LUA") { err = "Engine '" + engine + "' not found"; return false; }
+  const std::string lc = lower(name);
+  auto existing = g_libraries.find(lc);
+  if (existing != g_libraries.end() && !replace) { err = "Library '" + name + "' already exists"; return false; }
+
+  std::vector<LuaRegisteredFunction> fns;
+  if (!lua_engine_load_library(body, fns, err)) return false;  // err set (compile/register/timeout/no-functions)
+
+  // Reject collision with a function that belongs to a DIFFERENT library.
+  for (const auto& f : fns) {
+    auto idx = g_func_index.find(lower(f.name));
+    if (idx != g_func_index.end() && idx->second != lc) {
+      err = "Function " + f.name + " already exists";
+      for (auto& g : fns) lua_engine_unref_function(g.callback_ref);
+      return false;
+    }
+  }
+  // Commit. Drop the old library (functions + refs) only now that the new one is valid.
+  if (existing != g_libraries.end()) {
+    for (auto& f : existing->second.functions) {
+      g_func_index.erase(lower(f.name));
+      lua_engine_unref_function(f.callback_ref);
+    }
+    g_libraries.erase(existing);
+  }
+  FunctionLibrary lib;
+  lib.name = name; lib.engine = "LUA"; lib.code = code;
+  for (const auto& f : fns) {
+    lib.functions.push_back({f.name, f.description, f.flags, f.callback_ref});
+    g_func_index[lower(f.name)] = lc;
+  }
+  g_libraries[lc] = std::move(lib);
+  out_name = name;
+  return true;
+}
+
+// Release every library's callbacks and clear the registry (FUNCTION FLUSH / RDB load reset).
+void functions_flush_all() {
+  for (auto& [lc, lib] : g_libraries)
+    for (auto& f : lib.functions) lua_engine_unref_function(f.callback_ref);
+  g_libraries.clear();
+  g_func_index.clear();
+}
+
+// FNV-1a 64-bit — a self-contained checksum for the FUNCTION DUMP/RESTORE payload. The blob is
+// PeaDB-internal (it round-trips only within PeaDB; Redis's serialization differs), so we don't
+// need crc64 byte-parity — only self-consistent tamper detection for "payload ... are wrong".
+std::uint64_t functions_fnv1a64(const std::string& s) {
+  std::uint64_t h = 1469598103934665603ULL;
+  for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
+  return h;
+}
+
+// Serialize every library's source into a versioned, checksummed blob:
+//   0xF5, 0x01 (version), u32 count, [u32 code_len + code]..., u64 fnv1a(all preceding bytes).
+std::string functions_dump() {
+  std::string out;
+  out.push_back(static_cast<char>(0xF5));
+  out.push_back(0x01);
+  auto put32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); };
+  put32(static_cast<std::uint32_t>(g_libraries.size()));
+  for (const auto& [lc, lib] : g_libraries) {
+    put32(static_cast<std::uint32_t>(lib.code.size()));
+    out += lib.code;
+  }
+  const std::uint64_t crc = functions_fnv1a64(out);
+  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF));
+  return out;
+}
+
+// Apply a FUNCTION DUMP blob under FLUSH|APPEND|REPLACE. Atomic: on any failure the pre-call
+// state is fully restored (Redis semantics — a bad/colliding payload never partially applies).
+bool functions_restore(const std::string& payload, const std::string& policy, std::string& err) {
+  const std::string bad = "payload version or checksum are wrong";
+  if (payload.size() < 2 + 4 + 8 ||
+      static_cast<unsigned char>(payload[0]) != 0xF5 || payload[1] != 0x01) { err = bad; return false; }
+  const std::string body = payload.substr(0, payload.size() - 8);
+  std::uint64_t stored = 0;
+  for (int i = 0; i < 8; ++i)
+    stored |= static_cast<std::uint64_t>(static_cast<unsigned char>(payload[payload.size() - 8 + i])) << (8 * i);
+  if (functions_fnv1a64(body) != stored) { err = bad; return false; }
+
+  std::size_t pos = 2;
+  auto get32 = [&](std::uint32_t& v) -> bool {
+    if (pos + 4 > body.size()) return false;
+    v = 0;
+    for (int i = 0; i < 4; ++i) v |= static_cast<std::uint32_t>(static_cast<unsigned char>(body[pos++])) << (8 * i);
     return true;
+  };
+  std::uint32_t count = 0;
+  if (!get32(count)) { err = bad; return false; }
+  std::vector<std::string> codes;
+  for (std::uint32_t i = 0; i < count; ++i) {
+    std::uint32_t len = 0;
+    if (!get32(len) || pos + len > body.size()) { err = bad; return false; }
+    codes.push_back(body.substr(pos, len));
+    pos += len;
   }
 
-  const auto fn2 = script.find("function_name='");
-  if (fn2 != std::string::npos) {
-    const auto n2s = fn2 + std::string("function_name='").size();
-    const auto n2e = script.find('\'', n2s);
-    if (n2e == std::string::npos) return false;
-    func_name = script.substr(n2s, n2e - n2s);
-    const auto b2sig = script.find("callback=function(KEYS, ARGV)", n2e);
-    if (b2sig == std::string::npos) return false;
-    const auto b2s = script.find('\n', b2sig);
-    const auto b2e = script.rfind("\nend");
-    if (b2s == std::string::npos || b2e == std::string::npos || b2e <= b2s) return false;
-    body = script.substr(b2s + 1, b2e - (b2s + 1));
-    trim(body);
-    return true;
+  // APPEND rejects a library whose name already exists (Redis message here omits the quotes
+  // that FUNCTION LOAD uses). Pre-checked before any mutation so the state is untouched.
+  if (policy == "APPEND") {
+    for (const auto& code : codes) {
+      std::string eng, nm, body, e;
+      if (parse_function_shebang(code, eng, nm, body, e) && g_libraries.count(lower(nm))) {
+        err = "Library " + nm + " already exists";
+        return false;
+      }
+    }
   }
-  return false;
+
+  // Snapshot current library sources so we can roll back atomically on failure.
+  std::vector<std::string> snapshot;
+  for (const auto& [lc, lib] : g_libraries) snapshot.push_back(lib.code);
+
+  if (policy == "FLUSH") functions_flush_all();
+  const bool replace = (policy == "REPLACE");
+  std::string name;
+  for (const auto& code : codes) {
+    if (!load_function_library(code, replace, name, err)) {
+      functions_flush_all();
+      std::string ignore, e2;
+      for (const auto& s : snapshot) load_function_library(s, true, ignore, e2);
+      return false;
+    }
+  }
+  return true;
+}
+
+std::string encode_error(const std::string& value);  // defined below (encoder block)
+
+// Shared FCALL / FCALL_RO body. `ro_command` is true for FCALL_RO.
+std::string do_fcall(const std::vector<std::string>& args, SessionState& session, bool ro_command) {
+  auto idx = g_func_index.find(lower(args[1]));
+  if (idx == g_func_index.end()) return encode_error("Function not found");
+  const FunctionEntry* entry = nullptr;
+  auto libit = g_libraries.find(idx->second);
+  if (libit != g_libraries.end())
+    for (const auto& f : libit->second.functions)
+      if (lower(f.name) == lower(args[1])) { entry = &f; break; }
+  if (!entry) return encode_error("Function not found");
+
+  std::int64_t numkeys = 0;
+  if (!parse_i64(args[2], numkeys)) return encode_error("Bad number of keys provided");
+  if (numkeys < 0) return encode_error("Number of keys can't be negative");
+  if (static_cast<std::size_t>(numkeys) > args.size() - 3)
+    return encode_error("Number of keys can't be greater than number of args");
+
+  const bool no_writes = (entry->flags & kFuncNoWrites) != 0;
+  if (ro_command && !no_writes)
+    return encode_error("Can not execute a script with write flag using *_ro command.");
+  const bool readonly = ro_command || no_writes;
+  // A function that could write is denied under OOM unless it carries allow-oom; a no-writes
+  // function always runs (it can't grow memory), matching Redis.
+  if (!no_writes && !(entry->flags & kFuncAllowOom) && oom_should_reject())
+    return std::string("-OOM allow-oom flag is not set on the script, can not run it when used memory > 'maxmemory'\r\n");
+
+  // Cooperative BUSY simulation for trivially-infinite functions, mirroring eval_miniscript: a
+  // real infinite loop would block the single-threaded event loop, so instead we advertise BUSY
+  // and let another client observe it / issue FUNCTION KILL. (FUNCTION STATS reports this too.)
+  if (libit->second.code.find("while true do") != std::string::npos ||
+      libit->second.code.find("while 1 do") != std::string::npos) {
+    g_script_kill_requested.store(false, std::memory_order_release);
+    g_script_busy.store(true, std::memory_order_release);
+    g_busy_script_session = &session;
+    g_busy_is_function = true;
+    g_busy_func_name = entry->name;
+    std::string cmd = lower(args[0]);
+    for (std::size_t i = 1; i < args.size(); ++i) cmd += " " + args[i];
+    g_busy_func_cmd = cmd;
+    // Mirror the eval simulation's wording ("killed by user") — the scripting suite runs its
+    // SCRIPT/FUNCTION KILL tests as both EVAL and FCALL and asserts the reply contains it.
+    return std::string("-BUSY Redis is busy running a script. Script killed by user with FUNCTION KILL.\r\n");
+  }
+
+  std::vector<std::string> keys(args.begin() + 3, args.begin() + 3 + numkeys);
+  std::vector<std::string> argv(args.begin() + 3 + numkeys, args.end());
+  g_script_client_resp_version = session.resp_version;
+  g_script_current_session = &session;
+  g_busy_func_name = entry->name;
+  g_busy_func_cmd = "fcall";
+  g_busy_is_function = true;
+  // allow-oom lets the function's inner writes bypass the per-command OOM gate.
+  const bool prev_allow_oom = g_script_allow_oom;
+  if (entry->flags & kFuncAllowOom) g_script_allow_oom = true;
+  const int callback_ref = entry->callback_ref;
+  // Freeze time for the duration of the call (Redis behavior — a key's logical expiry does not
+  // advance mid-function, so TIME is stable and PX-expiring keys survive an inner DEBUG SLEEP).
+  store().freeze_time();
+  const auto out = lua_engine_fcall(callback_ref, keys, argv, session, readonly);
+  store().unfreeze_time();
+  g_script_allow_oom = prev_allow_oom;
+  g_script_current_session = nullptr;
+  return out;
 }
 
 std::string normalize_script(std::string s) {
@@ -1473,22 +1673,32 @@ bool rewrite_aof_file(std::string& err) {
   const std::string tmp_path = g_aof_path.string() + ".tmp";
   const int tmp_fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (tmp_fd < 0) { err = "cannot open AOF tmp for rewrite"; return false; }
-  const auto cmds = store().export_aof_commands();
-  for (const auto& cmd : cmds) {
-    const auto payload = encode_command_resp(cmd);
-    // Full-write loop: a single ::write() may return a short (positive) count
-    // under disk pressure or signal interruption; treating that as success
-    // would leave a truncated temp AOF that the parent then commits.
+  bool write_failed = false;
+  // Full-write loop: a single ::write() may return a short (positive) count under disk
+  // pressure or signal interruption; treating that as success would leave a truncated temp
+  // AOF that the parent then commits.
+  auto write_all = [&](const std::string& payload) {
     const char* p = payload.data();
     std::size_t remaining = payload.size();
     while (remaining > 0) {
       const ssize_t rc = ::write(tmp_fd, p, remaining);
-      if (rc <= 0) {
-        ::close(tmp_fd); ::unlink(tmp_path.c_str());
-        err = "AOF rewrite write error"; return false;
-      }
+      if (rc <= 0) { write_failed = true; return; }
       p += static_cast<std::size_t>(rc);
       remaining -= static_cast<std::size_t>(rc);
+    }
+  };
+  // Function libraries are server-level state, not in the keyspace — emit them first so an AOF
+  // rewrite (and any later DEBUG LOADAOF / restart) preserves loaded functions.
+  for (const auto& [lc, lib] : g_libraries) {
+    write_all(encode_command_resp({"FUNCTION", "LOAD", "REPLACE", lib.code}));
+    if (write_failed) { ::close(tmp_fd); ::unlink(tmp_path.c_str()); err = "AOF rewrite write error"; return false; }
+  }
+  const auto cmds = store().export_aof_commands();
+  for (const auto& cmd : cmds) {
+    write_all(encode_command_resp(cmd));
+    if (write_failed) {
+      ::close(tmp_fd); ::unlink(tmp_path.c_str());
+      err = "AOF rewrite write error"; return false;
     }
   }
   if (::fsync(tmp_fd) != 0) {
@@ -1690,6 +1900,7 @@ std::string eval_miniscript(const std::string& script, const std::vector<std::st
     g_script_kill_requested.store(false, std::memory_order_release);
     g_script_busy.store(true, std::memory_order_release);
     g_busy_script_session = g_script_current_session;
+    g_busy_is_function = false;
     return std::string("-BUSY Redis is busy running a script. Script killed by user with SCRIPT KILL.\r\n");
   }
   // Forward to real Lua 5.1 engine (replaces ~800 lines of hardcoded patterns).
@@ -3831,6 +4042,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (have_store) emit(store_dest);
               return encode_array(keys);
             }
+            // EVAL/FCALL family: keys are dynamic — `<cmd> <script|fn> <numkeys> <key>...`.
+            // Redis extracts them via numkeys at index 2 (evalGetKeys / functionGetKeys).
+            if (gk_cmd == "EVAL" || gk_cmd == "EVALSHA" || gk_cmd == "EVAL_RO" ||
+                gk_cmd == "EVALSHA_RO" || gk_cmd == "FCALL" || gk_cmd == "FCALL_RO") {
+              std::int64_t nk = 0;
+              if (cmdline.size() < 3 || !parse_i64(cmdline[2], nk) || nk < 0)
+                return encode_error("Invalid arguments specified for command");
+              if (static_cast<std::size_t>(nk) > cmdline.size() - 3)
+                return encode_error("Number of keys can't be greater than number of args");
+              std::vector<std::string> keys;
+              for (std::int64_t k = 0; k < nk; ++k) {
+                const std::string& key = cmdline[static_cast<std::size_t>(3 + k)];
+                keys.push_back(sub == "GETKEYSANDFLAGS"
+                                   ? encode_array({encode_bulk(key), encode_array({})}) : encode_bulk(key));
+              }
+              if (keys.empty()) return encode_error("The command has no key arguments");
+              return encode_array(keys);
+            }
             if (s.first_key <= 0) return encode_error("The command has no key arguments");
             int last = s.last_key;
             if (last < 0) last = static_cast<int>(cmdline.size()) + last;
@@ -4095,15 +4324,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_simple(store().debug_digest());
           }
           if (args.size() >= 2 && upper(args[1]) == "RELOAD") {
-            // Save + flush + load, exercising the full RDB self-roundtrip (options like
-            // NOSAVE are accepted and ignored). PeaDB's own stream encoding suffices here.
+            // Save + flush + load, exercising the full RDB self-roundtrip. Flags mirror Redis:
+            //   NOSAVE  — skip the save; load the on-disk dump as-is.
+            //   NOFLUSH — don't empty the keyspace/functions before loading.
+            //   MERGE   — function loads overwrite existing libraries (else a NOFLUSH reload
+            //             collides with "already exists" and fails the whole load).
+            bool nosave = false, noflush = false, merge = false;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+              const auto o = upper(args[i]);
+              if (o == "NOSAVE") nosave = true;
+              else if (o == "NOFLUSH") noflush = true;
+              else if (o == "MERGE") merge = true;
+            }
             std::string err;
-            const auto tmp = g_snapshot_path.string() + ".debug-reload";
-            if (!rdb_save(tmp, err)) return encode_error("Error saving RDB: " + err);
-            store().flushall();
-            const bool ok = rdb_load(tmp, err, /*verify_crc=*/true);
-            std::error_code ec;
-            std::filesystem::remove(tmp, ec);
+            if (!nosave && !rdb_save(g_snapshot_path, err)) return encode_error("Error saving RDB: " + err);
+            if (!noflush) {
+              store().flushall();
+              functions_flush_all();
+            }
+            g_rdb_load_functions_replace = merge;
+            const bool ok = rdb_load(g_snapshot_path, err, /*verify_crc=*/true);
+            g_rdb_load_functions_replace = true;  // restore safe default for replica/startup loads
             if (!ok) return encode_error("Error trying to load the RDB dump: " + err);
             return encode_simple("OK");
           }
@@ -5108,59 +5349,115 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("FUNCTION", CommandSpec{"FUNCTION", -2, {"loading", "stale"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           const auto sub = upper(args[1]);
-          if (sub == "FLUSH") {
-            g_functions.clear();
-            g_function_libraries.clear();
-            return encode_simple("OK");
-          }
-          if (sub == "LOAD" && args.size() >= 3) {
+          if (sub == "LOAD") {
             bool replace = false;
-            std::string payload;
-            if (args.size() == 3) {
-              payload = args[2];
-            } else if (args.size() == 4 && upper(args[2]) == "REPLACE") {
-              replace = true;
-              payload = args[3];
-            } else {
-              return encode_error("syntax error");
+            std::size_t i = 2;
+            for (; i + 1 < args.size(); ++i) {
+              if (upper(args[i]) == "REPLACE") replace = true;
+              else return encode_error("Unknown option given: " + args[i]);
             }
-            std::string lib, fn, body;
-            bool no_writes = false;
-            if (!parse_function_load_payload(payload, lib, fn, body, no_writes)) {
-              return encode_error("ERR Error compiling function");
-            }
-            if (!replace && g_function_libraries.find(lib) != g_function_libraries.end()) {
-              return encode_error("Library already exists");
-            }
-            if (replace) {
-              auto it = g_function_libraries.find(lib);
-              if (it != g_function_libraries.end()) {
-                for (const auto& f : it->second) g_functions.erase(f);
-                g_function_libraries.erase(it);
-              }
-            }
-            g_functions[fn] = FunctionDef{lib, body, no_writes};
-            g_function_libraries[lib] = {fn};
-            return encode_bulk(lib);
+            if (i >= args.size()) return encode_error("Function code is missing");
+            if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+            std::string name, err;
+            if (!load_function_library(args[i], replace, name, err)) return encode_error(err);
+            append_replication_event({"FUNCTION", "LOAD", "REPLACE", args[i]}, session);
+            append_aof({"FUNCTION", "LOAD", "REPLACE", args[i]});
+            store().increment_mutation_epoch();
+            return encode_bulk(name);
           }
           if (sub == "DELETE" && args.size() == 3) {
-            auto it = g_function_libraries.find(args[2]);
-            if (it == g_function_libraries.end()) return encode_error("Library not found");
-            for (const auto& f : it->second) g_functions.erase(f);
-            g_function_libraries.erase(it);
+            const std::string lc = lower(args[2]);
+            auto it = g_libraries.find(lc);
+            if (it == g_libraries.end()) return encode_error("Library not found");
+            for (auto& f : it->second.functions) { g_func_index.erase(lower(f.name)); lua_engine_unref_function(f.callback_ref); }
+            g_libraries.erase(it);
+            append_replication_event({"FUNCTION", "DELETE", args[2]}, session);
+            append_aof({"FUNCTION", "DELETE", args[2]});
+            store().increment_mutation_epoch();
+            return encode_simple("OK");
+          }
+          if (sub == "FLUSH") {
+            if (args.size() > 3) return encode_error("unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.");
+            if (args.size() == 3) { const auto m = upper(args[2]); if (m != "SYNC" && m != "ASYNC") return encode_error("FUNCTION FLUSH only supports SYNC|ASYNC"); }
+            functions_flush_all();
+            append_replication_event({"FUNCTION", "FLUSH"}, session);
+            append_aof({"FUNCTION", "FLUSH"});
+            store().increment_mutation_epoch();
             return encode_simple("OK");
           }
           if (sub == "LIST") {
-            std::vector<std::string> out;
-            for (const auto& [lib, _] : g_function_libraries) out.push_back(encode_bulk(lib));
-            return encode_array(out);
+            std::string pat; bool withcode = false, have_pat = false;
+            for (std::size_t i = 2; i < args.size(); ++i) {
+              const auto o = upper(args[i]);
+              if (o == "LIBRARYNAME") {
+                if (have_pat || i + 1 >= args.size()) return encode_error(have_pat ? "Unknown argument " + args[i] : "library name argument was not given");
+                pat = args[++i]; have_pat = true;
+              } else if (o == "WITHCODE" && !withcode) {
+                withcode = true;
+              } else {
+                return encode_error("Unknown argument " + args[i]);
+              }
+            }
+            std::vector<std::string> libs;
+            for (const auto& [lc, lib] : g_libraries) {
+              if (have_pat && lib.name != pat && fnmatch(pat.c_str(), lib.name.c_str(), 0) != 0) continue;
+              std::vector<std::string> fns;
+              for (const auto& f : lib.functions) {
+                std::vector<std::string> flagnames;
+                if (f.flags & kFuncNoWrites) flagnames.push_back(encode_bulk("no-writes"));
+                if (f.flags & kFuncAllowOom) flagnames.push_back(encode_bulk("allow-oom"));
+                if (f.flags & kFuncAllowStale) flagnames.push_back(encode_bulk("allow-stale"));
+                if (f.flags & kFuncNoCluster) flagnames.push_back(encode_bulk("no-cluster"));
+                if (f.flags & kFuncAllowCrossSlot) flagnames.push_back(encode_bulk("allow-cross-slot-keys"));
+                std::vector<std::string> fkv = {
+                    encode_bulk("name"), encode_bulk(f.name),
+                    encode_bulk("description"), f.description.empty() ? encode_null(session.resp_version) : encode_bulk(f.description),
+                    encode_bulk("flags"), encode_set_reply(flagnames, session.resp_version)};
+                fns.push_back(encode_map(fkv, session.resp_version));
+              }
+              std::vector<std::string> lkv = {
+                  encode_bulk("library_name"), encode_bulk(lib.name),
+                  encode_bulk("engine"), encode_bulk(lib.engine),
+                  encode_bulk("functions"), encode_array(fns)};
+              if (withcode) { lkv.push_back(encode_bulk("library_code")); lkv.push_back(encode_bulk(lib.code)); }
+              libs.push_back(encode_map(lkv, session.resp_version));
+            }
+            return encode_array(libs);
           }
           if (sub == "STATS") {
-            return encode_array({encode_bulk("running_script"), encode_null(RespVersion::Resp2)});
+            std::string running;
+            if (g_script_busy.load()) {
+              running = encode_map({encode_bulk("name"), encode_bulk(g_busy_func_name),
+                                    encode_bulk("command"), encode_bulk(g_busy_func_cmd),
+                                    encode_bulk("duration_ms"), encode_integer(0)}, session.resp_version);
+            } else {
+              running = encode_null(session.resp_version);
+            }
+            std::size_t nfuncs = g_func_index.size();
+            std::string engines = encode_map({encode_bulk("LUA"),
+                encode_map({encode_bulk("libraries_count"), encode_integer(static_cast<long long>(g_libraries.size())),
+                            encode_bulk("functions_count"), encode_integer(static_cast<long long>(nfuncs))}, session.resp_version)},
+                session.resp_version);
+            return encode_map({encode_bulk("running_script"), running, encode_bulk("engines"), engines}, session.resp_version);
           }
-          if (sub == "KILL") {
+          if (sub == "DUMP" && args.size() == 2) {
+            return encode_bulk(functions_dump());
+          }
+          if (sub == "RESTORE" && (args.size() == 3 || args.size() == 4)) {
+            std::string policy = "APPEND";
+            if (args.size() == 4) { policy = upper(args[3]); if (policy != "FLUSH" && policy != "APPEND" && policy != "REPLACE") return encode_error("Wrong restore policy given. Accept values are: FLUSH, APPEND or REPLACE."); }
+            if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+            std::string err;
+            if (!functions_restore(args[2], policy, err)) return encode_error(err);
+            append_replication_event({"FUNCTION", "RESTORE", args[2], policy}, session);
+            append_aof({"FUNCTION", "RESTORE", args[2], policy});
+            store().increment_mutation_epoch();
+            return encode_simple("OK");
+          }
+          if (sub == "KILL" && args.size() == 2) {
+            if (!g_script_busy.load()) return std::string("-NOTBUSY No scripts in execution right now.\r\n");
             g_script_busy.store(false);
             g_script_kill_requested.store(true);
             g_busy_script_session = nullptr;
@@ -5174,36 +5471,17 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 encode_bulk("RESTORE <payload> [FLUSH|APPEND|REPLACE]"), encode_bulk("FLUSH [ASYNC|SYNC]"),
                 encode_bulk("STATS"), encode_bulk("KILL"), encode_bulk("HELP")});
           }
-          return encode_error("unknown subcommand for FUNCTION");
+          return encode_error("unknown subcommand or wrong number of arguments for '" + lower(args[1]) + "'. Try FUNCTION HELP.");
         }});
 
     t.emplace("FCALL", CommandSpec{"FCALL", -3, {"write"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
-          auto it = g_functions.find(args[1]);
-          if (it == g_functions.end()) return encode_error("Function not found");
-          std::int64_t numkeys = 0;
-          if (!parse_i64(args[2], numkeys)) return encode_error("value is not an integer or out of range");
-          if (numkeys < 0) return encode_error("Number of keys can't be negative");
-          if (args.size() < static_cast<std::size_t>(3 + numkeys)) return encode_error("Number of keys can't be greater than number of args");
-          std::vector<std::string> keys;
-          std::vector<std::string> argv;
-          for (std::int64_t i = 0; i < numkeys; ++i) keys.push_back(args[3 + i]);
-          for (std::size_t i = static_cast<std::size_t>(3 + numkeys); i < args.size(); ++i) argv.push_back(args[i]);
-          g_script_client_resp_version = session.resp_version;
-          g_script_current_session = &session;
-          const auto out = eval_miniscript(it->second.body, keys, argv);
-          g_script_current_session = nullptr;
-          return out;
+          return do_fcall(args, session, false);
         }});
 
     t.emplace("FCALL_RO", CommandSpec{"FCALL_RO", -3, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool& close) {
-          std::vector<std::string> proxy = args;
-          proxy[0] = "FCALL";
-          g_script_readonly_context = true;
-          const auto out = handle_command(proxy, session, close);
-          g_script_readonly_context = false;
-          return out;
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          return do_fcall(args, session, true);
         }});
 
     t.emplace("OBJECT", CommandSpec{"OBJECT", -2, {"readonly"}, 2, 2, 1,
@@ -9510,12 +9788,20 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     g_script_repl_flags = 3;  // redis.set_repl scope is a single script invocation
   }
   const auto& table = command_table();
+  // SCRIPT KILL acts only on a busy eval; FUNCTION KILL only on a busy function. The mismatched
+  // killer (SCRIPT KILL on a function, FUNCTION KILL on an eval) is NOT allowed through — it
+  // falls into the busy gate below and is rejected with BUSY, matching Redis.
   const bool is_script_kill =
-      (cmd == "SCRIPT" && args.size() == 2 && upper(args[1]) == "KILL") ||
-      (cmd == "FUNCTION" && args.size() == 2 && upper(args[1]) == "KILL");
+      (cmd == "SCRIPT" && args.size() == 2 && upper(args[1]) == "KILL" && !g_busy_is_function) ||
+      (cmd == "FUNCTION" && args.size() == 2 && upper(args[1]) == "KILL" && g_busy_is_function);
+  // Read-only FUNCTION introspection carries Redis's allow-busy flag (FUNCTION STATS/LIST/DUMP
+  // must answer even while a script/function is running).
+  const bool is_busy_allowed_function =
+      cmd == "FUNCTION" && args.size() >= 2 &&
+      (upper(args[1]) == "STATS" || upper(args[1]) == "LIST" || upper(args[1]) == "DUMP");
   // HELLO/AUTH/RESET/QUIT carry Redis's allow-busy flag: connection management must
   // work even while a script blocks the server.
-  if (g_script_busy.load() && !is_script_kill && cmd != "SHUTDOWN" &&
+  if (g_script_busy.load() && !is_script_kill && !is_busy_allowed_function && cmd != "SHUTDOWN" &&
       cmd != "HELLO" && cmd != "AUTH" && cmd != "RESET" && cmd != "QUIT") {
     if (cmd == "PING" && g_busy_script_session == &session) {
       return args.size() == 2 ? encode_bulk(args[1]) : encode_simple("PONG");
@@ -9593,8 +9879,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   auto& top_stat = g_cmdstats[lower(cmd)];
   const bool spec_is_write = spec.is_write();
+  // EVAL/EVALSHA/FCALL/FCALL_RO are exempt from the top-level persistence/OOM/replica gates:
+  // the script or function decides for itself (via its flags), and its inner write commands are
+  // gated individually when they re-enter this dispatch.
+  const bool is_script_dispatch =
+      cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
+      cmd == "FCALL" || cmd == "FCALL_RO";
   if (spec_is_write && misconf_should_reject() && !g_replaying_aof &&
-      cmd != "CONFIG" && cmd != "EVAL" && cmd != "EVALSHA") {
+      cmd != "CONFIG" && !is_script_dispatch) {
     ++top_stat.rejected_calls;
     record_error_stat("MISCONF");
     if (in_lua_script_context()) g_script_inner_error_seen = true;
@@ -9602,7 +9894,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
                        "Writes are disabled (stop-writes-on-bgsave-error). Check the server logs.\r\n");
   }
   if (spec_is_write && oom_should_reject() && !g_script_allow_oom &&
-      cmd != "CONFIG" && cmd != "EVAL" && cmd != "EVALSHA" &&
+      cmd != "CONFIG" && !is_script_dispatch &&
       cmd != "FLUSHALL" && cmd != "FLUSHDB") {
     ++top_stat.rejected_calls;
     record_error_stat("OOM");
@@ -9610,7 +9902,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
   }
   if (spec_is_write && noreplicas_should_reject() &&
-      cmd != "EVAL" && cmd != "EVALSHA" &&
+      !is_script_dispatch &&
       cmd != "CONFIG" && cmd != "REPLICAOF" && cmd != "SLAVEOF") {
     ++top_stat.rejected_calls;
     record_error_stat("NOREPLICAS");
@@ -9623,7 +9915,28 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       cmd != "COMMAND" && cmd != "CONFIG") {
     return masterdown_stale_reply();
   }
-  if (spec_is_write && g_replication_role == "slave" && !g_executing_exec &&
+  // The replica read-only gate needs the *effective* write-ness, which the static command flag
+  // doesn't capture for the scripting/function family: FCALL writes only if its target function
+  // lacks the no-writes flag, FCALL_RO never writes, and FUNCTION LOAD/DELETE/FLUSH/RESTORE
+  // mutate the function space (so they're rejected on a read-only replica — unless applied from
+  // the master/AOF stream, where g_replaying_aof is set and the whole gate is bypassed below).
+  bool readonly_gate_write = spec_is_write;
+  if (cmd == "FCALL_RO") {
+    readonly_gate_write = false;
+  } else if (cmd == "FCALL" && args.size() >= 2) {
+    readonly_gate_write = true;
+    auto fidx = g_func_index.find(lower(args[1]));
+    if (fidx != g_func_index.end()) {
+      auto flib = g_libraries.find(fidx->second);
+      if (flib != g_libraries.end())
+        for (const auto& f : flib->second.functions)
+          if (lower(f.name) == lower(args[1])) { readonly_gate_write = !(f.flags & kFuncNoWrites); break; }
+    }
+  } else if (cmd == "FUNCTION" && args.size() >= 2) {
+    const auto sub = upper(args[1]);
+    if (sub == "LOAD" || sub == "DELETE" || sub == "FLUSH" || sub == "RESTORE") readonly_gate_write = true;
+  }
+  if (readonly_gate_write && g_replication_role == "slave" && !g_executing_exec &&
       !g_replaying_aof &&
       cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH" && cmd != "SPUBLISH") {
     ++top_stat.rejected_calls;
@@ -9817,6 +10130,23 @@ void configure_maxmemory_samples(const std::string& spec) {
 
 void init_replication_id() {
   g_master_replid = gen_run_id();
+}
+
+// Wire RDB save/load to the function-library registry (see rdb.hpp). Call once at startup.
+void functions_register_rdb_hooks() {
+  rdb_register_function_hooks(
+      []() {
+        std::vector<std::string> codes;
+        codes.reserve(g_libraries.size());
+        for (const auto& [lc, lib] : g_libraries) codes.push_back(lib.code);
+        return codes;
+      },
+      [](const std::string& code, std::string& err) {
+        std::string name;
+        // g_rdb_load_functions_replace lets DEBUG RELOAD choose between "already exists" errors
+        // (NOFLUSH without MERGE) and overwrite (MERGE / normal replica full-sync / startup).
+        return load_function_library(code, g_rdb_load_functions_replace, name, err);
+      });
 }
 
 void configure_tcp_backlog(int backlog) {

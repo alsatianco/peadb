@@ -140,6 +140,8 @@ int main(int argc, char** argv) {
       [](const std::vector<std::string>& args, peadb::SessionState& session, bool& close) -> std::string {
         return peadb::handle_command(args, session, close);
       });
+  // Wire RDB save/load to the function-library registry (must precede the RDB load below).
+  peadb::functions_register_rdb_hooks();
 
   peadb::log(peadb::LogLevel::Info, "Server initialized");
 

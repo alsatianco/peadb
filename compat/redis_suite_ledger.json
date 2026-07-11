@@ -50,6 +50,15 @@
       "mode": "native",
       "skipfile_lines": 3
     },
+    "unit/functions": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 6,
+        "ok": 109
+      },
+      "mode": "native",
+      "skipfile_lines": 1
+    },
     "unit/geo": {
       "last_counts": {
         "err": 0,

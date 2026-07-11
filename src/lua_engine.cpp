@@ -58,6 +58,15 @@ thread_local RespVersion g_lua_client_resp = RespVersion::Resp2;
 thread_local bool g_lua_readonly = false;
 thread_local bool g_lua_last_error_from_redis = false;
 
+// ─── FUNCTION library engine state ───────────────────────────────────────────
+struct LoadingFn { std::string name; std::string description; int flags = 0; int ref = -1; };
+bool g_in_function_load = false;                 // true only during a FUNCTION LOAD pcall
+std::vector<LoadingFn>* g_loading_fns = nullptr; // accumulator during a load
+int g_load_redis_ref = -1;                       // registry ref: the restricted load-time `redis` table
+int g_libenv_ref = -1;                           // registry ref: the shared library environment table
+std::chrono::steady_clock::time_point g_func_load_start;
+bool g_func_load_timed_out = false;
+
 // ─── Lua script timeout / kill hook ──────────────────────────────────────────
 static std::chrono::steady_clock::time_point g_script_start_time;
 
@@ -1086,7 +1095,182 @@ void register_redis_lib(lua_State* L) {
   lua_pushnumber(L, 3);
   lua_setfield(L, -2, "LOG_WARNING");
 
+  // Server version, exposed at script runtime the same as on the FUNCTION LOAD table.
+  lua_pushstring(L, "7.2.5"); lua_setfield(L, -2, "REDIS_VERSION");
+  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5); lua_setfield(L, -2, "REDIS_VERSION_NUM");
+
   lua_setglobal(L, "redis");
+}
+
+// ─── FUNCTION library engine ─────────────────────────────────────────────────
+
+bool valid_func_name(const std::string& s) {
+  if (s.empty()) return false;
+  for (unsigned char c : s)
+    if (!(std::isalnum(c) || c == '_')) return false;
+  return true;
+}
+
+// Read a Lua array of flag strings at `idx` into a bitmask. Returns false on an unknown flag.
+bool read_function_flags(lua_State* L, int idx, int& flags) {
+  flags = 0;
+  int i = 1;
+  while (true) {
+    lua_rawgeti(L, idx, i++);
+    if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
+    if (!lua_isstring(L, -1)) { lua_pop(L, 1); return false; }
+    std::string f = lower(lua_tostring(L, -1));
+    lua_pop(L, 1);
+    if (f == "no-writes") flags |= kFuncNoWrites;
+    else if (f == "allow-oom") flags |= kFuncAllowOom;
+    else if (f == "allow-stale") flags |= kFuncAllowStale;
+    else if (f == "no-cluster") flags |= kFuncNoCluster;
+    else if (f == "allow-cross-slot-keys") flags |= kFuncAllowCrossSlot;
+    else return false;
+  }
+  return true;
+}
+
+// redis.register_function — only valid during FUNCTION LOAD. Validates arguments exactly like
+// Redis and refs the callback into the registry, accumulating into g_loading_fns.
+int lua_func_register(lua_State* L) {
+  if (!g_in_function_load || g_loading_fns == nullptr)
+    return luaL_error(L, "redis.register_function can only be called on FUNCTION LOAD command");
+  const int nargs = lua_gettop(L);
+  if (nargs < 1 || nargs > 2)
+    return luaL_error(L, "wrong number of arguments to redis.register_function");
+
+  std::string name, desc;
+  int flags = 0, cb_ref = LUA_NOREF;
+
+  if (nargs == 1) {
+    if (!lua_istable(L, 1))
+      return luaL_error(L, "calling redis.register_function with a single argument is only "
+                           "applicable to Lua table (representing named arguments).");
+    bool have_name = false, have_cb = false;
+    lua_pushnil(L);
+    while (lua_next(L, 1) != 0) {
+      // stack: table(1) ... key(-2) value(-1)
+      if (!lua_isstring(L, -2)) {
+        if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+        return luaL_error(L, "named argument key given to redis.register_function is not a string");
+      }
+      const std::string key = lower(lua_tostring(L, -2));
+      if (key == "function_name") {
+        if (!lua_isstring(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "function_name argument given to redis.register_function must be a string"); }
+        { std::size_t nl = 0; const char* np = lua_tolstring(L, -1, &nl); name.assign(np, nl); }
+        have_name = true;
+      } else if (key == "description") {
+        if (!lua_isstring(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "description argument given to redis.register_function must be a string"); }
+        desc = lua_tostring(L, -1);
+      } else if (key == "callback") {
+        if (!lua_isfunction(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "callback argument given to redis.register_function must be a function"); }
+        lua_pushvalue(L, -1);
+        cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+        have_cb = true;
+      } else if (key == "flags") {
+        if (!lua_istable(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "flags argument to redis.register_function must be a table representing function flags"); }
+        if (!read_function_flags(L, lua_gettop(L), flags)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "unknown flag given"); }
+      } else {
+        if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+        return luaL_error(L, "unknown argument given to redis.register_function");
+      }
+      lua_pop(L, 1);  // pop value, keep key for lua_next
+    }
+    if (!have_name) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+      return luaL_error(L, "redis.register_function must get a function name argument"); }
+    if (!have_cb)
+      return luaL_error(L, "redis.register_function must get a callback argument");
+  } else {
+    if (!lua_isstring(L, 1))
+      return luaL_error(L, "first argument to redis.register_function must be a string");
+    if (!lua_isfunction(L, 2))
+      return luaL_error(L, "second argument to redis.register_function must be a function");
+    { std::size_t nl = 0; const char* np = lua_tolstring(L, 1, &nl); name.assign(np, nl); }
+    lua_pushvalue(L, 2);
+    cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  }
+
+  if (!valid_func_name(name)) {
+    luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+    return luaL_error(L, "Library names can only contain letters, numbers, or underscores(_) "
+                         "and must be at least one character long");
+  }
+  for (const auto& f : *g_loading_fns) {
+    if (lower(f.name) == lower(name)) {
+      luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+      return luaL_error(L, "Function already exists in the library");
+    }
+  }
+  g_loading_fns->push_back({name, desc, flags, cb_ref});
+  return 0;
+}
+
+// Shared library-environment metamethods. __index returns the restricted load `redis` table
+// while a load is running, otherwise the full script globals; a missing key is a hard error.
+int libenv_index(lua_State* L) {
+  const char* kc = lua_tostring(L, 2);
+  const std::string key = kc ? kc : "";
+  if (g_in_function_load) {
+    if (key == "redis" || key == "server") { lua_rawgeti(L, LUA_REGISTRYINDEX, g_load_redis_ref); return 1; }
+    return luaL_error(L, "Script attempted to access nonexistent global variable '%s'", key.c_str());
+  }
+  if (key == "redis" || key == "server") { lua_getglobal(L, "redis"); return 1; }
+  lua_getglobal(L, key.c_str());  // full sandboxed globals (string/table/math/cjson/…)
+  if (!lua_isnil(L, -1)) return 1;
+  lua_pop(L, 1);
+  return luaL_error(L, "Script attempted to access nonexistent global variable '%s'", key.c_str());
+}
+int libenv_newindex(lua_State* L) {
+  return luaL_error(L, "Attempt to modify a readonly table");
+}
+
+// FUNCTION LOAD instruction hook: enforce a 500 ms compile/run timeout.
+void lua_func_load_hook(lua_State* L, lua_Debug* /*ar*/) {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - g_func_load_start).count();
+  if (elapsed > 500) {
+    g_func_load_timed_out = true;
+    luaL_error(L, "FUNCTION LOAD timeout");
+  }
+}
+
+// Build the load-time `redis` table (register_function + log + version) and the shared library
+// environment table, storing both in the registry. Called once after the sandbox is installed.
+void setup_function_infra(lua_State* L) {
+  // load-time redis table
+  lua_newtable(L);
+  lua_pushcfunction(L, lua_func_register); lua_setfield(L, -2, "register_function");
+  lua_pushcfunction(L, lua_redis_log); lua_setfield(L, -2, "log");
+  lua_pushnumber(L, 0); lua_setfield(L, -2, "LOG_DEBUG");
+  lua_pushnumber(L, 1); lua_setfield(L, -2, "LOG_VERBOSE");
+  lua_pushnumber(L, 2); lua_setfield(L, -2, "LOG_NOTICE");
+  lua_pushnumber(L, 3); lua_setfield(L, -2, "LOG_WARNING");
+  lua_pushstring(L, "7.2.5"); lua_setfield(L, -2, "REDIS_VERSION");
+  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5); lua_setfield(L, -2, "REDIS_VERSION_NUM");
+  // error-on-missing metatable so redis.call/setresp/etc during load raise the right error
+  lua_newtable(L);
+  lua_pushcfunction(L, [](lua_State* S) -> int {
+    const char* kc = lua_tostring(S, 2);
+    return luaL_error(S, "Script attempted to access nonexistent global variable '%s'", kc ? kc : "");
+  });
+  lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, libenv_newindex); lua_setfield(L, -2, "__newindex");
+  lua_setmetatable(L, -2);
+  g_load_redis_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+
+  // shared library environment table (fenv for every library body + callback)
+  lua_newtable(L);
+  lua_newtable(L);  // metatable
+  lua_pushcfunction(L, libenv_index); lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, libenv_newindex); lua_setfield(L, -2, "__newindex");
+  lua_setmetatable(L, -2);
+  g_libenv_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
 } // anonymous namespace
@@ -1172,6 +1356,7 @@ void lua_engine_init() {
 
   register_redis_lib(g_L);
   sandbox_lua(g_L);
+  setup_function_infra(g_L);
 
   // Seed math.random deterministically (Redis does this)
   luaL_dostring(g_L, "math.randomseed(0)");
@@ -1334,6 +1519,134 @@ bool lua_engine_consume_last_error_from_redis() {
   const bool v = g_lua_last_error_from_redis;
   g_lua_last_error_from_redis = false;
   return v;
+}
+
+bool lua_engine_load_library(const std::string& body,
+                             std::vector<LuaRegisteredFunction>& out,
+                             std::string& err) {
+  if (!g_L) { err = "Lua engine not initialized"; return false; }
+  // Compile the body under the "@user_function" chunk name.
+  if (luaL_loadbuffer(g_L, body.data(), body.size(), "@user_function") != 0) {
+    err = "Error compiling function: " + std::string(lua_tostring(g_L, -1));
+    lua_pop(g_L, 1);
+    return false;
+  }
+  // Run it with the shared library environment as its fenv so register_function is reachable
+  // and globals are protected.
+  lua_rawgeti(g_L, LUA_REGISTRYINDEX, g_libenv_ref);
+  lua_setfenv(g_L, -2);
+
+  std::vector<LoadingFn> fns;
+  g_loading_fns = &fns;
+  g_in_function_load = true;
+  g_func_load_timed_out = false;
+  g_func_load_start = std::chrono::steady_clock::now();
+  lua_sethook(g_L, lua_func_load_hook, LUA_MASKCOUNT, 100000);
+
+  const int rc = lua_pcall(g_L, 0, 0, 0);
+
+  lua_sethook(g_L, nullptr, 0, 0);
+  g_in_function_load = false;
+  g_loading_fns = nullptr;
+
+  if (rc != 0) {
+    std::string m = lua_tostring(g_L, -1) ? lua_tostring(g_L, -1) : "";
+    lua_pop(g_L, 1);
+    for (const auto& f : fns) luaL_unref(g_L, LUA_REGISTRYINDEX, f.ref);
+    if (g_func_load_timed_out) {
+      err = "FUNCTION LOAD timeout";
+    } else {
+      // Strip a leading "@user_function:N:" location prefix if present.
+      auto pos = m.find(':');
+      if (m.rfind("@user_function", 0) == 0 && pos != std::string::npos) {
+        auto p2 = m.find(": ", pos);
+        if (p2 != std::string::npos) m = m.substr(p2 + 2);
+      }
+      err = "Error registering functions: " + m;
+    }
+    return false;
+  }
+  if (fns.empty()) { err = "No functions registered"; return false; }
+  for (const auto& f : fns)
+    out.push_back({f.name, f.description, f.flags, f.ref});
+  return true;
+}
+
+std::string lua_engine_fcall(int callback_ref,
+                             const std::vector<std::string>& keys,
+                             const std::vector<std::string>& argv,
+                             SessionState& session,
+                             bool no_writes) {
+  if (!g_L) return enc_error("Lua engine not initialized");
+  auto* prev_session = g_lua_session;
+  auto prev_resp = g_lua_script_resp;
+  auto prev_client_resp = g_lua_client_resp;
+  auto prev_readonly = g_lua_readonly;
+  g_lua_last_error_from_redis = false;
+
+  SessionState fcall_session = session;
+  g_lua_session = &fcall_session;
+  g_lua_script_resp = session.resp_version;
+  g_lua_client_resp = session.resp_version;
+  g_lua_readonly = no_writes;
+
+  // Push the callback closure and its two arguments: keys table, args table.
+  lua_rawgeti(g_L, LUA_REGISTRYINDEX, callback_ref);
+  lua_newtable(g_L);
+  for (std::size_t i = 0; i < keys.size(); ++i) {
+    lua_pushlstring(g_L, keys[i].c_str(), keys[i].size());
+    lua_rawseti(g_L, -2, static_cast<int>(i + 1));
+  }
+  lua_newtable(g_L);
+  for (std::size_t i = 0; i < argv.size(); ++i) {
+    lua_pushlstring(g_L, argv[i].c_str(), argv[i].size());
+    lua_rawseti(g_L, -2, static_cast<int>(i + 1));
+  }
+
+  g_script_start_time = std::chrono::steady_clock::now();
+  g_script_kill_requested.store(false, std::memory_order_release);
+  lua_sethook(g_L, lua_timeout_hook, LUA_MASKCOUNT, 100000);
+
+  const int rc = lua_pcall(g_L, 2, 1, 0);
+
+  lua_sethook(g_L, nullptr, 0, 0);
+  if (g_script_busy.load(std::memory_order_acquire)) {
+    g_script_busy.store(false, std::memory_order_release);
+    g_busy_script_session = nullptr;
+  }
+
+  std::string result;
+  if (rc != 0) {
+    std::string m = lua_tostring(g_L, -1) ? lua_tostring(g_L, -1) : "";
+    lua_pop(g_L, 1);
+    if (m.empty()) {
+      result = enc_error("Error running function");
+    } else if (m.rfind("-", 0) == 0) {
+      result = m;
+      if (result.size() < 2 || result.substr(result.size() - 2) != "\r\n") result += "\r\n";
+    } else {
+      static const char* kPfx[] = {"ERR ", "WRONGTYPE", "OOM ", "NOSCRIPT", "BUSY ",
+                                    "NOREPLICAS", "READONLY", "MASTERDOWN", "NOPERM"};
+      bool known = false;
+      for (auto* p : kPfx) if (m.rfind(p, 0) == 0) { known = true; break; }
+      result = enc_error_raw(known ? m : ("ERR " + m));
+    }
+  } else {
+    if (lua_gettop(g_L) == 0 || lua_isnil(g_L, -1)) result = enc_null(g_lua_client_resp);
+    else result = lua_to_resp(g_L, -1);
+    if (lua_gettop(g_L) > 0) lua_pop(g_L, 1);
+  }
+
+  g_lua_session = prev_session;
+  g_lua_script_resp = prev_resp;
+  g_lua_client_resp = prev_client_resp;
+  g_lua_readonly = prev_readonly;
+  return result;
+}
+
+void lua_engine_unref_function(int callback_ref) {
+  if (g_L && callback_ref != LUA_NOREF && callback_ref >= 0)
+    luaL_unref(g_L, LUA_REGISTRYINDEX, callback_ref);
 }
 
 } // namespace peadb

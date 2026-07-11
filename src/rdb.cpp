@@ -31,9 +31,16 @@ namespace peadb {
 
 namespace {
 bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
+FunctionDumpFn g_function_dump_hook;      // returns every function library's source
+FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
 }  // namespace
 
 void rdb_set_skip_checksum_validation(bool skip) { g_skip_checksum_validation = skip; }
+
+void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load) {
+  g_function_dump_hook = std::move(dump);
+  g_function_load_hook = std::move(load);
+}
 
 namespace {
 
@@ -57,6 +64,7 @@ constexpr uint8_t RDB_OPCODE_SELECTDB      = 254;
 constexpr uint8_t RDB_OPCODE_EOF           = 255;
 constexpr uint8_t RDB_OPCODE_RESIZEDB      = 251;
 constexpr uint8_t RDB_OPCODE_AUX           = 250;
+constexpr uint8_t RDB_OPCODE_FUNCTION2     = 245;  // one string payload = one library's source
 
 constexpr uint8_t RDB_TYPE_STRING   = 0;
 constexpr uint8_t RDB_TYPE_LIST     = 1;
@@ -662,6 +670,15 @@ std::string rdb_build_string(std::string& err) {
   write_aux("ctime", std::to_string(std::time(nullptr)));
   write_aux("used-mem", "0");
 
+  // Function libraries (server-level, not per-db) — one FUNCTION2 opcode + string per library,
+  // written after AUX and before the keyspace, matching Redis's RDB layout.
+  if (g_function_dump_hook) {
+    for (const auto& code : g_function_dump_hook()) {
+      w.write_u8(RDB_OPCODE_FUNCTION2);
+      w.write_string(code);
+    }
+  }
+
   // Iterate databases
   // We need access to internals. Use a temporary approach:
   // Export via the existing data access methods
@@ -911,6 +928,20 @@ bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_c
       std::string aux_key, aux_val;
       if (!r.read_string(aux_key) || !r.read_string(aux_val)) {
         err = "malformed AUX field";
+        ds.select_db(prev_db);
+        return false;
+      }
+      continue;
+    }
+
+    if (type == RDB_OPCODE_FUNCTION2) {
+      std::string code;
+      if (!r.read_string(code)) {
+        err = "malformed FUNCTION payload";
+        ds.select_db(prev_db);
+        return false;
+      }
+      if (g_function_load_hook && !g_function_load_hook(code, err)) {
         ds.select_db(prev_db);
         return false;
       }

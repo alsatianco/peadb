@@ -2,9 +2,21 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <vector>
 
 namespace peadb {
+
+// Function-library persistence hooks. Libraries live at the server level (command.cpp), not in
+// the DataStore, so RDB save/load calls back through these (RDB opcode 245 / FUNCTION2, matching
+// Redis). `dump` returns every library's full source; `load` feeds one library source back and
+// returns false (setting err) on a collision, which fails the whole RDB load — this drives the
+// DEBUG RELOAD NOFLUSH-without-MERGE "already exists" semantics. Registered once at startup by
+// functions_register_rdb_hooks().
+using FunctionDumpFn = std::function<std::vector<std::string>()>;
+using FunctionLoadFn = std::function<bool(const std::string& library_code, std::string& err)>;
+void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 
 // Save all databases to a Redis-compatible RDB file.
 bool rdb_save(const std::filesystem::path& path, std::string& err);

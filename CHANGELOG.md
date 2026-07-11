@@ -9,6 +9,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 18): FUNCTION / FCALL Lua function libraries + unit/functions adopted
+
+- **`unit/functions` adopted natively at 0 errors** (32 suites total; 109 ok / 1 skip), which
+  required building out the full Redis function-library engine on top of the bundled Lua 5.1.5:
+  - **`FUNCTION LOAD [REPLACE]`** — shebang metadata parser (`#!lua name=<lib>`), exact Redis
+    error strings for every malformed-metadata case, a restricted load environment whose
+    `redis` table exposes `register_function`/`log`/`REDIS_VERSION[_NUM]`, C-level global
+    protection (accessing/modifying anything else raises "attempted to access nonexistent
+    global variable"/"Attempt to modify a readonly table"), and `register_function` in both
+    positional and named-argument forms with the full flag matrix (`no-writes`, `allow-oom`,
+    `allow-stale`, `no-cluster`, `allow-cross-slot-keys`).
+  - **`FCALL` / `FCALL_RO`** — numkeys validation, no-writes/read-only enforcement, allow-oom
+    gating, and `COMMAND GETKEYS`/`GETKEYSANDFLAGS` key extraction (shared with the EVAL family).
+  - **`FUNCTION DELETE/FLUSH [SYNC|ASYNC]/LIST [LIBRARYNAME <pat>] [WITHCODE]/STATS/DUMP/
+    RESTORE [FLUSH|APPEND|REPLACE]/KILL/HELP`** — with RESP3-aware map/set replies, a
+    self-checksummed DUMP/RESTORE payload, and atomic RESTORE (a bad/colliding payload never
+    partially applies).
+  - **Persistence + replication** — libraries round-trip through RDB (real Redis opcode 245 /
+    FUNCTION2, so `DEBUG RELOAD` and `SAVE`/full-sync preserve them), `DEBUG RELOAD
+    NOSAVE|NOFLUSH|MERGE` flag semantics, and `FUNCTION LOAD/DELETE/FLUSH/RESTORE` + function
+    effects replicate to replicas; a no-writes `FCALL` runs on a read-only replica while a
+    write `FCALL`/`FUNCTION` mutation is rejected with `READONLY`.
+  - **BUSY / kill** — `SCRIPT KILL` and `FUNCTION KILL` act only on their own kind (the
+    mismatched killer is rejected with `BUSY`); `FUNCTION STATS` reports the running script;
+    a trivially-infinite function is advertised BUSY cooperatively (mirroring EVAL) since the
+    single-threaded loop cannot be preempted.
+  - Deferred: `FUNCTION - allow stale` (per-inner-command stale-flag enforcement on a stale
+    replica) is skipfiled — the same replica-mode-scripting gap tracked for EVAL in
+    `compat/delta.md` item 14.
+
 ### Added — parity roadmap Phase 1 (wave 17): limits + violations suites adopted
 
 - **`unit/limits` and `unit/violations` adopted natively at 0 errors** (31 suites total) — both were
