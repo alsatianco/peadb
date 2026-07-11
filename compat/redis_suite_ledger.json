@@ -77,6 +77,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "unit/introspection-2": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 46
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "unit/keyspace": {
       "last_counts": {
         "err": 0,

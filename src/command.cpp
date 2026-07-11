@@ -1,4 +1,5 @@
 #include "command.hpp"
+#include "command_metadata.generated.hpp"
 #include "server_context.hpp"
 
 #include "datastore.hpp"
@@ -4007,9 +4008,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 encode_bulk("INFO [<command-name> ...]"), encode_bulk("LIST"), encode_bulk("HELP")});
           }
           const auto& table = command_table();
+          // Top-level commands whose keys aren't a static range (from the generated Redis
+          // metadata) carry the movablekeys flag in COMMAND INFO.
+          static const std::set<std::string> kMovableKeys = [] {
+            std::set<std::string> m;
+            for (const auto& e : command_metadata())
+              if (e.movablekeys && std::string(e.full_name).find('|') == std::string::npos)
+                m.insert(e.full_name);
+            return m;
+          }();
           auto info = [](const CommandSpec& s) -> std::string {
             std::vector<std::string> flags;
             for (const auto& f : s.flags) flags.push_back(encode_bulk(f));
+            if (kMovableKeys.count(lower(s.name)) != 0) flags.push_back(encode_bulk("movablekeys"));
             // Redis COMMAND INFO shape: name, arity, flags, first/last/step key,
             // acl-categories, tips, key-specs, subcommands (last four left empty).
             return encode_array({
@@ -4109,6 +4120,50 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               } else {
                 out.push_back(encode_bulk(k));
               }
+            }
+            return encode_array(out);
+          }
+          if (sub == "LIST") {
+            // COMMAND LIST [FILTERBY MODULE <m> | ACLCAT <cat> | PATTERN <glob>]. Lists the
+            // commands (and their subcommands as "parent|sub") PeaDB implements, from the
+            // generated Redis metadata; the filter narrows by ACL category, name glob, or module.
+            enum { kAll, kModule, kAclcat, kPattern } mode = kAll;
+            std::string filter;
+            if (args.size() == 2) {
+              // no filter
+            } else if (args.size() == 5 && upper(args[2]) == "FILTERBY") {
+              const auto by = upper(args[3]);
+              filter = args[4];
+              if (by == "MODULE") mode = kModule;
+              else if (by == "ACLCAT") mode = kAclcat;
+              else if (by == "PATTERN") mode = kPattern;
+              else return encode_error("syntax error");
+            } else {
+              return encode_error("syntax error");
+            }
+            const std::string want_cat = lower(filter);
+            std::vector<std::string> out;
+            for (const auto& e : command_metadata()) {
+              const std::string full = e.full_name;
+              const auto bar = full.find('|');
+              const std::string top = bar == std::string::npos ? full : full.substr(0, bar);
+              if (table.find(upper(top)) == table.end()) continue;  // only implemented commands
+              if (mode == kModule) continue;  // no modules loaded → always empty
+              if (mode == kAclcat) {
+                bool has = false;
+                const std::string cats = e.acl_cats;  // space-separated
+                std::size_t p = 0;
+                while (p < cats.size()) {
+                  std::size_t sp = cats.find(' ', p);
+                  const std::string tok = cats.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+                  if (tok == want_cat) { has = true; break; }
+                  if (sp == std::string::npos) break;
+                  p = sp + 1;
+                }
+                if (!has) continue;
+              }
+              if (mode == kPattern && fnmatch(filter.c_str(), full.c_str(), 0) != 0) continue;
+              out.push_back(encode_bulk(full));
             }
             return encode_array(out);
           }
