@@ -10266,6 +10266,17 @@ void configure_save(const std::string& spec) {
 // arrives, which prevents master/replica divergence from independent expiry clocks.
 void on_client_disconnect(int fd) {
   g_monitor_fds.erase(fd);
+  // If this client owns an in-progress BUSY episode, release it. The cooperative "while true do"
+  // simulation (eval_miniscript / do_fcall) returns -BUSY immediately but leaves g_script_busy
+  // set until a SCRIPT/FUNCTION KILL arrives; if the client hangs up without killing, the flag
+  // would wedge the whole server BUSY for every client, and g_busy_script_session would dangle
+  // at the about-to-be-freed session. Clearing here is safe because the session still exists at
+  // disconnect time (it is erased after this callback).
+  if (g_busy_script_session != nullptr && g_busy_script_session->fd == fd) {
+    g_script_busy.store(false, std::memory_order_release);
+    g_script_kill_requested.store(false, std::memory_order_release);
+    g_busy_script_session = nullptr;
+  }
 }
 
 void run_active_expire_cycle() {
@@ -10693,6 +10704,11 @@ void drain_replica_cmd_queue() {
       g_replica_load_path.clear();
     }
     std::string err;
+    // A full resync replaces the entire dataset, including server-level function libraries.
+    // rdb_load() flushes the keyspace but not functions, so clear them here first — otherwise
+    // libraries that exist only on this node (before it became a replica) would survive and
+    // diverge from the master (Redis's emptyData clears functions on full sync).
+    functions_flush_all();
     // Skip CRC verification: the RDB came from the master (possibly real Redis, whose
     // CRC-64 variant differs from PeaDB's); the TCP stream + length framing + parser already
     // guard integrity. CRC verification is for on-disk startup loads of PeaDB's own dumps.
