@@ -4040,53 +4040,77 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it == table.end()) return encode_error("Invalid command specified");
             const auto& s = it->second;
             const std::vector<std::string> cmdline(args.begin() + 2, args.end());
-            // SORT/SORT_RO: the source key plus (for SORT) the optional STORE destination.
             const auto gk_cmd = upper(cmdline[0]);
+
+            // (key, per-key-spec flags) pairs. Flags mirror Redis's command key-spec flags
+            // (RO/RW/OW read-write intent + access/update/insert/delete). Commands whose keys
+            // aren't a fixed range (SORT STORE, EVAL/FCALL numkeys, MEMORY USAGE, XGROUP,
+            // ZUNIONSTORE-family) are extracted explicitly, like Redis's per-command getkeys procs.
+            std::vector<std::pair<std::string, std::vector<std::string>>> kf;
+            auto add = [&](const std::string& k, std::vector<std::string> flags) { kf.emplace_back(k, std::move(flags)); };
+            const bool dynamic_keys = (gk_cmd == "EVAL" || gk_cmd == "EVALSHA" || gk_cmd == "EVAL_RO" ||
+                                       gk_cmd == "EVALSHA_RO" || gk_cmd == "FCALL" || gk_cmd == "FCALL_RO");
+
             if ((gk_cmd == "SORT" || gk_cmd == "SORT_RO") && cmdline.size() >= 2) {
-              std::vector<std::string> keys;
-              auto emit = [&](const std::string& k) {
-                keys.push_back(sub == "GETKEYSANDFLAGS"
-                                   ? encode_array({encode_bulk(k), encode_array({})}) : encode_bulk(k));
-              };
-              emit(cmdline[1]);
-              // Multiple STORE clauses are allowed; the LAST destination wins (matches do_sort).
-              std::string store_dest; bool have_store = false;
+              add(cmdline[1], {"RO", "access"});
+              std::string dest; bool have_store = false;  // last STORE wins (matches do_sort)
               for (std::size_t i = 2; i + 1 < cmdline.size(); ++i)
-                if (upper(cmdline[i]) == "STORE") { store_dest = cmdline[i + 1]; have_store = true; ++i; }
-              if (have_store) emit(store_dest);
-              return encode_array(keys);
-            }
-            // EVAL/FCALL family: keys are dynamic — `<cmd> <script|fn> <numkeys> <key>...`.
-            // Redis extracts them via numkeys at index 2 (evalGetKeys / functionGetKeys).
-            if (gk_cmd == "EVAL" || gk_cmd == "EVALSHA" || gk_cmd == "EVAL_RO" ||
-                gk_cmd == "EVALSHA_RO" || gk_cmd == "FCALL" || gk_cmd == "FCALL_RO") {
+                if (upper(cmdline[i]) == "STORE") { dest = cmdline[i + 1]; have_store = true; ++i; }
+              if (have_store) add(dest, {"OW", "update"});
+            } else if (dynamic_keys) {
               std::int64_t nk = 0;
               if (cmdline.size() < 3 || !parse_i64(cmdline[2], nk) || nk < 0)
                 return encode_error("Invalid arguments specified for command");
               if (static_cast<std::size_t>(nk) > cmdline.size() - 3)
                 return encode_error("Number of keys can't be greater than number of args");
-              std::vector<std::string> keys;
-              for (std::int64_t k = 0; k < nk; ++k) {
-                const std::string& key = cmdline[static_cast<std::size_t>(3 + k)];
-                keys.push_back(sub == "GETKEYSANDFLAGS"
-                                   ? encode_array({encode_bulk(key), encode_array({})}) : encode_bulk(key));
+              for (std::int64_t k = 0; k < nk; ++k) add(cmdline[static_cast<std::size_t>(3 + k)], {"RW", "access", "update"});
+            } else if (gk_cmd == "MEMORY" && cmdline.size() >= 3 && upper(cmdline[1]) == "USAGE") {
+              add(cmdline[2], {"RO", "access"});
+            } else if (gk_cmd == "XGROUP" && cmdline.size() >= 3) {
+              const auto x = upper(cmdline[1]);
+              if (x == "CREATE" || x == "SETID" || x == "DESTROY" || x == "CREATECONSUMER" || x == "DELCONSUMER")
+                add(cmdline[2], {"RW"});
+            } else if ((gk_cmd == "ZUNIONSTORE" || gk_cmd == "ZINTERSTORE" || gk_cmd == "ZDIFFSTORE") &&
+                       cmdline.size() >= 4) {
+              std::int64_t nk = 0;
+              if (!parse_i64(cmdline[2], nk) || nk < 0) return encode_error("Invalid arguments specified for command");
+              add(cmdline[1], {"OW", "update"});  // destination
+              for (std::int64_t k = 0; k < nk && static_cast<std::size_t>(3 + k) < cmdline.size(); ++k)
+                add(cmdline[static_cast<std::size_t>(3 + k)], {"RO", "access"});
+            } else if (gk_cmd == "LMOVE" && cmdline.size() >= 3) {
+              add(cmdline[1], {"RW", "access", "delete"});
+              add(cmdline[2], {"RW", "insert"});
+            } else if (gk_cmd == "SET" && cmdline.size() >= 2) {
+              add(cmdline[1], {"OW", "update"});
+            } else if (gk_cmd == "MSET" && cmdline.size() >= 2) {
+              for (std::size_t i = 1; i + 1 < cmdline.size(); i += 2) add(cmdline[i], {"OW", "update"});
+            } else {
+              if (s.first_key > 0) {
+                int last = s.last_key;
+                if (last < 0) last = static_cast<int>(cmdline.size()) + last;
+                const int step = s.key_step > 0 ? s.key_step : 1;
+                const std::vector<std::string> def = s.is_write()
+                    ? std::vector<std::string>{"RW", "access", "update"}
+                    : std::vector<std::string>{"RO", "access"};
+                for (int k = s.first_key; k <= last && k < static_cast<int>(cmdline.size()); k += step)
+                  add(cmdline[static_cast<std::size_t>(k)], def);
               }
-              if (keys.empty()) return encode_error("The command has no key arguments");
-              return encode_array(keys);
             }
-            if (s.first_key <= 0) return encode_error("The command has no key arguments");
-            int last = s.last_key;
-            if (last < 0) last = static_cast<int>(cmdline.size()) + last;
-            const int step = s.key_step > 0 ? s.key_step : 1;
-            std::vector<std::string> keys;
-            for (int k = s.first_key; k <= last && k < static_cast<int>(cmdline.size()); k += step) {
-              if (sub == "GETKEYSANDFLAGS")
-                keys.push_back(encode_array({encode_bulk(cmdline[static_cast<std::size_t>(k)]), encode_array({})}));
-              else
-                keys.push_back(encode_bulk(cmdline[static_cast<std::size_t>(k)]));
+
+            // EVAL/FCALL with numkeys 0 legitimately has no keys — return an empty array, not an
+            // error (the "no key arguments" error is for commands that can never take a key).
+            if (kf.empty() && !dynamic_keys) return encode_error("The command has no key arguments");
+            std::vector<std::string> out;
+            for (const auto& [k, flags] : kf) {
+              if (sub == "GETKEYSANDFLAGS") {
+                std::vector<std::string> fl;
+                for (const auto& f : flags) fl.push_back(encode_bulk(f));
+                out.push_back(encode_array({encode_bulk(k), encode_array(fl)}));
+              } else {
+                out.push_back(encode_bulk(k));
+              }
             }
-            if (keys.empty()) return encode_error("The command has no key arguments");
-            return encode_array(keys);
+            return encode_array(out);
           }
           if (sub == "DOCS") return session.resp_version == RespVersion::Resp3 ? std::string("%0\r\n") : std::string("*0\r\n");
           return encode_error("unknown subcommand for COMMAND");
@@ -4370,9 +4394,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const auto dump = rdb_dump_key(args[2]);
             const std::size_t serialized = dump.size() >= 10 ? dump.size() - 10 : dump.size();
             const auto idle = store().object_idletime_seconds(args[2]).value_or(0);
+            const auto lru = store().object_lru_clock(args[2]).value_or(0);
             return encode_simple("Value at:0x0 refcount:1 encoding:" + enc +
                                  " serializedlength:" + std::to_string(serialized) +
-                                 " lru:0 lru_seconds_idle:" + std::to_string(idle));
+                                 " lru:" + std::to_string(lru) +
+                                 " lru_seconds_idle:" + std::to_string(idle));
           }
           if (args.size() == 2 && upper(args[1]) == "LOADAOF") {
             if (g_aof_fd >= 0) ::fsync(g_aof_fd);
@@ -7408,7 +7434,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (self && !skipme) { should_close = true; ++killed; }
             return encode_integer(killed);
           }
-          if (sub == "NO-EVICT" || sub == "NO-TOUCH") {
+          if (sub == "NO-EVICT" && args.size() == 3) {
+            const auto m = upper(args[2]);
+            if (m != "ON" && m != "OFF") return encode_error("syntax error");
+            return encode_simple("OK");  // eviction protection is a no-op (single-node)
+          }
+          if (sub == "NO-TOUCH" && args.size() == 3) {
+            const auto m = upper(args[2]);
+            if (m == "ON") session.no_touch = true;
+            else if (m == "OFF") session.no_touch = false;
+            else return encode_error("syntax error");
             return encode_simple("OK");
           }
           if (sub == "UNBLOCK" && (args.size() == 3 || args.size() == 4)) {
@@ -10104,7 +10139,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // dbAdd path, must not have that immediately overwritten by an access-time touch.
   if (!is_error_reply(reply) && cmd != "RESTORE" &&
       spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
-    store().touch_key_for_eviction(args[static_cast<std::size_t>(spec.first_key)]);
+    // Redis's LOOKUP_NOTOUCH commands inspect a key without counting as an access, so they
+    // must not reset its idle time; CLIENT NO-TOUCH suppresses the update for everything the
+    // client runs except an explicit TOUCH.
+    static const std::set<std::string> kNoTouchCmds = {
+        "TTL", "PTTL", "TYPE", "EXISTS", "OBJECT", "EXPIRETIME", "PEXPIRETIME", "DEBUG", "DUMP"};
+    const bool client_no_touch = session.no_touch && cmd != "TOUCH";
+    if (kNoTouchCmds.count(cmd) == 0 && !client_no_touch)
+      store().touch_key_for_eviction(args[static_cast<std::size_t>(spec.first_key)]);
   }
   return reply;
 }

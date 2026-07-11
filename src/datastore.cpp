@@ -2553,6 +2553,14 @@ std::optional<std::int64_t> DataStore::object_idletime_seconds(const std::string
   return static_cast<std::int64_t>(now >= last ? now - last : 0) / 1000;
 }
 
+std::optional<std::uint32_t> DataStore::object_lru_clock(const std::string& key) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return std::nullopt;
+  return it->second.lru;  // raw LRU clock (or LFU counter) — for DEBUG OBJECT's lru field
+}
+
 std::optional<std::int64_t> DataStore::object_freq(const std::string& key) {
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);

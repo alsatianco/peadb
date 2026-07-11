@@ -443,6 +443,7 @@ class DataStore {
   bool key_exists_raw(const std::string& key) const;
   // OBJECT IDLETIME/FREQ readers over Entry::lru (nullopt = missing/expired key).
   std::optional<std::int64_t> object_idletime_seconds(const std::string& key);
+  std::optional<std::uint32_t> object_lru_clock(const std::string& key);
   std::optional<std::int64_t> object_freq(const std::string& key);
   // RESTORE IDLETIME/FREQ: seed a key's LRU idle time (seconds) or LFU frequency counter.
   bool set_object_idle(const std::string& key, std::int64_t idle_seconds);
