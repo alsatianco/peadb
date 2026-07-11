@@ -9,6 +9,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 19): unit/info-command adopted — multi-section INFO
+
+- **`unit/info-command` adopted natively at 0 errors** (33 suites total), which required bringing
+  `INFO`'s section selection to Redis 7.0+ semantics:
+  - **Multiple section arguments** — `INFO cpu sentinel`, `INFO cpu all`, `INFO cpu default`
+    now union the requested sections (each emitted once), instead of honoring only the first arg.
+  - **`default` vs `all`/`everything`** — the default set (no args or `default`) now **excludes**
+    `commandstats` and `latencystats` (matching Redis); they appear only under `all`/`everything`
+    or when named explicitly. Section names are matched case-insensitively (`INFO commandSTATS`).
+
 ### Added — parity roadmap Phase 1 (wave 18): FUNCTION / FCALL Lua function libraries + unit/functions adopted
 
 - **`unit/functions` adopted natively at 0 errors** (32 suites total; 109 ok / 1 skip), which

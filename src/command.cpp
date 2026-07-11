@@ -3542,7 +3542,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("INFO", CommandSpec{"INFO", -1, {"readonly"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          const auto section = (args.size() >= 2) ? upper(args[1]) : std::string("ALL");
+          // Redis 7.0+ INFO takes zero or more section names (case-insensitive). No args (or
+          // "default") = the standard set, which EXCLUDES commandstats/latencystats; "all"/
+          // "everything" = every section; explicit names union together (each emitted once).
+          std::set<std::string> requested;
+          for (std::size_t i = 1; i < args.size(); ++i) requested.insert(upper(args[i]));
+          if (requested.empty()) requested.insert("DEFAULT");
+          const bool want_all = requested.count("ALL") != 0 || requested.count("EVERYTHING") != 0;
+          const bool want_default = requested.count("DEFAULT") != 0;
           auto uptime_s = (now_ms() - g_server_start_time.load()) / 1000;
           if (uptime_s < 1) uptime_s = 1;
 
@@ -3576,8 +3583,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           };
 
           std::string out;
+          // The default set matches Redis's default INFO: everything except commandstats and
+          // latencystats (those appear only under all/everything or when explicitly requested).
+          static const std::set<std::string> kDefaultSections = {
+              "SERVER", "CLIENTS", "MEMORY", "PERSISTENCE", "STATS", "REPLICATION",
+              "CPU", "MODULES", "ERRORSTATS", "CLUSTER", "KEYSPACE"};
           auto want = [&](const std::string& s) {
-            return section == "ALL" || section == "EVERYTHING" || section == s;
+            if (want_all) return true;
+            if (requested.count(s) != 0) return true;
+            return want_default && kDefaultSections.count(s) != 0;
           };
 
           if (want("SERVER")) {
