@@ -77,6 +77,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "unit/limits": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 1
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "unit/moduleapi": {
       "exclusion_reason": "Module certification out of scope; see compat/delta.md item 4.",
       "mode": "excluded"
@@ -274,6 +283,15 @@
         "err": 0,
         "ignored": 1,
         "ok": 320
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
+    "unit/violations": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 7,
+        "ok": 1
       },
       "mode": "native",
       "skipfile_lines": 0
