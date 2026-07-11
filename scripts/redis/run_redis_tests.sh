@@ -137,6 +137,7 @@ SUITES=(
   "unit/violations"
   "unit/functions"
   "unit/info-command"
+  "unit/introspection-2"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

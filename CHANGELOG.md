@@ -9,6 +9,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Added — parity roadmap Phase 1 (wave 20): unit/introspection-2 adopted + COMMAND-metadata codegen
+
+- **`unit/introspection-2` adopted natively at 0 errors** (34 suites total; 46 ok, no skips),
+  building on the LRU/CLIENT-NO-TOUCH/GETKEYS groundwork below. The remaining piece was
+  `COMMAND LIST`/`INFO` metadata, now **generated from the pinned upstream `redis/src/commands/*.json`**
+  (`scripts/ci/generate_command_metadata.py` → `include/command_metadata.generated.hpp`, 392
+  commands+subcommands) rather than hand-maintained:
+  - **`COMMAND LIST [FILTERBY MODULE|ACLCAT|PATTERN]`** — enumerates the commands (and their
+    `parent|sub` subcommands) PeaDB implements; ACL-category filter, name-glob filter, module
+    filter (always empty — no modules), and Redis's exact `syntax error` for malformed args.
+  - **`movablekeys`** flag in `COMMAND INFO` — derived from each command's key-spec
+    representability (a non-`index` begin-search or non-`range` find-keys ⇒ movable), matching
+    Redis for `ZUNIONSTORE`/`XREAD`/`EVAL`/`SORT`/`MIGRATE`/`GEORADIUS` (and not `SET`/`GET`/…).
+  - This codegen also becomes the source of truth for future `COMMAND DOCS`/scoreboard work.
+
 ### Changed — parity groundwork toward unit/introspection-2 (LRU access-time, CLIENT NO-TOUCH, COMMAND GETKEYS)
 
 - **LRU access-time fidelity**: read-only introspection commands (`TTL`/`PTTL`/`TYPE`/`EXISTS`/

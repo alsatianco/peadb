@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, registered: 0
+Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -188,7 +188,7 @@ Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, regist
 | `SWAPDB` | upstream | test_p1_object_swapdb_sync.py |
 | `SYNC` | upstream | — |
 | `TIME` | upstream | test_p1_copy_spop_time.py |
-| `TOUCH` | tested | test_p3_ecosystem_commands.py |
+| `TOUCH` | upstream | test_p3_ecosystem_commands.py |
 | `TTL` | upstream | test_m2_strings_expire.py, test_p1_expire_options.py, test_p1_move.py, test_p1_setex_psetex.py |
 | `TYPE` | upstream | test_m2_strings_expire.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py |
 | `UNLINK` | tested | test_b14_lazyfree.py, test_command_coverage_extras.py |
