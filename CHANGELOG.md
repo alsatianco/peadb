@@ -38,6 +38,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
   - Deferred: `FUNCTION - allow stale` (per-inner-command stale-flag enforcement on a stale
     replica) is skipfiled — the same replica-mode-scripting gap tracked for EVAL in
     `compat/delta.md` item 14.
+  - Hardening (adversarial-review findings, not suite-covered): a client that triggers the
+    cooperative BUSY simulation (an infinite-loop script/function) and then disconnects without
+    issuing SCRIPT/FUNCTION KILL no longer wedges the whole server BUSY — `on_client_disconnect`
+    now releases the BUSY episode it owned (also nulling the otherwise-dangling busy-session
+    pointer). A replica full-sync now flushes function libraries before loading the master's RDB,
+    so a node that had its own libraries before `REPLICAOF` no longer diverges from the master.
 
 ### Added — parity roadmap Phase 1 (wave 17): limits + violations suites adopted
 
