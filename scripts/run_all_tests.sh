@@ -217,6 +217,20 @@ run_stage fuzz "Fuzz sanity checks" \
 run_stage stability "ASAN/UBSAN stability checks" \
     scripts/qa/run_stability_checks.sh --seconds 15
 
+# The ASAN stage builds peadb-server with sanitizers; because CMake pins the target's
+# RUNTIME_OUTPUT_DIRECTORY to the source root, that build clobbers the repo-root
+# ./peadb-server with the (much slower) ASAN binary. The perf/sentinel/native-TCL stages
+# below run that root binary, and the extra latency flakes timing-sensitive suites
+# (e.g. unit/latency-monitor's BUSY-threshold tests). Restore a clean Release binary here.
+# (rm first: the object files are unchanged since the Release build, so CMake would otherwise
+# consider the target up-to-date and NOT relink over the ASAN output.)
+if [[ -n "$CTEST_DIR" && -f "$CTEST_DIR/CMakeCache.txt" && "$(basename "$CTEST_DIR")" != "build-asan" ]]; then
+    echo "=== Restoring clean (non-ASAN) peadb-server for perf/sentinel/native stages ==="
+    rm -f "$ROOT_DIR/peadb-server"
+    cmake --build "$CTEST_DIR" --target peadb-server >/dev/null 2>&1 || \
+        echo "warning: could not rebuild Release peadb-server from $CTEST_DIR" >&2
+fi
+
 # ── 7. Performance baseline ────────────────────────────────────────────
 run_stage perf "Performance baseline" \
     scripts/qa/run_perf_baseline.sh
