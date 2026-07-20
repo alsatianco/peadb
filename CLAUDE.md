@@ -42,6 +42,17 @@ python3 scripts/ci/check_suite_ratchet.py                           # monotonic 
 
 **The parity ratchet**: adopted upstream suites must stay at 0 `[err]`; growing a skipfile (`scripts/redis/skipfiles/`) or lowering a ledger count requires updating `compat/delta.md` in the same change. See the "Verification" section of `compat/delta.md`.
 
+### Adopting an upstream TCL suite
+
+The parity work adopts one upstream suite (or a small batch) per commit:
+
+1. **Baseline** the suite natively: `cd ~/.cache/peadb/redis-7.2.5 && SUITE_MODE=native REDIS_SERVER_BIN=<repo>/peadb-server ./runtest --single unit/<suite> --clients 1 --tags "-tls -cluster -modules -needs:pfdebug -leaks" --dont-clean [--skipfile <repo>/scripts/redis/skipfiles/<suite>.skip]`. The TCL control server uses a fixed port (21079) — only one `runtest` at a time; kill leftovers with `pkill -f test_helper.tcl`.
+2. A suite counts as adopted only when it **runs to completion** (`exit 0` / "All tests passed") — not merely `err=0`; a mid-suite hang records a truncated-but-green ok count.
+3. The pinned **Redis C source** (`~/.cache/peadb/redis-7.2.5/src/`) is the spec for exact error strings and semantics; `assert_match` is case-sensitive.
+4. **Skipfile only what's genuinely out of reach**; every skip line carries a comment naming its `compat/delta.md` item, added in the same commit (the ratchet enforces this).
+5. **Register**: add the suite to `SUITES` in `scripts/redis/run_redis_tests.sh` and a baseline entry to `compat/redis_suite_ledger.json` (canonical counts from a `-leaks`-tagged run; `ignored` = `[ignore]` + `[skip]`).
+6. Regenerate + validate: `parse_tcl_results.py`, `check_suite_ratchet.py`, `generate_compat_scoreboard.py`, `check_compat_delta.py`; update `CHANGELOG.md` (`[Unreleased]` wave entry) and `compat/delta.md`; then run both mandatory pre-commit checks below.
+
 ## MANDATORY pre-commit checks
 
 **After every set of changes that is ready to commit, you MUST run both of these and confirm they pass before considering the work done:**

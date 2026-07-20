@@ -15,14 +15,17 @@ Every script includes a detailed header comment (shell) or docstring (Python) at
 
 ## Layout
 
-| Folder | Purpose | Scripts |
-|--------|---------|---------|
-| `scripts/ci/` | CI gates and local CI helpers | `check_compat_delta.py`, `check_command_test_coverage.py`, `generate_compat_scoreboard.py`, `run_integration_tests.sh` |
-| `scripts/redis/` | Redis-harness helpers and bridge utilities | `run_redis_tests.sh`, `sync_from_redis.py`, `export_rdb_via_redis.py`, `import_rdb_via_redis.py` |
-| `scripts/qa/` | Quality assurance: fuzz, perf, stability, replication | `run_fuzz_sanity.sh`, `run_perf_baseline.sh`, `run_stability_checks.sh`, `run_sentinel_validation.sh` |
-| `scripts/dev/` | Local development helpers | `quick_start.sh`, `install_deps_ubuntu.sh` |
-| `scripts/debug/` | Ad-hoc developer debugging scripts | `test_repl_debug.py`, `test_eval_debug.py` |
-| `scripts/examples/` | Optional/experimental scripts (may need extra Python deps) | `stress_test_redis_py.py` |
+Each script's header documents it exhaustively (see above), so this table maps purpose to folder rather than repeating file lists — `ls` the folder for the current contents.
+
+| Folder | Purpose |
+|--------|---------|
+| `scripts/run_all_tests.sh` | The full pre-commit gate: all test stages (unit → integration → … → upstream TCL → differential) in one run |
+| `scripts/ci/` | CI gates and generators: compat-delta validation, suite ratchet, command-coverage check, scoreboard + command-metadata codegen, integration-test runner |
+| `scripts/redis/` | Upstream Redis TCL harness (`run_redis_tests.sh`, result parser, per-suite `skipfiles/`) and RDB bridge/sync utilities |
+| `scripts/qa/` | Quality assurance: fuzz sanity, perf baseline, ASAN/UBSAN stability, sentinel/replication validation |
+| `scripts/dev/` | Local development helpers: quick start, dependency install, Redis-vs-PeaDB benchmark, memtier |
+| `scripts/debug/` | Ad-hoc developer debugging scripts |
+| `scripts/examples/` | Optional/experimental scripts (may need extra Python deps) |
 
 ## Running scripts
 

@@ -8,7 +8,7 @@ For core workloads — strings, hashes, lists, sets, sorted sets, streams, trans
 
 ## Configuration
 
-PeaDB parses redis.conf-style files (`key value` lines, `#` comments) via `--config <path>`; CLI flags override file values. Recognized keys are a subset — `port`, `bind`, `loglevel`, `dir`, `dbfilename`, `maxclients`, `appendonly`, `appendfilename`, `appendfsync` — and unknown directives are accepted but ignored. `CONFIG SET` changes are in-memory only; there is no `CONFIG REWRITE`, so runtime changes do not survive a restart.
+PeaDB parses redis.conf-style files (`key value` lines, `#` comments) — either redis-server style (first positional argument) or `--config <path>`; CLI flags override file values. Recognized keys are a subset of Redis's (the full table lives in the [README Configuration section](../README.md#configuration)); unknown directives are accepted but ignored. `CONFIG SET` changes are in-memory only; there is no `CONFIG REWRITE`, so runtime changes do not survive a restart.
 
 ## Live migration & rollback
 
@@ -32,12 +32,12 @@ See [`../compat/delta.md`](../compat/delta.md) for authoritative, per-feature de
 
 | Works | Partial / surface | Not yet |
 |-------|-------------------|---------|
-| Strings, hashes, lists, sets, sorted sets, streams (RDB + replication) | Streams — full PEL, blocking XREAD/XREADGROUP, XCLAIM/XAUTOCLAIM; `XINFO GROUPS/CONSUMERS` incomplete | TLS (use a TLS-terminating proxy) |
-| Transactions — `MULTI`/`EXEC`/`WATCH` (optimistic locking) | RESP3 — `HELLO` negotiates; `HGETALL` returns maps and the map/set/double/bool encoders exist, but many replies are still RESP2-shaped | Multi-user ACL rules; TLS |
+| Strings, hashes, lists, sets, sorted sets, streams (RDB + replication) | Streams — full PEL, blocking XREAD/XREADGROUP, XCLAIM/XAUTOCLAIM, `XINFO STREAM/GROUPS/CONSUMERS`; consumer seen/active times don't survive an RDB round-trip | TLS (use a TLS-terminating proxy) |
+| Transactions — `MULTI`/`EXEC`/`WATCH` (optimistic locking) | RESP3 — `HELLO` negotiates; `HGETALL` returns maps and the map/set/double/bool encoders exist, but many replies are still RESP2-shaped | Multi-user ACL rules |
 | Pub/Sub — messages delivered; `PUBLISH` returns the receiver count | Cluster — routing, `KEYSLOT`, `MEET`; gossip + full slot migration in progress | Compact listpack/intset encodings (`OBJECT ENCODING` cosmetic); jemalloc/`activedefrag` |
 | Key eviction — all 8 `maxmemory-policy` modes (approximate LRU/LFU/random/TTL sampling) | | |
-| Lua — `EVAL`/`EVALSHA`, `FUNCTION`, `FCALL` (no `FUNCTION DUMP`/`RESTORE`) | Replication — PSYNC2 (randomized replid + replid2 on promotion) + fast `WAIT` (GETACK) + auto-reconnect; no automatic failover or diskless sync | Client-side caching (`CLIENT TRACKING`) |
-| RDB + AOF persistence | Modules — `MODULE LOAD`/`LIST`/`UNLOAD` + a minimal `RedisModule_*` subset | Sentinel; client-side caching (`CLIENT TRACKING`) |
+| Lua — `EVAL`/`EVALSHA`, full `FUNCTION` subsystem (LOAD/LIST/DUMP/RESTORE/STATS), `FCALL`/`FCALL_RO` | Replication — PSYNC2 (randomized replid + replid2 on promotion) + fast `WAIT` (GETACK) + auto-reconnect; no automatic failover or diskless sync | Client-side caching (`CLIENT TRACKING`) |
+| RDB + AOF persistence | Modules — `MODULE LOAD`/`LIST`/`UNLOAD` + a minimal `RedisModule_*` subset | Sentinel |
 
 ## Persistence & durability
 

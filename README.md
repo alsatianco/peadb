@@ -9,7 +9,7 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 ## Highlights
 
 - **Full RESP2 / partial RESP3 protocol** — works with existing Redis clients and tools, zero changes required.
-- **220+ commands** — strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo, bitmaps, pub/sub (incl. introspection + sharded aliases), transactions, Lua scripting, and more. (Authoritative per-command status: [`compat/commands.generated.md`](compat/commands.generated.md).)
+- **Broad command coverage** — strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo, bitmaps, pub/sub (incl. introspection + sharded aliases), transactions, Lua scripting, and more. (Authoritative, always-current command list, count, and per-command status: [`compat/commands.generated.md`](compat/commands.generated.md).)
 - **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`. RDB loads verify their CRC64 and refuse a corrupt dump.
 - **Memory & eviction** — enforced `maxmemory` with all eight `maxmemory-policy` modes (LRU/LFU/random/TTL, approximate sampling) so PeaDB works as a cache, a compact tagged-union value layout, per-class `client-output-buffer-limit` (slow-consumer/lagging-replica protection), and background `UNLINK` / `FLUSH ASYNC` (lazyfree).
 - **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and correct replica expiry (the master propagates `DEL` so clocks can't diverge). Automatic failover/Sentinel is not yet implemented.
@@ -116,8 +116,12 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file — eithe
 | `--tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
 | `unixsocket` | — | Also listen on an AF_UNIX socket path (config-file key) |
 | `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` |
+| `--client-output-buffer-limit` | Redis defaults | Per-class (`normal`/`slave`/`pubsub`) output-buffer limits; overflowing clients are disconnected |
+| `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax; config-file key or `CONFIG SET`) |
+| `rename-command` | — | Rename or disable a command (`rename-command FROM TO`, empty `TO` disables; config-file key) |
+| `--repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
 
-`appendonly`, `appendfilename`, `appendfsync`, `masterauth`, and `repl-backlog-size` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys).
+`appendonly`, `appendfilename`, `appendfsync`, and `save` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys); `maxclients`, `unixsocket`, `notify-keyspace-events`, and `rename-command` are config-file keys only.
 
 Recognized redis.conf keys are a subset of Redis's; unknown directives are accepted but ignored. Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`).
 
@@ -231,6 +235,7 @@ Full detail — drop-in posture, tested clients, `redis.conf` support, migration
 | [compat/commands.generated.md](compat/commands.generated.md) | Auto-generated per-command coverage scoreboard |
 | [scripts/README.md](scripts/README.md) | Guide to the helper, CI, QA, and dev scripts |
 | [CLAUDE.md](CLAUDE.md) | Build, test, and architecture notes for contributors and AI assistants |
+| [CHANGELOG.md](CHANGELOG.md) | Release history and the `[Unreleased]` parity-wave log |
 
 ## Project Structure
 
