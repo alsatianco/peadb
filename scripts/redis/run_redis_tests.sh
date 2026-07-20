@@ -21,7 +21,8 @@
 #      ``repro_commands.txt`` (copy-pasteable commands) under ``$OUT_DIR``.
 #
 # Default suites
-#   unit/keyspace, unit/type/string, unit/expire, unit/multi, unit/scripting
+#   The SUITES array below (kept in lockstep with compat/redis_suite_ledger.json,
+#   the canonical adoption ledger).
 #
 # How to run
 #   From the repo root:

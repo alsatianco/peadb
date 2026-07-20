@@ -1,6 +1,5 @@
 # Compatibility Delta
 
-Date: 2026-07-03
 Redis pin: 7.2.5 (`f60370ce28b946c1146dcea77c9c399d39601aaa`)
 
 This file is the **canonical status registry** for PeaDB compatibility gaps.
@@ -31,14 +30,8 @@ Parity is measured by two CI-gated, monotonically-improving numbers:
 Ratchet rules (`scripts/ci/check_suite_ratchet.py`): any `[err]` in an adopted suite
 fails; lowering a ledger count or growing a skipfile fails unless the same change
 touches this file. Every skipfile line under `scripts/redis/skipfiles/` is a tracked
-debt with a comment naming its delta item. Current tracked skipfile debts:
-multi-part-AOF manifest tests (item 3), writable replicas + replica script gating
-(item 8 note), ACL-dependent scripting (item 1), Lua debugger LDB protocol,
-SCRIPT KILL UNKILLABLE semantics, blocked-client-pop replication, in-script SELECT
-replication, busy-script event-loop I/O, a macOS `leaks` report on the Lua path
-(items 14–15 below), listpack insertion-order for hashes and the incremental
-dict-rehash internals (`DEBUG HTSTATS-KEY`) for sets — both item 13 (hashtable-grade
-storage until real listpack/intset backends land).
+debt with a comment naming its delta item — the skipfiles themselves are the
+authoritative debt list; each item below cites its skipfile where one exists.
 
 ## Known Deltas
 

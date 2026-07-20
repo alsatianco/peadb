@@ -68,3 +68,8 @@ __pycache__/
 # ── OS junk ──────────────────────────────────────────────────
 .DS_Store
 Thumbs.db
+
+# ── Regenerable tool outputs (never commit) ──────────────────
+comparison_report.txt
+tests/diff/last_repro.txt
+AI-TEMP/
