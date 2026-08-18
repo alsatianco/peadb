@@ -95,7 +95,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "[dry-run] cmake -B build-asan -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' ..."
+  echo "[dry-run] cmake -B build-asan -DCMAKE_CXX_FLAGS='-fsanitize=address,undefined -fno-omit-frame-pointer' -DPEADB_SERVER_OUTPUT_DIR=build-asan ..."
   echo "[dry-run] cmake --build build-asan"
   echo "[dry-run] ./build-asan/peadb-server --port $PORT &"
   echo "[dry-run] stress loop for ${SECONDS_TO_RUN}s"
