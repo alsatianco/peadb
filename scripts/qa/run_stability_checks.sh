@@ -109,6 +109,7 @@ cmake -S "$ROOT_DIR" -B "$ROOT_DIR/build-asan" \
   -DCMAKE_C_FLAGS="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" \
   -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined" \
   -DCMAKE_BUILD_TYPE=Debug \
+  -DPEADB_SERVER_OUTPUT_DIR="$ROOT_DIR/build-asan" \
   >/dev/null 2>&1
 cmake --build "$ROOT_DIR/build-asan" -j"$NPROC" 2>&1 | tail -3
 

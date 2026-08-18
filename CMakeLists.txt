@@ -80,9 +80,16 @@ endif()
 
 add_executable(peadb-server src/main.cpp)
 # Place the binary at the repo root so integration tests can find it via
-# ROOT / "peadb-server" without relying on an untracked symlink.
+# ROOT / "peadb-server" without relying on an untracked symlink. Overridable
+# (e.g. by scripts/qa/run_stability_checks.sh, which builds a sanitiser
+# variant into build-asan/ and must not clobber the repo-root Release
+# binary) via -DPEADB_SERVER_OUTPUT_DIR=... ; a plain
+# -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=... does NOT work here because this
+# set_target_properties call would win over it regardless.
+set(PEADB_SERVER_OUTPUT_DIR "${CMAKE_SOURCE_DIR}" CACHE PATH
+    "Directory the peadb-server binary is built into")
 set_target_properties(peadb-server PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    RUNTIME_OUTPUT_DIRECTORY "${PEADB_SERVER_OUTPUT_DIR}")
 if(APPLE)
   target_link_libraries(peadb-server PRIVATE peadb_core)
 else()
