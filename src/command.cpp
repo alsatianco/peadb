@@ -3720,8 +3720,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "\r\n";
           }
           if (want("CLUSTER")) {
-            // Redis emits this as its own section (server.c genRedisInfoString); the copy
-            // inside "# Server" above is kept because real Redis reports it in both places.
+            // Redis emits cluster_enabled here (server.c genRedisInfoString); the copy PeaDB
+            // also emits inside "# Server" above is a PeaDB-only addition with no upstream
+            // counterpart, kept because RedisInsight and ioredis detect cluster mode from it
+            // there (see the CLUSTER command's own comment on this below).
             out += "# Cluster\r\n"
                    "cluster_enabled:" + std::string(g_cluster_peers.empty() ? "0" : "1") + "\r\n\r\n";
           }
