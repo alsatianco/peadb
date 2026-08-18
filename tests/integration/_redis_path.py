@@ -11,6 +11,10 @@ used by:
     adds this directory to ``sys.path`` and imports the same functions).
   - the RDB migration bridge scripts (``scripts/redis/export_rdb_via_redis.py``
     and ``scripts/redis/import_rdb_via_redis.py``), which do the same.
+  - ``scripts/ci/generate_command_metadata.py``, which imports
+    ``_resolve_redis_dir()`` directly (rather than the ``redis_server_path()``/
+    ``redis_cli_path()`` wrappers) since it needs the source *directory*, not
+    a binary, to find ``src/commands/*.json``.
 
 Do not re-implement this order a second time in any of the above — see the
 note in each caller.

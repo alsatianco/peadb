@@ -9,6 +9,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Fixed — command-metadata generator now applies Redis's implicit ACL categories
+
+- **`scripts/ci/generate_command_metadata.py`** previously emitted only each command's
+  *explicit* `acl_categories` from the upstream JSON spec, missing the categories Redis derives
+  from command flags (`setImplicitACLCategories()` in `server.c`): `write` from `CMD_WRITE`,
+  `read` from `CMD_READONLY` (excluding `@scripting` commands), `admin`+`dangerous` from
+  `CMD_ADMIN`, `pubsub` from `CMD_PUBSUB`, `fast` from `CMD_FAST`, `blocking` from
+  `CMD_BLOCKING`, and `slow` for everything not `@fast`. Of 392 generated entries, 132 had an
+  empty `acl_cats` and only 15 of Redis's 21 categories appeared at all — `read`/`write`/`fast`/
+  `slow`/`blocking`/`pubsub` were entirely absent. This silently broke `COMMAND LIST FILTERBY
+  ACLCAT` for those six categories (returned empty); regenerating `include/command_metadata.generated.hpp`
+  now fixes it — 0 entries have an empty `acl_cats` and all 21 categories appear.
+- The generator also now resolves the pinned Redis checkout the same way
+  `scripts/redis/run_redis_tests.sh` does (`REDIS_DIR`, else `PEADB_CACHE_DIR`, else
+  `XDG_CACHE_HOME`, else `~/.cache/peadb`), by reusing `tests/integration/_redis_path.py`
+  instead of its own older `PEADB_CACHE_DIR`-only lookup.
+
 ### Added — parity roadmap Phase 1 (wave 20): unit/introspection-2 adopted + COMMAND-metadata codegen
 
 - **`unit/introspection-2` adopted natively at 0 errors** (34 suites total; 46 ok, no skips),
