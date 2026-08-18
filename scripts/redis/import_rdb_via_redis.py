@@ -81,7 +81,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 # redis-server discovery (project-local build, then the pinned Redis build,
 # then PATH) is shared with the test suite -- see tests/integration/_redis_path.py
 # for the resolution order and rationale. Do not re-implement that search here.
-sys.path.insert(0, str(ROOT / "tests" / "integration"))
+_INTEGRATION_DIR = str(ROOT / "tests" / "integration")
+if _INTEGRATION_DIR not in sys.path:
+    sys.path.insert(0, _INTEGRATION_DIR)
 from _redis_path import redis_server_path  # noqa: E402
 
 
