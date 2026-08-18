@@ -3719,6 +3719,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             out += "\r\n";
           }
+          if (want("CLUSTER")) {
+            // Redis emits this as its own section (server.c genRedisInfoString); the copy
+            // inside "# Server" above is kept because real Redis reports it in both places.
+            out += "# Cluster\r\n"
+                   "cluster_enabled:" + std::string(g_cluster_peers.empty() ? "0" : "1") + "\r\n\r\n";
+          }
           if (want("KEYSPACE")) {
             out += "# Keyspace\r\n";
             const int prev = store().current_db();
@@ -3735,10 +3741,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "\r\n";
           }
 
-          if (out.empty()) {
-            // Unknown section — return server info as default
-            out = "# Server\r\nredis_version:7.2.5\r\n";
-          }
           return encode_bulk(out);
         }});
 
