@@ -1,5 +1,6 @@
 #include "command.hpp"
 #include "command_metadata.generated.hpp"
+#include "peadb_version.hpp"
 #include "server_context.hpp"
 
 #include "datastore.hpp"
@@ -3603,7 +3604,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "redis_git_sha1:00000000\r\n"
                    "redis_git_dirty:0\r\n"
                    "redis_build_id:peadb-dev\r\n"
-                   "peadb_version:0.1.0\r\n"
+                   "peadb_version:" PEADB_VERSION "\r\n"
                    "redis_mode:standalone\r\n"
                    "os:Linux\r\n"
                    "arch_bits:64\r\n"

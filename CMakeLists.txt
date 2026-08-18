@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-project(peadb VERSION 0.1.0 LANGUAGES C CXX)
+
+# The repo-root VERSION file is the single source of truth for PeaDB's own version.
+# Keep it a plain MAJOR.MINOR.PATCH: project() rejects a "v" prefix or a "-rc1" suffix
+# outright, and an empty file fails configure. scripts/qa/run_fuzz_sanity.sh reads the
+# same file so its hand-rolled build cannot drift.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" PEADB_VERSION_RAW LIMIT_COUNT 1)
+project(peadb VERSION ${PEADB_VERSION_RAW} LANGUAGES C CXX)
 
 # Default to Release if no build type specified (Debug builds are much slower)
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
@@ -65,6 +71,7 @@ target_include_directories(peadb_core PUBLIC include)
 target_link_libraries(peadb_core PUBLIC lua_bundled m)
 target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(peadb_core PUBLIC PEADB_NUM_SHARDS=${PEADB_NUM_SHARDS})
+target_compile_definitions(peadb_core PUBLIC PEADB_VERSION="${PROJECT_VERSION}")
 if(LIBURING_FOUND)
   target_compile_definitions(peadb_core PUBLIC PEADB_HAVE_IO_URING)
   target_include_directories(peadb_core PUBLIC ${LIBURING_INCLUDE_DIRS})

@@ -65,6 +65,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 cd "$ROOT_DIR"
 
+# src/command.cpp includes peadb_version.hpp, which hard-errors unless the build defines
+# PEADB_VERSION. This harness compiles outside CMake, so read the same VERSION file CMake does.
+PEADB_VERSION="$(cat VERSION)"
+
 CXX="${CXX:-g++}"
 LUA_PKG="${LUA_PKG:-}"
 if [[ -z "$LUA_PKG" ]]; then
@@ -86,7 +90,7 @@ fi
 LUA_CFLAGS="$(pkg-config --cflags "$LUA_PKG")"
 LUA_LIBS="$(pkg-config --libs "$LUA_PKG")"
 
-COMMON_FLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude $LUA_CFLAGS"
+COMMON_FLAGS="-std=c++20 -O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -DPEADB_VERSION=\"$PEADB_VERSION\" $LUA_CFLAGS"
 ROUNDS="${1:-200}"
 
 echo "=== Building fuzz harnesses ==="
