@@ -420,3 +420,19 @@ authoritative debt list; each item below cites its skipfile where one exists.
   `scripts/redis/skipfiles/unit_other.skip`; the two RESET tests needing CLIENT TRACKING and
   multi-user ACL are tracked under item 7; the FLUSHALL dirty-counter reset under item 18.
 - Tracking: folds into the introspection/ops hardening in Phase 4 (DEBUG verbs, process title).
+
+22. INFO section coverage (Cluster present, Latencystats absent)
+- Status: `partial` (all sections Redis's default/all INFO emits are present except Latencystats)
+- Owner: observability
+- Severity: low
+- Target milestone: P5
+- Implemented: `INFO cluster` now emits a real `# Cluster` section (`cluster_enabled`), matching
+  Redis's `genRedisInfoString`, and is included in the default and `all`/`everything` output like
+  real Redis. An unrecognised section name now returns a genuinely empty bulk string instead of
+  falling back to a hardcoded `# Server` stub, matching Redis (which appends nothing for a section
+  it does not recognise).
+- Missing: `# Latencystats` (the `LATENCY HISTORY`/`LATENCY LATEST`-derived percentile section
+  Redis emits under `all`/`everything` or when explicitly requested) has no `want("LATENCYSTATS")`
+  block yet, so `INFO latencystats` returns empty and `INFO all` omits the section.
+- Tracking: add the Latencystats section alongside the existing per-command latency histogram
+  (`g_cmd_latency_hist`) as part of the observability hardening track.
