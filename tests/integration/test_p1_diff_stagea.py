@@ -1,21 +1,15 @@
 #!/usr/bin/env python3
 import pathlib
-import shutil
 import subprocess
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
-
-
-def _have_redis_server() -> bool:
-    local = ROOT / "third_party/redis/src/redis-server"
-    if local.exists():
-        return True
-    return shutil.which("redis-server") is not None
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _redis_path import redis_server_path  # noqa: E402
 
 
 def main():
-    if not _have_redis_server():
+    if redis_server_path() is None:
         print("SKIP: redis-server not found (install redis-server or build third_party/redis)")
         return 0
     subprocess.check_call(

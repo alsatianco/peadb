@@ -75,20 +75,24 @@ import subprocess
 import tempfile
 import time
 import os
+import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+
+# redis-server discovery (project-local build, then the pinned Redis build,
+# then PATH) is shared with the test suite -- see tests/integration/_redis_path.py
+# for the resolution order and rationale. Do not re-implement that search here.
+sys.path.insert(0, str(ROOT / "tests" / "integration"))
+from _redis_path import redis_server_path  # noqa: E402
 
 
 def resolve_redis_server() -> str:
     env = os.environ.get("REDIS_SERVER")
     if env:
         return env
-    third_party = str(ROOT / "third_party" / "redis" / "src" / "redis-server")
-    if os.path.isfile(third_party) and os.access(third_party, os.X_OK):
-        return third_party
-    which = shutil.which("redis-server")
-    if which:
-        return which
+    found = redis_server_path()
+    if found:
+        return found
     raise RuntimeError("redis-server not found (set REDIS_SERVER or install redis-server)")
 
 
