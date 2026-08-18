@@ -5,13 +5,11 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
-from _redis_path import redis_server_path  # noqa: E402
+from _redis_path import skip_if_no_redis_server  # noqa: E402
 
 
 def main():
-    if redis_server_path() is None:
-        print("SKIP: redis-server not found (install redis-server or build third_party/redis)")
-        return 0
+    skip_if_no_redis_server()
     subprocess.check_call(
         [
             sys.executable,
