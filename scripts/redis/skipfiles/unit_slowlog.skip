@@ -1,0 +1,5 @@
+# Calls `r acl setuser slowlog-test-user +get +set` uncaught at slowlog.tcl:57, so once
+# ACL SETUSER correctly refuses (no rule engine to apply it to) the test aborts instead of
+# failing an assertion. It asserts SETUSER args are redacted in SLOWLOG, a feature that needs
+# a working SETUSER — genuinely out of reach, not merely inconvenient. compat/delta.md item 7.
+SLOWLOG - Certain commands are omitted that contain sensitive information

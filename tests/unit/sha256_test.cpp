@@ -39,6 +39,16 @@ int main() {
             "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
         "one million 'a'");
 
+  // Exact multiples of the 64-byte block size (one block, two blocks) exercise the
+  // `remaining == 0` padding path, which none of the vectors above hit. Expected values
+  // computed independently: python3 -c "import hashlib; print(hashlib.sha256(b'a'*64).hexdigest())".
+  check(peadb::sha256_hex(std::string(64, 'a')) ==
+            "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb",
+        "64-byte exact one-block boundary");
+  check(peadb::sha256_hex(std::string(128, 'a')) ==
+            "6836cf13bac400e9105071cd6af47084dfacad4e5e302c94bfed24e013afb73e",
+        "128-byte exact two-block boundary");
+
   if (failures == 0) std::cout << "sha256_test passed\n";
   return failures == 0 ? 0 : 1;
 }

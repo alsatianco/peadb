@@ -5,14 +5,14 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registered: 0
+Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
-| `ACL` | upstream | test_p3_repl_cluster_surface.py |
+| `ACL` | tested | test_p3_repl_cluster_surface.py, test_p5_acl_surface.py |
 | `APPEND` | upstream | test_m2_strings_expire.py |
 | `ASKING` | upstream | test_p3_repl_cluster_surface.py |
-| `AUTH` | upstream | test_command_coverage_extras.py |
+| `AUTH` | upstream | test_command_coverage_extras.py, test_p5_acl_surface.py |
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
 | `BGSAVE` | upstream | test_m5_persistence_commands.py |
 | `BITCOUNT` | upstream | test_p3_ecosystem_commands.py |
@@ -91,7 +91,7 @@ Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registe
 | `INCR` | upstream | test_m2_strings_expire.py, test_m4_tx.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py |
 | `INCRBY` | upstream | test_m2_strings_expire.py |
 | `INCRBYFLOAT` | upstream | test_m2_strings_expire.py |
-| `INFO` | upstream | test_b4_observability.py, test_b7_eviction.py, test_b8_repl_safety.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py |
+| `INFO` | upstream | test_b4_observability.py, test_b7_eviction.py, test_b8_repl_safety.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py, test_p5_info_sections.py, test_p5_version_provenance.py |
 | `KEYS` | full | test_p1_keys_pattern.py |
 | `LATENCY` | upstream | test_p3_ecosystem_commands.py |
 | `LCS` | upstream | test_p1_lcs.py |
@@ -125,7 +125,7 @@ Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registe
 | `PFADD` | tested | test_b5_commands.py |
 | `PFCOUNT` | tested | test_b5_commands.py |
 | `PFMERGE` | tested | test_b5_commands.py |
-| `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p4_subscribe_mode_gate.py |
+| `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p4_subscribe_mode_gate.py, test_p5_acl_surface.py |
 | `PSETEX` | full | test_p1_expire_lazy_scan.py, test_p1_setex_psetex.py |
 | `PSUBSCRIBE` | upstream | test_b4_observability.py, test_b7_eviction.py, test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `PSYNC` | upstream | — |
