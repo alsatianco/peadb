@@ -245,6 +245,7 @@ To report a security vulnerability privately, or to read the known security gaps
 | [CLAUDE.md](CLAUDE.md) | Build, test, and architecture notes for contributors and AI assistants |
 | [CHANGELOG.md](CHANGELOG.md) | Release history and the `[Unreleased]` parity-wave log |
 | [SECURITY.md](SECURITY.md) | Supported versions, private vulnerability reporting, known security gaps |
+| [docs/RELEASING.md](docs/RELEASING.md) | Release tagging convention and the multi-arch publish sequence |
 
 ## Project Structure
 
