@@ -231,6 +231,8 @@ PeaDB is a drop-in replacement for core Redis workloads — standard clients con
 
 Full detail — drop-in posture, tested clients, `redis.conf` support, migration & rollback steps, the feature-status table, persistence internals, and security/monitoring notes — lives in **[docs/compatibility.md](docs/compatibility.md)**. The authoritative, always-current gap registry is **[compat/delta.md](compat/delta.md)**.
 
+To report a security vulnerability privately, or to read the known security gaps (no TLS, no multi-user ACL, no Sentinel, no cluster failover) before you deploy, see **[SECURITY.md](SECURITY.md)**.
+
 ## Documentation
 
 | Document | What it covers |
@@ -242,6 +244,7 @@ Full detail — drop-in posture, tested clients, `redis.conf` support, migration
 | [scripts/README.md](scripts/README.md) | Guide to the helper, CI, QA, and dev scripts |
 | [CLAUDE.md](CLAUDE.md) | Build, test, and architecture notes for contributors and AI assistants |
 | [CHANGELOG.md](CHANGELOG.md) | Release history and the `[Unreleased]` parity-wave log |
+| [SECURITY.md](SECURITY.md) | Supported versions, private vulnerability reporting, known security gaps |
 
 ## Project Structure
 
