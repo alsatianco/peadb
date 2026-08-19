@@ -39,13 +39,6 @@ struct PersistenceState {
     std::atomic<bool> bgrewrite_in_progress{false};
 };
 
-// ── Cluster state ──────────────────────────────────────────────────────────
-
-struct ClusterState {
-    std::string redirect_addr = "127.0.0.1:7000";
-    // slot_routes and peers remain in command.cpp anonymous namespace for now
-};
-
 // ── Server stats (extern-visible, set from server.cpp) ────────────────────
 
 struct ServerStats {
@@ -70,7 +63,6 @@ struct ServerCallbacks {
 struct ServerContext {
     ReplicationState replication;
     PersistenceState persistence;
-    ClusterState cluster;
     ServerStats stats;
     ServerCallbacks callbacks;
 };
