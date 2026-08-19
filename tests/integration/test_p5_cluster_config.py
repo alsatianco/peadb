@@ -128,11 +128,65 @@ def case_wildcard_bind_with_explicit_announce_ip_starts():
  finally:
   p.terminate(); p.wait(timeout=10)
 
+def _cget(s, k):
+ r = cmd(s, 'CONFIG', 'GET', k)
+ return dict(zip(r[0::2], r[1::2])).get(k)
+
+def _self_nodes_line(s):
+ nodes = cmd(s, 'CLUSTER', 'NODES')
+ return [ln for ln in nodes.split('\n') if 'myself' in ln][0]
+
+def case_announce_reregisters_after_cluster_touch():
+ # Final review finding: CONFIG SET cluster-announce-* used to leave a stale advertised
+ # address once any CLUSTER command had already lazily snapshotted the node table
+ # (ensure_self_registered()) — CONFIG GET would show the new value while CLUSTER
+ # NODES/SLOTS kept the old host/port/id. Order 1: touch CLUSTER first, then CONFIG SET.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6568','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--loglevel','error'])
+ try:
+  wait_until_ready(6568)
+  with socket.create_connection(('127.0.0.1',6568),timeout=5) as s:
+   old_id = cmd(s,'CLUSTER','MYID')  # forces the node-table snapshot
+   assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
+   assert cmd(s,'CONFIG','SET','cluster-announce-port','7100')=='OK'
+   assert cmd(s,'CONFIG','SET','cluster-announce-bus-port','17200')=='OK'
+   assert _cget(s,'cluster-announce-ip')=='203.0.113.9'
+   new_id = cmd(s,'CLUSTER','MYID')
+   assert new_id != old_id, 'a re-announced address must mint a new id (decision record)'
+   self_line = _self_nodes_line(s)
+   assert self_line.startswith(new_id + ' 203.0.113.9:7100@17200 '), self_line
+   slots = cmd(s,'CLUSTER','SLOTS')
+   assert slots == [], slots  # no slots assigned in this test — just checking the address
+  print('P5 cluster config: CONFIG SET announce-* re-registers after a CLUSTER touch passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
+def case_announce_reregisters_before_cluster_touch():
+ # Order 2: CONFIG SET before any CLUSTER command has ever run, so the node table doesn't
+ # exist yet. The first CLUSTER call must build it from the already-updated settings, not
+ # from whatever was live at startup.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6569','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--loglevel','error'])
+ try:
+  wait_until_ready(6569)
+  with socket.create_connection(('127.0.0.1',6569),timeout=5) as s:
+   assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
+   assert cmd(s,'CONFIG','SET','cluster-announce-port','7100')=='OK'
+   assert cmd(s,'CONFIG','SET','cluster-announce-bus-port','17200')=='OK'
+   myid = cmd(s,'CLUSTER','MYID')  # first-ever CLUSTER call
+   self_line = _self_nodes_line(s)
+   assert self_line.startswith(myid + ' 203.0.113.9:7100@17200 '), self_line
+  print('P5 cluster config: CONFIG SET announce-* re-registers before a CLUSTER touch passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
 def main():
  case_config_surface()
  case_standalone_redis_mode()
  case_wildcard_announce_refused()
  case_wildcard_bind_with_explicit_announce_ip_starts()
+ case_announce_reregisters_after_cluster_touch()
+ case_announce_reregisters_before_cluster_touch()
  print('P5 cluster config tests passed')
 
 main()

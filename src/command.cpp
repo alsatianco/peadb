@@ -1980,6 +1980,25 @@ int ensure_self_registered() {
   return 0;
 }
 
+// Re-derives g_cluster_nodes[0] (id, host, port) from the current cluster-announce-* settings.
+// Must be called after CONFIG SET changes any of cluster-announce-ip/-port/-bus-port, so the
+// node table can never disagree with CONFIG GET about this node's own advertised identity —
+// otherwise a CONFIG SET landing after the first CLUSTER call (which lazily snapshots the table
+// via ensure_self_registered() above) would leave CLUSTER NODES/SLOTS naming a stale address, or
+// worse, one that mixes the new host with the old id. The P5 decision record already commits to
+// "re-announcing on a new address mints a new id" (docs/decisions/
+// p5-cluster-addressing-and-version-provenance.md); this makes that true unconditionally rather
+// than only for a node whose table has never been read yet. A no-op before the table has ever
+// been touched — the next ensure_self_registered() call builds it fresh from current settings
+// anyway, so there is nothing to rebuild yet.
+void reregister_self_if_needed() {
+  if (g_cluster_nodes.empty()) return;
+  const std::string host = cluster_announced_host();
+  const int port = cluster_announced_port();
+  g_cluster_nodes[0] = ClusterNode{
+      sha1_hex("peadb-cluster-node:" + host + ":" + std::to_string(port)), host, port};
+}
+
 // Inserts (or finds) a peer by its announced host:port, used by MEET/MEETBACK. Idempotent:
 // re-MEETing the same address returns the existing index rather than minting a duplicate.
 int cluster_register_peer(const std::string& host, int port) {
@@ -4767,16 +4786,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             if (k == "cluster-announce-ip") {
               g_cluster_announce_ip = args[3];
+              // The node table (g_cluster_nodes[0]) is a lazy snapshot taken by the first
+              // CLUSTER call (ensure_self_registered()); without this, a CONFIG SET landing
+              // after that snapshot would leave CONFIG GET and CLUSTER NODES/SLOTS disagreeing
+              // about this node's own advertised address, and the NODES line would mix the new
+              // host with the old (now-stale) id. Re-derive it immediately so the two orderings
+              // — CONFIG SET before vs. after the first CLUSTER call — behave identically.
+              reregister_self_if_needed();
             }
             if (k == "cluster-announce-port") {
               std::int64_t v = 0;
               if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
               g_cluster_announce_port = static_cast<int>(v);
+              reregister_self_if_needed();
             }
             if (k == "cluster-announce-bus-port") {
               std::int64_t v = 0;
               if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
               g_cluster_announce_bus_port = static_cast<int>(v);
+              // The bus port is not part of the node id/host/port triple, but re-derive anyway
+              // for uniformity with the other two announce parameters — it is a cheap no-op
+              // when only the bus port changed.
+              reregister_self_if_needed();
             }
             if (k == "maxmemory") {
               std::int64_t v = 0;
