@@ -110,6 +110,48 @@ def case_wildcard_announce_refused():
    p.terminate(); p.wait(timeout=10)
  print('P5 cluster config: wildcard-announce refusal passed')
 
+def case_explicit_wildcard_announce_ip_refused():
+ # Final review finding: the startup guard used to gate on cluster_announce_ip.empty(), so an
+ # EXPLICIT wildcard announce-ip (rather than one reached via the bind fallback) sailed through
+ # and the server started advertising an address no peer can dial. The guard must check the
+ # resolved announced host unconditionally.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6570','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--cluster-announce-ip','0.0.0.0',
+                     '--loglevel','error'],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+ try:
+  try:
+   rc = p.wait(timeout=10)
+  except subprocess.TimeoutExpired:
+   p.kill(); p.wait(timeout=5)
+   raise AssertionError('server with --cluster-announce-ip 0.0.0.0 did not refuse to start '
+                        'within 10s')
+  assert rc != 0, f'server must refuse an explicit wildcard announce-ip, got exit code {rc}'
+  out = p.stdout.read().decode(errors='replace')
+  assert 'cluster-announce-ip' in out, f'refusal message must name cluster-announce-ip: {out!r}'
+ finally:
+  if p.poll() is None:
+   p.terminate(); p.wait(timeout=10)
+ print('P5 cluster config: explicit wildcard cluster-announce-ip refused at startup passed')
+
+def case_config_set_announce_ip_rejects_wildcard():
+ # CONFIG SET cluster-announce-ip used to accept any string while the two port parameters
+ # beside it were range-checked. Reject the same wildcard forms the startup guard refuses.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6571','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--loglevel','error'])
+ try:
+  wait_until_ready(6571)
+  with socket.create_connection(('127.0.0.1',6571),timeout=5) as s:
+   for wildcard in ('0.0.0.0', '::', '*'):
+    r = cmd(s,'CONFIG','SET','cluster-announce-ip',wildcard)
+    assert isinstance(r,tuple) and r[0]=='ERR', (wildcard, r)
+    assert 'cluster-announce-ip' in r[1] and 'wildcard' in r[1], (wildcard, r)
+   assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
+   assert _cget(s,'cluster-announce-ip')=='203.0.113.9'
+  print('P5 cluster config: CONFIG SET cluster-announce-ip rejects wildcard values passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
 def case_wildcard_bind_with_explicit_announce_ip_starts():
  # Same wildcard bind, but with cluster-announce-ip set explicitly: the hazard is covered by
  # the operator's own configuration, so the server must start normally.
@@ -184,6 +226,8 @@ def main():
  case_config_surface()
  case_standalone_redis_mode()
  case_wildcard_announce_refused()
+ case_explicit_wildcard_announce_ip_refused()
+ case_config_set_announce_ip_rejects_wildcard()
  case_wildcard_bind_with_explicit_announce_ip_starts()
  case_announce_reregisters_after_cluster_touch()
  case_announce_reregisters_before_cluster_touch()
