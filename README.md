@@ -120,6 +120,10 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file — eithe
 | `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax; config-file key or `CONFIG SET`) |
 | `rename-command` | — | Rename or disable a command (`rename-command FROM TO`, empty `TO` disables; config-file key) |
 | `--repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
+| `--cluster-enabled` | `no` | Enable cluster mode; startup-only, like Redis's `IMMUTABLE_CONFIG` — `CONFIG SET cluster-enabled` is refused |
+| `--cluster-announce-ip` | — | Address this node announces to peers/clients; empty falls back to `--bind` — a documented simplification of Redis's live-connection auto-detection (see `docs/decisions/p5-cluster-addressing-and-version-provenance.md`). With `--cluster-enabled yes`, the server refuses to start if this falls back to a wildcard (`0.0.0.0`, `::`, `*`, or empty) |
+| `--cluster-announce-port` | — | Port this node announces; empty falls back to `--port` |
+| `--cluster-announce-bus-port` | — | Cluster bus port this node announces; empty falls back to the announced port + 10000 |
 
 `appendonly`, `appendfilename`, `appendfsync`, and `save` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys); `maxclients`, `unixsocket`, `notify-keyspace-events`, and `rename-command` are config-file keys only.
 

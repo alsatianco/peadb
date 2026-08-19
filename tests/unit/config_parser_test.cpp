@@ -13,6 +13,10 @@ int main() {
     out << "maxclients 4096\n";
     out << "bind 0.0.0.0\n";
     out << "loglevel debug\n";
+    out << "cluster-enabled yes\n";
+    out << "cluster-announce-ip 10.9.8.7\n";
+    out << "cluster-announce-port 7100\n";
+    out << "cluster-announce-bus-port 17100\n";
     out << "unknown-directive some value\n";
   }
 
@@ -36,6 +40,22 @@ int main() {
   }
   if (cfg.raw.find("unknown-directive") == cfg.raw.end()) {
     std::cerr << "unknown directive should be tolerated\n";
+    return 1;
+  }
+  if (!cfg.cluster_enabled) {
+    std::cerr << "cluster-enabled parse failed\n";
+    return 1;
+  }
+  if (cfg.cluster_announce_ip != "10.9.8.7") {
+    std::cerr << "cluster-announce-ip parse failed\n";
+    return 1;
+  }
+  if (cfg.cluster_announce_port != "7100") {
+    std::cerr << "cluster-announce-port parse failed\n";
+    return 1;
+  }
+  if (cfg.cluster_announce_bus_port != "17100") {
+    std::cerr << "cluster-announce-bus-port parse failed\n";
     return 1;
   }
 

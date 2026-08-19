@@ -34,6 +34,13 @@ struct ServerConfig {
   std::string enable_module_command = "no"; // "yes" | "no" | "local" — gates MODULE LOAD
   // rename-command FROM TO (TO empty disables FROM). Order-preserving, repeatable.
   std::vector<std::pair<std::string, std::string>> rename_commands;
+  // ── Cluster ──
+  bool cluster_enabled = false;             // startup-only, like Redis's IMMUTABLE_CONFIG
+  std::string cluster_announce_ip;          // empty = use `bind` (a documented simplification —
+                                             // Redis instead auto-detects from a live connection;
+                                             // see docs/decisions/p5-cluster-addressing-and-version-provenance.md)
+  std::string cluster_announce_port;        // empty = use `port`
+  std::string cluster_announce_bus_port;    // empty = announced port + 10000
   std::unordered_map<std::string, std::string> raw;
 };
 

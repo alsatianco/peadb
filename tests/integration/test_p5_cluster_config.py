@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+"""P5 cluster configuration plumbing: cluster-enabled and cluster-announce-* config, CONFIG GET
+bind reporting the real bind address instead of a hardcoded 0.0.0.0, redis_mode deriving from
+cluster-enabled (server.c:5477), and the wildcard-announce startup refusal (see
+docs/decisions/p5-cluster-addressing-and-version-provenance.md)."""
+import pathlib,socket,subprocess,sys
+ROOT=pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from _readiness import wait_until_ready
+
+def rx(s,n):
+ b=b''
+ while len(b)<n:
+  c=s.recv(n-len(b))
+  if not c: raise RuntimeError('closed')
+  b+=c
+ return b
+
+def rl(s):
+ b=b''
+ while not b.endswith(b'\r\n'):
+  b+=rx(s,1)
+ return b[:-2]
+
+def recv(s):
+ p=rx(s,1)
+ if p==b'+': return rl(s).decode()
+ if p==b'-': return ('ERR',rl(s).decode())
+ if p==b':': return int(rl(s))
+ if p==b'$':
+  n=int(rl(s))
+  if n==-1: return None
+  v=rx(s,n); rx(s,2); return v.decode()
+ if p==b'*':
+  n=int(rl(s))
+  if n==-1: return None
+  return [recv(s) for _ in range(n)]
+ raise RuntimeError(p)
+
+def cmd(s,*a):
+ d=f"*{len(a)}\r\n".encode()
+ for x in a:
+  b=x.encode(); d+=f"${len(b)}\r\n".encode()+b+b"\r\n"
+ s.sendall(d); return recv(s)
+
+def case_config_surface():
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6564','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--cluster-announce-ip','10.9.8.7',
+                     '--cluster-announce-port','7100','--cluster-announce-bus-port','17100',
+                     '--loglevel','error'])
+ try:
+  wait_until_ready(6564)
+  with socket.create_connection(('127.0.0.1',6564),timeout=5) as s:
+   def cget(k):
+    r=cmd(s,'CONFIG','GET',k); return dict(zip(r[0::2],r[1::2])).get(k)
+   assert cget('cluster-enabled')=='yes', cget('cluster-enabled')
+   assert cget('cluster-announce-ip')=='10.9.8.7'
+   assert cget('cluster-announce-port')=='7100'
+   assert cget('cluster-announce-bus-port')=='17100'
+   # CONFIG GET bind must report the real bind address, not a hardcoded 0.0.0.0.
+   assert cget('bind')=='127.0.0.1', cget('bind')
+   assert 'cluster_enabled:1' in cmd(s,'INFO','cluster')
+   # redis_mode must derive from cluster-enabled (server.c:5477), not stay hardcoded standalone.
+   info_server = cmd(s,'INFO','server')
+   assert 'redis_mode:cluster\r\n' in info_server, info_server
+   # The # Server cluster_enabled field must agree with # Cluster and redis_mode — same global.
+   assert 'cluster_enabled:1\r\n' in info_server, info_server
+   # The three announce options are runtime-modifiable in Redis; cluster-enabled is not.
+   assert cmd(s,'CONFIG','SET','cluster-announce-ip','10.1.1.1')=='OK'
+   assert cget('cluster-announce-ip')=='10.1.1.1'
+   r = cmd(s,'CONFIG','SET','cluster-enabled','no')
+   assert isinstance(r,tuple) and r[0]=='ERR', r
+   assert "can't set immutable config" in r[1], r
+  print('P5 cluster config: enabled + CONFIG GET/SET surface passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
+def case_standalone_redis_mode():
+ # No --cluster-enabled at all: redis_mode and cluster_enabled must both read as disabled,
+ # matching pre-existing standalone behaviour (they must not drift apart from each other).
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6567','--bind','127.0.0.1','--loglevel','error'])
+ try:
+  wait_until_ready(6567)
+  with socket.create_connection(('127.0.0.1',6567),timeout=5) as s:
+   info_server = cmd(s,'INFO','server')
+   assert 'redis_mode:standalone\r\n' in info_server, info_server
+   assert 'cluster_enabled:0\r\n' in info_server, info_server
+  print('P5 cluster config: standalone redis_mode passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
+def case_wildcard_announce_refused():
+ # CONTROLLER ADDENDUM 1: cluster-enabled yes + a wildcard bind + no explicit cluster-announce-ip
+ # must refuse to start rather than announce an address (0.0.0.0) that no peer can dial.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6565','--bind','0.0.0.0',
+                     '--cluster-enabled','yes','--loglevel','error'],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+ try:
+  try:
+   rc = p.wait(timeout=10)
+  except subprocess.TimeoutExpired:
+   p.kill(); p.wait(timeout=5)
+   raise AssertionError('server with --cluster-enabled yes --bind 0.0.0.0 and no '
+                        '--cluster-announce-ip did not refuse to start within 10s')
+  assert rc != 0, f'server must refuse to start (wildcard announce), got exit code {rc}'
+  out = p.stdout.read().decode(errors='replace')
+  assert 'cluster-announce-ip' in out, f'refusal message must name cluster-announce-ip: {out!r}'
+ finally:
+  if p.poll() is None:
+   p.terminate(); p.wait(timeout=10)
+ print('P5 cluster config: wildcard-announce refusal passed')
+
+def case_wildcard_bind_with_explicit_announce_ip_starts():
+ # Same wildcard bind, but with cluster-announce-ip set explicitly: the hazard is covered by
+ # the operator's own configuration, so the server must start normally.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6566','--bind','0.0.0.0',
+                     '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
+                     '--loglevel','error'])
+ try:
+  wait_until_ready(6566)
+  with socket.create_connection(('127.0.0.1',6566),timeout=5) as s:
+   assert cmd(s,'PING')=='PONG'
+   r=cmd(s,'CONFIG','GET','bind'); d=dict(zip(r[0::2],r[1::2]))
+   assert d.get('bind')=='0.0.0.0', d
+   r=cmd(s,'CONFIG','GET','cluster-announce-ip'); d=dict(zip(r[0::2],r[1::2]))
+   assert d.get('cluster-announce-ip')=='203.0.113.5', d
+  print('P5 cluster config: wildcard bind + explicit announce-ip starts normally passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
+def main():
+ case_config_surface()
+ case_standalone_redis_mode()
+ case_wildcard_announce_refused()
+ case_wildcard_bind_with_explicit_announce_ip_starts()
+ print('P5 cluster config tests passed')
+
+main()

@@ -264,24 +264,29 @@ int run_server(const ServerConfig& config) {
     }
   }
 
-  // ── Cluster bus listener on port N+10000 ──
-  const int cluster_bus_port = config.port + 10000;
-  int cbus_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (cbus_fd >= 0) {
-    int one_c = 1;
-    setsockopt(cbus_fd, SOL_SOCKET, SO_REUSEADDR, &one_c, sizeof(one_c));
-    set_nonblocking(cbus_fd);
-    sockaddr_in cbus_addr {};
-    cbus_addr.sin_family = AF_INET;
-    cbus_addr.sin_port = htons(static_cast<uint16_t>(cluster_bus_port));
-    inet_pton(AF_INET, config.bind.c_str(), &cbus_addr.sin_addr);
-    if (bind(cbus_fd, reinterpret_cast<sockaddr*>(&cbus_addr), sizeof(cbus_addr)) == 0 &&
-        listen(cbus_fd, 16) == 0) {
-      log(LogLevel::Info, "cluster bus listening on port " + std::to_string(cluster_bus_port));
-    } else {
-      log(LogLevel::Warn, "cluster bus bind/listen failed on port " + std::to_string(cluster_bus_port));
-      close(cbus_fd);
-      cbus_fd = -1;
+  // ── Cluster bus listener on port N+10000 (cluster-enabled only) ──
+  // A standalone node has no cluster bus peers to talk to, so it should not expose the extra
+  // port at all (Redis only opens its bus port when cluster-enabled too, cluster.c).
+  int cbus_fd = -1;
+  if (config.cluster_enabled) {
+    const int cluster_bus_port = config.port + 10000;
+    cbus_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (cbus_fd >= 0) {
+      int one_c = 1;
+      setsockopt(cbus_fd, SOL_SOCKET, SO_REUSEADDR, &one_c, sizeof(one_c));
+      set_nonblocking(cbus_fd);
+      sockaddr_in cbus_addr {};
+      cbus_addr.sin_family = AF_INET;
+      cbus_addr.sin_port = htons(static_cast<uint16_t>(cluster_bus_port));
+      inet_pton(AF_INET, config.bind.c_str(), &cbus_addr.sin_addr);
+      if (bind(cbus_fd, reinterpret_cast<sockaddr*>(&cbus_addr), sizeof(cbus_addr)) == 0 &&
+          listen(cbus_fd, 16) == 0) {
+        log(LogLevel::Info, "cluster bus listening on port " + std::to_string(cluster_bus_port));
+      } else {
+        log(LogLevel::Warn, "cluster bus bind/listen failed on port " + std::to_string(cluster_bus_port));
+        close(cbus_fd);
+        cbus_fd = -1;
+      }
     }
   }
   // Set of cluster bus client fds (gossip connections)

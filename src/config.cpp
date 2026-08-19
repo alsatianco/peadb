@@ -119,6 +119,14 @@ ServerConfig load_config(const std::string& path) {
       cfg.repl_backlog_size = value;
     } else if (key == "notify-keyspace-events") {
       cfg.notify_keyspace_events = value;
+    } else if (key == "cluster-enabled") {
+      cfg.cluster_enabled = (value == "yes" || value == "1" || value == "true");
+    } else if (key == "cluster-announce-ip") {
+      cfg.cluster_announce_ip = value;
+    } else if (key == "cluster-announce-port") {
+      cfg.cluster_announce_port = value;
+    } else if (key == "cluster-announce-bus-port") {
+      cfg.cluster_announce_bus_port = value;
     }
   }
 

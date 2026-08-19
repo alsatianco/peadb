@@ -75,7 +75,9 @@ int main(int argc, char** argv) {
       std::cout << "Usage: peadb-server [<config-file>] [--port <port>] [--bind <ip>] [--loglevel <error|warn|info|debug>]\n"
                    "                    [--dir <path>] [--dbfilename <file>] [--config <path>]\n"
                    "                    [--requirepass <pass>] [--masterauth <pass>]\n"
-                   "                    [--protected-mode <yes|no>] [--enable-module-command <yes|no|local>]\n";
+                   "                    [--protected-mode <yes|no>] [--enable-module-command <yes|no|local>]\n"
+                   "                    [--cluster-enabled <yes|no>] [--cluster-announce-ip <ip>]\n"
+                   "                    [--cluster-announce-port <port>] [--cluster-announce-bus-port <port>]\n";
       return 0;
     }
   }
@@ -107,6 +109,10 @@ int main(int argc, char** argv) {
     if (arg == "--appendfilename" && i + 1 < argc) { config.appendfilename = argv[++i]; continue; }
     if (arg == "--appendfsync" && i + 1 < argc) { config.appendfsync = argv[++i]; continue; }
     if (arg == "--repl-backlog-size" && i + 1 < argc) { config.repl_backlog_size = argv[++i]; continue; }
+    if (arg == "--cluster-enabled" && i + 1 < argc) { const std::string v = argv[++i]; config.cluster_enabled = (v == "yes" || v == "1" || v == "true"); continue; }
+    if (arg == "--cluster-announce-ip" && i + 1 < argc) { config.cluster_announce_ip = argv[++i]; continue; }
+    if (arg == "--cluster-announce-port" && i + 1 < argc) { config.cluster_announce_port = argv[++i]; continue; }
+    if (arg == "--cluster-announce-bus-port" && i + 1 < argc) { config.cluster_announce_bus_port = argv[++i]; continue; }
   }
 
   peadb::set_log_level(peadb::parse_log_level(config.log_level));
@@ -134,6 +140,27 @@ int main(int argc, char** argv) {
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);
+  peadb::configure_cluster(config.cluster_enabled, config.bind, config.port, config.cluster_announce_ip,
+                           config.cluster_announce_port, config.cluster_announce_bus_port);
+
+  // Cluster addressing hazard: PeaDB falls back to the static `bind` address when no
+  // cluster-announce-ip is set, which is a documented simplification of Redis's live-connection
+  // auto-detection (docs/decisions/p5-cluster-addressing-and-version-provenance.md) — it does NOT
+  // match Redis, which instead blanks its address to force auto-detection (cluster.c:898-916).
+  // That fallback has a hole: a wildcard bind (0.0.0.0, ::, *, or empty — e.g. the shipped
+  // Dockerfile's `--bind 0.0.0.0`) would announce an address no peer can dial. Refuse to start
+  // rather than announce it, and never silently substitute loopback either.
+  if (config.cluster_enabled && config.cluster_announce_ip.empty()) {
+    const std::string announced_host = peadb::cluster_announced_host();
+    if (announced_host.empty() || announced_host == "0.0.0.0" || announced_host == "::" ||
+        announced_host == "*") {
+      peadb::log(peadb::LogLevel::Error,
+          "FATAL: cluster-enabled is yes but 'bind' ('" + config.bind + "') resolves to a wildcard "
+          "address that no peer can dial, and no 'cluster-announce-ip' (--cluster-announce-ip) was "
+          "set to give this node a real, peer-reachable address — refusing to start.");
+      return 1;
+    }
+  }
 
   // Initialize the Lua scripting engine and wire the command dispatcher.
   peadb::lua_engine_init();
