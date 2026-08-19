@@ -4785,7 +4785,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   "') - can't set immutable config");
             }
             if (k == "cluster-announce-ip") {
-              g_cluster_announce_ip = args[3];
+              // Same hazard the startup guard refuses (main.cpp): a wildcard address is
+              // undialable by any peer. Unlike the two port parameters beside it (already
+              // range-checked below), this field used to accept any string verbatim — an
+              // operator could CONFIG SET their way into the exact address class the server
+              // refuses to boot with. Empty is still allowed: it means "clear the override and
+              // fall back to bind" (mirrors Redis's EMPTY_STRING_IS_NULL treatment of this same
+              // parameter, config.c:3105), not a new wildcard to reject — bind itself was
+              // already validated at startup and cluster-enabled/bind cannot change afterward.
+              const auto& v = args[3];
+              if (v == "0.0.0.0" || v == "::" || v == "*") {
+                return encode_error("CONFIG SET failed (possibly related to argument '" +
+                                    args[2] + "') - cluster-announce-ip must not be a wildcard "
+                                    "address ('" + v + "'); no peer could dial it back");
+              }
+              g_cluster_announce_ip = v;
               // The node table (g_cluster_nodes[0]) is a lazy snapshot taken by the first
               // CLUSTER call (ensure_self_registered()); without this, a CONFIG SET landing
               // after that snapshot would leave CONFIG GET and CLUSTER NODES/SLOTS disagreeing

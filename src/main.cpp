@@ -150,14 +150,24 @@ int main(int argc, char** argv) {
   // That fallback has a hole: a wildcard bind (0.0.0.0, ::, *, or empty — e.g. the shipped
   // Dockerfile's `--bind 0.0.0.0`) would announce an address no peer can dial. Refuse to start
   // rather than announce it, and never silently substitute loopback either.
-  if (config.cluster_enabled && config.cluster_announce_ip.empty()) {
+  //
+  // The guard checks the resolved announced host unconditionally — NOT gated on whether
+  // cluster-announce-ip was left empty — because the same hazard exists when an operator
+  // explicitly sets `--cluster-announce-ip 0.0.0.0`: cluster_announced_host() returns the
+  // explicit value verbatim in that case, and an explicit wildcard is exactly as undialable by
+  // a peer as an unset one that fell back to a wildcard bind. Gating on "was announce-ip left
+  // empty" only caught the fallback path and let an explicit wildcard sail through.
+  if (config.cluster_enabled) {
     const std::string announced_host = peadb::cluster_announced_host();
     if (announced_host.empty() || announced_host == "0.0.0.0" || announced_host == "::" ||
         announced_host == "*") {
+      const std::string source = config.cluster_announce_ip.empty()
+          ? "'bind' ('" + config.bind + "')"
+          : "the explicit 'cluster-announce-ip' ('" + config.cluster_announce_ip + "')";
       peadb::log(peadb::LogLevel::Error,
-          "FATAL: cluster-enabled is yes but 'bind' ('" + config.bind + "') resolves to a wildcard "
-          "address that no peer can dial, and no 'cluster-announce-ip' (--cluster-announce-ip) was "
-          "set to give this node a real, peer-reachable address — refusing to start.");
+          "FATAL: cluster-enabled is yes but " + source + " resolves to a wildcard address "
+          "that no peer can dial — refusing to start. Set 'cluster-announce-ip' "
+          "(--cluster-announce-ip) to a real, peer-reachable address.");
       return 1;
     }
   }
