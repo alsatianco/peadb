@@ -274,13 +274,38 @@ struct ClusterNode {
 std::vector<ClusterNode> g_cluster_nodes;
 
 // Unassigned is first so the value-initialised array starts with no ownership at all — a
-// standalone (or freshly cluster-enabled, unconfigured) node must never redirect. Owned,
-// Moved, and Ask all carry the owning node's index in g_slot_owner; Unassigned always
-// carries -1 there.
-enum class SlotRoute { Unassigned, Owned, Moved, Ask };
+// standalone (or freshly cluster-enabled, unconfigured) node must never redirect. Owned and
+// Moved carry the owning node's index in g_slot_owner; Unassigned always carries -1 there.
+enum class SlotRoute { Unassigned, Owned, Moved };
 std::array<SlotRoute, 16384> g_slot_routes {};
-// -1 = no owner (Unassigned); otherwise an index into g_cluster_nodes.
+// -1 = no owner (Unassigned); otherwise an index into g_cluster_nodes. This is the single
+// authority for reported ownership — cluster_owned_ranges() (which feeds CLUSTER SLOTS/SHARDS/
+// NODES and cluster_size) reads only this array. SETSLOT MIGRATING/IMPORTING must never write
+// it: a slot in flight is still owned by whoever owned it before the migration started, exactly
+// as Redis keeps the slot in the owner's bitmap throughout MIGRATING/IMPORTING and only moves it
+// on the final SETSLOT NODE. Ownership changes only via ADDSLOTS/DELSLOTS/ADDSLOTSRANGE/
+// DELSLOTSRANGE/SETSLOT NODE.
 std::array<std::int32_t, 16384> g_slot_owner = [] {
+  std::array<std::int32_t, 16384> a {};
+  a.fill(-1);
+  return a;
+}();
+// Redirect target for a slot this node is migrating away (SETSLOT <slot> MIGRATING <node>);
+// -1 when not migrating. Consulted only by the dispatch chokepoint's ASK check and by CLUSTER
+// NODES' "[slot->-<id>]" marker on this node's own line — never by cluster_owned_ranges(), so a
+// migration in progress cannot leak into reported ownership (see g_slot_owner above and
+// compat/delta.md item 6). Mirrors Redis's server.cluster->migrating_slots_to[slot].
+std::array<std::int32_t, 16384> g_slot_migrating_to = [] {
+  std::array<std::int32_t, 16384> a {};
+  a.fill(-1);
+  return a;
+}();
+// Source node for a slot this node is importing (SETSLOT <slot> IMPORTING <node>); -1 when not
+// importing. Recorded for CLUSTER NODES' "[slot-<-<id>]" marker; PeaDB does not yet special-case
+// ASKING traffic for an importing slot (compat/delta.md item 6 tracks this as a remaining gap —
+// only the reporting-honesty half of MIGRATING/IMPORTING is in scope here). Mirrors Redis's
+// server.cluster->importing_slots_from[slot].
+std::array<std::int32_t, 16384> g_slot_importing_from = [] {
   std::array<std::int32_t, 16384> a {};
   a.fill(-1);
   return a;
@@ -4304,13 +4329,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               g_slot_routes[static_cast<std::size_t>(slot)] =
                   (idx == 0) ? SlotRoute::Owned : SlotRoute::Moved;
               g_slot_owner[static_cast<std::size_t>(slot)] = idx;
+              // A definitive NODE assignment ends any in-flight migration for this slot from
+              // this node's point of view — Redis clears the matching side (migrating_slots_to
+              // when the slot moves away, importing_slots_from when this node becomes the owner;
+              // cluster.c:6146-6183) rather than leaving a stale marker naming a migration that
+              // already concluded.
+              g_slot_migrating_to[static_cast<std::size_t>(slot)] = -1;
+              g_slot_importing_from[static_cast<std::size_t>(slot)] = -1;
               return encode_simple("OK");
             }
             if (mode == "MIGRATING" || mode == "IMPORTING") {
               const int idx = cluster_resolve_node(args[4]);
               if (idx < 0) return encode_error("I don't know about node " + args[4]);
-              g_slot_routes[static_cast<std::size_t>(slot)] = SlotRoute::Ask;
-              g_slot_owner[static_cast<std::size_t>(slot)] = idx;
+              // Reported ownership (g_slot_owner/g_slot_routes) is untouched: a slot in flight
+              // stays owned by whoever owned it before the migration started, exactly like
+              // Redis's migrating_slots_to/importing_slots_from, which never move the slot out
+              // of the owner's bitmap. Only the redirect-target side channel changes here — see
+              // g_slot_migrating_to/g_slot_importing_from above.
+              if (mode == "MIGRATING") {
+                g_slot_migrating_to[static_cast<std::size_t>(slot)] = idx;
+              } else {
+                g_slot_importing_from[static_cast<std::size_t>(slot)] = idx;
+              }
               return encode_simple("OK");
             }
             return encode_error("Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP");
@@ -4360,6 +4400,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                      " - 0 0 1 connected";
               for (const auto& [start, end, owner] : ranges) {
                 if (owner == static_cast<int>(i)) out += " " + format_slot_range(start, end);
+              }
+              // Redis's clusterGenNodeDescription (cluster.c:5329-5344) only ever appends these
+              // markers to the MYSELF node's own line — migrating_slots_to/importing_slots_from
+              // are this node's perspective on slots in flight, not a fact about node i in
+              // general.
+              if (i == 0) {
+                for (int slot = 0; slot < 16384; ++slot) {
+                  const int mig = g_slot_migrating_to[static_cast<std::size_t>(slot)];
+                  const int imp = g_slot_importing_from[static_cast<std::size_t>(slot)];
+                  if (mig >= 0) {
+                    out += " [" + std::to_string(slot) + "->-" + g_cluster_nodes[static_cast<std::size_t>(mig)].id + "]";
+                  } else if (imp >= 0) {
+                    out += " [" + std::to_string(slot) + "-<-" + g_cluster_nodes[static_cast<std::size_t>(imp)].id + "]";
+                  }
+                }
               }
               out += "\n";
             }
@@ -10552,11 +10607,15 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     if (route == SlotRoute::Moved && owner >= 0) {
       return "-MOVED " + std::to_string(slot) + " " + cluster_node_addr(owner) + "\r\n";
     }
-    if (route == SlotRoute::Ask && owner >= 0) {
+    // ASK reads the migration side channel, never g_slot_owner: reported ownership does not
+    // move until SETSLOT ... NODE, so the redirect target for a slot in flight has to come from
+    // somewhere else (see g_slot_migrating_to above and compat/delta.md item 6).
+    const auto migrating_to = g_slot_migrating_to[static_cast<std::size_t>(slot)];
+    if (migrating_to >= 0) {
       if (session.asking) {
         session.asking = false;
       } else {
-        return "-ASK " + std::to_string(slot) + " " + cluster_node_addr(owner) + "\r\n";
+        return "-ASK " + std::to_string(slot) + " " + cluster_node_addr(migrating_to) + "\r\n";
       }
     }
   }
