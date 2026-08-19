@@ -55,17 +55,28 @@ def cmd(s, *a):
 
 
 def main():
-    p1 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6431", "--bind", "127.0.0.1", "--loglevel", "error"])
-    p2 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6432", "--bind", "127.0.0.1", "--loglevel", "error"])
+    # SETSLOT MIGRATING/IMPORTING now resolves its node argument against a real node table
+    # (see docs/decisions/p5-cluster-addressing-and-version-provenance.md) instead of accepting
+    # any token, and the whole CLUSTER command is gated on --cluster-enabled
+    # (cluster.c:5888-5891), so both servers MEET each other before using their real
+    # host:port as the node argument.
+    p1 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6431", "--bind", "127.0.0.1",
+                          "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
+                          "--loglevel", "error"])
+    p2 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6432", "--bind", "127.0.0.1",
+                          "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
+                          "--loglevel", "error"])
     try:
         wait_until_ready(6431)
+        wait_until_ready(6432)
         with socket.create_connection(("127.0.0.1", 6431), timeout=2) as a, socket.create_connection(("127.0.0.1", 6432), timeout=2) as b:
             assert cmd(a, "FLUSHALL") == "OK"
             assert cmd(b, "FLUSHALL") == "OK"
+            assert cmd(a, "CLUSTER", "MEET", "127.0.0.1", "6432") == "OK"
             assert cmd(a, "SET", "migrate-key", "v1") == "OK"
             assert cmd(a, "PEXPIRE", "migrate-key", "5000") == 1
             slot = cmd(a, "CLUSTER", "KEYSLOT", "migrate-key")
-            assert cmd(a, "CLUSTER", "SETSLOT", str(slot), "MIGRATING", "remote") == "OK"
+            assert cmd(a, "CLUSTER", "SETSLOT", str(slot), "MIGRATING", "127.0.0.1:6432") == "OK"
             assert cmd(b, "CLUSTER", "SETSLOT", str(slot), "IMPORTING", "self") == "OK"
 
             r = cmd(a, "MIGRATE", "127.0.0.1", "6432", "migrate-key", "0", "2000")

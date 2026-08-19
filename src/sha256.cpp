@@ -1,7 +1,7 @@
 // FIPS 180-4 SHA-256 (https://doi.org/10.6028/NIST.FIPS.180-4), section 6.2. Used for the
 // ACL password digest Redis prints as "#<hex>" (acl.c ACLHashPassword). Deliberately not
-// the SHA-1 already in the tree under the misleading name pseudo_sha1 — that is a correct
-// SHA-1, not SHA-256, and is the wrong algorithm for this.
+// the SHA-1 already in the tree as sha1_hex (src/command.cpp) — that is a correct SHA-1,
+// not SHA-256, and is the wrong algorithm for this.
 
 #include "sha256.hpp"
 
