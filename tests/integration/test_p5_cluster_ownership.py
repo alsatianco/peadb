@@ -2,6 +2,7 @@
 import pathlib
 import socket
 import subprocess
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys
@@ -88,6 +89,22 @@ def main():
             # An unknown node is refused, with Redis's wording.
             r = cmd(s, "CLUSTER", "SETSLOT", "0", "NODE", "nosuchnode")
             assert r == ("ERR", "ERR Unknown node nosuchnode"), r
+            # CLUSTER MEET to this node's own announced address must be refused rather than
+            # hang the server: try_send_cluster_meetback does a synchronous connect()/read()
+            # on the single event-loop thread, so meeting self would deadlock (this node trying
+            # to connect() to its own listening socket while it is the only thing that could
+            # ever accept() the connection) rather than merely time out.
+            r = cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6565")
+            assert isinstance(r, tuple) and r[0] == "ERR" and "MEET self" in r[1], r
+
+            # CLUSTER MEET to an unreachable address must return promptly (bounded by a socket
+            # timeout) rather than hang indefinitely, and must not block a subsequent command.
+            t0 = time.monotonic()
+            assert cmd(s, "CLUSTER", "MEET", "10.255.255.1", "7999") == "OK"
+            elapsed = time.monotonic() - t0
+            assert elapsed < 5.0, f"MEET to an unreachable address took {elapsed:.2f}s"
+            assert cmd(s, "PING") == "PONG"
+
             # Register a peer, all slots still owned by self at this point.
             assert cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6566") == "OK"
 
