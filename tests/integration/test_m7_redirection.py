@@ -51,12 +51,19 @@ def main():
   with socket.create_connection(('127.0.0.1',6428),timeout=2) as s:
    assert cmd(s,'CLUSTER','MEET','127.0.0.1','6567')=='OK'
    slot=cmd(s,'CLUSTER','KEYSLOT','foo')
-   assert cmd(s,'CLUSTER','SETSLOT',str(slot),'NODE','127.0.0.1:6567')=='OK'
-   r=cmd(s,'GET','foo')
-   assert r[0]=='ERR' and r[1]=='MOVED %d 127.0.0.1:6567' % slot, r
+   # Realistic order: negotiate the move (MIGRATING) before any key has actually moved, then
+   # finalize it (SETSLOT NODE) once migration completes. MIGRATING must not transfer reported
+   # ownership by itself (final review finding, compat/delta.md item 6) - self still owns the
+   # slot at this point, so a missing key gets ASK, not MOVED.
    assert cmd(s,'CLUSTER','SETSLOT',str(slot),'MIGRATING','127.0.0.1:6567')=='OK'
+   r=cmd(s,'GET','foo')
+   assert r[0]=='ERR' and r[1]=='ASK %d 127.0.0.1:6567' % slot, r
+   # SETSLOT NODE is the only thing that actually transfers ownership; once it does, the same
+   # key now gets MOVED instead, and the migration marker is gone (checked in
+   # test_p5_cluster_ownership.py's NODES-line assertions).
+   assert cmd(s,'CLUSTER','SETSLOT',str(slot),'NODE','127.0.0.1:6567')=='OK'
    r2=cmd(s,'GET','foo')
-   assert r2[0]=='ERR' and r2[1]=='ASK %d 127.0.0.1:6567' % slot, r2
+   assert r2[0]=='ERR' and r2[1]=='MOVED %d 127.0.0.1:6567' % slot, r2
    assert cmd(s,'CLUSTER','SETSLOT',str(slot),'NODE','self')=='OK'
    # An unresolvable node is refused rather than silently accepted (Redis's wording).
    r3=cmd(s,'CLUSTER','SETSLOT',str(slot),'NODE','nosuchnode')
