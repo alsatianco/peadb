@@ -3411,7 +3411,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_array(out);
           }
           if (sub == "GETUSER" && args.size() == 3) {
-            if (lower(args[2]) != "default") return encode_null(session.resp_version);
+            // Redis resolves usernames via ACLGetUserByName -> raxFind (acl.c:1536-1540), a
+            // byte-exact radix lookup, so this comparison is case-sensitive: "DEFAULT" is a
+            // different (non-existent) user, unlike ACL CAT's category name below.
+            if (args[2] != "default") return encode_null(session.resp_version);
             std::vector<std::string> flags = {encode_bulk("on")};
             if (g_requirepass.empty()) flags.push_back(encode_bulk("nopass"));
             flags.push_back(encode_bulk("sanitize-payload"));
@@ -3461,9 +3464,17 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 encode_bulk("WHOAMI"),
                 encode_bulk("HELP")});
           }
-          static const std::set<std::string> kNoRuleEngine = {
-              "SETUSER", "DELUSER", "LOAD", "SAVE", "LOG", "DRYRUN"};
-          if (kNoRuleEngine.count(sub) != 0) {
+          // Redis dispatches on subcommand AND argc together, so a wrong-arity call for one
+          // of these must fall through to the generic unknown-subcommand error below rather
+          // than this "not supported" gap message. Arities are Redis's own: setuser argc>=3
+          // (acl.c:2761), deluser argc>=3 (:2789), load argc==2 (:2892), save argc==2 (:2900),
+          // log argc==2||argc==3 (:2943), dryrun argc>=4 (:3017).
+          bool no_rule_engine_arity_ok = false;
+          if (sub == "SETUSER" || sub == "DELUSER") no_rule_engine_arity_ok = args.size() >= 3;
+          else if (sub == "LOAD" || sub == "SAVE") no_rule_engine_arity_ok = args.size() == 2;
+          else if (sub == "LOG") no_rule_engine_arity_ok = args.size() == 2 || args.size() == 3;
+          else if (sub == "DRYRUN") no_rule_engine_arity_ok = args.size() >= 4;
+          if (no_rule_engine_arity_ok) {
             return encode_error("ACL " + sub +
                                 " is not supported: PeaDB enforces a single 'default' user "
                                 "and has no ACL rule engine (see compat/delta.md items 1 and 7)");
