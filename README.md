@@ -76,10 +76,12 @@ scripts/dev/quick_start.sh
 Run the published image directly:
 
 ```bash
-docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest
+docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest --requirepass "<your-password>"
 ```
 
-Available public tags: `alsatianco/peadb-server:latest`, `alsatianco/peadb-server:0.1`.
+The `Dockerfile`'s default `CMD` binds `0.0.0.0`, and **protected-mode is on by default**: a client reaching it through the published port is not seen as a loopback connection, so without a password PeaDB refuses it with `-DENIED`. Pass `--requirepass` as above, or, only if your network already isolates the container (for example a private Docker network with no published port), append `--protected-mode no` instead.
+
+See the [Docker Hub tags page](https://hub.docker.com/repository/docker/alsatianco/peadb-server/tags) for the current list of published tags — see [`docs/RELEASING.md`](docs/RELEASING.md) for what each tag means and when `latest` moves.
 
 Or build and run locally with Docker Compose:
 

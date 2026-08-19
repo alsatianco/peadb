@@ -1,0 +1,115 @@
+name: Release
+
+# This workflow fires only on a version tag push (v0.3.0, v1.2.3, ...) — never on a
+# branch push or a pull request. See docs/RELEASING.md for the full release runbook:
+# this workflow publishes the versioned tags only and deliberately never moves
+# `latest` — that stays a manual step a week after the tag, once the new build has
+# proven itself in the wild.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  # First and only gate: the pushed tag must name exactly the version in VERSION.
+  # This can't drift, because every other job in this workflow depends on it.
+  check-version:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches VERSION
+        run: test "v$(cat VERSION)" = "${GITHUB_REF_NAME}"
+
+  # Build each architecture natively — no QEMU. Dockerfile runs
+  # `cmake --build ... -j"$(nproc)"` over ~19k LOC of C++20 plus the bundled Lua
+  # 5.1.5 sources; nproc misreports the available parallelism under QEMU emulation,
+  # so an emulated arm64 leg risks timing out the runner. ubuntu-24.04-arm is a
+  # GitHub-hosted arm64 runner, free for public repositories (as of this writing) —
+  # if this repository is ever made private, this leg needs a paid runner plan or a
+  # QEMU fallback with a raised job timeout.
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            platform: linux/amd64
+          - os: ubuntu-24.04-arm
+            platform: linux/arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Push each architecture's image to the registry by digest only — no tag yet.
+      # The merge job below assembles the digests into one multi-arch manifest and
+      # is the only job that actually applies a version tag.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          outputs: type=image,name=alsatianco/peadb-server,push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.os }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Assemble the two per-architecture digests into one multi-arch manifest list and
+  # apply the version tags. This is the only job in the workflow that writes a tag,
+  # and it never writes `latest` — see docs/RELEASING.md for why.
+  merge:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Compute version tags
+        id: ver
+        run: |
+          full="$(cat VERSION)"
+          minor="$(echo "$full" | cut -d. -f1,2)"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "minor=$minor" >> "$GITHUB_OUTPUT"
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            -t alsatianco/peadb-server:${{ steps.ver.outputs.full }} \
+            -t alsatianco/peadb-server:${{ steps.ver.outputs.minor }} \
+            $(printf 'alsatianco/peadb-server@sha256:%s ' *)
+
+      - name: Inspect published manifest
+        run: docker buildx imagetools inspect alsatianco/peadb-server:${{ steps.ver.outputs.full }}
