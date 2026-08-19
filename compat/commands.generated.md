@@ -29,7 +29,7 @@ Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, regist
 | `BZPOPMAX` | upstream | test_p1_bzpop.py |
 | `BZPOPMIN` | upstream | test_p1_bzpop.py |
 | `CLIENT` | upstream | test_b4_observability.py, test_p3_ecosystem_commands.py, test_p4_new_events_hello_object.py |
-| `CLUSTER` | tested | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py, test_p5_cluster_ownership.py |
+| `CLUSTER` | tested | test_m7_cluster_surface.py, test_m7_gossip.py, test_m7_keyslot.py, test_m7_migrate.py, test_m7_redirection.py, test_p5_cluster_ownership.py, test_p5_cluster_replies.py |
 | `COMMAND` | upstream | test_b5_commands.py, test_m1_commands.py |
 | `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py, test_p5_cluster_config.py |
 | `COPY` | upstream | test_p1_copy_spop_time.py, test_p1_xinfo_stream_full.py |
