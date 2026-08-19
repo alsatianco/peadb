@@ -88,8 +88,51 @@ def main():
             # An unknown node is refused, with Redis's wording.
             r = cmd(s, "CLUSTER", "SETSLOT", "0", "NODE", "nosuchnode")
             assert r == ("ERR", "ERR Unknown node nosuchnode"), r
-            # Hand slot 0 to a real peer and check MOVED names it.
+            # Register a peer, all slots still owned by self at this point.
             assert cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6566") == "OK"
+
+            # SETSLOT ... MIGRATING must not transfer reported ownership before any key has
+            # actually moved (final review finding: it used to write the same array
+            # cluster_owned_ranges() reads for CLUSTER SLOTS/SHARDS/NODES/cluster_size, so a
+            # client refreshing its slot map would route slot-100 traffic to the peer and get
+            # misses instead of ASK). Self must still show slot 100 as owned, cluster_size must
+            # stay 1, and ASK must still work for a missing key in that slot.
+            migrating_slot = 100
+            slot100key = None
+            for i in range(20000):
+                k = f"mig{i}"
+                if cmd(s, "CLUSTER", "KEYSLOT", k) == migrating_slot:
+                    slot100key = k
+                    break
+            assert slot100key is not None, "could not find a key hashing to slot 100"
+            assert cmd(s, "CLUSTER", "SETSLOT", str(migrating_slot), "MIGRATING",
+                       "127.0.0.1:6566") == "OK"
+            nodes_migrating = cmd(s, "CLUSTER", "NODES")
+            self_line = [ln for ln in nodes_migrating.split("\n") if "myself" in ln][0]
+            # Self's own slot ranges still include the whole space (nothing has been
+            # reassigned yet), and the migrating marker names the peer.
+            assert "0-16383" in self_line, self_line
+            assert "[100->-" in self_line, self_line
+            slots_migrating = cmd(s, "CLUSTER", "SLOTS")
+            owning_ranges = [r for r in slots_migrating if r[0] <= migrating_slot <= r[1]]
+            assert len(owning_ranges) == 1, slots_migrating
+            assert owning_ranges[0][2][0] == "127.0.0.1" and owning_ranges[0][2][1] == 6565, \
+                slots_migrating
+            info_migrating = cmd(s, "CLUSTER", "INFO")
+            assert "cluster_size:1" in info_migrating, info_migrating
+            r = cmd(s, "GET", slot100key)
+            assert isinstance(r, tuple) and r[1] == "ASK 100 127.0.0.1:6566", r
+            # A definitive SETSLOT ... NODE ends the migration: the stale marker must not
+            # linger on self's own NODES line once the slot has actually moved.
+            assert cmd(s, "CLUSTER", "SETSLOT", str(migrating_slot), "NODE",
+                       "127.0.0.1:6566") == "OK"
+            nodes_after_node = cmd(s, "CLUSTER", "NODES")
+            self_line_after = [ln for ln in nodes_after_node.split("\n") if "myself" in ln][0]
+            assert "[100->-" not in self_line_after, self_line_after
+            r = cmd(s, "GET", slot100key)
+            assert isinstance(r, tuple) and r[1] == "MOVED 100 127.0.0.1:6566", r
+
+            # Hand slot 0 to a real peer and check MOVED names it.
             assert cmd(s, "CLUSTER", "SETSLOT", "0", "NODE", "127.0.0.1:6566") == "OK"
             slot0key = "06S"  # CLUSTER KEYSLOT '06S' == 0
             assert cmd(s, "CLUSTER", "KEYSLOT", slot0key) == 0
@@ -98,6 +141,7 @@ def main():
             # A node id token (not just host:port) also resolves — round-trip via NODES.
             nodes = cmd(s, "CLUSTER", "NODES")
             assert "127.0.0.1:6566" in nodes, nodes
+
             # COUNTKEYSINSLOT / GETKEYSINSLOT are pure functions of the keyspace.
             assert cmd(s, "SET", "x", "1") == "OK"
             xs = cmd(s, "CLUSTER", "KEYSLOT", "x")
