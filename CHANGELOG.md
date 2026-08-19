@@ -9,6 +9,19 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-08-19
+
+This is the first released section of this changelog — earlier work up to this point was never tagged, so there are no `0.1.0`/`0.2.0` entries here even though `0.1` and `0.2` Docker tags exist; see [`docs/RELEASING.md`](docs/RELEASING.md) for the tagging convention this release establishes going forward.
+
+### Changed
+
+- **BREAKING:** protected-mode is on by default. A client reaching a PeaDB instance from a non-loopback address with no `requirepass` configured is refused with `-DENIED`. This is correct behaviour and it will break any 0.2 deployment relying on unauthenticated remote access. Set `requirepass`, or set `protected-mode no` if the network already isolates the instance.
+- **BREAKING:** `ACL SETUSER` now returns an explicit error instead of a false `OK`. It never applied the rule it was given — it silently discarded it — so this closes a gap where the command claimed success for an operation it did not perform; a client or script that only checked for `OK` and never verified the rule took effect will now see the failure it was already exposed to.
+- **BREAKING:** every `CLUSTER` subcommand — including read-only ones like `CLUSTER INFO`/`KEYSLOT`/`HELP` — now requires `cluster-enabled yes` and returns `-ERR This instance has cluster support disabled` otherwise, matching Redis's own gate at the top of `clusterCommand()`. A deployment that issued read-only `CLUSTER` calls against a standalone instance will now get this error instead of a standalone-mode answer.
+- **BREAKING:** `INFO <unknown-section>` now returns a genuinely empty bulk string, matching Redis, instead of falling back to a `# Server` stub. A caller that previously parsed that stub for an unrecognized section name will now see nothing.
+- The cluster bus port (announced port + 10000) is no longer opened unless cluster mode is on, so a standalone instance no longer exposes a listener it has no use for.
+- With `cluster-enabled yes`, the server now refuses to start if the announced address would resolve to a wildcard (`0.0.0.0`, `::`, `*`, or empty) and no explicit `cluster-announce-ip` was given — a node cannot announce an address no peer can dial back to.
+
 ### Fixed — command-metadata generator now applies Redis's implicit ACL categories
 
 - **`scripts/ci/generate_command_metadata.py`** previously emitted only each command's
