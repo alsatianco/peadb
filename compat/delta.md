@@ -448,3 +448,37 @@ authoritative debt list; each item below cites its skipfile where one exists.
   block yet, so `INFO latencystats` returns empty and `INFO all` omits the section.
 - Tracking: add the Latencystats section alongside the existing per-command latency histogram
   (`g_cmd_latency_hist`) as part of the observability hardening track.
+
+23. `CONFIG SET` accepts unrecognized parameter names
+- Status: `partial` (every parameter PeaDB implements is validated; an unrecognized parameter
+  name is accepted rather than rejected)
+- Owner: config-compat
+- Severity: medium
+- Target milestone: unscheduled
+- Implemented: every `CONFIG SET` parameter PeaDB actually implements validates its *value*
+  (range/enum/type checks throughout the handler — e.g. `maxmemory-policy` rejects an unknown
+  policy name, `cluster-announce-port` rejects an out-of-range port, `cluster-announce-ip`
+  rejects a wildcard address per item 6). Loading a config *file* with an unrecognized directive
+  is disclosed in `docs/compatibility.md`: "unknown directives are accepted but ignored."
+- Missing: `CONFIG SET <name> <value>` for a parameter name PeaDB does not recognize at all
+  (a typo, or a real Redis parameter PeaDB has not implemented) falls through the handler's
+  `if (k == "...")` chain untouched and returns `+OK` — the same "accepted but ignored" behavior
+  as a config file, but never disclosed for `CONFIG SET` specifically, and worse there: an
+  operator who runs `CONFIG SET` expects a synchronous, authoritative answer about *this*
+  server's live state, not a batch-load default. Redis returns `ERR Unknown option or number of
+  arguments for CONFIG SET - '<param>'` for this case. Concretely reproducible: `CONFIG SET
+  totally-made-up-param 42` and `CONFIG SET cluster-announce-ipp 1.2.3.4` (note the typo) both
+  return `OK` against PeaDB today. This item is pre-existing, not introduced by this milestone,
+  but this milestone made it materially more misleading: three new `cluster-announce-*`
+  parameters were added into this same permissive handler while a fourth, sibling parameter
+  (`cluster-enabled`) was deliberately made to *error* on `CONFIG SET` (item 6's
+  `IMMUTABLE_CONFIG` treatment) — so an operator who typos one of the three gets `+OK` and has
+  positive, adjacent evidence (the immutable-config error working correctly next door) to
+  believe the typo'd parameter was validated too, when it was silently discarded.
+- Tracking: deliberately not fixed in this milestone — making `CONFIG SET` strict is a
+  behavior change with a much larger blast radius than this milestone's scope (any deployment
+  or automation currently relying on a typo'd or not-yet-implemented parameter silently
+  no-op'ing instead of erroring would break), and needs its own change with its own rollout
+  consideration, not a size-driven fix folded into an unrelated commit. Recorded here per this
+  project's standing rule against affirming an operation that was not actually performed (see
+  the `ACL SETUSER` fix this same rule motivated, `compat/delta.md` item 7).

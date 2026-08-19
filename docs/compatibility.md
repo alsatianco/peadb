@@ -8,7 +8,7 @@ For core workloads — strings, hashes, lists, sets, sorted sets, streams, trans
 
 ## Configuration
 
-PeaDB parses redis.conf-style files (`key value` lines, `#` comments) — either redis-server style (first positional argument) or `--config <path>`; CLI flags override file values. Recognized keys are a subset of Redis's (the full table lives in the [README Configuration section](../README.md#configuration)); unknown directives are accepted but ignored. `CONFIG SET` changes are in-memory only; there is no `CONFIG REWRITE`, so runtime changes do not survive a restart.
+PeaDB parses redis.conf-style files (`key value` lines, `#` comments) — either redis-server style (first positional argument) or `--config <path>`; CLI flags override file values. Recognized keys are a subset of Redis's (the full table lives in the [README Configuration section](../README.md#configuration)); unknown directives are accepted but ignored. `CONFIG SET` changes are in-memory only; there is no `CONFIG REWRITE`, so runtime changes do not survive a restart. This same "accepted but ignored" leniency also applies to `CONFIG SET` itself: a parameter name PeaDB does not recognize (a typo, or a real Redis parameter not yet implemented) returns `+OK` rather than Redis's `ERR Unknown option or number of arguments for CONFIG SET - '<param>'` — see `compat/delta.md` item 23. This is deliberately left as-is for now (making it strict is a behavior change with its own rollout considerations, tracked separately), but it means `CONFIG SET`'s `OK` is not on its own proof that a given parameter name was recognized — every parameter PeaDB does implement validates its value, so an `OK` for a *known* parameter with a bad value would instead be an error.
 
 ## Live migration & rollback
 
