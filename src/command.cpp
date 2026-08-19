@@ -47,6 +47,7 @@
 #include <fnmatch.h>
 #include <netdb.h>
 #include <deque>
+#include <poll.h>
 #include <sys/resource.h>
 
 #include "logger.hpp"
@@ -1784,6 +1785,17 @@ bool rewrite_aof_file(std::string& err) {
   return true;
 }
 
+// This round trip runs synchronously on the single event-loop thread, so every other client
+// stalls for however long it takes — there is no async handshake state machine to fall back
+// to (compat/delta.md item 6). An unbounded connect()/read() here used to mean a single bad
+// address (unreachable, filtered, or this node's own — see the caller's self-address check)
+// could hang the whole server until killed. Bound both with a short timeout instead: this does
+// not make MEET reliable over a slow or lossy link, but it prevents one bad address from
+// hanging every client indefinitely, which is the concrete, reported hazard. connect() itself
+// ignores SO_SNDTIMEO/SO_RCVTIMEO on Linux, so the socket is made non-blocking for the connect
+// step and polled with the same budget.
+constexpr int kMeetbackTimeoutMs = 1000;
+
 void try_send_cluster_meetback(const std::string& host, int port) {
   const int fd = socket(AF_INET, SOCK_STREAM, 0);
   if (fd < 0) return;
@@ -1791,7 +1803,30 @@ void try_send_cluster_meetback(const std::string& host, int port) {
   sa.sin_family = AF_INET;
   sa.sin_port = htons(static_cast<uint16_t>(port));
   if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) != 1) { close(fd); return; }
-  if (connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { close(fd); return; }
+
+  timeval tv{};
+  tv.tv_sec = kMeetbackTimeoutMs / 1000;
+  tv.tv_usec = (kMeetbackTimeoutMs % 1000) * 1000;
+  setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  const int orig_flags = fcntl(fd, F_GETFL, 0);
+  fcntl(fd, F_SETFL, orig_flags | O_NONBLOCK);
+  const int connect_rc = connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa));
+  if (connect_rc != 0 && errno != EINPROGRESS) { close(fd); return; }
+  if (connect_rc != 0) {
+    pollfd pfd{fd, POLLOUT, 0};
+    const int poll_rc = poll(&pfd, 1, kMeetbackTimeoutMs);
+    int so_error = 0;
+    socklen_t so_error_len = sizeof(so_error);
+    if (poll_rc <= 0 || !(pfd.revents & POLLOUT) ||
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &so_error, &so_error_len) != 0 || so_error != 0) {
+      close(fd);
+      return;
+    }
+  }
+  fcntl(fd, F_SETFL, orig_flags);  // restore blocking mode for the write/read below
+
   std::vector<std::string> args = {"CLUSTER", "MEETBACK", cluster_announced_host(),
                                     std::to_string(cluster_announced_port())};
   const auto payload = encode_command_resp(args);
@@ -1801,7 +1836,7 @@ void try_send_cluster_meetback(const std::string& host, int port) {
     if (rc <= 0) break;
     sent += static_cast<std::size_t>(rc);
   }
-  // Read the +OK reply before closing so the peer has time to process.
+  // Read the +OK reply before closing so the peer has time to process; bounded by SO_RCVTIMEO.
   char buf[32];
   (void)read(fd, buf, sizeof(buf));
   close(fd);
@@ -4213,6 +4248,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               // clusterStartHandshake) — PeaDB has no async handshake to fail into, so both
               // cases are rejected synchronously here, under Redis's exact wording.
               return encode_error("Invalid base port specified: " + args[3]);
+            }
+            // Refuse a MEET that targets this node's own announced address. The round trip
+            // below (try_send_cluster_meetback) is a synchronous connect()/read() on this same
+            // single event-loop thread: MEETing self means the thread would try to connect() to
+            // its own listening socket while it is the only thing that could ever accept() that
+            // connection — a guaranteed deadlock, not merely a slow connect, and the socket
+            // timeout added below cannot help because nothing ever completes the handshake to
+            // time out on. This is also the natural failure mode of a startup script that loops
+            // CLUSTER MEET from every node to every known address, including its own — see
+            // compat/delta.md item 6.
+            if (args[2] == cluster_announced_host() &&
+                static_cast<int>(port) == cluster_announced_port()) {
+              return encode_error("Can't MEET self (" + args[2] + ":" + std::to_string(port) +
+                                  " is this node's own cluster-announce address)");
             }
             cluster_register_peer(args[2], static_cast<int>(port));
             try_send_cluster_meetback(args[2], static_cast<int>(port));
