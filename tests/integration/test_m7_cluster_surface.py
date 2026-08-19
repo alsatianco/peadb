@@ -40,6 +40,31 @@ def cmd(s,*a):
   b=x.encode(); d+=f"${len(b)}\r\n".encode()+b+b"\r\n"
  s.sendall(d); return recv(s)
 
+def check_cluster_surface(port):
+ with socket.create_connection(('127.0.0.1',port),timeout=2) as s:
+  info=cmd(s,'CLUSTER','INFO')
+  assert 'cluster_state:fail' in info and 'cluster_slots_assigned:0' in info, info
+  nodes=cmd(s,'CLUSTER','NODES')
+  assert 'myself,master' in nodes, nodes
+  slots=cmd(s,'CLUSTER','SLOTS')
+  assert slots==[], slots
+  shards=cmd(s,'CLUSTER','SHARDS')
+  assert shards==[], shards
+  # KEYSLOT works once cluster mode is on
+  ks=cmd(s,'CLUSTER','KEYSLOT','foo'); assert isinstance(ks,int)
+
+def check_standalone_disabled(port):
+ # cluster-enabled is a startup-only (IMMUTABLE_CONFIG) gate, checked at the very top of
+ # clusterCommand() before any subcommand dispatch (cluster.c:5887-5891) — a standalone node
+ # must refuse every CLUSTER subcommand with the same error, including read-only ones like
+ # KEYSLOT and HELP, not just the mutating ones.
+ with socket.create_connection(('127.0.0.1',port),timeout=2) as s:
+  for args in (('CLUSTER','INFO'), ('CLUSTER','NODES'), ('CLUSTER','SLOTS'),
+               ('CLUSTER','SHARDS'), ('CLUSTER','MYID'), ('CLUSTER','KEYSLOT','foo'),
+               ('CLUSTER','HELP'), ('CLUSTER','ADDSLOTS','0'), ('CLUSTER','MEET','127.0.0.1','1')):
+   reply=cmd(s,*args)
+   assert reply==('ERR','ERR This instance has cluster support disabled'), (args, reply)
+
 def main():
  # CLUSTER is gated on --cluster-enabled at the top of the handler, before any subcommand
  # dispatch (cluster.c:5888-5891) — including KEYSLOT — so this needs cluster mode on. With
@@ -48,21 +73,18 @@ def main():
  # not-all-slots-covered state rather than the old fabricated "always ok once active".
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6427','--bind','127.0.0.1',
    '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+ p_standalone=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6428','--bind','127.0.0.1',
+   '--loglevel','error'])
  try:
   wait_until_ready(6427)
-  with socket.create_connection(('127.0.0.1',6427),timeout=2) as s:
-   info=cmd(s,'CLUSTER','INFO')
-   assert 'cluster_state:fail' in info and 'cluster_slots_assigned:0' in info, info
-   nodes=cmd(s,'CLUSTER','NODES')
-   assert 'myself,master' in nodes, nodes
-   slots=cmd(s,'CLUSTER','SLOTS')
-   assert slots==[], slots
-   # KEYSLOT works once cluster mode is on
-   ks=cmd(s,'CLUSTER','KEYSLOT','foo'); assert isinstance(ks,int)
+  wait_until_ready(6428)
+  check_cluster_surface(6427)
+  check_standalone_disabled(6428)
   print('M7 cluster surface tests passed')
   return 0
  finally:
   p.terminate(); p.wait(timeout=3)
+  p_standalone.terminate(); p_standalone.wait(timeout=3)
 
 if __name__=='__main__':
  raise SystemExit(main())

@@ -13,7 +13,7 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 - **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`. RDB loads verify their CRC64 and refuse a corrupt dump.
 - **Memory & eviction** — enforced `maxmemory` with all eight `maxmemory-policy` modes (LRU/LFU/random/TTL, approximate sampling) so PeaDB works as a cache, a compact tagged-union value layout, per-class `client-output-buffer-limit` (slow-consumer/lagging-replica protection), and background `UNLINK` / `FLUSH ASYNC` (lazyfree).
 - **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and correct replica expiry (the master propagates `DEL` so clocks can't diverge). Automatic failover/Sentinel is not yet implemented.
-- **Cluster** — 16 384 hash-slot routing, `CLUSTER KEYSLOT`/`INFO`/`NODES`/`SLOTS`, `MEET` peer discovery, and `MOVED`/`ASK` redirection (surface-level; full gossip and slot migration in progress).
+- **Cluster** — 16 384 hash-slot routing with real per-node ownership and Redis 7.2 reply shapes (`CLUSTER SLOTS`/`SHARDS`/`NODES`/`INFO`), `MEET` peer discovery, and `MOVED`/`ASK` redirection naming each slot's true owner — but operator-configured, not gossiped: no cluster bus gossip protocol, no automatic failover, no `nodes.conf` persistence (see [`compat/delta.md`](compat/delta.md) item 6 and [the design record](docs/decisions/p5-cluster-addressing-and-version-provenance.md)).
 - **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries.
 - **Redis Modules API** — minimal `RedisModule_*` C API; load `.so` modules at runtime via `MODULE LOAD`.
 - **Observability** — populated `SLOWLOG` and `LATENCY` (real per-command timing), keyspace notifications (`notify-keyspace-events`, incl. `expired`), `MONITOR`, `CLIENT LIST`/`KILL`, runtime `CONFIG SET loglevel`, and Redis-compatible `INFO` (RSS, fragmentation ratio, fork timing, ops/sec) for `redis_exporter` and dashboards.
@@ -160,7 +160,7 @@ Recognized redis.conf keys are a subset of Redis's; unknown directives are accep
 
 **Replication** — `SYNC`, `PSYNC`, `REPLCONF`, `REPLICAOF`, `SLAVEOF`, `WAIT`
 
-**Cluster** — `CLUSTER` (INFO/MYID/NODES/SLOTS/KEYSLOT/MEET/ADDSLOTS/SETSLOT/…), `ASKING`
+**Cluster** — `CLUSTER` (INFO/MYID/NODES/SLOTS/SHARDS/KEYSLOT/MEET/ADDSLOTS/DELSLOTS/ADDSLOTSRANGE/DELSLOTSRANGE/SETSLOT/COUNTKEYSINSLOT/GETKEYSINSLOT/HELP, plus `MEETBACK`, a PeaDB-only extension not in Redis), `ASKING`
 
 **Modules** — `MODULE` (LOAD/LIST/UNLOAD)
 

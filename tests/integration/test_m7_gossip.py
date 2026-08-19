@@ -39,23 +39,35 @@ def cmd(s,*a):
 def main():
  # CLUSTER MEET is gated on --cluster-enabled at the top of the handler, before any
  # subcommand dispatch (cluster.c:5888-5891), so both nodes need cluster mode on.
- p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6429','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
- p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6430','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+ port_a, port_b = 6429, 6430
+ announce_a, announce_b = '127.0.0.1', '127.0.0.1'
+ p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port_a),'--bind','127.0.0.1',
+   '--cluster-enabled','yes','--cluster-announce-ip',announce_a,'--loglevel','error'])
+ p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port_b),'--bind','127.0.0.1',
+   '--cluster-enabled','yes','--cluster-announce-ip',announce_b,'--loglevel','error'])
  try:
-  wait_until_ready(6429)
-  with socket.create_connection(('127.0.0.1',6429),timeout=2) as a, socket.create_connection(('127.0.0.1',6430),timeout=2) as b:
-   assert cmd(a,'CLUSTER','MEET','127.0.0.1','6430')=='OK'
+  wait_until_ready(port_a)
+  wait_until_ready(port_b)
+  with socket.create_connection(('127.0.0.1',port_a),timeout=2) as a, \
+       socket.create_connection(('127.0.0.1',port_b),timeout=2) as b:
+   assert cmd(a,'CLUSTER','MEET',announce_b,str(port_b))=='OK'
+   # CLUSTER MEET's peer registration (cluster_register_peer) and its synchronous MEETBACK
+   # round trip (try_send_cluster_meetback) both complete before MEET's own +OK reply, so
+   # each side should already know about the other node's announced address immediately —
+   # the poll loop below is a defensive margin, not the expected path. On a genuine failure
+   # this must report what CLUSTER NODES actually said, not silently time out.
+   expect_b_in_a = announce_b + ':' + str(port_b)
+   expect_a_in_b = announce_a + ':' + str(port_a)
    deadline=time.time()+2
-   seen=False
+   n1=n2=''
    while time.time()<deadline:
     n1=cmd(a,'CLUSTER','NODES')
     n2=cmd(b,'CLUSTER','NODES')
-    if '127.0.0.1:6430' in n1 and '127.0.0.1:6429' in n2:
-      seen=True; break
+    if expect_b_in_a in n1 and expect_a_in_b in n2:
+      break
     time.sleep(0.1)
-   assert seen
+   assert expect_b_in_a in n1, ('node A never learned about B', expect_b_in_a, n1)
+   assert expect_a_in_b in n2, ('node B never learned about A (no MEETBACK)', expect_a_in_b, n2)
   print('M7 gossip tests passed')
   return 0
  finally:

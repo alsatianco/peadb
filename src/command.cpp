@@ -32,6 +32,7 @@
 #include <array>
 #include <set>
 #include <memory>
+#include <tuple>
 #include <random>
 #include <limits>
 #include <arpa/inet.h>
@@ -1990,6 +1991,34 @@ std::string cluster_node_addr(int index) {
   if (index < 0 || static_cast<std::size_t>(index) >= g_cluster_nodes.size()) return "";
   const auto& n = g_cluster_nodes[static_cast<std::size_t>(index)];
   return n.host + ":" + std::to_string(n.port);
+}
+
+// Groups slot 0..16383 into contiguous [start, end, owner-index] runs, from this node's own
+// point of view (g_slot_owner), skipping unassigned slots (owner == -1) entirely — the same
+// end result as clusterReplyMultiBulkSlots's boundary-skip loop (cluster.c:5787-5806), which
+// re-enters its "find start" branch on every NULL-owner slot so no group is ever emitted for
+// them. Shared by CLUSTER SLOTS, SHARDS, and NODES so the three replies can never disagree
+// about who owns what.
+std::vector<std::tuple<int, int, int>> cluster_owned_ranges() {
+  std::vector<std::tuple<int, int, int>> ranges;
+  int run_start = -1;
+  int run_owner = -1;
+  for (int slot = 0; slot < 16384; ++slot) {
+    const int owner = g_slot_owner[static_cast<std::size_t>(slot)];
+    if (owner != run_owner) {
+      if (run_owner != -1) ranges.emplace_back(run_start, slot - 1, run_owner);
+      run_owner = owner;
+      run_start = slot;
+    }
+  }
+  if (run_owner != -1) ranges.emplace_back(run_start, 16383, run_owner);
+  return ranges;
+}
+
+// "170" or "170-201" — the per-node slot-range tokens at the tail of a CLUSTER NODES line
+// (clusterGenNodeDescription, cluster.c:5323-5327: a single slot never gets a "-end" suffix).
+std::string format_slot_range(int start, int end) {
+  return start == end ? std::to_string(start) : std::to_string(start) + "-" + std::to_string(end);
 }
 
 std::string eval_miniscript(const std::string& script, const std::vector<std::string>& keys, const std::vector<std::string>& argv) {
@@ -4105,7 +4134,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("CLUSTER", CommandSpec{"CLUSTER", -2, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           // Gate the whole command on cluster-enabled, exactly where Redis does it — before
           // any subcommand dispatch, including HELP/KEYSLOT (cluster.c:5888-5891). It is a
           // startup-only (IMMUTABLE_CONFIG) setting, so this can never flip mid-connection.
@@ -4134,7 +4163,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "MEET" && args.size() == 4) {
             std::int64_t port = 0;
             if (!parse_i64(args[3], port) || port <= 0 || port > 65535) {
-              return encode_error("Invalid cluster port");
+              // cluster.c:5958 (CLUSTER MEET's getLongLongFromObject failure branch). Redis's
+              // own port argument is otherwise unbounded (it only fails synchronously on a
+              // non-numeric argument; an out-of-TCP-range port fails later, asynchronously, in
+              // clusterStartHandshake) — PeaDB has no async handshake to fail into, so both
+              // cases are rejected synchronously here, under Redis's exact wording.
+              return encode_error("Invalid base port specified: " + args[3]);
             }
             cluster_register_peer(args[2], static_cast<int>(port));
             try_send_cluster_meetback(args[2], static_cast<int>(port));
@@ -4143,7 +4177,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "MEETBACK" && args.size() == 4) {
             std::int64_t port = 0;
             if (!parse_i64(args[3], port) || port <= 0 || port > 65535) {
-              return encode_error("Invalid cluster port");
+              // cluster.c:5958 (CLUSTER MEET's getLongLongFromObject failure branch). Redis's
+              // own port argument is otherwise unbounded (it only fails synchronously on a
+              // non-numeric argument; an out-of-TCP-range port fails later, asynchronously, in
+              // clusterStartHandshake) — PeaDB has no async handshake to fail into, so both
+              // cases are rejected synchronously here, under Redis's exact wording.
+              return encode_error("Invalid base port specified: " + args[3]);
             }
             cluster_register_peer(args[2], static_cast<int>(port));
             return encode_simple("OK");
@@ -4281,6 +4320,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             for (const auto r : g_slot_routes) {
               if (r != SlotRoute::Unassigned) ++slots_assigned;
             }
+            // Distinct owners with at least one slot, not the whole known-node count: a node
+            // MEET-registered but not yet assigned any slot does not count toward cluster
+            // size, matching Redis's own notion of shard count (genClusterInfoString reads
+            // server.cluster->size, which clusterUpdateState() derives the same way).
+            std::set<int> owners_with_slots;
+            for (const auto owner : g_slot_owner) {
+              if (owner != -1) owners_with_slots.insert(owner);
+            }
+            // cluster-require-full-coverage defaults to yes (config.c:3072); PeaDB does not
+            // expose that config, so this always requires full coverage, matching the default.
             const bool ok = slots_assigned == 16384;
             return encode_bulk(
                 "cluster_enabled:1\r\n"
@@ -4290,7 +4339,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 "cluster_slots_pfail:0\r\n"
                 "cluster_slots_fail:0\r\n"
                 "cluster_known_nodes:" + std::to_string(g_cluster_nodes.size()) + "\r\n"
-                "cluster_size:" + std::to_string(g_cluster_nodes.size()) + "\r\n"
+                "cluster_size:" + std::to_string(owners_with_slots.size()) + "\r\n"
                 "cluster_current_epoch:1\r\n"
                 "cluster_my_epoch:1\r\n"
                 "cluster_stats_messages_sent:0\r\n"
@@ -4298,15 +4347,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 "total_cluster_links_buffer_limit_exceeded:0\r\n");
           }
           if (sub == "NODES") {
-            // Node ids come from the stable node table now, not from a fabricated,
-            // insertion-order-dependent index — see g_cluster_nodes.
-            std::string out = g_cluster_nodes[0].id + " 127.0.0.1:" + std::to_string(g_server_port) +
-                              "@" + std::to_string(g_server_port + 10000) +
-                              " myself,master - 0 0 1 connected 0-16383\r\n";
-            for (std::size_t i = 1; i < g_cluster_nodes.size(); ++i) {
+            // clusterGenNodeDescription (cluster.c:5254-5331): id, ip:port@bus-port, flags,
+            // slaveof-or-"-", ping-sent, pong-recv, config-epoch, link-state, then this node's
+            // own owned slot ranges — real Redis joins lines with "\n", not "\r\n".
+            const auto ranges = cluster_owned_ranges();
+            std::string out;
+            for (std::size_t i = 0; i < g_cluster_nodes.size(); ++i) {
               const auto& n = g_cluster_nodes[i];
-              out += n.id + " " + n.host + ":" + std::to_string(n.port) +
-                     "@" + std::to_string(n.port + 10000) + " master - 0 0 1 connected\r\n";
+              const int bus_port = (i == 0) ? cluster_announced_bus_port() : n.port + 10000;
+              out += n.id + " " + n.host + ":" + std::to_string(n.port) + "@" +
+                     std::to_string(bus_port) + " " + (i == 0 ? "myself,master" : "master") +
+                     " - 0 0 1 connected";
+              for (const auto& [start, end, owner] : ranges) {
+                if (owner == static_cast<int>(i)) out += " " + format_slot_range(start, end);
+              }
+              out += "\n";
             }
             return encode_bulk(out);
           }
@@ -4314,17 +4369,60 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_bulk(g_cluster_nodes[0].id);
           }
           if (sub == "SLOTS") {
-            // No slot is reported until this node actually owns one — Redis omits unassigned
-            // slots from CLUSTER SLOTS (cluster.c:5787-5805) rather than fabricating a range.
-            bool any_owned = false;
-            for (const auto r : g_slot_routes) {
-              if (r == SlotRoute::Owned) { any_owned = true; break; }
+            // Grouped by real owner, unassigned slots omitted entirely — clusterReplyMultiBulkSlots
+            // (cluster.c:5772-5806). Each node entry is 4 elements: ip, port, 40-hex id, and an
+            // additional-endpoints map that is empty because PeaDB's preferred endpoint type is
+            // always "ip" (addNodeToNodeReply, cluster.c:5591-5639) — there is no
+            // cluster-preferred-endpoint-type config to make it anything else.
+            std::vector<std::string> out;
+            for (const auto& [start, end, owner] : cluster_owned_ranges()) {
+              const auto& n = g_cluster_nodes[static_cast<std::size_t>(owner)];
+              std::string node_entry = encode_array({encode_bulk(n.host), encode_integer(n.port),
+                                                      encode_bulk(n.id),
+                                                      encode_map({}, session.resp_version)});
+              out.push_back(encode_array(
+                  {encode_integer(start), encode_integer(end), node_entry}));
             }
-            if (!any_owned) return encode_array({});
-            return std::string("*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + std::to_string(g_server_port) + "\r\n");
+            return encode_array(out);
           }
           if (sub == "SHARDS") {
-            return encode_array({});
+            // One shard per owner (PeaDB models no replicas — see
+            // docs/decisions/p5-cluster-addressing-and-version-provenance.md), each a 2-field
+            // map: "slots" (a flat start,end,... array) and "nodes" (an array of 7-field maps —
+            // addShardReplyForClusterShards/addNodeDetailsToShardReply, cluster.c:5664-5756).
+            std::vector<int> owner_order;
+            std::map<int, std::vector<std::pair<int, int>>> by_owner;
+            for (const auto& [start, end, owner] : cluster_owned_ranges()) {
+              if (by_owner.find(owner) == by_owner.end()) owner_order.push_back(owner);
+              by_owner[owner].emplace_back(start, end);
+            }
+            std::vector<std::string> shards;
+            for (const int owner : owner_order) {
+              const auto& n = g_cluster_nodes[static_cast<std::size_t>(owner)];
+              std::vector<std::string> slot_ints;
+              for (const auto& [start, end] : by_owner[owner]) {
+                slot_ints.push_back(encode_integer(start));
+                slot_ints.push_back(encode_integer(end));
+              }
+              // No tls-port and no hostname configured, so those two optional fields are
+              // omitted, exactly as addNodeDetailsToShardReply omits them when absent.
+              const std::vector<std::string> node_kv = {
+                  encode_bulk("id"), encode_bulk(n.id),
+                  encode_bulk("port"), encode_integer(n.port),
+                  encode_bulk("ip"), encode_bulk(n.host),
+                  encode_bulk("endpoint"), encode_bulk(n.host),
+                  // No replicas in the cluster model, so every node is a master reporting the
+                  // same replication offset INFO replication uses for master_repl_offset.
+                  encode_bulk("role"), encode_bulk("master"),
+                  encode_bulk("replication-offset"), encode_integer(g_master_repl_offset),
+                  encode_bulk("health"), encode_bulk("online")};
+              const std::vector<std::string> shard_kv = {
+                  encode_bulk("slots"), encode_array(slot_ints),
+                  encode_bulk("nodes"),
+                  encode_array({encode_map(node_kv, session.resp_version)})};
+              shards.push_back(encode_map(shard_kv, session.resp_version));
+            }
+            return encode_array(shards);
           }
           // Redis's addReplySubcommandSyntaxError (networking.c:1146-1153): this is also what
           // an unrecognized subcommand *or* a recognized one called with the wrong argument
