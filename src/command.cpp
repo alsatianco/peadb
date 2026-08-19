@@ -260,10 +260,30 @@ std::atomic<std::uint64_t> g_repl_generation{0};
 std::atomic<bool> g_loading_replication{false};
 bool g_script_allow_oom = false;
 bool g_script_inner_error_seen = false;
-enum class SlotRoute { Owned, Moved, Ask };
+// A cluster node PeaDB knows about. Index 0 of g_cluster_nodes is always self — see
+// ensure_self_registered() below. The id is derived deterministically from the announced
+// address rather than randomly generated and persisted, so it is stable across restarts
+// without a nodes.conf file — see
+// docs/decisions/p5-cluster-addressing-and-version-provenance.md.
+struct ClusterNode {
+  std::string id;
+  std::string host;
+  int port = 0;
+};
+std::vector<ClusterNode> g_cluster_nodes;
+
+// Unassigned is first so the value-initialised array starts with no ownership at all — a
+// standalone (or freshly cluster-enabled, unconfigured) node must never redirect. Owned,
+// Moved, and Ask all carry the owning node's index in g_slot_owner; Unassigned always
+// carries -1 there.
+enum class SlotRoute { Unassigned, Owned, Moved, Ask };
 std::array<SlotRoute, 16384> g_slot_routes {};
-std::string g_cluster_redirect_addr = "127.0.0.1:7000";
-std::set<std::string> g_cluster_peers;
+// -1 = no owner (Unassigned); otherwise an index into g_cluster_nodes.
+std::array<std::int32_t, 16384> g_slot_owner = [] {
+  std::array<std::int32_t, 16384> a {};
+  a.fill(-1);
+  return a;
+}();
 bool g_cluster_enabled = false;
 std::string g_server_bind = "127.0.0.1";  // mirror of config.bind — see configure_cluster
 std::string g_cluster_announce_ip;        // empty = fall back to g_server_bind
@@ -1746,7 +1766,8 @@ void try_send_cluster_meetback(const std::string& host, int port) {
   sa.sin_port = htons(static_cast<uint16_t>(port));
   if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) != 1) { close(fd); return; }
   if (connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) { close(fd); return; }
-  std::vector<std::string> args = {"CLUSTER", "MEETBACK", "127.0.0.1", std::to_string(g_server_port)};
+  std::vector<std::string> args = {"CLUSTER", "MEETBACK", cluster_announced_host(),
+                                    std::to_string(cluster_announced_port())};
   const auto payload = encode_command_resp(args);
   std::size_t sent = 0;
   while (sent < payload.size()) {
@@ -1822,7 +1843,7 @@ bool read_resp_reply(int fd, std::string& payload, bool& is_err) {
   return false;
 }
 
-std::string pseudo_sha1(const std::string& script) {
+std::string sha1_hex(const std::string& script) {
   auto leftrotate = [](std::uint32_t x, int n) -> std::uint32_t {
     return static_cast<std::uint32_t>((x << n) | (x >> (32 - n)));
   };
@@ -1915,6 +1936,60 @@ int cluster_keyslot(const std::string& key) {
     }
   }
   return crc16_xmodem(key) % 16384;
+}
+
+// Node-table access. Index 0 of g_cluster_nodes is always self.
+
+// Registers self as g_cluster_nodes[0] if the table has not been touched yet, and returns 0.
+// Every node-table reader/writer below calls this first so index 0 exists as soon as the
+// table is read, with no explicit startup hook: self's announced address is only knowable
+// once configure_cluster() has run, and by the time any client can reach CLUSTER it has.
+int ensure_self_registered() {
+  if (g_cluster_nodes.empty()) {
+    const std::string host = cluster_announced_host();
+    const int port = cluster_announced_port();
+    g_cluster_nodes.push_back(ClusterNode{
+        sha1_hex("peadb-cluster-node:" + host + ":" + std::to_string(port)), host, port});
+  }
+  return 0;
+}
+
+// Inserts (or finds) a peer by its announced host:port, used by MEET/MEETBACK. Idempotent:
+// re-MEETing the same address returns the existing index rather than minting a duplicate.
+int cluster_register_peer(const std::string& host, int port) {
+  ensure_self_registered();
+  for (std::size_t i = 1; i < g_cluster_nodes.size(); ++i) {
+    if (g_cluster_nodes[i].host == host && g_cluster_nodes[i].port == port) {
+      return static_cast<int>(i);
+    }
+  }
+  g_cluster_nodes.push_back(ClusterNode{
+      sha1_hex("peadb-cluster-node:" + host + ":" + std::to_string(port)), host, port});
+  return static_cast<int>(g_cluster_nodes.size() - 1);
+}
+
+// Resolves "self" (case-insensitive, matching the existing SETSLOT convention), a known
+// 40-hex node id, or a "host:port" token to an index into g_cluster_nodes. -1 if unknown.
+int cluster_resolve_node(const std::string& token) {
+  ensure_self_registered();
+  if (lower(token) == "self") return 0;
+  for (std::size_t i = 0; i < g_cluster_nodes.size(); ++i) {
+    if (g_cluster_nodes[i].id == token) return static_cast<int>(i);
+  }
+  for (std::size_t i = 0; i < g_cluster_nodes.size(); ++i) {
+    if (g_cluster_nodes[i].host + ":" + std::to_string(g_cluster_nodes[i].port) == token) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+// "host:port" for a node table index, for MOVED/ASK and CLUSTER NODES. Empty if out of range.
+std::string cluster_node_addr(int index) {
+  ensure_self_registered();
+  if (index < 0 || static_cast<std::size_t>(index) >= g_cluster_nodes.size()) return "";
+  const auto& n = g_cluster_nodes[static_cast<std::size_t>(index)];
+  return n.host + ":" + std::to_string(n.port);
 }
 
 std::string eval_miniscript(const std::string& script, const std::vector<std::string>& keys, const std::vector<std::string>& argv) {
@@ -3493,7 +3568,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           const std::string sub = upper(args[1]);
           if (sub == "LOAD" && args.size() == 3) {
-            const auto sha = pseudo_sha1(args[2]);
+            const auto sha = sha1_hex(args[2]);
             g_script_cache[sha] = args[2];
             return encode_bulk(sha);
           }
@@ -3631,7 +3706,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
           }
 
-          const auto sha = pseudo_sha1(args[1]);
+          const auto sha = sha1_hex(args[1]);
           g_script_cache[sha] = args[1];
           g_script_client_resp_version = session.resp_version;
           g_script_current_session = &session;
@@ -4031,11 +4106,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("CLUSTER", CommandSpec{"CLUSTER", -2, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
+          // Gate the whole command on cluster-enabled, exactly where Redis does it — before
+          // any subcommand dispatch, including HELP/KEYSLOT (cluster.c:5888-5891). It is a
+          // startup-only (IMMUTABLE_CONFIG) setting, so this can never flip mid-connection.
+          if (!g_cluster_enabled) {
+            return encode_error("This instance has cluster support disabled");
+          }
+          ensure_self_registered();
           const auto sub = upper(args[1]);
-          // Note: RedisInsight / ioredis detect cluster mode via
-          // cluster_enabled:0 in INFO server — not via CLUSTER SLOTS.
-          // All cluster subcommands remain available so users can set up
-          // clustering (CLUSTER MEET / SETSLOT) and tests can inspect state.
+          if (sub == "HELP") {
+            return encode_array({
+                encode_bulk("CLUSTER <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("MEET <ip> <port>"), encode_bulk("MEETBACK <ip> <port>"),
+                encode_bulk("MYID"), encode_bulk("NODES"), encode_bulk("SLOTS"),
+                encode_bulk("SHARDS"), encode_bulk("INFO"), encode_bulk("KEYSLOT <key>"),
+                encode_bulk("SETSLOT <slot> NODE|MIGRATING|IMPORTING <node>"),
+                encode_bulk("ADDSLOTS <slot> [<slot> ...]"),
+                encode_bulk("DELSLOTS <slot> [<slot> ...]"),
+                encode_bulk("ADDSLOTSRANGE <start slot> <end slot> [...]"),
+                encode_bulk("DELSLOTSRANGE <start slot> <end slot> [...]"),
+                encode_bulk("COUNTKEYSINSLOT <slot>"),
+                encode_bulk("GETKEYSINSLOT <slot> <count>"), encode_bulk("HELP")});
+          }
           if (sub == "KEYSLOT" && args.size() == 3) {
             return encode_integer(cluster_keyslot(args[2]));
           }
@@ -4044,8 +4136,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (!parse_i64(args[3], port) || port <= 0 || port > 65535) {
               return encode_error("Invalid cluster port");
             }
-            const std::string peer = args[2] + ":" + std::to_string(port);
-            g_cluster_peers.insert(peer);
+            cluster_register_peer(args[2], static_cast<int>(port));
             try_send_cluster_meetback(args[2], static_cast<int>(port));
             return encode_simple("OK");
           }
@@ -4054,44 +4145,152 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (!parse_i64(args[3], port) || port <= 0 || port > 65535) {
               return encode_error("Invalid cluster port");
             }
-            const std::string peer = args[2] + ":" + std::to_string(port);
-            g_cluster_peers.insert(peer);
+            cluster_register_peer(args[2], static_cast<int>(port));
             return encode_simple("OK");
+          }
+          if ((sub == "ADDSLOTS" || sub == "DELSLOTS") && args.size() >= 3) {
+            const bool del = (sub == "DELSLOTS");
+            std::vector<std::int64_t> slots;
+            slots.reserve(args.size() - 2);
+            for (std::size_t i = 2; i < args.size(); ++i) {
+              std::int64_t slot = -1;
+              if (!parse_i64(args[i], slot) || slot < 0 || slot >= 16384) {
+                return encode_error("Invalid or out of range slot");
+              }
+              slots.push_back(slot);
+            }
+            // Validate first (parse errors, already-busy/unassigned, duplicates-in-this-call —
+            // cluster.c's checkSlotAssignmentsOrReply) before mutating anything, so a rejected
+            // call never applies a partial change.
+            std::array<bool, 16384> seen{};
+            for (auto slot : slots) {
+              const auto idx = static_cast<std::size_t>(slot);
+              if (del && g_slot_routes[idx] == SlotRoute::Unassigned) {
+                return encode_error("Slot " + std::to_string(slot) + " is already unassigned");
+              }
+              if (!del && g_slot_routes[idx] != SlotRoute::Unassigned) {
+                return encode_error("Slot " + std::to_string(slot) + " is already busy");
+              }
+              if (seen[idx]) {
+                return encode_error("Slot " + std::to_string(slot) + " specified multiple times");
+              }
+              seen[idx] = true;
+            }
+            for (auto slot : slots) {
+              const auto idx = static_cast<std::size_t>(slot);
+              g_slot_routes[idx] = del ? SlotRoute::Unassigned : SlotRoute::Owned;
+              g_slot_owner[idx] = del ? -1 : 0;
+            }
+            return encode_simple("OK");
+          }
+          if ((sub == "ADDSLOTSRANGE" || sub == "DELSLOTSRANGE") && args.size() >= 4) {
+            if (args.size() % 2 != 0) {
+              return encode_error("wrong number of arguments for 'cluster|" + lower(sub) + "' command");
+            }
+            const bool del = (sub == "DELSLOTSRANGE");
+            std::vector<std::pair<std::int64_t, std::int64_t>> ranges;
+            ranges.reserve((args.size() - 2) / 2);
+            for (std::size_t i = 2; i < args.size(); i += 2) {
+              std::int64_t start = -1, end = -1;
+              if (!parse_i64(args[i], start) || start < 0 || start >= 16384 ||
+                  !parse_i64(args[i + 1], end) || end < 0 || end >= 16384) {
+                return encode_error("Invalid or out of range slot");
+              }
+              if (start > end) {
+                return encode_error("start slot number " + std::to_string(start) +
+                                    " is greater than end slot number " + std::to_string(end));
+              }
+              ranges.emplace_back(start, end);
+            }
+            std::array<bool, 16384> seen{};
+            for (const auto& [start, end] : ranges) {
+              for (std::int64_t slot = start; slot <= end; ++slot) {
+                const auto idx = static_cast<std::size_t>(slot);
+                if (del && g_slot_routes[idx] == SlotRoute::Unassigned) {
+                  return encode_error("Slot " + std::to_string(slot) + " is already unassigned");
+                }
+                if (!del && g_slot_routes[idx] != SlotRoute::Unassigned) {
+                  return encode_error("Slot " + std::to_string(slot) + " is already busy");
+                }
+                if (seen[idx]) {
+                  return encode_error("Slot " + std::to_string(slot) + " specified multiple times");
+                }
+                seen[idx] = true;
+              }
+            }
+            for (const auto& [start, end] : ranges) {
+              for (std::int64_t slot = start; slot <= end; ++slot) {
+                const auto idx = static_cast<std::size_t>(slot);
+                g_slot_routes[idx] = del ? SlotRoute::Unassigned : SlotRoute::Owned;
+                g_slot_owner[idx] = del ? -1 : 0;
+              }
+            }
+            return encode_simple("OK");
+          }
+          if (sub == "COUNTKEYSINSLOT" && args.size() == 3) {
+            std::int64_t slot = -1;
+            if (!parse_i64(args[2], slot) || slot < 0 || slot >= 16384) return encode_error("Invalid slot");
+            std::int64_t count = 0;
+            // No slot->keys index exists (unlike Redis's server.db->slots_to_keys) — walk the
+            // real keyspace, exactly as the brief requires: no caching, no estimate.
+            for (const auto& k : store().keys("*")) {
+              if (cluster_keyslot(k) == slot) ++count;
+            }
+            return encode_integer(count);
+          }
+          if (sub == "GETKEYSINSLOT" && args.size() == 4) {
+            std::int64_t slot = -1, maxkeys = 0;
+            if (!parse_i64(args[2], slot) || slot < 0 || slot >= 16384 ||
+                !parse_i64(args[3], maxkeys) || maxkeys < 0) {
+              return encode_error("Invalid slot or number of keys");
+            }
+            auto keys = store().keys("*");
+            std::sort(keys.begin(), keys.end());
+            std::vector<std::string> out;
+            for (const auto& k : keys) {
+              if (static_cast<std::int64_t>(out.size()) >= maxkeys) break;
+              if (cluster_keyslot(k) == slot) out.push_back(encode_bulk(k));
+            }
+            return encode_array(out);
           }
           if (sub == "SETSLOT" && args.size() >= 5) {
             std::int64_t slot = -1;
-            if (!parse_i64(args[2], slot) || slot < 0 || slot >= 16384) return encode_error("Invalid slot");
+            if (!parse_i64(args[2], slot) || slot < 0 || slot >= 16384) {
+              return encode_error("Invalid or out of range slot");
+            }
             const std::string mode = upper(args[3]);
             if (mode == "NODE") {
-              const std::string node = lower(args[4]);
-              g_slot_routes[static_cast<std::size_t>(slot)] = (node == "self") ? SlotRoute::Owned : SlotRoute::Moved;
+              const int idx = cluster_resolve_node(args[4]);
+              if (idx < 0) return encode_error("Unknown node " + args[4]);
+              g_slot_routes[static_cast<std::size_t>(slot)] =
+                  (idx == 0) ? SlotRoute::Owned : SlotRoute::Moved;
+              g_slot_owner[static_cast<std::size_t>(slot)] = idx;
               return encode_simple("OK");
             }
             if (mode == "MIGRATING" || mode == "IMPORTING") {
+              const int idx = cluster_resolve_node(args[4]);
+              if (idx < 0) return encode_error("I don't know about node " + args[4]);
               g_slot_routes[static_cast<std::size_t>(slot)] = SlotRoute::Ask;
+              g_slot_owner[static_cast<std::size_t>(slot)] = idx;
               return encode_simple("OK");
             }
-            return encode_error("Unsupported CLUSTER SETSLOT mode");
+            return encode_error("Invalid CLUSTER SETSLOT action or number of arguments. Try CLUSTER HELP");
           }
           if (sub == "INFO") {
-            // In standalone mode (no peers), return an error matching Redis.
-            if (g_cluster_peers.empty()) {
-              return std::string("-ERR This instance has cluster support disabled\r\n");
+            std::size_t slots_assigned = 0;
+            for (const auto r : g_slot_routes) {
+              if (r != SlotRoute::Unassigned) ++slots_assigned;
             }
-            // In cluster mode, report full cluster info.
-            bool cluster_active = !g_cluster_peers.empty();
-            std::size_t cluster_size = cluster_active ? (1 + g_cluster_peers.size()) : 0;
-            std::size_t slots_assigned = cluster_active ? 16384 : 0;
-            std::size_t slots_ok = cluster_active ? 16384 : 0;
+            const bool ok = slots_assigned == 16384;
             return encode_bulk(
-                "cluster_enabled:" + std::string(cluster_active ? "1" : "0") + "\r\n"
-                "cluster_state:ok\r\n"
+                "cluster_enabled:1\r\n"
+                "cluster_state:" + std::string(ok ? "ok" : "fail") + "\r\n"
                 "cluster_slots_assigned:" + std::to_string(slots_assigned) + "\r\n"
-                "cluster_slots_ok:" + std::to_string(slots_ok) + "\r\n"
+                "cluster_slots_ok:" + std::to_string(slots_assigned) + "\r\n"
                 "cluster_slots_pfail:0\r\n"
                 "cluster_slots_fail:0\r\n"
-                "cluster_known_nodes:" + std::to_string(cluster_active ? cluster_size : 1) + "\r\n"
-                "cluster_size:" + std::to_string(cluster_size) + "\r\n"
+                "cluster_known_nodes:" + std::to_string(g_cluster_nodes.size()) + "\r\n"
+                "cluster_size:" + std::to_string(g_cluster_nodes.size()) + "\r\n"
                 "cluster_current_epoch:1\r\n"
                 "cluster_my_epoch:1\r\n"
                 "cluster_stats_messages_sent:0\r\n"
@@ -4099,43 +4298,39 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 "total_cluster_links_buffer_limit_exceeded:0\r\n");
           }
           if (sub == "NODES") {
-            std::string out = g_master_replid + " 127.0.0.1:" + std::to_string(g_server_port) +
+            // Node ids come from the stable node table now, not from a fabricated,
+            // insertion-order-dependent index — see g_cluster_nodes.
+            std::string out = g_cluster_nodes[0].id + " 127.0.0.1:" + std::to_string(g_server_port) +
                               "@" + std::to_string(g_server_port + 10000) +
                               " myself,master - 0 0 1 connected 0-16383\r\n";
-            std::size_t idx = 2;
-            for (const auto& peer : g_cluster_peers) {
-              std::ostringstream id;
-              id << std::hex << std::setw(40) << std::setfill('0') << idx++;
-              // Parse host:port from peer
-              auto colon = peer.rfind(':');
-              std::string phost = (colon != std::string::npos) ? peer.substr(0, colon) : peer;
-              std::string pport = (colon != std::string::npos) ? peer.substr(colon + 1) : "6379";
-              int pp = 6379;
-              try { pp = std::stoi(pport); } catch (...) {}
-              out += id.str() + " " + phost + ":" + pport +
-                     "@" + std::to_string(pp + 10000) + " master - 0 0 1 connected\r\n";
+            for (std::size_t i = 1; i < g_cluster_nodes.size(); ++i) {
+              const auto& n = g_cluster_nodes[i];
+              out += n.id + " " + n.host + ":" + std::to_string(n.port) +
+                     "@" + std::to_string(n.port + 10000) + " master - 0 0 1 connected\r\n";
             }
             return encode_bulk(out);
           }
           if (sub == "MYID") {
-            return encode_bulk(g_master_replid);
+            return encode_bulk(g_cluster_nodes[0].id);
           }
           if (sub == "SLOTS") {
-            // In standalone mode (no peers), return an error matching Redis
-            // behaviour.  This prevents ioredis/RedisInsight from switching
-            // to cluster connection mode.
-            if (g_cluster_peers.empty()) {
-              return std::string("-ERR This instance has cluster support disabled\r\n");
+            // No slot is reported until this node actually owns one — Redis omits unassigned
+            // slots from CLUSTER SLOTS (cluster.c:5787-5805) rather than fabricating a range.
+            bool any_owned = false;
+            for (const auto r : g_slot_routes) {
+              if (r == SlotRoute::Owned) { any_owned = true; break; }
             }
+            if (!any_owned) return encode_array({});
             return std::string("*1\r\n*3\r\n:0\r\n:16383\r\n*2\r\n$9\r\n127.0.0.1\r\n:" + std::to_string(g_server_port) + "\r\n");
           }
           if (sub == "SHARDS") {
-            if (g_cluster_peers.empty()) {
-              return std::string("-ERR This instance has cluster support disabled\r\n");
-            }
             return encode_array({});
           }
-          return encode_error("unknown subcommand for CLUSTER");
+          // Redis's addReplySubcommandSyntaxError (networking.c:1146-1153): this is also what
+          // an unrecognized subcommand *or* a recognized one called with the wrong argument
+          // count (e.g. ADDSLOTSRANGE with no matching end slot) falls through to.
+          return encode_error("unknown subcommand or wrong number of arguments for '" + args[1] +
+                              "'. Try CLUSTER HELP.");
         }});
 
     t.emplace("ASKING", CommandSpec{"ASKING", 1, {"fast"}, 0, 0, 0,
@@ -10248,17 +10443,22 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
 
   ++top_stat.calls;
 
-  if (spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
+  // A standalone (cluster-disabled) node must never redirect: g_slot_routes defaults to
+  // Unassigned and ADDSLOTS/SETSLOT are gated on cluster-enabled, so this is also true in
+  // practice — but skip the whole check rather than rely on that alone.
+  if (g_cluster_enabled && spec.first_key > 0 &&
+      static_cast<std::size_t>(spec.first_key) < args.size()) {
     const auto slot = cluster_keyslot(args[static_cast<std::size_t>(spec.first_key)]);
     const auto route = g_slot_routes[static_cast<std::size_t>(slot)];
-    if (route == SlotRoute::Moved) {
-      return "-MOVED " + std::to_string(slot) + " " + g_cluster_redirect_addr + "\r\n";
+    const auto owner = g_slot_owner[static_cast<std::size_t>(slot)];
+    if (route == SlotRoute::Moved && owner >= 0) {
+      return "-MOVED " + std::to_string(slot) + " " + cluster_node_addr(owner) + "\r\n";
     }
-    if (route == SlotRoute::Ask) {
+    if (route == SlotRoute::Ask && owner >= 0) {
       if (session.asking) {
         session.asking = false;
       } else {
-        return "-ASK " + std::to_string(slot) + " " + g_cluster_redirect_addr + "\r\n";
+        return "-ASK " + std::to_string(slot) + " " + cluster_node_addr(owner) + "\r\n";
       }
     }
   }
@@ -10708,14 +10908,19 @@ void configure_cluster(bool enabled, const std::string& bind, int port, const st
   g_server_bind = bind;
   g_server_port = port;
   g_cluster_announce_ip = announce_ip;
+  // 0 is Redis's own documented sentinel for "use the default" here (config.c:3171-3172,
+  // redis.conf:1807), not an invalid value — cluster_announced_port()/_bus_port() already
+  // treat > 0 as "explicitly set" and fall back otherwise, so only reject what CONFIG SET's
+  // own validation for these two params rejects (unparseable, negative, or out of range),
+  // matching it rather than warning about a value Redis itself ships as the example.
   if (!announce_port.empty()) {
     std::int64_t v = 0;
-    if (parse_i64(announce_port, v) && v > 0 && v <= 65535) g_cluster_announce_port = static_cast<int>(v);
+    if (parse_i64(announce_port, v) && v >= 0 && v <= 65535) g_cluster_announce_port = static_cast<int>(v);
     else log(LogLevel::Warn, "ignoring invalid cluster-announce-port: " + announce_port);
   }
   if (!announce_bus_port.empty()) {
     std::int64_t v = 0;
-    if (parse_i64(announce_bus_port, v) && v > 0 && v <= 65535) g_cluster_announce_bus_port = static_cast<int>(v);
+    if (parse_i64(announce_bus_port, v) && v >= 0 && v <= 65535) g_cluster_announce_bus_port = static_cast<int>(v);
     else log(LogLevel::Warn, "ignoring invalid cluster-announce-bus-port: " + announce_bus_port);
   }
 }

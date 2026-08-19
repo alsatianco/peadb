@@ -41,19 +41,23 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6427','--bind','127.0.0.1','--loglevel','error'])
+ # CLUSTER is gated on --cluster-enabled at the top of the handler, before any subcommand
+ # dispatch (cluster.c:5888-5891) — including KEYSLOT — so this needs cluster mode on. With
+ # no slots assigned yet, cluster_state is genuinely "fail" (not "ok"): a freshly
+ # cluster-enabled, unconfigured node owns nothing, matching real Redis's own
+ # not-all-slots-covered state rather than the old fabricated "always ok once active".
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6427','--bind','127.0.0.1',
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
  try:
   wait_until_ready(6427)
   with socket.create_connection(('127.0.0.1',6427),timeout=2) as s:
-   # In standalone mode (no peers), cluster subcommands that expose topology
-   # return errors matching Redis behaviour.  CLUSTER KEYSLOT always works.
    info=cmd(s,'CLUSTER','INFO')
-   assert isinstance(info,tuple) or 'cluster_state:ok' in info
+   assert 'cluster_state:fail' in info and 'cluster_slots_assigned:0' in info, info
    nodes=cmd(s,'CLUSTER','NODES')
-   assert (isinstance(nodes,tuple) and nodes[0]=='ERR') or 'myself,master' in nodes
+   assert 'myself,master' in nodes, nodes
    slots=cmd(s,'CLUSTER','SLOTS')
-   assert isinstance(slots,list) or (isinstance(slots,tuple) and slots[0]=='ERR')
-   # KEYSLOT always works
+   assert slots==[], slots
+   # KEYSLOT works once cluster mode is on
    ks=cmd(s,'CLUSTER','KEYSLOT','foo'); assert isinstance(ks,int)
   print('M7 cluster surface tests passed')
   return 0

@@ -37,8 +37,12 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6429','--bind','127.0.0.1','--loglevel','error'])
- p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6430','--bind','127.0.0.1','--loglevel','error'])
+ # CLUSTER MEET is gated on --cluster-enabled at the top of the handler, before any
+ # subcommand dispatch (cluster.c:5888-5891), so both nodes need cluster mode on.
+ p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6429','--bind','127.0.0.1',
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+ p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6430','--bind','127.0.0.1',
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
  try:
   wait_until_ready(6429)
   with socket.create_connection(('127.0.0.1',6429),timeout=2) as a, socket.create_connection(('127.0.0.1',6430),timeout=2) as b:
