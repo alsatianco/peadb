@@ -264,6 +264,11 @@ enum class SlotRoute { Owned, Moved, Ask };
 std::array<SlotRoute, 16384> g_slot_routes {};
 std::string g_cluster_redirect_addr = "127.0.0.1:7000";
 std::set<std::string> g_cluster_peers;
+bool g_cluster_enabled = false;
+std::string g_server_bind = "127.0.0.1";  // mirror of config.bind — see configure_cluster
+std::string g_cluster_announce_ip;        // empty = fall back to g_server_bind
+int g_cluster_announce_port = 0;          // 0 = fall back to g_server_port
+int g_cluster_announce_bus_port = 0;      // 0 = announced port + 10000
 struct LoadedModule {
   void* handle = nullptr;
   std::string path;
@@ -3750,7 +3755,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "redis_git_dirty:0\r\n"
                    "redis_build_id:peadb-dev\r\n"
                    "peadb_version:" PEADB_VERSION "\r\n"
-                   "redis_mode:standalone\r\n"
+                   // Redis computes this from server.cluster_enabled (server.c:5477); its third
+                   // value, "sentinel", has no PeaDB equivalent and is never emitted here.
+                   "redis_mode:" + std::string(g_cluster_enabled ? "cluster" : "standalone") + "\r\n"
                    "os:Linux\r\n"
                    "arch_bits:64\r\n"
                    "tcp_port:" + std::to_string(g_server_port) + "\r\n"
@@ -3758,7 +3765,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "uptime_in_days:" + std::to_string(uptime_s / 86400) + "\r\n"
                    "executable:peadb-server\r\n"
                    "config_file:\r\n"
-                   "cluster_enabled:" + std::string(g_cluster_peers.empty() ? "0" : "1") + "\r\n\r\n";
+                   "cluster_enabled:" + std::string(g_cluster_enabled ? "1" : "0") + "\r\n\r\n";
           }
           if (want("CLIENTS")) {
             out += "# Clients\r\n"
@@ -3868,9 +3875,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             // Redis emits cluster_enabled here (server.c genRedisInfoString); the copy PeaDB
             // also emits inside "# Server" above is a PeaDB-only addition with no upstream
             // counterpart, kept because RedisInsight and ioredis detect cluster mode from it
-            // there (see the CLUSTER command's own comment on this below).
+            // there (see the CLUSTER command's own comment on this below). Both copies derive
+            // from the same g_cluster_enabled global as redis_mode, so they cannot disagree.
             out += "# Cluster\r\n"
-                   "cluster_enabled:" + std::string(g_cluster_peers.empty() ? "0" : "1") + "\r\n\r\n";
+                   "cluster_enabled:" + std::string(g_cluster_enabled ? "1" : "0") + "\r\n\r\n";
           }
           if (want("KEYSPACE")) {
             out += "# Keyspace\r\n";
@@ -4355,8 +4363,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               {"list-max-listpack-size", std::to_string(store().encoding_limits().list_size)},
               {"dbfilename", g_snapshot_path.filename().string()},
               {"dir", std::filesystem::current_path().string()},
-              {"bind", "0.0.0.0"},
+              {"bind", g_server_bind},
               {"port", std::to_string(g_server_port)},
+              {"cluster-enabled", g_cluster_enabled ? "yes" : "no"},
+              {"cluster-announce-ip", g_cluster_announce_ip},
+              {"cluster-announce-port", std::to_string(cluster_announced_port())},
+              {"cluster-announce-bus-port", std::to_string(cluster_announced_bus_port())},
               {"hz", "10"},
               {"lfu-log-factor", "10"},
               {"lfu-decay-time", "1"},
@@ -4398,6 +4410,26 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (args.size() >= 4 && upper(args[1]) == "SET") {
             const auto k = lower(args[2]);
+            // cluster-enabled is startup-only, matching Redis's IMMUTABLE_CONFIG flag for the
+            // same parameter (config.c:3085); CONFIG SET on it fails with the same error text
+            // Redis uses for any IMMUTABLE_CONFIG parameter (config.c:859,950).
+            if (k == "cluster-enabled") {
+              return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] +
+                                  "') - can't set immutable config");
+            }
+            if (k == "cluster-announce-ip") {
+              g_cluster_announce_ip = args[3];
+            }
+            if (k == "cluster-announce-port") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
+              g_cluster_announce_port = static_cast<int>(v);
+            }
+            if (k == "cluster-announce-bus-port") {
+              std::int64_t v = 0;
+              if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
+              g_cluster_announce_bus_port = static_cast<int>(v);
+            }
             if (k == "maxmemory") {
               std::int64_t v = 0;
               if (!parse_memory(args[3], v) || v < 0) {
@@ -10645,6 +10677,47 @@ bool load_aof_file(const std::string& path, std::string& err) {
 
 void configure_runtime_port(int port) {
   g_server_port = port;
+}
+
+// What this node tells other nodes and clients to reach it on. Redis resolves this from
+// cluster-announce-ip / -port / -bus-port, falling back to the bound address, the client
+// port, and port+10000 respectively (config.c:3105,3171-3172). The IP fallback here is a
+// documented simplification, not a match for Redis: Redis instead auto-detects its address
+// from a live connection (cluster.c:898-916,2875-2888); PeaDB has no such mechanism, so it
+// falls back to the statically configured bind address instead — see
+// docs/decisions/p5-cluster-addressing-and-version-provenance.md for the full rationale and
+// the wildcard-refusal startup check that guards the hazard this creates.
+std::string cluster_announced_host() {
+  return g_cluster_announce_ip.empty() ? g_server_bind : g_cluster_announce_ip;
+}
+int cluster_announced_port() {
+  return g_cluster_announce_port > 0 ? g_cluster_announce_port : g_server_port;
+}
+int cluster_announced_bus_port() {
+  return g_cluster_announce_bus_port > 0 ? g_cluster_announce_bus_port
+                                         : cluster_announced_port() + 10000;
+}
+
+// Mirrors config.bind/.port into command.cpp (the only prior reader was server.cpp, which is
+// why the cluster surface used to hardcode 127.0.0.1 — see cluster_announced_host() above) and
+// sets the cluster-specific fields. cluster-enabled is startup-only (Redis's IMMUTABLE_CONFIG);
+// this is the single place it and g_server_bind are set, called once from main.cpp.
+void configure_cluster(bool enabled, const std::string& bind, int port, const std::string& announce_ip,
+                       const std::string& announce_port, const std::string& announce_bus_port) {
+  g_cluster_enabled = enabled;
+  g_server_bind = bind;
+  g_server_port = port;
+  g_cluster_announce_ip = announce_ip;
+  if (!announce_port.empty()) {
+    std::int64_t v = 0;
+    if (parse_i64(announce_port, v) && v > 0 && v <= 65535) g_cluster_announce_port = static_cast<int>(v);
+    else log(LogLevel::Warn, "ignoring invalid cluster-announce-port: " + announce_port);
+  }
+  if (!announce_bus_port.empty()) {
+    std::int64_t v = 0;
+    if (parse_i64(announce_bus_port, v) && v > 0 && v <= 65535) g_cluster_announce_bus_port = static_cast<int>(v);
+    else log(LogLevel::Warn, "ignoring invalid cluster-announce-bus-port: " + announce_bus_port);
+  }
 }
 
 void configure_max_clients(int max_clients) {

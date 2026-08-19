@@ -95,6 +95,17 @@ void reap_background_children();
 void configure_runtime_port(int port);
 void configure_max_clients(int max_clients);
 int configured_max_clients();
+// ── Cluster configuration (wired from main.cpp at startup; startup-only, like Redis's
+// IMMUTABLE_CONFIG for cluster-enabled) ──
+void configure_cluster(bool enabled, const std::string& bind, int port, const std::string& announce_ip,
+                       const std::string& announce_port, const std::string& announce_bus_port);
+// What this node tells other nodes and clients to reach it on. `announce_ip` empty falls back
+// to the bound address — a documented simplification of Redis's live-connection auto-detection
+// (see docs/decisions/p5-cluster-addressing-and-version-provenance.md); `announce_port`/`-bus-port`
+// fall back to the client port and announced-port+10000, matching Redis (config.c:3105,3171-3172).
+std::string cluster_announced_host();
+int cluster_announced_port();
+int cluster_announced_bus_port();
 // ── Security configuration (wired from main.cpp at startup) ──
 void configure_security(const std::string& requirepass, const std::string& masterauth,
                         bool protected_mode, const std::string& enable_module_command,
