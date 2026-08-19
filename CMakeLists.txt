@@ -132,6 +132,10 @@ if(BUILD_TESTING)
   target_link_libraries(entry_size_test PRIVATE peadb_core)
   add_test(NAME entry_size_test COMMAND entry_size_test)
 
+  add_executable(command_metadata_acl_test tests/unit/command_metadata_acl_test.cpp)
+  target_link_libraries(command_metadata_acl_test PRIVATE peadb_core)
+  add_test(NAME command_metadata_acl_test COMMAND command_metadata_acl_test)
+
   add_executable(sha256_test tests/unit/sha256_test.cpp)
   target_link_libraries(sha256_test PRIVATE peadb_core)
   add_test(NAME sha256_test COMMAND sha256_test)
