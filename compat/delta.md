@@ -40,8 +40,11 @@ authoritative debt list; each item below cites its skipfile where one exists.
 - Owner: security-compat
 - Severity: high
 - Target milestone: P4
-- Implemented: basic AUTH/default user flow.
-- Missing: full ACL user/rules engine and ACL command family behavior.
+- Implemented: basic AUTH/default user flow; a truthful ACL introspection surface
+  (`WHOAMI`/`USERS`/`LIST`/`CAT`/`GETUSER`/`GENPASS`/`HELP`) against the single `default`
+  user — see item 7 for the full description.
+- Missing: full ACL user/rules engine. `SETUSER`/`DELUSER`/`LOAD`/`SAVE`/`LOG`/`DRYRUN` refuse
+  with an error naming this gap rather than applying, discarding, or faking a rule (item 7).
 - Tracking task: `M8` and later security-hardening milestones.
 
 2. Redis RDB binary compatibility
@@ -145,10 +148,21 @@ authoritative debt list; each item below cites its skipfile where one exists.
   cap, `INT_MAX` multibulk cap with incremental arg reads, a 64 KB single-line desync limit, and
   a 1 GB per-client query-buffer cap close the unbounded-allocation / OOM DoS); unauthenticated
   clients get Redis's tighter pre-auth caps (>10 multibulk elements or >16 KB bulk are refused
-  before buffering); the Lua sandbox now removes `os`/`io`. ACL SETUSER/GETUSER/LIST/LOG/CAT
-  remain registered stubs.
+  before buffering); the Lua sandbox now removes `os`/`io`. `ACL WHOAMI`/`USERS`/`LIST`/`CAT`/
+  `GETUSER`/`GENPASS`/`HELP` truthfully introspect the single `default` user: `ACL LIST` and
+  `ACL GETUSER` print its password the way Redis does, `#<sha256-hex>` of `requirepass` or
+  `nopass` when none is set (`ACLDescribeUser`/`ACLUpdateDefaultUserPassword`); `ACL CAT
+  <category>` filters the real generated per-command category metadata rather than a
+  hand-written list; `ACL GENPASS` draws from the same entropy source as the replication run
+  id. `ACL SETUSER`/`DELUSER`/`LOAD`/`SAVE`/`LOG`/`DRYRUN` refuse with an error naming this gap
+  instead of the previous behavior — `SETUSER` used to answer `+OK` and silently discard its
+  rule, and the others were unregistered — because there is no rule engine to create, delete,
+  persist, or execute a rule against, and no log of auth events to show or reset.
 - Missing: full multi-user ACL rule evaluation (users, key patterns, command categories,
-  pub/sub channels) and TLS — both deferred as dedicated XL tracks.
+  pub/sub channels), the rule-authoring subcommands themselves (`SETUSER`/`DELUSER`/`LOAD`/
+  `SAVE`/`DRYRUN`), `ACL LOG`, and TLS — all deferred as dedicated XL tracks. One upstream
+  `unit/slowlog` test needs a working `SETUSER` to redact its arguments and is skipfile-tracked
+  (`scripts/redis/skipfiles/unit_slowlog.skip`).
 - Tracking: security hardening milestone.
 
 8. REPLICAOF in-process streaming

@@ -106,11 +106,18 @@ def main() -> int:
 
         with socket.create_connection(("127.0.0.1", 6522), timeout=2) as s:
             # ── ACL ──────────────────────────────────────────────
-            assert cmd(s, "ACL", "SETUSER", "testuser") == "OK"
+            # ACL SETUSER has no rule engine behind it and must refuse rather than
+            # answer OK to a rule it discards (compat/delta.md items 1 and 7).
+            r = cmd(s, "ACL", "SETUSER", "testuser")
+            assert isinstance(r, tuple) and "not supported" in r[1], r
+            assert cmd(s, "ACL", "WHOAMI") == "default"
 
-            # Unknown subcommand
+            # Unknown subcommand: Redis's exact addReplySubcommandSyntaxError wording
+            # (networking.c:1146-1153), including the lowercase "unknown".
             err = cmd(s, "ACL", "NOSUCHCMD")
-            assert err[0] == "ERR"
+            assert err == ("ERR",
+                "ERR unknown subcommand or wrong number of arguments for "
+                "'NOSUCHCMD'. Try ACL HELP."), err
 
         with socket.create_connection(("127.0.0.1", 6522), timeout=2) as s:
             # ── ASKING ───────────────────────────────────────────

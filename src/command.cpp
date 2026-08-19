@@ -9,6 +9,7 @@
 #include <map>
 #include "protocol.hpp"
 #include "rdb.hpp"
+#include "sha256.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -178,6 +179,19 @@ inline bool const_time_eq(const std::string& a, const std::string& b) {
   for (std::size_t i = 0; i < a.size(); ++i)
     acc |= static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]);
   return acc == 0;
+}
+// Mirrors Redis's ACLDescribeUser (acl.c:831-876): user flags in ACLUserFlags order
+// (acl.c:93-101), then one "#<sha256-hex>" per password, then the root selector
+// description. PeaDB has exactly one user, "default", which is always enabled and always
+// holds full key/channel/command access; its password is `requirepass`, or nopass when
+// none is set — which is what ACLUpdateDefaultUserPassword (acl.c:3141-3150) does.
+inline std::string acl_describe_default_user() {
+  std::string out = "on ";
+  if (g_requirepass.empty()) out += "nopass ";
+  out += "sanitize-payload ";
+  if (!g_requirepass.empty()) out += "#" + sha256_hex(g_requirepass) + " ";
+  out += "~* &* +@all";
+  return out;
 }
 // Circular replication backlog (replaces unbounded g_replication_events vector).
 // Size is configurable via repl-backlog-size; a larger window lets a briefly
@@ -398,16 +412,20 @@ inline void apply_maxmemory_policy(MaxmemoryPolicy p) {
   store().set_eviction_lfu(p == MaxmemoryPolicy::AllkeysLfu || p == MaxmemoryPolicy::VolatileLfu);
 }
 
+// Shared entropy source for anything that needs random lowercase-hex characters: the
+// replication run id (fixed 40 chars) and ACL GENPASS (caller-specified length).
+inline std::string gen_hex_chars(std::size_t n) {
+  static thread_local std::mt19937_64 rng{std::random_device{}()};
+  static const char* hex = "0123456789abcdef";
+  std::string out(n, '0');
+  for (char& c : out) c = hex[rng() & 0xF];
+  return out;
+}
+
 // A Redis-style 40-char lowercase-hex run id, used as the replication id. Randomizing it
 // per process means two unrelated PeaDB instances never share a replid, so a re-pointed
 // replica can't be wrongly served a +CONTINUE partial resync against a different stream.
-inline std::string gen_run_id() {
-  static thread_local std::mt19937_64 rng{std::random_device{}()};
-  static const char* hex = "0123456789abcdef";
-  std::string id(40, '0');
-  for (char& c : id) c = hex[rng() & 0xF];
-  return id;
-}
+inline std::string gen_run_id() { return gen_hex_chars(40); }
 
 // Defined later (needs the AOF/backlog/notify propagation helpers). When over the
 // maxmemory budget and a policy is set, evict keys until back under budget or nothing
@@ -3334,9 +3352,125 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("ACL", CommandSpec{"ACL", -2, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          if (upper(args[1]) == "SETUSER") return encode_simple("OK");
-          return encode_error("unknown subcommand for ACL");
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          // ACLCommandCategories order from acl.c:64-87. ACL CAT returns them in this order.
+          static constexpr const char* kAclCategories[] = {
+              "keyspace",     "read",       "write",      "set",        "sortedset",
+              "list",         "hash",       "string",     "bitmap",     "hyperloglog",
+              "geo",          "stream",     "pubsub",     "admin",      "fast",
+              "slow",         "blocking",   "dangerous",  "connection", "transaction",
+              "scripting"};
+          const std::string sub = upper(args[1]);
+          // PeaDB has one user, "default", whose password is `requirepass` and which always
+          // holds full access. Introspection below reports that truthfully. Anything that
+          // would create or change a rule refuses: there is no rule engine behind it
+          // (compat/delta.md items 1 and 7). ACL LOG refuses rather than returning an empty
+          // array, because "no events" would misrepresent auth failures PeaDB never records.
+          if (sub == "WHOAMI" && args.size() == 2) return encode_bulk(session.user);
+          if (sub == "USERS" && args.size() == 2) {
+            return encode_array({encode_bulk("default")});
+          }
+          if (sub == "LIST" && args.size() == 2) {
+            return encode_array({encode_bulk("user default " + acl_describe_default_user())});
+          }
+          if (sub == "CAT" && args.size() == 2) {
+            std::vector<std::string> out;
+            for (const char* c : kAclCategories) out.push_back(encode_bulk(c));
+            return encode_array(out);
+          }
+          if (sub == "CAT" && args.size() == 3) {
+            const std::string want_cat = lower(args[2]);
+            bool known = false;
+            for (const char* c : kAclCategories) {
+              if (want_cat == c) { known = true; break; }
+            }
+            if (!known) return encode_error("Unknown category '" + args[2] + "'");
+            // Mirrors COMMAND LIST FILTERBY ACLCAT's iteration idiom: filter the generated
+            // command metadata by its space-separated acl_cats field, restricted to commands
+            // PeaDB actually implements (the metadata table also covers commands it does not).
+            const auto& table = command_table();
+            std::vector<std::string> out;
+            for (const auto& e : command_metadata()) {
+              const std::string full = e.full_name;
+              const auto bar = full.find('|');
+              const std::string top = bar == std::string::npos ? full : full.substr(0, bar);
+              if (table.find(upper(top)) == table.end()) continue;  // only implemented commands
+              const std::string cats = e.acl_cats;  // space-separated
+              bool has = false;
+              std::size_t p = 0;
+              while (p < cats.size()) {
+                std::size_t sp = cats.find(' ', p);
+                const std::string tok = cats.substr(p, sp == std::string::npos ? std::string::npos : sp - p);
+                if (tok == want_cat) { has = true; break; }
+                if (sp == std::string::npos) break;
+                p = sp + 1;
+              }
+              if (!has) continue;
+              out.push_back(encode_bulk(full));
+            }
+            return encode_array(out);
+          }
+          if (sub == "GETUSER" && args.size() == 3) {
+            if (lower(args[2]) != "default") return encode_null(session.resp_version);
+            std::vector<std::string> flags = {encode_bulk("on")};
+            if (g_requirepass.empty()) flags.push_back(encode_bulk("nopass"));
+            flags.push_back(encode_bulk("sanitize-payload"));
+            std::vector<std::string> passwords;
+            if (!g_requirepass.empty()) passwords.push_back(encode_bulk(sha256_hex(g_requirepass)));
+            // 6-field map: flags, passwords, commands, keys, channels, selectors.
+            // aclAddReplySelectorDescription (acl.c:2704) contributes commands/keys/channels;
+            // PeaDB's one user always holds the root selector's full access, and has no
+            // additional (non-root) selectors.
+            std::vector<std::string> kv = {
+                encode_bulk("flags"), encode_set_reply(flags, session.resp_version),
+                encode_bulk("passwords"), encode_array(passwords),
+                encode_bulk("commands"), encode_bulk("+@all"),
+                encode_bulk("keys"), encode_bulk("~*"),
+                encode_bulk("channels"), encode_bulk("&*"),
+                encode_bulk("selectors"), encode_array({})};
+            return encode_map(kv, session.resp_version);
+          }
+          if (sub == "GENPASS" && (args.size() == 2 || args.size() == 3)) {
+            // Redis default is 256 bits rendered as hex (acl.c:2924-2942).
+            std::int64_t bits = 256;
+            if (args.size() == 3 && !parse_i64(args[2], bits)) {
+              return encode_error("value is not an integer or out of range");
+            }
+            if (bits <= 0 || bits > 4096) {
+              return encode_error(
+                  "ACL GENPASS argument must be the number of bits for the output password, "
+                  "a positive number up to 4096");
+            }
+            const std::int64_t chars = (bits + 3) / 4;
+            return encode_bulk(gen_hex_chars(static_cast<std::size_t>(chars)));
+          }
+          if (sub == "HELP" && args.size() == 2) {
+            return encode_array({
+                encode_bulk("ACL <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_bulk("CAT [<category>]"),
+                encode_bulk("DELUSER <username> [<username> ...]"),
+                encode_bulk("DRYRUN <username> <command> [<arg> ...]"),
+                encode_bulk("GETUSER <username>"),
+                encode_bulk("GENPASS [<bits>]"),
+                encode_bulk("LIST"),
+                encode_bulk("LOAD"),
+                encode_bulk("LOG [<count> | RESET]"),
+                encode_bulk("SAVE"),
+                encode_bulk("SETUSER <username> <attribute> [<attribute> ...]"),
+                encode_bulk("USERS"),
+                encode_bulk("WHOAMI"),
+                encode_bulk("HELP")});
+          }
+          static const std::set<std::string> kNoRuleEngine = {
+              "SETUSER", "DELUSER", "LOAD", "SAVE", "LOG", "DRYRUN"};
+          if (kNoRuleEngine.count(sub) != 0) {
+            return encode_error("ACL " + sub +
+                                " is not supported: PeaDB enforces a single 'default' user "
+                                "and has no ACL rule engine (see compat/delta.md items 1 and 7)");
+          }
+          // Redis's addReplySubcommandSyntaxError (networking.c:1146-1153).
+          return encode_error("unknown subcommand or wrong number of arguments for '" + args[1] +
+                              "'. Try ACL HELP.");
         }});
 
     t.emplace("SCRIPT", CommandSpec{"SCRIPT", -2, {"write"}, 0, 0, 0,

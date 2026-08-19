@@ -205,11 +205,11 @@
     "unit/slowlog": {
       "last_counts": {
         "err": 0,
-        "ignored": 1,
-        "ok": 17
+        "ignored": 2,
+        "ok": 16
       },
       "mode": "native",
-      "skipfile_lines": 0
+      "skipfile_lines": 1
     },
     "unit/sort": {
       "last_counts": {
