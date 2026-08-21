@@ -204,6 +204,12 @@ class DataStore {
   // skipped), so callers see the same keyset KEYS/DBSIZE would report at this instant.
   // For callers (e.g. CLUSTER COUNTKEYSINSLOT/GETKEYSINSLOT) that only need to look at
   // every key once, not collect them all.
+  //
+  // Contract: `fn` must not mutate this DataStore (directly, or through any callback
+  // back into it) and must not retain the passed reference past the call — it aliases
+  // the live map entry's key, not a copy. The walk reaps expired keys as it goes with
+  // `it = db.erase(it)`, so a callback that inserted, erased, or expired a key would
+  // invalidate the iterator mid-walk and the reference along with it.
   void for_each_key(const std::function<void(const std::string&)>& fn);
   std::optional<std::string> randomkey();
 
