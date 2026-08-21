@@ -42,6 +42,13 @@ def recv_resp(sock: socket.socket):
         body = read_exact(n)
         read_exact(2)
         return body.decode()
+    if lead == b"=":
+        # RESP3 verbatim string: same "$<len>\r\n<payload>\r\n" shape, but the payload carries
+        # a leading 3-char format tag + ":" (e.g. "txt:") that the length header counts too.
+        n = int(line().decode())
+        body = read_exact(n)
+        read_exact(2)
+        return body.decode()
     if lead == b"*":
         n = int(line().decode())
         return [recv_resp(sock) for _ in range(n)]
