@@ -1338,6 +1338,17 @@ std::string encode_double(double d, RespVersion v) {
 std::string encode_bool(bool b, RespVersion v) {
   return v == RespVersion::Resp3 ? (b ? "#t\r\n" : "#f\r\n") : (b ? ":1\r\n" : ":0\r\n");
 }
+// RESP3 verbatim string: a human-readable multi-line blob tagged with a 3-char format (Redis
+// only ever sends "txt"). Mirrors addReplyVerbatim (networking.c): the header's length counts
+// the 4-byte "fmt:" prefix (format padded/truncated to exactly 3 chars) plus the payload; RESP2
+// has no verbatim type, so addReplyVerbatim degrades to an identical-bytes bulk string there.
+std::string encode_verbatim(const std::string& value, RespVersion v, const char* ext = "txt") {
+  if (v != RespVersion::Resp3) return encode_bulk(value);
+  char fmt[3] = {' ', ' ', ' '};
+  for (int i = 0; i < 3 && ext[i] != '\0'; ++i) fmt[i] = ext[i];
+  return "=" + std::to_string(value.size() + 4) + "\r\n" +
+         std::string(fmt, 3) + ":" + value + "\r\n";
+}
 // kv holds already-encoded elements [k,v,k,v,...]; RESP3 emits a map (%N), RESP2 a flat array.
 std::string encode_map(const std::vector<std::string>& kv, RespVersion v) {
   const std::size_t pairs = kv.size() / 2;
@@ -3876,7 +3887,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("INFO", CommandSpec{"INFO", -1, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           // Redis 7.0+ INFO takes zero or more section names (case-insensitive). No args (or
           // "default") = the standard set, which EXCLUDES commandstats/latencystats; "all"/
           // "everything" = every section; explicit names union together (each emitted once).
@@ -4079,7 +4090,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += "\r\n";
           }
 
-          return encode_bulk(out);
+          return encode_verbatim(out, session.resp_version);
         }});
 
     t.emplace("SAVE", CommandSpec{"SAVE", 1, {"admin", "noscript"}, 0, 0, 0,
@@ -4449,7 +4460,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             // cluster-require-full-coverage defaults to yes (config.c:3072); PeaDB does not
             // expose that config, so this always requires full coverage, matching the default.
             const bool ok = slots_assigned == 16384;
-            return encode_bulk(
+            return encode_verbatim(
                 "cluster_enabled:1\r\n"
                 "cluster_state:" + std::string(ok ? "ok" : "fail") + "\r\n"
                 "cluster_slots_assigned:" + std::to_string(slots_assigned) + "\r\n"
@@ -4462,7 +4473,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 "cluster_my_epoch:1\r\n"
                 "cluster_stats_messages_sent:0\r\n"
                 "cluster_stats_messages_received:0\r\n"
-                "total_cluster_links_buffer_limit_exceeded:0\r\n");
+                "total_cluster_links_buffer_limit_exceeded:0\r\n",
+                session.resp_version);
           }
           if (sub == "NODES") {
             // clusterGenNodeDescription (cluster.c:5254-5331): id, ip:port@bus-port, flags,
@@ -4496,7 +4508,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               }
               out += "\n";
             }
-            return encode_bulk(out);
+            return encode_verbatim(out, session.resp_version);
           }
           if (sub == "MYID") {
             return encode_bulk(g_cluster_nodes[0].id);
@@ -5158,7 +5170,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                         : std::string("*6\r\n:0\r\n:0\r\n:1\r\n:1\r\n:2\r\n:0\r\n");
             if (ptype == "verbatim") {
               const std::string s = "This is a verbatim\nstring";  // 25 bytes
-              return r3 ? ("=29\r\ntxt:" + s + "\r\n") : encode_bulk(s);
+              return encode_verbatim(s, session.resp_version);
             }
             if (ptype == "true") return std::string(r3 ? "#t\r\n" : ":1\r\n");
             if (ptype == "false") return std::string(r3 ? "#f\r\n" : ":0\r\n");
@@ -8076,9 +8088,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (sub == "LIST") {
             if (g_client_list_callback) {
-              return encode_bulk(g_client_list_callback());
+              return encode_verbatim(g_client_list_callback(), session.resp_version);
             }
-            return encode_bulk("");
+            return encode_verbatim("", session.resp_version);
           }
           if (sub == "INFO") {
             // Return info about the current session in CLIENT LIST format
@@ -8097,7 +8109,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             out += " cmd=client|info user=default redir=-1";
             out += " resp=" + std::to_string(static_cast<int>(session.resp_version));
             out += "\n";
-            return encode_bulk(out);
+            return encode_verbatim(out, session.resp_version);
           }
           if (sub == "KILL") {
             // Old form: CLIENT KILL <ip:port>.  New form: CLIENT KILL [ID id] [ADDR a] [SKIPME y/n] ...
@@ -8184,7 +8196,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── MEMORY ──────────────────────────────────────────────────────────
     t.emplace("MEMORY", CommandSpec{"MEMORY", -2, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           const auto sub = upper(args[1]);
           if (sub == "USAGE") {
             if (args.size() < 3) return encode_error("wrong number of arguments for 'memory|usage' command");
@@ -8218,7 +8230,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_integer(bytes);
           }
           if (sub == "DOCTOR") {
-            return encode_bulk("Sam, I have no memory problems");
+            return encode_verbatim("Sam, I have no memory problems", session.resp_version);
           }
           if (sub == "STATS") {
             // Minimal stub matching Redis output format
@@ -8317,7 +8329,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::string g = args[2] + " - high " + std::to_string(hi) + " ms, low " +
                             std::to_string(lo) + " ms (all time high " +
                             std::to_string(it->second.max_ms) + " ms)\n";
-            return encode_bulk(g);
+            return encode_verbatim(g, session.resp_version);
           }
           if (sub == "HISTOGRAM") {
             // Per-command latency histograms, optionally filtered by command / parent name.
@@ -8364,11 +8376,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (sub == "DOCTOR") {
             if (g_latency_events.empty())
-              return encode_bulk("Dave, I have observed the system, no worrying latency spikes. Everything seems fine.");
+              return encode_verbatim("Dave, I have observed the system, no worrying latency spikes. Everything seems fine.", session.resp_version);
             std::string rep = "Dave, I detected latency events:\n";
             for (const auto& [name, ev] : g_latency_events)
               rep += "- " + name + ": max " + std::to_string(ev.max_ms) + " ms (last " + std::to_string(ev.latest_ms) + " ms)\n";
-            return encode_bulk(rep);
+            return encode_verbatim(rep, session.resp_version);
           }
           if (sub == "HELP") {
             if (args.size() != 2)
