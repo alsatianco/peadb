@@ -405,6 +405,19 @@ std::vector<std::string> DataStore::keys(const std::string& pattern) {
   return out;
 }
 
+void DataStore::for_each_key(const std::function<void(const std::string&)>& fn) {
+  auto& db = dbs_[current_db_];
+  const auto now = now_ms();
+  for (auto it = db.begin(); it != db.end();) {
+    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
+      it = db.erase(it);
+      continue;
+    }
+    fn(it->first);
+    ++it;
+  }
+}
+
 std::optional<std::string> DataStore::randomkey() {
   auto& db = dbs_[current_db_];
   if (db.empty()) return std::nullopt;

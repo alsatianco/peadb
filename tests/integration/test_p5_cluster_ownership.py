@@ -164,6 +164,67 @@ def main():
             xs = cmd(s, "CLUSTER", "KEYSLOT", "x")
             assert cmd(s, "CLUSTER", "COUNTKEYSINSLOT", str(xs)) == 1
             assert cmd(s, "CLUSTER", "GETKEYSINSLOT", str(xs), "10") == ["x"]
+
+            # Regression coverage for the for_each_key-based rewrite: COUNTKEYSINSLOT and
+            # GETKEYSINSLOT must keep agreeing with an independently computed histogram
+            # (KEYS * + CLUSTER KEYSLOT per key, a code path neither subcommand under test
+            # goes through) over a keyspace with varied names, plus a key that is about to
+            # expire. The expiring key must vanish from KEYS/DBSIZE and from both slot
+            # commands together -- keys("*")'s expiry handling is the correctness bar the
+            # new for_each_key() walk has to match exactly, not just a speed target.
+            assert cmd(s, "FLUSHALL") == "OK"
+            nkeys = 300
+            for i in range(nkeys):
+                assert cmd(s, "SET", f"bulkkey:{i}", "v") == "OK"
+            # A hash tag forces a same-slot collision so the maxkeys cap has something to
+            # cap (with unclustered names alone, 300 keys rarely collide in the same slot
+            # out of 16384).
+            same_slot_keys = [f"{{sameslot}}:{i}" for i in range(5)]
+            for k in same_slot_keys:
+                assert cmd(s, "SET", k, "v") == "OK"
+            nkeys += len(same_slot_keys)
+            # A key that is about to expire: present right now, gone by the time we check.
+            # A GET after the TTL passes forces a deterministic lazy reap (DataStore::get()
+            # erases past-TTL entries on access) rather than relying on the active-expire
+            # cron's random-bucket, budget-64-per-tick sweep to have found this one key by
+            # chance -- that budget is unrelated to this change and not something this test
+            # should depend on the timing of. Once reaped, DBSIZE (a raw map-size read,
+            # unlike KEYS/for_each_key) is directly comparable to KEYS/for_each_key again.
+            assert cmd(s, "SET", "expiring:soon", "v") == "OK"
+            assert cmd(s, "PEXPIRE", "expiring:soon", "50") == 1
+            time.sleep(0.2)
+            assert cmd(s, "GET", "expiring:soon") is None
+
+            dbsize = cmd(s, "DBSIZE")
+            all_keys = cmd(s, "KEYS", "*")
+            assert "expiring:soon" not in all_keys, all_keys
+            assert dbsize == len(all_keys) == nkeys, (dbsize, len(all_keys), nkeys)
+
+            histogram = {}
+            for k in all_keys:
+                slot = cmd(s, "CLUSTER", "KEYSLOT", k)
+                histogram.setdefault(slot, []).append(k)
+            assert len(histogram) > 1, histogram
+            for slot, expected_keys in histogram.items():
+                got_count = cmd(s, "CLUSTER", "COUNTKEYSINSLOT", str(slot))
+                assert got_count == len(expected_keys), (slot, got_count, expected_keys)
+                got_keys = cmd(s, "CLUSTER", "GETKEYSINSLOT", str(slot), "1000")
+                assert sorted(got_keys) == sorted(expected_keys), (slot, got_keys, expected_keys)
+
+            # A slot with zero keys (which also would have held the now-expired key, had it
+            # not expired) reports 0 / [] cleanly.
+            empty_slot = next(s2 for s2 in range(16384) if s2 not in histogram)
+            assert cmd(s, "CLUSTER", "COUNTKEYSINSLOT", str(empty_slot)) == 0
+            assert cmd(s, "CLUSTER", "GETKEYSINSLOT", str(empty_slot), "10") == []
+
+            # The forced collision slot exercises the maxkeys cap: exactly 5 keys land
+            # there; capping to 1 returns exactly one of them, and the count is unaffected
+            # by the cap.
+            sameslot = cmd(s, "CLUSTER", "KEYSLOT", same_slot_keys[0])
+            assert cmd(s, "CLUSTER", "COUNTKEYSINSLOT", str(sameslot)) == len(same_slot_keys)
+            capped = cmd(s, "CLUSTER", "GETKEYSINSLOT", str(sameslot), "1")
+            assert len(capped) == 1 and capped[0] in same_slot_keys, capped
+
             # DELSLOTS drops ownership again.
             assert cmd(s, "CLUSTER", "DELSLOTSRANGE", "1", "16383") == "OK"
             assert "cluster_state:fail" in cmd(s, "CLUSTER", "INFO")
