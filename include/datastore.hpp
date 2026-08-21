@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <optional>
 #include <deque>
 #include <unordered_set>
@@ -197,6 +198,13 @@ class DataStore {
   bool persist(const std::string& key);
 
   std::vector<std::string> keys(const std::string& pattern);
+  // Walks every live key of the current database, calling `fn` with each `const
+  // std::string&` in turn — no vector, no per-key copy. Expiry handling matches
+  // keys("*") exactly (a key past its TTL is lazily reaped and excluded, not just
+  // skipped), so callers see the same keyset KEYS/DBSIZE would report at this instant.
+  // For callers (e.g. CLUSTER COUNTKEYSINSLOT/GETKEYSINSLOT) that only need to look at
+  // every key once, not collect them all.
+  void for_each_key(const std::function<void(const std::string&)>& fn);
   std::optional<std::string> randomkey();
 
   bool rename(const std::string& src, const std::string& dst, bool nx_only);

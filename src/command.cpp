@@ -4364,10 +4364,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (!parse_i64(args[2], slot) || slot < 0 || slot >= 16384) return encode_error("Invalid slot");
             std::int64_t count = 0;
             // No slot->keys index exists (unlike Redis's server.db->slots_to_keys) — walk the
-            // real keyspace, exactly as the brief requires: no caching, no estimate.
-            for (const auto& k : store().keys("*")) {
+            // real keyspace, exactly as the brief requires: no caching, no estimate. Unlike
+            // store().keys("*"), for_each_key() hands out each key by reference instead of
+            // building a vector copy of the whole keyspace first, so this is a single O(N)
+            // pass with no allocation instead of "materialise N strings, then scan them".
+            store().for_each_key([&](const std::string& k) {
               if (cluster_keyslot(k) == slot) ++count;
-            }
+            });
             return encode_integer(count);
           }
           if (sub == "GETKEYSINSLOT" && args.size() == 4) {
@@ -4376,12 +4379,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 !parse_i64(args[3], maxkeys) || maxkeys < 0) {
               return encode_error("Invalid slot or number of keys");
             }
-            auto keys = store().keys("*");
-            std::sort(keys.begin(), keys.end());
+            // Collect only the keys that actually land in this slot, then sort just that
+            // subset — not the whole keyspace — before trimming to maxkeys. Result order
+            // stays lexicographic (the documented divergence from Redis's slot-index order,
+            // compat/delta.md item 6); only the cost of getting there changes.
+            std::vector<std::string> matched;
+            store().for_each_key([&](const std::string& k) {
+              if (cluster_keyslot(k) == slot) matched.push_back(k);
+            });
+            std::sort(matched.begin(), matched.end());
             std::vector<std::string> out;
-            for (const auto& k : keys) {
+            for (const auto& k : matched) {
               if (static_cast<std::int64_t>(out.size()) >= maxkeys) break;
-              if (cluster_keyslot(k) == slot) out.push_back(encode_bulk(k));
+              out.push_back(encode_bulk(k));
             }
             return encode_array(out);
           }
