@@ -4860,15 +4860,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               // undialable by any peer. Unlike the two port parameters beside it (already
               // range-checked below), this field used to accept any string verbatim — an
               // operator could CONFIG SET their way into the exact address class the server
-              // refuses to boot with. Empty is still allowed: it means "clear the override and
-              // fall back to bind" (mirrors Redis's EMPTY_STRING_IS_NULL treatment of this same
-              // parameter, config.c:3105), not a new wildcard to reject — bind itself was
-              // already validated at startup and cluster-enabled/bind cannot change afterward.
+              // refuses to boot with. Empty still means "clear the override and fall back to
+              // bind" (mirrors Redis's EMPTY_STRING_IS_NULL treatment of this same parameter,
+              // config.c:3105) — but check the address that would actually be announced
+              // afterward, not just the literal argument: a node can only ever start with a
+              // wildcard `bind` if it also had an explicit, non-wildcard cluster-announce-ip
+              // (the startup guard above refuses every other combination), so that startup check
+              // having passed does NOT mean falling back to `bind` is safe now — this override
+              // may be the only thing standing between the announced host and that wildcard bind.
               const auto& v = args[3];
-              if (v == "0.0.0.0" || v == "::" || v == "*") {
+              const std::string resolved = v.empty() ? g_server_bind : v;
+              if (is_wildcard_announce_host(resolved)) {
                 return encode_error("CONFIG SET failed (possibly related to argument '" +
-                                    args[2] + "') - cluster-announce-ip must not be a wildcard "
-                                    "address ('" + v + "'); no peer could dial it back");
+                                    args[2] + "') - cluster-announce-ip must not resolve to a "
+                                    "wildcard address ('" + resolved + "'); no peer could dial it "
+                                    "back");
               }
               g_cluster_announce_ip = v;
               // The node table (g_cluster_nodes[0]) is a lazy snapshot taken by the first
@@ -11169,6 +11175,12 @@ int cluster_announced_port() {
 int cluster_announced_bus_port() {
   return g_cluster_announce_bus_port > 0 ? g_cluster_announce_bus_port
                                          : cluster_announced_port() + 10000;
+}
+
+// Shared by the main.cpp startup refusal and CONFIG SET's cluster-announce-ip validation (see
+// their call sites) so the two checks of the same hazard cannot drift apart.
+bool is_wildcard_announce_host(const std::string& host) {
+  return host.empty() || host == "0.0.0.0" || host == "::" || host == "*";
 }
 
 // Mirrors config.bind/.port into command.cpp (the only prior reader was server.cpp, which is

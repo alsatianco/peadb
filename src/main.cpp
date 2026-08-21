@@ -159,8 +159,7 @@ int main(int argc, char** argv) {
   // empty" only caught the fallback path and let an explicit wildcard sail through.
   if (config.cluster_enabled) {
     const std::string announced_host = peadb::cluster_announced_host();
-    if (announced_host.empty() || announced_host == "0.0.0.0" || announced_host == "::" ||
-        announced_host == "*") {
+    if (peadb::is_wildcard_announce_host(announced_host)) {
       const std::string source = config.cluster_announce_ip.empty()
           ? "'bind' ('" + config.bind + "')"
           : "the explicit 'cluster-announce-ip' ('" + config.cluster_announce_ip + "')";
