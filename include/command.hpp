@@ -106,6 +106,10 @@ void configure_cluster(bool enabled, const std::string& bind, int port, const st
 std::string cluster_announced_host();
 int cluster_announced_port();
 int cluster_announced_bus_port();
+// A wildcard (any-interface) address that no specific peer could dial back — shared by the
+// main.cpp startup refusal and CONFIG SET's cluster-announce-ip validation so the two checks
+// cannot drift apart.
+bool is_wildcard_announce_host(const std::string& host);
 // ── Security configuration (wired from main.cpp at startup) ──
 void configure_security(const std::string& requirepass, const std::string& masterauth,
                         bool protected_mode, const std::string& enable_module_command,

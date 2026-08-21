@@ -148,7 +148,54 @@ def case_config_set_announce_ip_rejects_wildcard():
     assert 'cluster-announce-ip' in r[1] and 'wildcard' in r[1], (wildcard, r)
    assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
    assert _cget(s,'cluster-announce-ip')=='203.0.113.9'
+   # Emptying it back out is still fine here: bind ('127.0.0.1') is not itself a wildcard, so
+   # the fallback CONFIG SET would land on is safe. Only a wildcard fallback must be refused.
+   assert cmd(s,'CONFIG','SET','cluster-announce-ip','')=='OK'
+   assert _cget(s,'cluster-announce-ip')==''
   print('P5 cluster config: CONFIG SET cluster-announce-ip rejects wildcard values passed')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+
+def case_announce_port_zero_accepted_without_warning():
+ # Review finding: 0 is Redis's own documented sentinel meaning "use the default" for
+ # cluster-announce-port (redis-7.2.5/src/config.c:3171-3172; it is also the example value in
+ # redis.conf:1807), not an invalid value. The startup path used to log "ignoring invalid
+ # cluster-announce-port: 0" for it while still honouring the fallback correctly — telling an
+ # operator their setting was ignored when it was not. It must accept 0 silently, the same way
+ # CONFIG SET already does, and fall back to the client port.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6572','--bind','127.0.0.1',
+                     '--cluster-enabled','yes','--cluster-announce-ip','10.9.8.7',
+                     '--cluster-announce-port','0','--loglevel','warning'],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+ try:
+  wait_until_ready(6572)
+  with socket.create_connection(('127.0.0.1',6572),timeout=5) as s:
+   assert _cget(s,'cluster-announce-port')=='6572', _cget(s,'cluster-announce-port')
+ finally:
+  p.terminate(); p.wait(timeout=10)
+ out = p.stdout.read().decode(errors='replace')
+ assert 'ignoring invalid cluster-announce-port' not in out, out
+ print('P5 cluster config: explicit cluster-announce-port 0 accepted without a bogus warning '
+       'passed')
+
+def case_config_set_announce_ip_empty_rejected_when_bind_is_wildcard():
+ # Review finding: CONFIG SET cluster-announce-ip '' (empty) was accepted with no validation —
+ # only literal wildcard strings were rejected. A node can only ever start with cluster-enabled
+ # yes and a wildcard bind if it also has an explicit, non-wildcard cluster-announce-ip (the
+ # startup guard refuses every other combination), so this override may be the only thing
+ # standing between the announced host and that wildcard bind. Emptying it must be refused.
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6573','--bind','0.0.0.0',
+                     '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
+                     '--loglevel','error'])
+ try:
+  wait_until_ready(6573)
+  with socket.create_connection(('127.0.0.1',6573),timeout=5) as s:
+   r = cmd(s,'CONFIG','SET','cluster-announce-ip','')
+   assert isinstance(r,tuple) and r[0]=='ERR', r
+   assert 'cluster-announce-ip' in r[1] and 'wildcard' in r[1], r
+   assert _cget(s,'cluster-announce-ip')=='203.0.113.5', _cget(s,'cluster-announce-ip')
+  print('P5 cluster config: CONFIG SET cluster-announce-ip "" rejected when bind is a wildcard '
+        'passed')
  finally:
   p.terminate(); p.wait(timeout=10)
 
@@ -228,6 +275,8 @@ def main():
  case_wildcard_announce_refused()
  case_explicit_wildcard_announce_ip_refused()
  case_config_set_announce_ip_rejects_wildcard()
+ case_announce_port_zero_accepted_without_warning()
+ case_config_set_announce_ip_empty_rejected_when_bind_is_wildcard()
  case_wildcard_bind_with_explicit_announce_ip_starts()
  case_announce_reregisters_after_cluster_touch()
  case_announce_reregisters_before_cluster_touch()
