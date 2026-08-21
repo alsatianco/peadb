@@ -224,6 +224,10 @@ def main():
             assert cmd(s, "CLUSTER", "COUNTKEYSINSLOT", str(sameslot)) == len(same_slot_keys)
             capped = cmd(s, "CLUSTER", "GETKEYSINSLOT", str(sameslot), "1")
             assert len(capped) == 1 and capped[0] in same_slot_keys, capped
+            # maxkeys=0 is a boundary Redis handles explicitly (numkeys = min(maxkeys,
+            # keys_in_slot), cluster.c:6261-6262): even a slot with keys returns an empty
+            # array, not an error and not the uncapped set.
+            assert cmd(s, "CLUSTER", "GETKEYSINSLOT", str(sameslot), "0") == []
 
             # DELSLOTS drops ownership again.
             assert cmd(s, "CLUSTER", "DELSLOTSRANGE", "1", "16383") == "OK"
