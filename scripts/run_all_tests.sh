@@ -12,12 +12,13 @@
 #   1. C++ unit tests          — via `ctest` in build/
 #   2. Integration tests       — scripts/ci/run_integration_tests.sh
 #   3. Command test coverage   — scripts/ci/check_command_test_coverage.py
-#   4. Compat delta validation — scripts/ci/check_compat_delta.py
-#   5. Fuzz sanity checks      — scripts/qa/run_fuzz_sanity.sh
-#   6. Stability checks        — scripts/qa/run_stability_checks.sh
-#   7. Perf baseline           — scripts/qa/run_perf_baseline.sh
-#   8. Sentinel validation     — scripts/qa/run_sentinel_validation.sh
-#   9. Redis Tcl tests         — scripts/redis/run_redis_tests.sh
+#   4. Port collision check    — scripts/ci/check_port_collisions.py
+#   5. Compat delta validation — scripts/ci/check_compat_delta.py
+#   6. Fuzz sanity checks      — scripts/qa/run_fuzz_sanity.sh
+#   7. Stability checks        — scripts/qa/run_stability_checks.sh
+#   8. Perf baseline           — scripts/qa/run_perf_baseline.sh
+#   9. Sentinel validation     — scripts/qa/run_sentinel_validation.sh
+#  10. Redis Tcl tests         — scripts/redis/run_redis_tests.sh
 #
 # How to run
 #   From the repo root, with a peadb-server already running on port 6379:
@@ -36,8 +37,8 @@
 #
 # Environment variables
 #   SKIP   Comma-separated list of stage names to skip.  Valid names:
-#          unit, integration, coverage, compat, fuzz, stability, perf,
-#          sentinel, redis, diff.
+#          unit, integration, coverage, portcheck, compat, fuzz, stability,
+#          perf, sentinel, redis, diff.
 #
 # Exit codes
 #   0   All executed stages passed.
@@ -205,15 +206,19 @@ run_stage integration "Integration tests" \
 run_stage coverage "Command test coverage check" \
     python3 scripts/ci/check_command_test_coverage.py
 
-# ── 4. Compat delta validation ──────────────────────────────────────────
+# ── 4. Integration test port collision check ────────────────────────────
+run_stage portcheck "Integration test port collision check" \
+    python3 scripts/ci/check_port_collisions.py
+
+# ── 5. Compat delta validation ──────────────────────────────────────────
 run_stage compat "Compat delta validation" \
     python3 scripts/ci/check_compat_delta.py
 
-# ── 5. Fuzz sanity checks ──────────────────────────────────────────────
+# ── 6. Fuzz sanity checks ──────────────────────────────────────────────
 run_stage fuzz "Fuzz sanity checks" \
     scripts/qa/run_fuzz_sanity.sh
 
-# ── 6. ASAN/UBSAN stability checks ─────────────────────────────────────
+# ── 7. ASAN/UBSAN stability checks ─────────────────────────────────────
 run_stage stability "ASAN/UBSAN stability checks" \
     scripts/qa/run_stability_checks.sh --seconds 15
 
@@ -231,19 +236,19 @@ if [[ -n "$CTEST_DIR" && -f "$CTEST_DIR/CMakeCache.txt" && "$(basename "$CTEST_D
         echo "warning: could not rebuild Release peadb-server from $CTEST_DIR" >&2
 fi
 
-# ── 7. Performance baseline ────────────────────────────────────────────
+# ── 8. Performance baseline ────────────────────────────────────────────
 run_stage perf "Performance baseline" \
     scripts/qa/run_perf_baseline.sh
 
-# ── 8. Sentinel / replication validation ────────────────────────────────
+# ── 9. Sentinel / replication validation ────────────────────────────────
 run_stage sentinel "Sentinel / replication validation" \
     scripts/qa/run_sentinel_validation.sh
 
-# ── 9. Upstream Redis Tcl tests (native mode: the harness spawns peadb-server) ──
+# ── 10. Upstream Redis Tcl tests (native mode: the harness spawns peadb-server) ──
 run_stage redis "Upstream Redis Tcl tests" \
     env SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
 
-# ── 10. Differential tests (PeaDB vs real Redis) ────────────────────────
+# ── 11. Differential tests (PeaDB vs real Redis) ────────────────────────
 run_stage diff "Differential tests (PeaDB vs Redis)" \
     python3 tests/diff/run_diff_tests.py
 
