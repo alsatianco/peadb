@@ -60,16 +60,16 @@ def cmd(s, *a):
 
 
 def main():
-    a = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6565", "--bind", "127.0.0.1",
+    a = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6315", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
                           "--loglevel", "error"])
-    b = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6566", "--bind", "127.0.0.1",
+    b = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6316", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
                           "--loglevel", "error"])
     try:
-        wait_until_ready(6565)
-        wait_until_ready(6566)
-        with socket.create_connection(("127.0.0.1", 6565), timeout=5) as s:
+        wait_until_ready(6315)
+        wait_until_ready(6316)
+        with socket.create_connection(("127.0.0.1", 6315), timeout=5) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             myid = cmd(s, "CLUSTER", "MYID")
             assert len(myid) == 40 and all(c in "0123456789abcdef" for c in myid), myid
@@ -94,7 +94,7 @@ def main():
             # on the single event-loop thread, so meeting self would deadlock (this node trying
             # to connect() to its own listening socket while it is the only thing that could
             # ever accept() the connection) rather than merely time out.
-            r = cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6565")
+            r = cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6315")
             assert isinstance(r, tuple) and r[0] == "ERR" and "MEET self" in r[1], r
 
             # CLUSTER MEET to an unreachable address must return promptly (bounded by a socket
@@ -106,7 +106,7 @@ def main():
             assert cmd(s, "PING") == "PONG"
 
             # Register a peer, all slots still owned by self at this point.
-            assert cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6566") == "OK"
+            assert cmd(s, "CLUSTER", "MEET", "127.0.0.1", "6316") == "OK"
 
             # SETSLOT ... MIGRATING must not transfer reported ownership before any key has
             # actually moved (final review finding: it used to write the same array
@@ -123,7 +123,7 @@ def main():
                     break
             assert slot100key is not None, "could not find a key hashing to slot 100"
             assert cmd(s, "CLUSTER", "SETSLOT", str(migrating_slot), "MIGRATING",
-                       "127.0.0.1:6566") == "OK"
+                       "127.0.0.1:6316") == "OK"
             nodes_migrating = cmd(s, "CLUSTER", "NODES")
             self_line = [ln for ln in nodes_migrating.split("\n") if "myself" in ln][0]
             # Self's own slot ranges still include the whole space (nothing has been
@@ -133,31 +133,31 @@ def main():
             slots_migrating = cmd(s, "CLUSTER", "SLOTS")
             owning_ranges = [r for r in slots_migrating if r[0] <= migrating_slot <= r[1]]
             assert len(owning_ranges) == 1, slots_migrating
-            assert owning_ranges[0][2][0] == "127.0.0.1" and owning_ranges[0][2][1] == 6565, \
+            assert owning_ranges[0][2][0] == "127.0.0.1" and owning_ranges[0][2][1] == 6315, \
                 slots_migrating
             info_migrating = cmd(s, "CLUSTER", "INFO")
             assert "cluster_size:1" in info_migrating, info_migrating
             r = cmd(s, "GET", slot100key)
-            assert isinstance(r, tuple) and r[1] == "ASK 100 127.0.0.1:6566", r
+            assert isinstance(r, tuple) and r[1] == "ASK 100 127.0.0.1:6316", r
             # A definitive SETSLOT ... NODE ends the migration: the stale marker must not
             # linger on self's own NODES line once the slot has actually moved.
             assert cmd(s, "CLUSTER", "SETSLOT", str(migrating_slot), "NODE",
-                       "127.0.0.1:6566") == "OK"
+                       "127.0.0.1:6316") == "OK"
             nodes_after_node = cmd(s, "CLUSTER", "NODES")
             self_line_after = [ln for ln in nodes_after_node.split("\n") if "myself" in ln][0]
             assert "[100->-" not in self_line_after, self_line_after
             r = cmd(s, "GET", slot100key)
-            assert isinstance(r, tuple) and r[1] == "MOVED 100 127.0.0.1:6566", r
+            assert isinstance(r, tuple) and r[1] == "MOVED 100 127.0.0.1:6316", r
 
             # Hand slot 0 to a real peer and check MOVED names it.
-            assert cmd(s, "CLUSTER", "SETSLOT", "0", "NODE", "127.0.0.1:6566") == "OK"
+            assert cmd(s, "CLUSTER", "SETSLOT", "0", "NODE", "127.0.0.1:6316") == "OK"
             slot0key = "06S"  # CLUSTER KEYSLOT '06S' == 0
             assert cmd(s, "CLUSTER", "KEYSLOT", slot0key) == 0
             r = cmd(s, "GET", slot0key)
-            assert isinstance(r, tuple) and r[1] == "MOVED 0 127.0.0.1:6566", r
+            assert isinstance(r, tuple) and r[1] == "MOVED 0 127.0.0.1:6316", r
             # A node id token (not just host:port) also resolves — round-trip via NODES.
             nodes = cmd(s, "CLUSTER", "NODES")
-            assert "127.0.0.1:6566" in nodes, nodes
+            assert "127.0.0.1:6316" in nodes, nodes
 
             # COUNTKEYSINSLOT / GETKEYSINSLOT are pure functions of the keyspace.
             assert cmd(s, "SET", "x", "1") == "OK"

@@ -42,10 +42,10 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6561','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6301','--bind','127.0.0.1','--loglevel','error'])
  try:
-  wait_until_ready(6561)
-  with socket.create_connection(('127.0.0.1',6561),timeout=5) as s:
+  wait_until_ready(6301)
+  with socket.create_connection(('127.0.0.1',6301),timeout=5) as s:
    # Redis emits a real "# Cluster" section; PeaDB is standalone here so cluster_enabled:0.
    c=cmd(s,'INFO','cluster')
    assert c.startswith('# Cluster\r\n'), f"INFO cluster should emit its own section: {c!r}"

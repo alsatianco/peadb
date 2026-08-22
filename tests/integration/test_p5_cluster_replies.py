@@ -66,12 +66,12 @@ def cmd(s, *a):
 
 
 def main():
-    p = subprocess.Popen([str(ROOT / 'peadb-server'), '--port', '6567', '--bind', '127.0.0.1',
+    p = subprocess.Popen([str(ROOT / 'peadb-server'), '--port', '6317', '--bind', '127.0.0.1',
                           '--cluster-enabled', 'yes', '--cluster-announce-ip', '10.9.8.7',
                           '--cluster-announce-port', '7100', '--loglevel', 'error'])
     try:
-        wait_until_ready(6567)
-        with socket.create_connection(('127.0.0.1', 6567), timeout=5) as s:
+        wait_until_ready(6317)
+        with socket.create_connection(('127.0.0.1', 6317), timeout=5) as s:
             myid = cmd(s, 'CLUSTER', 'MYID')
             assert cmd(s, 'CLUSTER', 'ADDSLOTSRANGE', '0', '16383') == 'OK'
 
