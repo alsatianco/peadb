@@ -68,7 +68,8 @@ Prerequisites
 
 Interpreting the output
     Success (no new collisions):
-        port collision check OK (21 known collisions, 0 new)
+        port collision check OK: heuristic scan of literal 6xxx ports in
+        tests/integration/test_*.py (21 known collisions, 0 new)
         (exit code 0)
 
     Failure (a new collision):
@@ -207,7 +208,8 @@ def main() -> int:
               "collision.", file=sys.stderr)
         return 1
 
-    print(f"port collision check OK ({len(current)} known collisions, "
+    print(f"port collision check OK: heuristic scan of literal 6xxx ports in "
+          f"tests/integration/test_*.py ({len(current)} known collisions, "
           f"{new_collision_ports} new)")
     return 0
 
