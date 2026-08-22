@@ -9,5 +9,5 @@
 // There is deliberately no fallback definition. A build path that forgets to define
 // PEADB_VERSION must fail here rather than silently report a stale version in INFO.
 #ifndef PEADB_VERSION
-#error "PEADB_VERSION is not defined - the build must pass -DPEADB_VERSION=\"<major.minor.patch>\" sourced from the repo-root VERSION file"
+#error "PEADB_VERSION undefined - the build must pass -DPEADB_VERSION from the VERSION file"
 #endif
