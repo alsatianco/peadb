@@ -30,14 +30,32 @@
 #   next test that happens to reuse that port then fails with a confusing
 #   connection error instead of a real failure.
 #
-#   To make that survivable, this script snapshots the PIDs of any
-#   peadb-server processes already running before its test loop starts (e.g.
-#   a shared instance a caller such as `scripts/run_all_tests.sh` deliberately
-#   keeps up on port 6379 for other stages) and never touches those. After
-#   every test file it looks for any *other* peadb-server process and, if one
-#   is found, terminates it (SIGTERM, then SIGKILL after a bounded wait). In
-#   the normal case (no stragglers) this is one cheap `pgrep` call and no
-#   sleep at all, since this runs 120+ times per suite.
+#   To make that survivable, this script tracks two things before its test
+#   loop starts: a snapshot of the PIDs of any peadb-server processes already
+#   running (e.g. a shared instance a caller such as `scripts/run_all_tests.sh`
+#   deliberately keeps up on port 6379 for other stages), and this invocation's
+#   own process group ID (own_pgid — a peadb-server spawned by one of this
+#   script's tests inherits the script's PGID, verified directly: script
+#   pid=22819 pgid=22813, server pid=22825 pgid=22813). After every test file
+#   it looks for any *other* peadb-server process and, if one is found,
+#   terminates it (SIGTERM, then SIGKILL after a bounded wait) — but only a
+#   candidate that clears *both* guards is touched:
+#     - it is not one of the PIDs in the start-of-run snapshot (so a
+#       pre-existing shared server, such as the one on 6379, is never
+#       touched), and
+#     - its process group matches own_pgid (so a server started by a
+#       *different*, concurrently running invocation of this same script —
+#       two CI jobs sharing a runner, or a developer running the suite twice
+#       — is never killed just because `pgrep -x peadb-server` also matches
+#       it; that match is system-wide by process name alone and has no notion
+#       of which invocation started the process).
+#   Both guards are kept because they cover different things: the snapshot
+#   guards a server that predates this run, the PGID guard scopes reaping to
+#   this run's own descendants and so protects a sibling invocation's servers.
+#   In the normal case (no stragglers) this is one cheap `pgrep` call and no
+#   sleep at all, since this runs 120+ times per suite; the per-candidate PGID
+#   check costs one extra `ps` call, paid only when there is actually a
+#   candidate (normally there are none).
 #
 # How it works
 #   - Uses GNU coreutils `timeout` if available; on macOS it also checks
@@ -108,6 +126,13 @@ stop_server() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+# This invocation's own process group ID. A peadb-server spawned by one of
+# this script's tests inherits the script's PGID (see "Straggler reaping"
+# above), so reap_stragglers() uses this to recognize a candidate as this
+# run's own descendant rather than a different, concurrently running
+# invocation's live server.
+own_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"
+
 # PIDs of peadb-server processes already running before this script's test loop
 # starts — e.g. a shared instance a caller keeps up on purpose (scripts/run_all_tests.sh
 # expects one on 6379 for its later stages). reap_stragglers() below must never
@@ -122,10 +147,12 @@ protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ' || tru
 # is left over. Only polls/sleeps when there is actually a straggler to wait
 # for, and only for up to ~2s before escalating to SIGKILL.
 reap_stragglers() {
-  local pid
+  local pid pgid
   local -a strays=()
   for pid in $(pgrep -x peadb-server 2>/dev/null || true); do
     [[ "$protected_server_pids" == *" $pid "* ]] && continue
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ -n "$pgid" && "$pgid" != "$own_pgid" ]] && continue
     strays+=("$pid")
   done
   [[ ${#strays[@]} -eq 0 ]] && return
