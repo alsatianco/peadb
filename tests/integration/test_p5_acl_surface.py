@@ -49,6 +49,11 @@ def recv(s):
   n=int(rl(s))
   if n==-1: return None
   v=rx(s,n); rx(s,2); return v.decode()
+ if p==b'=':
+  # RESP3 verbatim string: same "$<len>\r\n<payload>\r\n" shape, but the payload carries a
+  # leading 3-char format tag + ":" (e.g. "txt:") that the length header counts too.
+  n=int(rl(s))
+  v=rx(s,n); rx(s,2); return v.decode()
  if p in (b'*', b'~'):
   n=int(rl(s))
   if n==-1: return None
