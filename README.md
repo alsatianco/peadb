@@ -210,7 +210,7 @@ cmake -S . -B build-asan \
 cmake --build build-asan -j$(nproc)
 ```
 
-This build replaces the repo-root `peadb-server` with the sanitised binary, on purpose — that is how `scripts/ci/run_integration_tests.sh` (and the nightly CI "Integration smoke (ASAN)" step, which runs it from `build-asan/`) ends up exercising the sanitiser instead of a plain Release build, since every integration test resolves the server as `ROOT / "peadb-server"`. Add `-DPEADB_SERVER_OUTPUT_DIR=build-asan` to the first command above if you want the sanitised binary kept out of the way in `build-asan/` instead — this is what `scripts/qa/run_stability_checks.sh` does. Either way, rebuild Release afterwards (`cmake --build build`) to put a plain `peadb-server` back at the repo root.
+This build replaces the repo-root `peadb-server` with the sanitised binary, on purpose. Every integration test resolves the server as `ROOT / "peadb-server"`, so this is how `scripts/ci/run_integration_tests.sh` ends up running against the sanitiser instead of a plain Release build. The nightly CI "Integration smoke (ASAN)" step relies on the same swap; it runs the tests from `build-asan/`. If you would rather keep the sanitised binary out of the way in `build-asan/` instead, add `-DPEADB_SERVER_OUTPUT_DIR=build-asan` to the first command above — this is what `scripts/qa/run_stability_checks.sh` does. Either way, rebuild Release afterwards (`cmake --build build`) to put a plain `peadb-server` back at the repo root.
 
 ## Benchmarks
 

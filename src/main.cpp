@@ -119,8 +119,9 @@ int main(int argc, char** argv) {
   // Startup log contract (relied on by the upstream Redis test harness): a line
   // containing " PID: <pid>", then "Server initialized", then "Ready to accept"
   // once the listeners are up (logged in run_server).
-  peadb::log(peadb::LogLevel::Info, "PeaDB " PEADB_VERSION " starting, version 7.2.5-compat, PID: " +
-                                        std::to_string(getpid()));
+  peadb::log(peadb::LogLevel::Info,
+             "PeaDB " PEADB_VERSION " starting, version 7.2.5-compat, PID: " +
+                 std::to_string(getpid()));
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
