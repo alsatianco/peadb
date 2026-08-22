@@ -36,6 +36,9 @@ jobs:
       - name: Command coverage gate
         run: python3 scripts/ci/check_command_test_coverage.py
 
+      - name: Integration test port collision check
+        run: python3 scripts/ci/check_port_collisions.py
+
       - name: Compat delta check
         run: |
           if [ -f scripts/ci/check_compat_delta.py ]; then
