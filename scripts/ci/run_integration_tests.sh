@@ -57,6 +57,10 @@
 #   check costs one extra `ps` call, paid only when there is actually a
 #   candidate (normally there are none).
 #
+#   If `pgrep` itself is unavailable, straggler reaping (and the start-of-run
+#   snapshot) is disabled for the whole run — a single warning is printed once
+#   at start-up rather than the reaper silently no-op'ing on every test file.
+#
 # How it works
 #   - Uses GNU coreutils `timeout` if available; on macOS it also checks
 #     for `gtimeout` (from Homebrew coreutils).  If neither is found, tests
@@ -133,12 +137,27 @@ stop_server() {
 # invocation's live server.
 own_pgid="$(ps -o pgid= -p $$ | tr -d ' ')"
 
+# Straggler reaping (and its start-of-run snapshot, right below) depends on
+# `pgrep`, which is common but not guaranteed to be installed. Check once,
+# here at start-up, rather than inside reap_stragglers() — which runs once per
+# test file — so a missing `pgrep` produces exactly one warning per run
+# instead of the reaper silently no-op'ing 120+ times with no trace.
+have_pgrep=1
+if ! command -v pgrep >/dev/null 2>&1; then
+  have_pgrep=0
+  echo "WARNING: pgrep not found - straggler reaping is disabled for this run;" \
+       "a peadb-server left behind by a timed-out test will not be cleaned up." >&2
+fi
+
 # PIDs of peadb-server processes already running before this script's test loop
 # starts — e.g. a shared instance a caller keeps up on purpose (scripts/run_all_tests.sh
 # expects one on 6379 for its later stages). reap_stragglers() below must never
 # touch these; it only cleans up peadb-server processes that appeared *during*
 # this script's own test loop and outlived the test that started them.
-protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ' || true) "
+protected_server_pids=""
+if [[ "$have_pgrep" -eq 1 ]]; then
+  protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ' || true) "
+fi
 
 # Reap any peadb-server process not in $protected_server_pids — i.e. one left
 # behind by the test that just finished (see "Straggler reaping" above; the
@@ -147,6 +166,7 @@ protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ' || tru
 # is left over. Only polls/sleeps when there is actually a straggler to wait
 # for, and only for up to ~2s before escalating to SIGKILL.
 reap_stragglers() {
+  [[ "$have_pgrep" -eq 1 ]] || return
   local pid pgid
   local -a strays=()
   for pid in $(pgrep -x peadb-server 2>/dev/null || true); do
