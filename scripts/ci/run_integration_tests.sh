@@ -113,7 +113,7 @@ stop_server() {
 # expects one on 6379 for its later stages). reap_stragglers() below must never
 # touch these; it only cleans up peadb-server processes that appeared *during*
 # this script's own test loop and outlived the test that started them.
-protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ') "
+protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ' || true) "
 
 # Reap any peadb-server process not in $protected_server_pids — i.e. one left
 # behind by the test that just finished (see "Straggler reaping" above; the
