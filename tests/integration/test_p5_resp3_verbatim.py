@@ -25,7 +25,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _readiness import wait_until_ready
 
-PORT = 6574
+PORT = 6318
 
 
 def rx(s, n):

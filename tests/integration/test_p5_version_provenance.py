@@ -42,10 +42,10 @@ def cmd(s,*a):
 
 def main():
  want=(ROOT/'VERSION').read_text().strip()
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6560','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6300','--bind','127.0.0.1','--loglevel','error'])
  try:
-  wait_until_ready(6560)
-  with socket.create_connection(('127.0.0.1',6560),timeout=5) as s:
+  wait_until_ready(6300)
+  with socket.create_connection(('127.0.0.1',6300),timeout=5) as s:
    blob=cmd(s,'INFO','server')
    assert f"peadb_version:{want}\r\n" in blob, f"INFO peadb_version does not match VERSION ({want!r}): {blob!r}"
    assert "redis_version:7.2.5\r\n" in blob, "redis_version must stay the 7.2.5 compatibility target"

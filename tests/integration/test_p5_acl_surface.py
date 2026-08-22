@@ -87,10 +87,10 @@ class RawSock:
   return d
 
 def check_nopass():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6562','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6302','--bind','127.0.0.1','--loglevel','error'])
  try:
-  wait_up(6562)
-  with socket.create_connection(('127.0.0.1',6562),timeout=5) as s:
+  wait_up(6302)
+  with socket.create_connection(('127.0.0.1',6302),timeout=5) as s:
    assert cmd(s,'ACL','WHOAMI')=='default'
    assert cmd(s,'ACL','USERS')==['default']
    assert cmd(s,'ACL','LIST')==['user default on nopass sanitize-payload ~* &* +@all']
@@ -138,11 +138,11 @@ def check_nopass():
 
 def check_withpass():
  import hashlib
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6563','--bind','127.0.0.1',
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6303','--bind','127.0.0.1',
                      '--requirepass','hunter2','--loglevel','error'])
  try:
-  wait_up(6563, auth_required=True)
-  with socket.create_connection(('127.0.0.1',6563),timeout=5) as s:
+  wait_up(6303, auth_required=True)
+  with socket.create_connection(('127.0.0.1',6303),timeout=5) as s:
    assert cmd(s,'AUTH','hunter2')=='OK'
    h=hashlib.sha256(b'hunter2').hexdigest()
    assert cmd(s,'ACL','LIST')==[f'user default on sanitize-payload #{h} ~* &* +@all']
@@ -157,10 +157,10 @@ def check_resp3_getuser():
  # Nothing else pins the RESP3 shape of ACL GETUSER on the wire: RESP2's flat *12 array
  # collapses the map/set distinction that RESP3 clients (and assert_encoded_reply-style
  # test harnesses) rely on, so a regression there would pass every other check here.
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6564','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6304','--bind','127.0.0.1','--loglevel','error'])
  try:
-  wait_up(6564)
-  with socket.create_connection(('127.0.0.1',6564),timeout=5) as s:
+  wait_up(6304)
+  with socket.create_connection(('127.0.0.1',6304),timeout=5) as s:
    hello=cmd(s,'HELLO','3')
    assert hello['proto']==3, hello
    raw=RawSock(s)
