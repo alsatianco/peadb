@@ -15,7 +15,29 @@
 #   3. On failure, captures the last 3 lines of stdout/stderr for quick
 #      triage and marks the test as FAIL (distinguishing timeouts from
 #      other errors).
-#   4. After all tests, prints a summary:  PASSED: N / FAILED: M.
+#   4. After each test file (pass, fail, or timeout), reaps any peadb-server
+#      process left behind by that test before starting the next one — see
+#      "Straggler reaping" below.
+#   5. After all tests, prints a summary:  PASSED: N / FAILED: M.
+#
+# Straggler reaping
+#   Integration tests share a fairly small port range, and each test is
+#   responsible for stopping its own peadb-server subprocess(es) in a
+#   `finally` block. That mostly works, but `timeout`/`gtimeout` only signals
+#   its direct child (`python3 <file>`), not any grandchild peadb-server
+#   subprocess that child spawned — so a test that times out can leave its
+#   server running, still bound to its port, for the rest of the run. The
+#   next test that happens to reuse that port then fails with a confusing
+#   connection error instead of a real failure.
+#
+#   To make that survivable, this script snapshots the PIDs of any
+#   peadb-server processes already running before its test loop starts (e.g.
+#   a shared instance a caller such as `scripts/run_all_tests.sh` deliberately
+#   keeps up on port 6379 for other stages) and never touches those. After
+#   every test file it looks for any *other* peadb-server process and, if one
+#   is found, terminates it (SIGTERM, then SIGKILL after a bounded wait). In
+#   the normal case (no stragglers) this is one cheap `pgrep` call and no
+#   sleep at all, since this runs 120+ times per suite.
 #
 # How it works
 #   - Uses GNU coreutils `timeout` if available; on macOS it also checks
@@ -86,6 +108,42 @@ stop_server() {
   kill -KILL "$pid" 2>/dev/null || true
 }
 
+# PIDs of peadb-server processes already running before this script's test loop
+# starts — e.g. a shared instance a caller keeps up on purpose (scripts/run_all_tests.sh
+# expects one on 6379 for its later stages). reap_stragglers() below must never
+# touch these; it only cleans up peadb-server processes that appeared *during*
+# this script's own test loop and outlived the test that started them.
+protected_server_pids=" $(pgrep -x peadb-server 2>/dev/null | tr '\n' ' ') "
+
+# Reap any peadb-server process not in $protected_server_pids — i.e. one left
+# behind by the test that just finished (see "Straggler reaping" above; the
+# usual cause is a timed-out test whose `timeout`-killed python3 never reaped
+# its own child). Cheap in the common case: one `pgrep`, no sleep, if nothing
+# is left over. Only polls/sleeps when there is actually a straggler to wait
+# for, and only for up to ~2s before escalating to SIGKILL.
+reap_stragglers() {
+  local pid
+  local -a strays=()
+  for pid in $(pgrep -x peadb-server 2>/dev/null || true); do
+    [[ "$protected_server_pids" == *" $pid "* ]] && continue
+    strays+=("$pid")
+  done
+  [[ ${#strays[@]} -eq 0 ]] && return
+
+  kill -TERM "${strays[@]}" 2>/dev/null || true
+  local i
+  for i in $(seq 1 20); do
+    local -a remaining=()
+    for pid in "${strays[@]}"; do
+      kill -0 "$pid" 2>/dev/null && remaining+=("$pid")
+    done
+    [[ ${#remaining[@]} -eq 0 ]] && return
+    strays=("${remaining[@]}")
+    sleep 0.1
+  done
+  kill -KILL "${strays[@]}" 2>/dev/null || true
+}
+
 passed=0
 failed=0
 fail_list=""
@@ -134,6 +192,7 @@ for t in "${tests[@]}"; do
       fail_list="${fail_list}FAIL: ${name} (exit ${code})\n${msg}\n---\n"
     fi
   fi
+  reap_stragglers
 done
 
 printf "%b" "$fail_list"
