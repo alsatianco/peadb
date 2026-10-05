@@ -116,7 +116,7 @@ fi
 [[ -x "$PEADB_BIN" ]] || { echo "Missing PeaDB binary at $PEADB_BIN. Build first." >&2; exit 1; }
 
 echo "=== Starting peadb-server on port $PORT ==="
-"$PEADB_BIN" --port "$PORT" --bind 127.0.0.1 --loglevel error >/tmp/peadb-perf.log 2>&1 &
+"$PEADB_BIN" --port "$PORT" --bind 127.0.0.1 --loglevel warning >/tmp/peadb-perf.log 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID:-0} >/dev/null 2>&1 || true; wait ${SERVER_PID:-0} 2>/dev/null || true' EXIT
 

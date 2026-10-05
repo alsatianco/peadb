@@ -40,7 +40,7 @@ def cmd(s,*a):
  s.sendall(d); return recv(s)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6417','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6417','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6417)
   with socket.create_connection(('127.0.0.1',6417),timeout=2) as s:

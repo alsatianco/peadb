@@ -172,7 +172,10 @@ std::string g_requirepass;                    // empty = no auth required (Redis
 std::string g_masterauth;                     // sent to master during replica handshake
 bool g_protected_mode = true;                 // refuse non-loopback clients when no auth set
 std::string g_enable_module_command = "no";   // "yes" | "no" | "local" — gates MODULE LOAD
-std::vector<std::pair<std::string, std::string>> g_rename_commands;
+std::vector<RenameCommandDirective> g_rename_commands;
+// Set while command_table() applies g_rename_commands (validate_command_renames() reports them).
+std::string g_rename_error;
+std::vector<std::string> g_rename_warnings;
 // Length-checked, content-time-independent compare to avoid leaking the password
 // via per-byte timing. (Length is not secret enough to warrant masking here.)
 inline bool const_time_eq(const std::string& a, const std::string& b) {
@@ -4917,7 +4920,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             if (k == "maxmemory-samples") {
               std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 1 || v > 1000) return encode_error("value is not an integer or out of range");
+              if (!parse_i64(args[3], v) || v < 1 || v > std::numeric_limits<int>::max()) {
+                // Redis's range is 1..INT_MAX
+                return encode_error("value is not an integer or out of range");
+              }
               g_maxmemory_samples = static_cast<int>(v);
             }
             if (k == "timeout") {
@@ -5026,13 +5032,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
             if (k == "loglevel") {
               const auto v = lower(args[3]);
+              LogLevel level = LogLevel::Info;
+              if (!parse_redis_log_level(v, level)) {
+                return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] +
+                                    "') - argument(s) must be one of the following: debug, "
+                                    "verbose, notice, warning, nothing");
+              }
               g_loglevel_name = v;
-              // Map redis-style levels onto PeaDB's logger levels.
-              if (v == "debug") set_log_level(LogLevel::Debug);
-              else if (v == "verbose") set_log_level(LogLevel::Info);
-              else if (v == "notice") set_log_level(LogLevel::Info);
-              else if (v == "warning") set_log_level(LogLevel::Warn);
-              else set_log_level(parse_log_level(v));
+              set_log_level(level);
             }
             return encode_simple("OK");
           }
@@ -10467,19 +10474,36 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
       }
     }
 
-    // Apply rename-command directives (config-file only). Renaming to an empty
-    // target disables the command. Done after flag computation so the moved spec
-    // keeps its flags. Command names are matched case-insensitively (table keys
-    // are upper-case, and handle_command upper-cases incoming command names).
-    for (const auto& [from, to] : g_rename_commands) {
-      const std::string f = upper(from);
+    // Apply rename-command directives in config order. The config loader (src/config.cpp) has
+    // already checked them against Redis's command table, as Redis's own loader does
+    // (config.c): each one removes the command and, unless the new name is empty, adds it back
+    // under the new name. Done after flag computation so the moved spec keeps its flags. Names
+    // are matched case-insensitively (table keys are upper-case, and handle_command
+    // upper-cases incoming command names).
+    for (const auto& rename : g_rename_commands) {
+      const std::string f = upper(rename.from);
+      const std::string tname = upper(rename.to);
       auto fit = t.find(f);
-      if (fit == t.end()) continue;
-      if (to.empty()) { t.erase(fit); continue; }
-      const std::string tname = upper(to);
+      if (fit == t.end()) {
+        // A Redis command PeaDB does not implement (delta item 68). Removing it changes
+        // nothing; renaming it cannot give a working command. The new name is not logged,
+        // because operators often use it as a secret.
+        if (!tname.empty()) {
+          g_rename_warnings.push_back("config line " + std::to_string(rename.line) +
+                                      ": rename-command " + upper(rename.redis_name) +
+                                      " has no effect, because PeaDB does not implement " +
+                                      upper(rename.redis_name) + " (compat/delta.md item 68)");
+        }
+        continue;
+      }
       CommandSpec spec = fit->second;
-      spec.name = tname;
       t.erase(fit);
+      if (tname.empty()) continue;
+      if (t.count(tname) != 0) {  // cannot happen after the loader's check; kept as a guard
+        g_rename_error = format_config_error(rename.origin, "Target command name already exists");
+        break;
+      }
+      spec.name = tname;
       t[tname] = std::move(spec);
     }
 
@@ -10870,12 +10894,25 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
 
 void configure_security(const std::string& requirepass, const std::string& masterauth,
                         bool protected_mode, const std::string& enable_module_command,
-                        const std::vector<std::pair<std::string, std::string>>& rename_commands) {
+                        const std::vector<RenameCommandDirective>& rename_commands) {
   g_requirepass = requirepass;
   g_masterauth = masterauth;
   g_protected_mode = protected_mode;
   g_enable_module_command = enable_module_command;
   g_rename_commands = rename_commands;
+}
+
+void configure_log_level(const std::string& name) {
+  LogLevel level = LogLevel::Info;
+  if (!parse_redis_log_level(name, level)) return;  // the config loader already checked it
+  g_loglevel_name = name;
+  set_log_level(level);
+}
+
+std::string validate_command_renames(std::vector<std::string>& warnings) {
+  (void)command_table();  // the first call builds the table and applies the renames
+  warnings.insert(warnings.end(), g_rename_warnings.begin(), g_rename_warnings.end());
+  return g_rename_error;
 }
 
 bool protected_mode_enabled() { return g_protected_mode; }
@@ -10897,7 +10934,8 @@ void configure_maxmemory_policy(const std::string& spec) {
 void configure_maxmemory_samples(const std::string& spec) {
   if (spec.empty()) return;
   std::int64_t v = 0;
-  if (parse_i64(spec, v) && v >= 1 && v <= 1000) g_maxmemory_samples = static_cast<int>(v);
+  if (parse_i64(spec, v) && v >= 1 && v <= std::numeric_limits<int>::max())
+    g_maxmemory_samples = static_cast<int>(v);
   else log(LogLevel::Warn, "ignoring invalid maxmemory-samples: " + spec);
 }
 
@@ -10934,20 +10972,38 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
     std::int64_t v = 0;
     if (parse_i64(it->second, v) && (v >= 0 || allow_negative)) slot = v;
   };
-  // ziplist aliases first so the newer listpack spelling wins when both are present.
-  apply("hash-max-ziplist-entries", lim.hash_entries, false);
+  // The config loader folds the old *-ziplist-* aliases into these names (last value wins).
   apply("hash-max-listpack-entries", lim.hash_entries, false);
-  apply("hash-max-ziplist-value", lim.hash_value, false);
   apply("hash-max-listpack-value", lim.hash_value, false);
-  apply("list-max-ziplist-size", lim.list_size, true);
   apply("list-max-listpack-size", lim.list_size, true);
   apply("set-max-intset-entries", lim.set_intset, false);
   apply("set-max-listpack-entries", lim.set_entries, false);
   apply("set-max-listpack-value", lim.set_value, false);
-  apply("zset-max-ziplist-entries", lim.zset_entries, false);
   apply("zset-max-listpack-entries", lim.zset_entries, false);
-  apply("zset-max-ziplist-value", lim.zset_value, false);
   apply("zset-max-listpack-value", lim.zset_value, false);
+}
+
+void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw) {
+  auto num = [&](const char* key, auto& slot) {
+    const auto it = raw.find(key);
+    std::int64_t v = 0;
+    if (it != raw.end() && parse_i64(it->second, v)) {
+      slot = static_cast<std::decay_t<decltype(slot)>>(v);
+    }
+  };
+  auto yes = [&](const char* key, bool& slot) {
+    const auto it = raw.find(key);
+    if (it != raw.end()) slot = it->second == "yes";
+  };
+  num("min-replicas-to-write", g_config_min_replicas_to_write);
+  yes("replica-serve-stale-data", g_config_replica_serve_stale_data);
+  num("busy-reply-threshold", g_config_lua_time_limit);
+  yes("lazyfree-lazy-server-del", g_lazyfree_lazy_server_del);
+  yes("stop-writes-on-bgsave-error", g_stop_writes_on_bgsave_error);
+  yes("aof-load-truncated", g_aof_load_truncated);
+  num("slowlog-log-slower-than", g_slowlog_threshold_us);
+  num("slowlog-max-len", g_slowlog_max_len);
+  num("latency-monitor-threshold", g_latency_monitor_threshold_ms);
 }
 
 void script_set_repl_flags(int flags) { g_script_repl_flags = flags; }
@@ -11029,7 +11085,8 @@ void configure_save(const std::string& spec) {
   std::istringstream iss(spec);
   std::int64_t sec = 0, changes = 0;
   while (iss >> sec >> changes) {
-    if (sec > 0 && changes > 0) g_save_params.emplace_back(sec, changes);
+    // Redis keeps every pair with seconds >= 1; a change count of 0 means "every <sec> seconds".
+    if (sec > 0) g_save_params.emplace_back(sec, changes);
   }
 }
 
@@ -11093,7 +11150,7 @@ void background_save_cron() {
   if (g_save_params.empty() || g_bgsave_in_progress.load()) return;
   const std::int64_t now_s = now_ms() / 1000;
   const std::int64_t dirty = static_cast<std::int64_t>(store().mutation_epoch()) - g_dirty_at_last_save;
-  if (dirty <= 0) return;
+  // No early return when nothing changed: `save 60 0` saves every 60 s, as in Redis.
   for (const auto& [sec, changes] : g_save_params) {
     if (dirty >= changes && (now_s - g_last_save_time) >= sec) {
       do_bgsave_fork();

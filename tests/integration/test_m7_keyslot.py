@@ -36,7 +36,7 @@ def main():
  # CLUSTER is gated on --cluster-enabled at the top of the handler, before any subcommand
  # dispatch including KEYSLOT (cluster.c:5888-5891), so this needs cluster mode on.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6426','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6426)
   with socket.create_connection(('127.0.0.1',6426),timeout=2) as s:

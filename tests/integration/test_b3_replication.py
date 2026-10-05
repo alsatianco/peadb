@@ -27,7 +27,7 @@ def rc(port, *args):
 
 def start(port, *extra):
     p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                          "--loglevel", "error", *extra])
+                          "--loglevel", "warning", *extra])
     wait_until_ready(port)
     return p
 

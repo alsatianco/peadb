@@ -87,7 +87,7 @@ class RawSock:
   return d
 
 def check_nopass():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6302','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6302','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_up(6302)
   with socket.create_connection(('127.0.0.1',6302),timeout=5) as s:
@@ -139,7 +139,7 @@ def check_nopass():
 def check_withpass():
  import hashlib
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6303','--bind','127.0.0.1',
-                     '--requirepass','hunter2','--loglevel','error'])
+                     '--requirepass','hunter2','--loglevel','warning'])
  try:
   wait_up(6303, auth_required=True)
   with socket.create_connection(('127.0.0.1',6303),timeout=5) as s:
@@ -157,7 +157,7 @@ def check_resp3_getuser():
  # Nothing else pins the RESP3 shape of ACL GETUSER on the wire: RESP2's flat *12 array
  # collapses the map/set distinction that RESP3 clients (and assert_encoded_reply-style
  # test harnesses) rely on, so a regression there would pass every other check here.
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6304','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6304','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_up(6304)
   with socket.create_connection(('127.0.0.1',6304),timeout=5) as s:

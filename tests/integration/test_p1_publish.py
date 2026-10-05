@@ -52,7 +52,7 @@ def repl_cmd(s):
     return out
 
 def main():
-    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6500","--bind","127.0.0.1","--loglevel","error"])
+    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6500","--bind","127.0.0.1","--loglevel","warning"])
     try:
         wait_until_ready(6500)
         with socket.create_connection(("127.0.0.1",6500),timeout=2) as c, socket.create_connection(("127.0.0.1",6500),timeout=2) as r:

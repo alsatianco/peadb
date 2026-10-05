@@ -56,7 +56,7 @@ def cmd(sock: socket.socket, *args):
 
 
 def main() -> int:
-    proc = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6397", "--bind", "127.0.0.1", "--loglevel", "error"])
+    proc = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6397", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         wait_until_ready(6397)
         with socket.create_connection(("127.0.0.1", 6397), timeout=2) as s:

@@ -43,7 +43,7 @@ def cmd(s,*a):
 def isid(x): return isinstance(x,str) and re.match(r'^\d+-\d+$',x)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6408','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6408','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6408)
   with socket.create_connection(('127.0.0.1',6408),timeout=2) as s:

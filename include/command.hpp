@@ -10,6 +10,8 @@
 #include <chrono>
 #include <utility>
 
+#include "config.hpp"
+
 namespace peadb {
 
 enum class RespVersion {
@@ -113,7 +115,16 @@ bool is_wildcard_announce_host(const std::string& host);
 // ── Security configuration (wired from main.cpp at startup) ──
 void configure_security(const std::string& requirepass, const std::string& masterauth,
                         bool protected_mode, const std::string& enable_module_command,
-                        const std::vector<std::pair<std::string, std::string>>& rename_commands);
+                        const std::vector<RenameCommandDirective>& rename_commands);
+// Builds the command table and applies the rename-command directives (already checked by the
+// config loader against Redis's command table). Returns a config error report if a rename
+// still cannot be applied ("" otherwise), and adds a warning for each line that renames a Redis
+// command PeaDB does not implement. Call once at startup, after configure_security() and before
+// anything else uses the command table.
+std::string validate_command_renames(std::vector<std::string>& warnings);
+// Sets the log level from a Redis loglevel name (debug, verbose, notice, warning, nothing),
+// as reported by CONFIG GET loglevel.
+void configure_log_level(const std::string& name);
 bool protected_mode_enabled();   // read by the server accept loop
 bool requirepass_is_set();       // read by the server accept loop (protected-mode bypass)
 void configure_maxmemory(const std::string& spec);   // "100mb"/bytes; "" = unlimited
@@ -123,9 +134,14 @@ void init_replication_id();   // randomize the replication id at startup (call o
 void functions_register_rdb_hooks();   // wire RDB save/load to the function-library registry (call once in main)
 void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
 void configure_tcp_backlog(int backlog);            // listen(2) backlog, for CONFIG GET reporting
-// Apply *-max-listpack-*/set-max-intset-entries thresholds from config-file directives
-// (the raw key/value map) — the upstream harness passes per-test overrides this way.
+// Apply *-max-listpack-*/set-max-intset-entries thresholds from the checked config settings
+// (ServerConfig::raw, canonical names) — the upstream harness passes per-test overrides this way.
 void configure_encoding_limits(const std::unordered_map<std::string, std::string>& raw);
+// Apply the config-file settings that CONFIG SET also changes at runtime and that have no
+// ServerConfig field: min-replicas-to-write, replica-serve-stale-data, busy-reply-threshold,
+// lazyfree-lazy-server-del, stop-writes-on-bgsave-error, aof-load-truncated,
+// slowlog-log-slower-than, slowlog-max-len and latency-monitor-threshold (values already checked).
+void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw);
 void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
 int client_timeout_seconds();                       // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping

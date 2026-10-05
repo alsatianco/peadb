@@ -72,9 +72,9 @@ def main():
  # cluster-enabled, unconfigured node owns nothing, matching real Redis's own
  # not-all-slots-covered state rather than the old fabricated "always ok once active".
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6427','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  p_standalone=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6428','--bind','127.0.0.1',
-   '--loglevel','error'])
+   '--loglevel','warning'])
  try:
   wait_until_ready(6427)
   wait_until_ready(6428)

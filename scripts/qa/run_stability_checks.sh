@@ -121,7 +121,7 @@ else
   ASAN_OPTS="detect_leaks=1:halt_on_error=1"
 fi
 ASAN_OPTIONS="$ASAN_OPTS" \
-  "$ROOT_DIR/build-asan/peadb-server" --port "$PORT" --bind 127.0.0.1 --loglevel error >/tmp/peadb-asan.log 2>&1 &
+  "$ROOT_DIR/build-asan/peadb-server" --port "$PORT" --bind 127.0.0.1 --loglevel warning >/tmp/peadb-asan.log 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID:-0} >/dev/null 2>&1 || true; wait ${SERVER_PID:-0} 2>/dev/null || true' EXIT
 sleep 1

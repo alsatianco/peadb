@@ -70,7 +70,7 @@ def main():
             'port 6409',
             f'dir {tdp}',
             'dbfilename dump.rdb',
-            'loglevel error',
+            'loglevel warning',
         ]) + '\n', encoding='utf-8')
 
         p = start(cfg, 6409)

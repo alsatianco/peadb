@@ -16,6 +16,7 @@
 #include <netinet/tcp.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -182,39 +183,43 @@ int run_server(const ServerConfig& config) {
     }
   }
 
-  const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (listen_fd < 0) {
-    log(LogLevel::Error, "socket() failed: " + std::string(std::strerror(errno)));
-    return 1;
-  }
+  // `port 0` means no TCP listener, as in Redis (initListeners(), server.c).
+  int listen_fd = -1;
+  if (config.port != 0) {
+    listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) {
+      log(LogLevel::Error, "socket() failed: " + std::string(std::strerror(errno)));
+      return 1;
+    }
 
-  int one = 1;
-  setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  set_nonblocking(listen_fd);
+    int one = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    set_nonblocking(listen_fd);
 
-  sockaddr_in addr {};
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(config.port));
-  if (inet_pton(AF_INET, config.bind.c_str(), &addr.sin_addr) != 1) {
-    log(LogLevel::Error, "invalid bind address: " + config.bind);
-    close(listen_fd);
-    return 1;
-  }
+    sockaddr_in addr {};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(config.port));
+    if (inet_pton(AF_INET, config.bind.c_str(), &addr.sin_addr) != 1) {
+      log(LogLevel::Error, "invalid bind address: " + config.bind);
+      close(listen_fd);
+      return 1;
+    }
 
-  if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    // "Failed listening on port" is grepped by the upstream Redis test harness to
-    // detect port-in-use and retry with a different port — keep the phrase intact.
-    log(LogLevel::Error, "bind() failed: " + std::string(std::strerror(errno)) +
-                             " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
-    close(listen_fd);
-    return 1;
-  }
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+      // "Failed listening on port" is grepped by the upstream Redis test harness to
+      // detect port-in-use and retry with a different port — keep the phrase intact.
+      log(LogLevel::Error, "bind() failed: " + std::string(std::strerror(errno)) +
+                               " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
+      close(listen_fd);
+      return 1;
+    }
 
-  if (listen(listen_fd, config.tcp_backlog) != 0) {
-    log(LogLevel::Error, "listen() failed: " + std::string(std::strerror(errno)) +
-                             " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
-    close(listen_fd);
-    return 1;
+    if (listen(listen_fd, config.tcp_backlog) != 0) {
+      log(LogLevel::Error, "listen() failed: " + std::string(std::strerror(errno)) +
+                               " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
+      close(listen_fd);
+      return 1;
+    }
   }
 
   // Optional AF_UNIX listener (redis.conf `unixsocket`). The upstream test harness
@@ -227,7 +232,7 @@ int run_server(const ServerConfig& config) {
     if (unix_fd < 0 || config.unixsocket.size() >= sizeof(uaddr.sun_path)) {
       log(LogLevel::Error, "unixsocket setup failed (path too long or socket() error): " + config.unixsocket);
       if (unix_fd >= 0) close(unix_fd);
-      close(listen_fd);
+      if (listen_fd >= 0) close(listen_fd);
       return 1;
     }
     std::strncpy(uaddr.sun_path, config.unixsocket.c_str(), sizeof(uaddr.sun_path) - 1);
@@ -238,9 +243,23 @@ int run_server(const ServerConfig& config) {
       log(LogLevel::Error, "Failed listening on unix socket " + config.unixsocket + ": " +
                                std::string(std::strerror(errno)));
       close(unix_fd);
-      close(listen_fd);
+      if (listen_fd >= 0) close(listen_fd);
       return 1;
     }
+    // unixsocketperm, as in Redis's anetUnixServer(): 0 leaves the mode bind(2) gave the file.
+    if (config.unixsocketperm != 0 &&
+        ::chmod(config.unixsocket.c_str(), static_cast<mode_t>(config.unixsocketperm)) != 0) {
+      log(LogLevel::Error, "Failed setting unixsocketperm on " + config.unixsocket + ": " +
+                               std::string(std::strerror(errno)));
+      close(unix_fd);
+      if (listen_fd >= 0) close(listen_fd);
+      return 1;
+    }
+  }
+
+  if (listen_fd < 0 && unix_fd < 0) {
+    log(LogLevel::Error, "Configured to not listen anywhere, exiting.");
+    return 1;
   }
 
   int reserved_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -248,7 +267,9 @@ int run_server(const ServerConfig& config) {
     log(LogLevel::Warn, "failed to open reserved fd for EMFILE handling: " + std::string(std::strerror(errno)));
   }
 
-  log(LogLevel::Info, "peadb-server listening on " + config.bind + ":" + std::to_string(config.port));
+  if (listen_fd >= 0) {
+    log(LogLevel::Info, "peadb-server listening on " + config.bind + ":" + std::to_string(config.port));
+  }
 
   // Loud warning when reachable from the network without authentication. protected-mode
   // (on by default) still refuses non-loopback clients in this state, but operators who
@@ -295,11 +316,11 @@ int run_server(const ServerConfig& config) {
   Poller poller;
   if (!poller.create()) {
     log(LogLevel::Error, "poller create failed: " + std::string(std::strerror(errno)));
-    close(listen_fd);
+    if (listen_fd >= 0) close(listen_fd);
     if (cbus_fd >= 0) close(cbus_fd);
     return 1;
   }
-  poller.add_read(listen_fd);
+  if (listen_fd >= 0) poller.add_read(listen_fd);
   if (unix_fd >= 0) poller.add_read(unix_fd);
   if (cbus_fd >= 0) poller.add_read(cbus_fd);
   // Third line of the startup log contract; the upstream harness counts these lines
@@ -1013,7 +1034,7 @@ int run_server(const ServerConfig& config) {
   // Cleanup
   for (auto& [fd, _] : sessions) ::close(fd);
   for (auto& [fd, _] : cbus_buffers) ::close(fd);
-  close(listen_fd);
+  if (listen_fd >= 0) close(listen_fd);
   if (unix_fd >= 0) {
     close(unix_fd);
     ::unlink(config.unixsocket.c_str());

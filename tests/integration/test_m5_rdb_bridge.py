@@ -14,7 +14,7 @@ def cmd(host, port, *args):
 
 
 def start_peadb(port):
-    p = subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','error'])
+    p = subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','warning'])
     wait_until_ready(port)
     return p
 

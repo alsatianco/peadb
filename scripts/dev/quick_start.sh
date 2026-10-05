@@ -25,7 +25,7 @@
 # CLI options
 #   --port PORT        TCP port (default: 6379)
 #   --bind ADDR        Bind address (default: 127.0.0.1, loopback-only)
-#   --loglevel LEVEL   Log level (default: info)
+#   --loglevel LEVEL   Log level: debug, verbose, notice, warning or nothing (default: notice)
 #   --config PATH      Path to a PeaDB config file
 #   --dir DIR          Persistence / working directory (default: ./data)
 #   --                 Everything after -- is forwarded verbatim to the server
@@ -65,7 +65,7 @@ cd "$PROJECT_ROOT"
 # ── Defaults ────────────────────────────────────────────────────────────────
 PORT="${PEADB_PORT:-6379}"
 BIND="${PEADB_BIND:-127.0.0.1}"
-LOGLEVEL="${PEADB_LOGLEVEL:-info}"
+LOGLEVEL="${PEADB_LOGLEVEL:-notice}"
 CONFIG=""
 EXTRA_ARGS=()
 

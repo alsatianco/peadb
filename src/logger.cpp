@@ -22,6 +22,8 @@ const char* to_string(LogLevel level) {
       return "INFO";
     case LogLevel::Debug:
       return "DEBUG";
+    case LogLevel::Nothing:
+      break;
   }
   return "UNKNOWN";
 }
@@ -29,12 +31,15 @@ const char* to_string(LogLevel level) {
 
 void set_log_level(LogLevel level) { g_level = level; }
 
-LogLevel parse_log_level(const std::string& level) {
-  if (level == "error") return LogLevel::Error;
-  if (level == "warn" || level == "warning") return LogLevel::Warn;
-  if (level == "info" || level == "notice") return LogLevel::Info;    // redis.conf "notice"
-  if (level == "debug" || level == "verbose") return LogLevel::Debug; // redis.conf "verbose"
-  return LogLevel::Info;
+bool parse_redis_log_level(const std::string& name, LogLevel& level) {
+  // Redis logs accepted connections at "verbose", and PeaDB logs them at Debug, so verbose
+  // shares Debug with debug.
+  if (name == "debug" || name == "verbose") level = LogLevel::Debug;
+  else if (name == "notice") level = LogLevel::Info;
+  else if (name == "warning") level = LogLevel::Warn;
+  else if (name == "nothing") level = LogLevel::Nothing;
+  else return false;
+  return true;
 }
 
 void log(LogLevel level, const std::string& message) {

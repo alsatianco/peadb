@@ -82,7 +82,7 @@ def expect(cond, msg):
 
 def start(port, *extra):
     return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                             "--loglevel", "warn", *extra])
+                             "--loglevel", "warning", *extra])
 
 
 def test_slowlog_and_loglevel():

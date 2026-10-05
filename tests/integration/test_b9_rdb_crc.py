@@ -35,7 +35,7 @@ def cli(port, *args):
 
 def start(port, td):
     return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                             "--loglevel", "error", "--dir", td])
+                             "--loglevel", "warning", "--dir", td])
 
 
 def expect(c, m):

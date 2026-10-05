@@ -82,7 +82,7 @@ def expect(c, m):
 
 def start(port, *extra):
     return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                             "--loglevel", "error", *extra])
+                             "--loglevel", "warning", *extra])
 
 
 def info_field(s, field):

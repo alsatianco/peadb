@@ -76,7 +76,7 @@ def expect(c, m):
 
 
 def start(port):
-    return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"])
+    return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
 
 
 def test_inline_quoting():

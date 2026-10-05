@@ -51,7 +51,7 @@ def main():
    'port 6410',
    f'dir {td}',
    'dbfilename dump.rdb',
-   'loglevel error',
+   'loglevel warning',
   ])+'\n',encoding='utf-8')
   p=subprocess.Popen([str(ROOT/'peadb-server'),'--config',str(cfg)])
   try:

@@ -56,7 +56,7 @@ def expect(cond, msg):
 
 def start(port, *extra):
     return subprocess.Popen(
-        [str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error", *extra]
+        [str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning", *extra]
     )
 
 

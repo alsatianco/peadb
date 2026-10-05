@@ -324,7 +324,7 @@ if [[ "$START_PEADB" == "1" ]]; then
     fi
   fi
 
-  "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel error >"$OUT_DIR/peadb-start.log" 2>&1 &
+  "$PEADB_BIN" --port "$PORT" --bind "$HOST" --loglevel warning >"$OUT_DIR/peadb-start.log" 2>&1 &
   PEADB_PID="$!"
   python3 - "$HOST" "$PORT" "$PEADB_PID" <<'PY'
 import os

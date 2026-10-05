@@ -55,7 +55,7 @@ def main():
    'dbfilename dump.rdb',
    'appendonly yes',
    'appendfilename appendonly.aof',
-   'loglevel error',
+   'loglevel warning',
   ])+'\n',encoding='utf-8')
 
   p=start(cfg, 6411)
