@@ -425,11 +425,10 @@ class DataStore {
 
   // Memory accounting — walks all databases to compute an estimate
   std::int64_t estimate_used_memory() const;
-  // Bounded-staleness cached view of estimate_used_memory(): recomputed at most
-  // once per ~100ms so INFO and per-write maxmemory checks are O(1) amortised
-  // instead of O(N+members) on every call. Drift-free (always the ground truth,
-  // just possibly up to ~100ms stale). True per-op O(1) accounting is deferred to
-  // the Entry tagged-union refactor (see compat/delta.md).
+  // Cached view of estimate_used_memory(), recomputed when the cache is ~100ms old.
+  // The cache time is taken before the walk, so once one walk takes 100ms or more
+  // (about 2M keys) every call walks again, and the estimate leaves out container
+  // and allocator overhead, so it is too low for collections (compat/delta.md item 38).
   std::int64_t used_memory() const;
   bool save_snapshot_file(const std::filesystem::path& path, std::string& err);
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);

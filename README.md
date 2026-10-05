@@ -10,13 +10,13 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 
 - **Full RESP2 / partial RESP3 protocol** — works with existing Redis clients and tools, zero changes required.
 - **Broad command coverage** — strings, hashes, lists, sets, sorted sets, streams, HyperLogLog, geo, bitmaps, pub/sub (incl. introspection + sharded aliases), transactions, Lua scripting, and more. (Authoritative, always-current command list, count, and per-command status: [`compat/commands.generated.md`](compat/commands.generated.md).)
-- **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`. RDB loads verify their CRC64 and refuse a corrupt dump.
-- **Memory & eviction** — enforced `maxmemory` with all eight `maxmemory-policy` modes (LRU/LFU/random/TTL, approximate sampling) so PeaDB works as a cache, a compact tagged-union value layout, per-class `client-output-buffer-limit` (slow-consumer/lagging-replica protection), and background `UNLINK` / `FLUSH ASYNC` (lazyfree).
-- **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and correct replica expiry (the master propagates `DEL` so clocks can't diverge). Automatic failover/Sentinel is not yet implemented.
-- **Cluster** — 16 384 hash-slot routing with real per-node ownership and Redis 7.2 reply shapes (`CLUSTER SLOTS`/`SHARDS`/`NODES`/`INFO`), `MEET` peer discovery, and `MOVED`/`ASK` redirection naming each slot's true owner — but operator-configured, not gossiped: no cluster bus gossip protocol, no automatic failover, no `nodes.conf` persistence (see [`compat/delta.md`](compat/delta.md) item 6 and [the design record](docs/decisions/p5-cluster-addressing-and-version-provenance.md)).
-- **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries.
+- **Persistence** — RDB snapshots and AOF logging with a configurable `appendfsync` policy (`always` / `everysec` / `no`), plus `SAVE` / `BGSAVE` / `BGREWRITEAOF`. RDB loads verify their CRC64 and refuse a corrupt dump. **Open defects can lose data today:** the RDB checksum uses the wrong table, so real Redis and PeaDB cannot load each other's files; a restart with both an RDB and an AOF applies writes twice; SIGTERM skips the final save. Read [`compat/delta.md`](compat/delta.md) items 27–37 before you rely on it.
+- **Memory & eviction** — `maxmemory` with all eight `maxmemory-policy` modes (LRU/LFU/random/TTL, approximate sampling), a compact tagged-union value layout, per-class `client-output-buffer-limit` (slow-consumer/lagging-replica protection), and background `UNLINK` / `FLUSH ASYNC` (lazyfree). `maxmemory` does not yet keep process memory under the limit: the used-memory estimate is too low for collections and slows every write from about 2M keys (delta items 38–39).
+- **Replication** — native PSYNC2-based replication with multi-replica support, `WAIT`, manual replica promotion, **automatic reconnect** (exponential backoff) and `masterauth`, configurable `repl-backlog-size`, and master-driven replica expiry (the master propagates `DEL`). Automatic failover/Sentinel is not yet implemented. Open defects can make a replica silently differ from its master, and every reconnect of a PeaDB replica is a full sync (delta items 37 and 40–48).
+- **Cluster (experimental, not production-safe)** — 16 384 hash slots with real per-node ownership, Redis 7.2 reply shapes (`CLUSTER SLOTS`/`SHARDS`/`NODES`/`INFO`) and `MOVED`/`ASK` redirection naming each slot's true owner, over an operator-configured topology: no gossip, no automatic failover, no `nodes.conf`. Today cluster mode can write keys on the wrong node (routing checks only the first key; there is no `CROSSSLOT`), and a restarted node serves slots that other nodes own; `redis-cli --cluster` workflows do not work. See [`compat/delta.md`](compat/delta.md) items 6 and 64–67 and [the design record](docs/decisions/p5-cluster-addressing-and-version-provenance.md).
+- **Lua scripting** — `EVAL`/`EVALSHA`, `FUNCTION` subsystem, `FCALL`/`FCALL_RO`, with cjson, cmsgpack, bit, and struct libraries. These libraries are PeaDB's own code and some output differs from Redis (for example `cjson.encode` writes integers as `1.0`, delta item 63), and a script whose text contains `while true do` is never run (delta item 54).
 - **Redis Modules API** — minimal `RedisModule_*` C API; load `.so` modules at runtime via `MODULE LOAD`.
-- **Observability** — populated `SLOWLOG` and `LATENCY` (real per-command timing), keyspace notifications (`notify-keyspace-events`, incl. `expired`), `MONITOR`, `CLIENT LIST`/`KILL`, runtime `CONFIG SET loglevel`, and Redis-compatible `INFO` (RSS, fragmentation ratio, fork timing, ops/sec) for `redis_exporter` and dashboards.
+- **Observability** — populated `SLOWLOG` and `LATENCY` (real per-command timing), keyspace notifications (`notify-keyspace-events`, incl. `expired`), `MONITOR`, `CLIENT LIST`/`KILL`, runtime `CONFIG SET loglevel`, and `INFO` in Redis's format (RSS, fragmentation ratio, fork timing, ops/sec) for `redis_exporter` and dashboards. About 16 standard INFO fields are still missing (delta item 22), and each INFO call walks the whole keyspace (delta item 55).
 - **Docker-ready** — published image at `alsatianco/peadb-server`, plus multi-stage Dockerfile and docker-compose for local builds.
 
 ## Quick Start
@@ -26,7 +26,7 @@ PeaDB aims to be **behaviorally indistinguishable** from Redis 7.2.5 — same pr
 - C++20 compiler (GCC 11+ or Clang 14+)
 - CMake ≥ 3.16
 
-Lua 5.1.5 is bundled (`third_party/lua-5.1.5`) — the exact interpreter Redis 7.2.5 embeds — so no Lua dev package is needed and script semantics match Redis byte-for-byte.
+Lua 5.1.5 is bundled (`third_party/lua-5.1.5`), so no Lua dev package is needed. It is stock Lua 5.1.5, not the patched copy Redis 7.2.5 embeds, so some script results differ from Redis (for example table order for long string keys): see [`compat/delta.md`](compat/delta.md) items 62–63.
 
 On Ubuntu/Debian:
 
@@ -76,10 +76,15 @@ scripts/dev/quick_start.sh
 Run the published image directly:
 
 ```bash
-docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest --requirepass "<your-password>"
+docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-server:latest \
+  --port 6379 --bind 0.0.0.0 --dir /data --appendonly yes --requirepass "<your-password>"
 ```
 
-The `Dockerfile`'s default `CMD` binds `0.0.0.0`, and **protected-mode is on by default**: a client reaching it through the published port is not seen as a loopback connection, so without a password PeaDB refuses it with `-DENIED`. Pass `--requirepass` as above, or, only if your network already isolates the container (for example a private Docker network with no published port), append `--protected-mode no` instead.
+Arguments after the image name replace the image's default `CMD` (`--port 6379 --bind 0.0.0.0 --dir /data`) completely, so the line above repeats those defaults. Without `--bind 0.0.0.0`, PeaDB listens on `127.0.0.1` inside the container and the published port cannot reach it.
+
+The image turns on neither save points nor AOF, so without `--appendonly yes` (or `--save`) nothing is saved to the `/data` volume unless you run `SAVE` or `BGSAVE` yourself. Prefer AOF in a container: `docker stop` sends SIGTERM, which today skips the final RDB save (delta item 33). Read the open persistence defects in [`compat/delta.md`](compat/delta.md) items 27–37 first.
+
+**protected-mode is on by default**: a client reaching the container through the published port is not seen as a loopback connection, so without a password PeaDB refuses it with `-DENIED`. Pass `--requirepass` as above, or, only if your network already isolates the container (for example a private Docker network with no published port), use `--protected-mode no` instead.
 
 See the [Docker Hub tags page](https://hub.docker.com/repository/docker/alsatianco/peadb-server/tags) for the current list of published tags — see [`docs/RELEASING.md`](docs/RELEASING.md) for what each tag means and when `latest` moves.
 
@@ -89,7 +94,7 @@ Or build and run locally with Docker Compose:
 docker compose up -d
 ```
 
-The container exposes port `6379` (configurable via `PEADB_PORT`) and persists data to a named volume. For high-connection load tests, compose sets `ulimits.nofile` by default (`PEADB_NOFILE_SOFT` / `PEADB_NOFILE_HARD`, both default to `65536`).
+The container exposes port `6379` (configurable via `PEADB_PORT`) and mounts a named volume at `/data`. Like the image, the compose file turns on neither save points nor AOF, so add `--appendonly yes` to its `command` to keep data in that volume. For high-connection load tests, compose sets `ulimits.nofile` by default (`PEADB_NOFILE_SOFT` / `PEADB_NOFILE_HARD`, both default to `65536`).
 
 ## Configuration
 
@@ -103,7 +108,7 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file — eithe
 | `--dir` | `.` | Data directory for snapshots and AOF |
 | `--dbfilename` | `dump.rdb` | RDB snapshot filename |
 | `--config` | — | Path to a config file |
-| `maxclients` | — | Maximum concurrent client connections |
+| `maxclients` | — | Maximum concurrent client connections (`CONFIG SET maxclients` is not enforced, delta item 25) |
 | `appendonly` | `false` | Enable AOF persistence |
 | `appendfilename` | `appendonly.aof` | AOF filename |
 | `appendfsync` | `everysec` | AOF fsync policy (`always` / `everysec` / `no`) |
@@ -111,16 +116,16 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file — eithe
 | `--masterauth` | — | Password a replica sends to its master during sync |
 | `--protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
 | `--enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
-| `--maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `--maxmemory-policy`, else denyoom writes get `-OOM` |
+| `--maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `--maxmemory-policy`, else writes get `-OOM` — today every write, `DEL` included (delta item 39). The limit is checked against an estimate that is too low (delta item 38) |
 | `--maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
 | `--maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
 | `--timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
 | `--tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
 | `unixsocket` | — | Also listen on an AF_UNIX socket path (config-file key) |
-| `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` |
+| `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` (not on SIGTERM/SIGINT, delta item 33) |
 | `--client-output-buffer-limit` | Redis defaults | Per-class (`normal`/`slave`/`pubsub`) output-buffer limits; overflowing clients are disconnected |
 | `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax; config-file key or `CONFIG SET`) |
-| `rename-command` | — | Rename or disable a command (`rename-command FROM TO`, empty `TO` disables; config-file key) |
+| `rename-command` | — | Rename or disable a command (`rename-command FROM TO`; leave out `TO` to disable; config-file key). Unlike Redis, `rename-command FROM ""` renames the command to a literal `""` and does not disable it, and Redis refuses the form without `TO` (delta item 24) |
 | `--repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
 | `--cluster-enabled` | `no` | Enable cluster mode; startup-only, like Redis's `IMMUTABLE_CONFIG` — `CONFIG SET cluster-enabled` is refused |
 | `--cluster-announce-ip` | — | Address this node announces to peers/clients; empty falls back to `--bind` — a documented simplification of Redis's live-connection auto-detection (see `docs/decisions/p5-cluster-addressing-and-version-provenance.md`). With `--cluster-enabled yes`, the server refuses to start if this falls back to a wildcard (`0.0.0.0`, `::`, `*`, or empty) |
@@ -129,7 +134,7 @@ PeaDB accepts Redis-style configuration via CLI flags or a config file — eithe
 
 `appendonly`, `appendfilename`, `appendfsync`, and `save` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys); `maxclients`, `unixsocket`, `notify-keyspace-events`, and `rename-command` are config-file keys only.
 
-Recognized redis.conf keys are a subset of Redis's; unknown directives are accepted but ignored. Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`).
+Recognized redis.conf keys are a subset of Redis's. Every other directive, and a missing config file, is accepted and ignored with no warning. This includes `user`, `aclfile`, `include` and every `tls-*` line, so a hardened redis.conf that sets its password with `user default on >…` starts PeaDB with **no password**, and a TLS config gives a plaintext server ([`compat/delta.md`](compat/delta.md) item 24). Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`). `CONFIG SET` answers `OK` for unknown names (item 23) and for some known ones that it does not apply, such as `appendonly`, `dir` and `maxclients` (item 25).
 
 ## Supported Commands
 
@@ -175,7 +180,7 @@ PeaDB has a comprehensive suite spanning unit, integration, fuzz, and differenti
 Parity against real Redis is measured by the **upstream Redis 7.2.5 TCL suite running in native mode** (the official harness spawns `peadb-server` as a redis-server stand-in). Adopted suites, per-suite baselines, and the monotonic no-regression ratchet live in [`compat/redis_suite_ledger.json`](compat/redis_suite_ledger.json); every skipped upstream test is a tracked debt in `scripts/redis/skipfiles/` tied to a [`compat/delta.md`](compat/delta.md) entry.
 
 ```bash
-# Run all tests (10 stages: unit, integration, coverage, compat, fuzz, stability, perf, sentinel, redis, diff)
+# Run all tests (11 stages: unit, integration, coverage, portcheck, compat, fuzz, stability, perf, sentinel, redis, diff)
 scripts/run_all_tests.sh
 
 # Upstream Redis TCL suite, native mode + pass-rate report
@@ -229,11 +234,11 @@ Reproduce with `scripts/dev/redis_vs_peadb_benchmark.sh` (compares PeaDB against
 
 ## Compatibility, Persistence & Migration
 
-PeaDB is a drop-in replacement for core Redis workloads — standard clients connect unmodified, and you can migrate in via `REPLICAOF` (native PSYNC2 sync) or the RDB bridge scripts, and roll back the same way. Durability matches Redis (`appendfsync always`/`everysec`/`no`).
+Standard Redis clients connect to PeaDB unmodified. **No migration or rollback path between Redis and PeaDB works end to end today**: not `REPLICAOF` from a real Redis master, not RDB files in either direction, not `DUMP`/`RESTORE`/`MIGRATE`, and not the bridge scripts ([`compat/delta.md`](compat/delta.md) item 49). PeaDB offers Redis's durability options (`appendfsync always`/`everysec`/`no`), but open defects can lose acknowledged writes (items 27–37).
 
 Full detail — drop-in posture, tested clients, `redis.conf` support, migration & rollback steps, the feature-status table, persistence internals, and security/monitoring notes — lives in **[docs/compatibility.md](docs/compatibility.md)**. The authoritative, always-current gap registry is **[compat/delta.md](compat/delta.md)**.
 
-To report a security vulnerability privately, or to read the known security gaps (no TLS, no multi-user ACL, no Sentinel, no cluster failover) before you deploy, see **[SECURITY.md](SECURITY.md)**.
+To report a security vulnerability privately, or to read the known security gaps (no TLS, no multi-user ACL, config-file ACL and TLS lines ignored, no Sentinel, cluster mode not production-safe) before you deploy, see **[SECURITY.md](SECURITY.md)**.
 
 ## Documentation
 

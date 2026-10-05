@@ -864,7 +864,8 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataS
     return {0, out};
   }
 
-  // Bucket-based reverse-binary cursor (rehash-safe, like the main SCAN).
+  // Bucket-based cursor like the main SCAN (not rehash-safe on prime-sized tables:
+  // elements can be missed when the hash grows during a scan, compat/delta.md item 32).
   const auto& h = it->second.hash();
   const std::uint64_t nb = h.bucket_count();
   if (nb == 0 || h.empty()) return {0, out};
@@ -1124,9 +1125,9 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
     return {0, out};
   }
 
-  // Bucket-based reverse-binary cursor (like the main-keyspace SCAN) so elements present
-  // throughout the scan are always returned even as the set is mutated/rehashed between
-  // calls — fixes the ordinal-cursor bug (Redis issue #4906).
+  // Bucket-based cursor like the main-keyspace SCAN, so elements present throughout the
+  // scan are returned when the set does not grow between calls (Redis issue #4906). Not
+  // rehash-safe on prime-sized tables: growth can hide elements (compat/delta.md item 32).
   const auto& set = it->second.set();
   const std::uint64_t nb = set.bucket_count();
   if (nb == 0 || set.empty()) return {0, out};
@@ -1242,7 +1243,8 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
     return {0, out};
   }
 
-  // Bucket-based reverse-binary cursor (rehash-safe, like the main SCAN).
+  // Bucket-based cursor like the main SCAN (not rehash-safe on prime-sized tables:
+  // members can be missed when the zset grows during a scan, compat/delta.md item 32).
   const auto& z = it->second.zset();
   const std::uint64_t nb = z.bucket_count();
   if (nb == 0 || z.empty()) return {0, out};
@@ -3131,7 +3133,8 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
     // monotonically from cursor without wrapping. This guarantees termination
     // because the cursor increases from 0 to num_buckets-1 and we return 0 when
     // we fall off the end. Wrapping would allow the cursor to revisit buckets it
-    // has already seen, producing cycles that never return 0.
+    // has already seen, producing cycles that never return 0. It does not survive
+    // a rehash: keys that move to an already-visited bucket are missed (delta item 32).
     std::uint64_t b = cursor % num_buckets;
     while (b < num_buckets) {
       emit_bucket(b);

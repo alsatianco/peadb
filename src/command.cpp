@@ -485,8 +485,9 @@ inline std::string gen_run_id() { return gen_hex_chars(40); }
 void evict_to_fit();
 
 // maxmemory enforcement: when used memory exceeds the limit, first try to evict per
-// maxmemory-policy; reject denyoom writes with -OOM only if still over budget (true
-// noeviction, or nothing left to evict). used_memory() is the bounded-staleness cache.
+// maxmemory-policy; reject writes with -OOM only if still over budget (true noeviction,
+// or nothing left to evict). The caller gates on the `write` flag, so DEL and other writes
+// that free memory are refused too (no denyoom flag yet: compat/delta.md item 39).
 inline bool oom_should_reject() {
   if (g_config_maxmemory <= 0) return false;
   if (store().used_memory() <= g_config_maxmemory) return false;
