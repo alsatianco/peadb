@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+### Changed
+
+- `compat/delta.md` now lists the defects found by a verified review of `cb7194a` (2026-10-03) as items 24–71. They include silent data loss in RDB files, the AOF and replication (items 27–31 and 40–46) and broken migration paths to and from Redis (item 49). None is fixed yet. Older items that the review proved wrong are corrected: cluster mode (item 6) is now marked `experimental` and not production-safe, eviction (item 12) is `partial`, and items 2, 3, 5, 7, 8, 11, 13, 14, 19, 22 and 23 point to the new items.
+
 ## [0.3.0] - 2026-08-19
 
 This is the first released section of this changelog — earlier work up to this point was never tagged, so there are no `0.1.0`/`0.2.0` entries here even though `0.1` and `0.2` Docker tags exist; see [`docs/RELEASING.md`](docs/RELEASING.md) for the tagging convention this release establishes going forward.
