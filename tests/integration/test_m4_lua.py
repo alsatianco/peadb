@@ -59,7 +59,7 @@ def cmd(s,*a):
 
 def main():
  port=free_port()
- p=subprocess.Popen([str(PEADB_BIN),'--port',str(port),'--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(PEADB_BIN),'--port',str(port),'--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_ready(port,p)
   with socket.create_connection(('127.0.0.1',port),timeout=2) as s:

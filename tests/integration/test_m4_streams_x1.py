@@ -44,7 +44,7 @@ def is_stream_id(x):
  return isinstance(x,str) and re.match(r'^\d+-\d+$',x)
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6407','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6407','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6407)
   with socket.create_connection(('127.0.0.1',6407),timeout=2) as s:

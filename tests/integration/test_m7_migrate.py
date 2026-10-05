@@ -62,10 +62,10 @@ def main():
     # host:port as the node argument.
     p1 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6431", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
-                          "--loglevel", "error"])
+                          "--loglevel", "warning"])
     p2 = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6432", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
-                          "--loglevel", "error"])
+                          "--loglevel", "warning"])
     try:
         wait_until_ready(6431)
         wait_until_ready(6432)

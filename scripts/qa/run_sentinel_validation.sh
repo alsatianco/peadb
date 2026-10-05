@@ -136,12 +136,12 @@ fi
 [[ -x "$PEADB_BIN" ]] || fail "peadb-server binary not found at $PEADB_BIN"
 
 echo "=== Starting primary on port $PRIMARY_PORT ==="
-"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel error &
+"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel warning &
 PRIMARY_PID=$!
 sleep 1
 
 echo "=== Starting replica on port $REPLICA_PORT ==="
-"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel error &
+"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel warning &
 REPLICA_PID=$!
 sleep 1
 

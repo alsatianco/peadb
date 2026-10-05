@@ -65,7 +65,7 @@ def start_peadb(root: pathlib.Path, port: int) -> ServerProc:
             "--bind",
             "127.0.0.1",
             "--loglevel",
-            "error",
+            "warning",
             "--dir",
             str(work),
             "--dbfilename",

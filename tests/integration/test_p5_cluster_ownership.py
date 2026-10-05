@@ -62,10 +62,10 @@ def cmd(s, *a):
 def main():
     a = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6315", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
-                          "--loglevel", "error"])
+                          "--loglevel", "warning"])
     b = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6316", "--bind", "127.0.0.1",
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
-                          "--loglevel", "error"])
+                          "--loglevel", "warning"])
     try:
         wait_until_ready(6315)
         wait_until_ready(6316)

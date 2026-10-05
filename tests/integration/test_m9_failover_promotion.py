@@ -55,8 +55,8 @@ def cmd(s, *a):
 
 
 def main():
-    m = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6436", "--bind", "127.0.0.1", "--loglevel", "error"])
-    r = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6437", "--bind", "127.0.0.1", "--loglevel", "error"])
+    m = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6436", "--bind", "127.0.0.1", "--loglevel", "warning"])
+    r = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6437", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         wait_until_ready(6436)
         with socket.create_connection(("127.0.0.1", 6436), timeout=2) as master, socket.create_connection(("127.0.0.1", 6437), timeout=2) as replica:

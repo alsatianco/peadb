@@ -45,7 +45,7 @@ def is_err(v,needle):
     return isinstance(v,tuple) and v[0]=="ERR" and needle in v[1]
 
 def main():
-    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6516","--bind","127.0.0.1","--loglevel","error"])
+    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6516","--bind","127.0.0.1","--loglevel","warning"])
     try:
         wait_until_ready(6516)
         with socket.create_connection(("127.0.0.1",6516),timeout=2) as s:

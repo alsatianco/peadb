@@ -115,7 +115,7 @@ def eval_head(sock: socket.socket, script: str):
 def main() -> int:
     port = 6505
     proc = subprocess.Popen(
-        [str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"]
+        [str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"]
     )
     try:
         wait_until_ready(port)

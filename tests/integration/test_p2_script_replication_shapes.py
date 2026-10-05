@@ -60,7 +60,7 @@ def read_n_repl(s,n):
     return out
 
 def main():
-    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6514","--bind","127.0.0.1","--loglevel","error"])
+    p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6514","--bind","127.0.0.1","--loglevel","warning"])
     try:
         wait_until_ready(6514)
         with socket.create_connection(("127.0.0.1",6514),timeout=2) as c, socket.create_connection(("127.0.0.1",6514),timeout=2) as r:

@@ -7,8 +7,10 @@
 #include "rdb.hpp"
 #include "server.hpp"
 
+#include <algorithm>
 #include <iostream>
 #include <string>
+#include <vector>
 #include <fstream>
 #include <filesystem>
 #include <csignal>
@@ -60,68 +62,82 @@ int main(int argc, char** argv) {
   std::signal(SIGINT, signal_handler);
   install_crash_handlers();
 
-  // First pass: find the config file. Two spellings are accepted: redis-server style
-  // (first positional argument, `peadb-server /path/peadb.conf ...`) — required by the
-  // upstream Redis test harness, which spawns `$binary $config_file` — and the native
-  // `--config <path>` flag. CLI flags override file values either way.
+  // Command line, as in Redis's main() (server.c): -v/--version or -h/--help as the first
+  // argument; otherwise an optional config file as the first argument (when it does not start
+  // with '-'), then `--name value...` options that are appended to the config text and parsed
+  // with it, so `--port 6380` means the same as a `port 6380` line, the last value wins, and an
+  // option Redis does not know stops startup. "-" as the first or last argument reads the config
+  // from stdin. PeaDB adds one option of its own, `--config <path>`, another way to name the
+  // config file (kept for existing scripts; Redis has no setting called "config").
+  std::vector<std::string> args(argv, argv + argc);
+  if (args.size() >= 2 && (args[1] == "-v" || args[1] == "--version")) {
+    std::cout << "PeaDB server v=" PEADB_VERSION " (Redis 7.2.5 compatible)\n";
+    return 0;
+  }
+  if (args.size() >= 2 && (args[1] == "-h" || args[1] == "--help")) {
+    std::cout << "Usage: peadb-server [/path/to/redis.conf] [options] [-]\n"
+                 "       peadb-server - (read config from stdin)\n"
+                 "       peadb-server -v or --version\n"
+                 "       peadb-server -h or --help\n"
+                 "       peadb-server --config /path/to/redis.conf [options]\n\n"
+                 "Options are Redis config settings with a leading --, for example:\n"
+                 "       peadb-server --port 7777\n"
+                 "       peadb-server /etc/redis/6379.conf --loglevel verbose\n"
+                 "       peadb-server --save \"\" --appendonly yes --requirepass secret\n";
+    return 0;
+  }
+  // Redis enters Sentinel mode for a --sentinel argument or a redis-sentinel program name
+  // (checkForSentinelMode(), server.c); PeaDB has no Sentinel, so it must not start as a data
+  // server instead.
+  if (std::string(args[0]).find("redis-sentinel") != std::string::npos ||
+      std::find(args.begin() + 1, args.end(), "--sentinel") != args.end()) {
+    std::cerr << peadb::format_config_error(
+        "", "PeaDB has no Sentinel mode (compat/delta.md item 8); run Redis Sentinel itself");
+    return 1;
+  }
   std::string config_path;
-  if (argc >= 2 && argv[1][0] != '-') config_path = argv[1];
-  for (int i = 1; i < argc; ++i) {
-    if (std::string(argv[i]) == "--config" && i + 1 < argc) {
-      config_path = argv[i + 1];
+  for (std::size_t i = 1; i < args.size(); ++i) {
+    if (args[i] == "--config") {
+      if (i + 1 >= args.size()) {
+        std::cerr << peadb::format_config_error("", "--config needs a file name");
+        return 1;
+      }
+      config_path = args[i + 1];
+      args.erase(args.begin() + static_cast<std::ptrdiff_t>(i),
+                 args.begin() + static_cast<std::ptrdiff_t>(i) + 2);
       break;
     }
-    if (std::string(argv[i]) == "--help" || std::string(argv[i]) == "-h") {
-      std::cout << "Usage: peadb-server [<config-file>] [--port <port>] [--bind <ip>] [--loglevel <error|warn|info|debug>]\n"
-                   "                    [--dir <path>] [--dbfilename <file>] [--config <path>]\n"
-                   "                    [--requirepass <pass>] [--masterauth <pass>]\n"
-                   "                    [--protected-mode <yes|no>] [--enable-module-command <yes|no|local>]\n"
-                   "                    [--cluster-enabled <yes|no>] [--cluster-announce-ip <ip>]\n"
-                   "                    [--cluster-announce-port <port>] [--cluster-announce-bus-port <port>]\n";
-      return 0;
+  }
+  std::size_t first_option = 1;
+  if (args.size() >= 2 && !args[1].empty() && args[1][0] != '-') {
+    if (!config_path.empty()) {
+      std::cerr << peadb::format_config_error(
+          "", "two config files given: '" + args[1] + "' and --config '" + config_path + "'");
+      return 1;
     }
+    config_path = args[1];
+    first_option = 2;
+  }
+  bool config_from_stdin = false;
+  const std::string options =
+      peadb::config_options_from_argv(args, first_option, config_from_stdin);
+
+  peadb::ServerConfig config;
+  std::string config_error;
+  if (!peadb::load_server_config(config_path, config_from_stdin, options, config, config_error)) {
+    std::cerr << config_error;
+    if (config_error.empty() || config_error.back() != '\n') std::cerr << '\n';
+    return 1;
   }
 
-  // Start from file config (if any), then let CLI args override
-  peadb::ServerConfig config = config_path.empty() ? peadb::ServerConfig{}
-                                                    : peadb::load_config(config_path);
-
-  for (int i = (argc >= 2 && argv[1][0] != '-') ? 2 : 1; i < argc; ++i) {
-    const std::string arg = argv[i];
-    if (arg == "--config" && i + 1 < argc) { ++i; continue; } // already handled
-    if (arg == "--port" && i + 1 < argc) { config.port = std::stoi(argv[++i]); continue; }
-    if (arg == "--bind" && i + 1 < argc) { config.bind = argv[++i]; continue; }
-    if (arg == "--loglevel" && i + 1 < argc) { config.log_level = argv[++i]; continue; }
-    if (arg == "--dir" && i + 1 < argc) { config.dir = argv[++i]; continue; }
-    if (arg == "--dbfilename" && i + 1 < argc) { config.dbfilename = argv[++i]; continue; }
-    if (arg == "--requirepass" && i + 1 < argc) { config.requirepass = argv[++i]; continue; }
-    if (arg == "--masterauth" && i + 1 < argc) { config.masterauth = argv[++i]; continue; }
-    if (arg == "--protected-mode" && i + 1 < argc) { const std::string v = argv[++i]; config.protected_mode = (v == "yes" || v == "1" || v == "true"); continue; }
-    if (arg == "--enable-module-command" && i + 1 < argc) { config.enable_module_command = argv[++i]; continue; }
-    if (arg == "--maxmemory" && i + 1 < argc) { config.maxmemory = argv[++i]; continue; }
-    if (arg == "--maxmemory-policy" && i + 1 < argc) { config.maxmemory_policy = argv[++i]; continue; }
-    if (arg == "--maxmemory-samples" && i + 1 < argc) { config.maxmemory_samples = argv[++i]; continue; }
-    if (arg == "--timeout" && i + 1 < argc) { config.timeout = argv[++i]; continue; }
-    if (arg == "--tcp-backlog" && i + 1 < argc) { try { config.tcp_backlog = std::stoi(argv[++i]); } catch (...) {} continue; }
-    if (arg == "--client-output-buffer-limit" && i + 1 < argc) { config.client_output_buffer_limit = argv[++i]; continue; }
-    if (arg == "--save" && i + 1 < argc) { config.save = argv[++i]; continue; }
-    if (arg == "--appendonly" && i + 1 < argc) { const std::string v = argv[++i]; config.appendonly = (v == "yes" || v == "1" || v == "true"); continue; }
-    if (arg == "--appendfilename" && i + 1 < argc) { config.appendfilename = argv[++i]; continue; }
-    if (arg == "--appendfsync" && i + 1 < argc) { config.appendfsync = argv[++i]; continue; }
-    if (arg == "--repl-backlog-size" && i + 1 < argc) { config.repl_backlog_size = argv[++i]; continue; }
-    if (arg == "--cluster-enabled" && i + 1 < argc) { const std::string v = argv[++i]; config.cluster_enabled = (v == "yes" || v == "1" || v == "true"); continue; }
-    if (arg == "--cluster-announce-ip" && i + 1 < argc) { config.cluster_announce_ip = argv[++i]; continue; }
-    if (arg == "--cluster-announce-port" && i + 1 < argc) { config.cluster_announce_port = argv[++i]; continue; }
-    if (arg == "--cluster-announce-bus-port" && i + 1 < argc) { config.cluster_announce_bus_port = argv[++i]; continue; }
-  }
-
-  peadb::set_log_level(peadb::parse_log_level(config.log_level));
+  peadb::configure_log_level(config.log_level);
   // Startup log contract (relied on by the upstream Redis test harness): a line
   // containing " PID: <pid>", then "Server initialized", then "Ready to accept"
   // once the listeners are up (logged in run_server).
   peadb::log(peadb::LogLevel::Info,
              "PeaDB " PEADB_VERSION " starting, version 7.2.5-compat, PID: " +
                  std::to_string(getpid()));
+  for (const auto& w : config.warnings) peadb::log(peadb::LogLevel::Warn, w);
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
@@ -137,12 +153,23 @@ int main(int argc, char** argv) {
   peadb::configure_timeout(config.timeout);
   peadb::configure_tcp_backlog(config.tcp_backlog);
   peadb::configure_encoding_limits(config.raw);
+  peadb::configure_runtime_settings(config.raw);
   peadb::configure_client_output_buffer_limit(config.client_output_buffer_limit);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);
   peadb::configure_cluster(config.cluster_enabled, config.bind, config.port, config.cluster_announce_ip,
                            config.cluster_announce_port, config.cluster_announce_bus_port);
+  // Builds the command table, so every configure_* call that it depends on must come first.
+  {
+    std::vector<std::string> rename_warnings;
+    const std::string rename_error = peadb::validate_command_renames(rename_warnings);
+    if (!rename_error.empty()) {
+      std::cerr << rename_error;
+      return 1;
+    }
+    for (const auto& w : rename_warnings) peadb::log(peadb::LogLevel::Warn, w);
+  }
 
   // Cluster addressing hazard: PeaDB falls back to the static `bind` address when no
   // cluster-announce-ip is set, which is a documented simplification of Redis's live-connection

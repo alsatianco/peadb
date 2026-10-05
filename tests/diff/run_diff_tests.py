@@ -62,7 +62,13 @@ def main() -> int:
     commands = json.loads((root / args.case).read_text(encoding="utf-8"))
 
     redis = start_redis(root, args.redis_port)
-    peadb = start_peadb(root, args.peadb_port)
+    try:
+        peadb = start_peadb(root, args.peadb_port)
+    except BaseException:
+        # Without this, a PeaDB that fails to start leaves redis-server running on its port,
+        # and the integration runner's reaper only stops peadb-server processes.
+        redis.stop()
+        raise
 
     mismatches: list[str] = []
     repro_lines: list[str] = []

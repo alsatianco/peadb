@@ -98,43 +98,55 @@ The container exposes port `6379` (configurable via `PEADB_PORT`) and mounts a n
 
 ## Configuration
 
-PeaDB accepts Redis-style configuration via CLI flags or a config file — either redis-server style (`peadb-server /path/peadb.conf`, first positional argument) or `--config <path>` — using redis.conf `key value` syntax. CLI flags override config-file values.
+PeaDB reads its configuration the way `redis-server` 7.2.5 does: an optional config file as the first argument (`peadb-server /etc/redis/redis.conf`), then command-line options, where `--name value` means the same as a `name value` line and the last value wins (`peadb-server --port 6380 --save ""`). A lone `-` as the first or last argument reads the config from stdin, and PeaDB also accepts `--config <path>` as another way to name the file. Lines are split like Redis splits them (quotes and escapes work, and `#` starts a comment only at the start of a line, so `requirepass pass#word` keeps the `#`). Setting names and their old aliases (`slaveof`, `hash-max-ziplist-entries`, …) are Redis's own, `include` works (also with wildcards), and every value is checked the way Redis checks it.
 
-| Flag | Default | Description |
+PeaDB refuses to start, with Redis's error text and the line number, in the cases where Redis's config loader refuses: a config file that cannot be opened, a name Redis does not know, the wrong number of arguments (a `# note` after a value counts as extra arguments), unbalanced quotes, a value Redis rejects, a `logfile` that cannot be opened, `rename-command` with no target, and `rename-command` for a command that does not exist (or no longer exists after an earlier rename) or onto a name that is taken. It also refuses the Redis settings it cannot honour safely: `user` and `aclfile` (PeaDB has no ACL users), `loadmodule`, `replicaof`/`slaveof` other than `no one`, `masteruser`, `tls-port` other than 0, `tls-replication yes`, `tls-cluster yes`, `enable-debug-command no` or `local`, `bind` with more than one address, and `--sentinel`. These settings are judged on their final value, so a later line or option can undo an earlier one (`--bind 0.0.0.0` after the stock `bind 127.0.0.1 -::1` line starts). Every other Redis setting that PeaDB does not apply yet is accepted, and the log gets one warning for each, naming its last line ([`compat/delta.md`](compat/delta.md) item 24 lists them and the few checks Redis makes that PeaDB does not), unless the value is what PeaDB always does (for example `daemonize no` or `databases 16`).
+
+The settings PeaDB applies (each works as a config-file line and as a `--name` option):
+
+| Setting | Default | Description |
 |------|---------|-------------|
-| `--port` | `6379` | Listening port |
-| `--bind` | `127.0.0.1` | Bind address |
-| `--loglevel` | `info` | Log level (`error`, `warn`, `info`, `debug`) |
-| `--dir` | `.` | Data directory for snapshots and AOF |
-| `--dbfilename` | `dump.rdb` | RDB snapshot filename |
-| `--config` | — | Path to a config file |
-| `maxclients` | — | Maximum concurrent client connections (`CONFIG SET maxclients` is not enforced, delta item 25) |
-| `appendonly` | `false` | Enable AOF persistence |
-| `appendfilename` | `appendonly.aof` | AOF filename |
+| `port` | `6379` | Listening port; `0` opens no TCP listener (then `unixsocket` is needed), as in Redis |
+| `bind` | `127.0.0.1` | Bind address; PeaDB listens on one address only (delta item 69) |
+| `loglevel` | `notice` | `debug`, `verbose`, `notice`, `warning` or `nothing` |
+| `dir` | `.` | Data directory for snapshots and AOF; it must exist |
+| `dbfilename` | `dump.rdb` | RDB snapshot filename (a file name, not a path) |
+| `maxclients` | `10000` | Maximum concurrent client connections (`CONFIG SET maxclients` is not enforced, delta item 25) |
+| `appendonly` | `no` | Enable AOF persistence |
+| `appendfilename` | `appendonly.aof` | AOF filename (a file name, not a path) |
 | `appendfsync` | `everysec` | AOF fsync policy (`always` / `everysec` / `no`) |
-| `--requirepass` | — | Require clients to `AUTH` with this password (empty = open, like Redis) |
-| `--masterauth` | — | Password a replica sends to its master during sync |
-| `--protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
-| `--enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
-| `--maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `--maxmemory-policy`, else writes get `-OOM` — today every write, `DEL` included (delta item 39). The limit is checked against an estimate that is too low (delta item 38) |
-| `--maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
-| `--maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
-| `--timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
-| `--tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
-| `unixsocket` | — | Also listen on an AF_UNIX socket path (config-file key) |
-| `--save` | — | Save points, e.g. `"900 1 300 10"` (`""` disables); triggers `BGSAVE` + saves on `SHUTDOWN` (not on SIGTERM/SIGINT, delta item 33) |
-| `--client-output-buffer-limit` | Redis defaults | Per-class (`normal`/`slave`/`pubsub`) output-buffer limits; overflowing clients are disconnected |
-| `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax; config-file key or `CONFIG SET`) |
-| `rename-command` | — | Rename or disable a command (`rename-command FROM TO`; leave out `TO` to disable; config-file key). Unlike Redis, `rename-command FROM ""` renames the command to a literal `""` and does not disable it, and Redis refuses the form without `TO` (delta item 24) |
-| `--repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
-| `--cluster-enabled` | `no` | Enable cluster mode; startup-only, like Redis's `IMMUTABLE_CONFIG` — `CONFIG SET cluster-enabled` is refused |
-| `--cluster-announce-ip` | — | Address this node announces to peers/clients; empty falls back to `--bind` — a documented simplification of Redis's live-connection auto-detection (see `docs/decisions/p5-cluster-addressing-and-version-provenance.md`). With `--cluster-enabled yes`, the server refuses to start if this falls back to a wildcard (`0.0.0.0`, `::`, `*`, or empty) |
-| `--cluster-announce-port` | — | Port this node announces; empty falls back to `--port` |
-| `--cluster-announce-bus-port` | — | Cluster bus port this node announces; empty falls back to the announced port + 10000 |
+| `requirepass` | — | Require clients to `AUTH` with this password (empty = open, like Redis) |
+| `masterauth` | — | Password a replica sends to its master during sync |
+| `protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
+| `enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
+| `rename-command` | — | `rename-command FROM TO` renames a command; `rename-command FROM ""` removes it, as in Redis |
+| `include` | — | Read another config file at this point; a path with `*`, `?` or `[` is a wildcard, and one that matches nothing is skipped |
+| `maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `maxmemory-policy`, else writes get `-OOM` — today every write, `DEL` included (delta item 39). The limit is checked against an estimate that is too low (delta item 38) |
+| `maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
+| `maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
+| `timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
+| `tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
+| `unixsocket` | — | Also listen on an AF_UNIX socket path |
+| `unixsocketperm` | `0` | Octal file mode for the unix socket (e.g. `700`); `0` leaves the mode it was created with |
+| `save` | none | Save points, e.g. `save 900 1` (each line adds one; `save ""` clears them; `save 60 0` saves every 60 s); triggers `BGSAVE` + saves on `SHUTDOWN` (not on SIGTERM/SIGINT, delta item 33). With no `save` line Redis uses `3600 1 300 100 60 10000`, PeaDB uses none (delta item 2) |
+| `client-output-buffer-limit` | Redis defaults | Per-class (`normal`/`replica`/`pubsub`) output-buffer limits; overflowing clients are disconnected |
+| `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax) |
+| `repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
+| `min-replicas-to-write` | `0` | Refuse writes unless this many replicas are connected (`min-replicas-max-lag` is not applied) |
+| `replica-serve-stale-data` | `yes` | Whether a replica answers reads while its master link is down |
+| `busy-reply-threshold` (`lua-time-limit`) | `5000` | Milliseconds a script may run before other clients get `-BUSY` |
+| `lazyfree-lazy-server-del` | `no` | Propagate server-side deletes as `UNLINK` |
+| `stop-writes-on-bgsave-error` | `yes` | Refuse writes with `-MISCONF` after a failed background save |
+| `aof-load-truncated` | `yes` | Accept an AOF whose last command is cut short (delta item 30) |
+| `slowlog-log-slower-than`, `slowlog-max-len` | `10000`, `128` | `SLOWLOG` threshold (µs) and length |
+| `latency-monitor-threshold` | `0` (off) | `LATENCY` monitor threshold (ms) |
+| `hash-max-listpack-entries`, `hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`, `set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`, `zset-max-listpack-value` | Redis defaults | Encoding thresholds reported by `OBJECT ENCODING` |
+| `cluster-enabled` | `no` | Enable cluster mode; startup-only, like Redis's `IMMUTABLE_CONFIG` — `CONFIG SET cluster-enabled` is refused |
+| `cluster-announce-ip` | — | Address this node announces to peers/clients; empty falls back to `bind` — a documented simplification of Redis's live-connection auto-detection (see `docs/decisions/p5-cluster-addressing-and-version-provenance.md`). With `cluster-enabled yes`, the server refuses to start if this falls back to a wildcard (`0.0.0.0`, `::`, `*`, or empty) |
+| `cluster-announce-port` | — | Port this node announces; empty falls back to `port` |
+| `cluster-announce-bus-port` | — | Cluster bus port this node announces; empty falls back to the announced port + 10000 |
 
-`appendonly`, `appendfilename`, `appendfsync`, and `save` are also accepted as `--`-prefixed CLI flags (in addition to config-file keys); `maxclients`, `unixsocket`, `notify-keyspace-events`, and `rename-command` are config-file keys only.
-
-Recognized redis.conf keys are a subset of Redis's. Every other directive, and a missing config file, is accepted and ignored with no warning. This includes `user`, `aclfile`, `include` and every `tls-*` line, so a hardened redis.conf that sets its password with `user default on >…` starts PeaDB with **no password**, and a TLS config gives a plaintext server ([`compat/delta.md`](compat/delta.md) item 24). Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`). `CONFIG SET` answers `OK` for unknown names (item 23) and for some known ones that it does not apply, such as `appendonly`, `dir` and `maxclients` (item 25).
+Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`). `CONFIG SET` answers `OK` for unknown names (item 23) and for some known ones that it does not apply, such as `appendonly`, `dir` and `maxclients` (item 25).
 
 ## Supported Commands
 
@@ -238,7 +250,7 @@ Standard Redis clients connect to PeaDB unmodified. **No migration or rollback p
 
 Full detail — drop-in posture, tested clients, `redis.conf` support, migration & rollback steps, the feature-status table, persistence internals, and security/monitoring notes — lives in **[docs/compatibility.md](docs/compatibility.md)**. The authoritative, always-current gap registry is **[compat/delta.md](compat/delta.md)**.
 
-To report a security vulnerability privately, or to read the known security gaps (no TLS, no multi-user ACL, config-file ACL and TLS lines ignored, no Sentinel, cluster mode not production-safe) before you deploy, see **[SECURITY.md](SECURITY.md)**.
+To report a security vulnerability privately, or to read the known security gaps (no TLS, no multi-user ACL, no Sentinel, cluster mode not production-safe) before you deploy, see **[SECURITY.md](SECURITY.md)**.
 
 ## Documentation
 

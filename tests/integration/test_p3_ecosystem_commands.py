@@ -69,7 +69,7 @@ def main():
     binary = ROOT / "peadb-server"
     if not binary.exists():
         binary = ROOT / "build" / "peadb-server"
-    p = subprocess.Popen([str(binary), "--port", str(PORT), "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(binary), "--port", str(PORT), "--bind", "127.0.0.1", "--loglevel", "warning"])
     passed = failed = 0
     try:
         wait_until_ready(PORT)

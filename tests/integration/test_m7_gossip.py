@@ -42,9 +42,9 @@ def main():
  port_a, port_b = 6429, 6430
  announce_a, announce_b = '127.0.0.1', '127.0.0.1'
  p1=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port_a),'--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip',announce_a,'--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip',announce_a,'--loglevel','warning'])
  p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port_b),'--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip',announce_b,'--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip',announce_b,'--loglevel','warning'])
  try:
   wait_until_ready(port_a)
   wait_until_ready(port_b)

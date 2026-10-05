@@ -146,7 +146,7 @@ def repl_cmd(s):
 
 
 def main() -> int:
-    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6514", "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6514", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         time.sleep(0.25)
         with socket.create_connection(("127.0.0.1", 6514), timeout=2) as c, socket.create_connection(("127.0.0.1", 6514), timeout=2) as r:

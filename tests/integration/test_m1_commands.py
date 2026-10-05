@@ -78,7 +78,7 @@ def send_cmd(sock: socket.socket, *args: str):
 
 def main() -> int:
     server = ROOT / "peadb-server"
-    proc = subprocess.Popen([str(server), "--port", "6394", "--bind", "127.0.0.1", "--loglevel", "error"])
+    proc = subprocess.Popen([str(server), "--port", "6394", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         deadline = time.time() + 5
         while time.time() < deadline:

@@ -54,7 +54,7 @@ def measure(port, blkcmd, wakecmd, n=15):
 
 def test_blpop_wake_is_fast():
     port = 6590
-    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         expect(wait_up(port), "up")
         med, mx = measure(port, b"*3\r\n$5\r\nBLPOP\r\n$1\r\nk\r\n$1\r\n5\r\n",
@@ -67,7 +67,7 @@ def test_blpop_wake_is_fast():
 
 def test_bzpopmin_via_zadd_wake_is_fast():
     port = 6591
-    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         expect(wait_up(port), "up")
         # cross-type: a ZADD must wake a blocked BZPOPMIN (not just LPUSH waking BLPOP)

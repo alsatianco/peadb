@@ -9,7 +9,7 @@ services:
     volumes:
       - peadb-data:/data
     environment:
-      - PEADB_LOGLEVEL=${PEADB_LOGLEVEL:-info}
+      - PEADB_LOGLEVEL=${PEADB_LOGLEVEL:-notice}
     ulimits:
       nofile:
         soft: ${PEADB_NOFILE_SOFT:-65536}
@@ -22,7 +22,7 @@ services:
     # over the published port. For production set PEADB_REQUIREPASS (and leave protected-mode
     # on) — an unauthenticated server must not be exposed to an untrusted network.
     command: ["--port", "6379", "--bind", "0.0.0.0", "--dir", "/data",
-              "--loglevel", "${PEADB_LOGLEVEL:-info}",
+              "--loglevel", "${PEADB_LOGLEVEL:-notice}",
               "--protected-mode", "${PEADB_PROTECTED_MODE:-no}",
               "--requirepass", "${PEADB_REQUIREPASS:-}"]
     healthcheck:

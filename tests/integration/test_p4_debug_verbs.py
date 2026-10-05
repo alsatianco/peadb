@@ -65,7 +65,7 @@ def cmd(s, *a):
 def main():
     workdir = tempfile.mkdtemp(prefix="peadb-debug-test-")
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", str(PORT),
-                          "--bind", "127.0.0.1", "--loglevel", "error",
+                          "--bind", "127.0.0.1", "--loglevel", "warning",
                           "--dir", workdir, "--appendonly", "yes"])
     try:
         wait_until_ready(PORT)

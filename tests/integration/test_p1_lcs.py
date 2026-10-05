@@ -68,7 +68,7 @@ def to_dict(arr):
 
 
 def main():
-    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6478", "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6478", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         wait_until_ready(6478)
         with socket.create_connection(("127.0.0.1", 6478), timeout=2) as s:

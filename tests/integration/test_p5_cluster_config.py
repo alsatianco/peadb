@@ -47,7 +47,7 @@ def case_config_surface():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6305','--bind','127.0.0.1',
                      '--cluster-enabled','yes','--cluster-announce-ip','10.9.8.7',
                      '--cluster-announce-port','7100','--cluster-announce-bus-port','17100',
-                     '--loglevel','error'])
+                     '--loglevel','warning'])
  try:
   wait_until_ready(6305)
   with socket.create_connection(('127.0.0.1',6305),timeout=5) as s:
@@ -78,7 +78,7 @@ def case_config_surface():
 def case_standalone_redis_mode():
  # No --cluster-enabled at all: redis_mode and cluster_enabled must both read as disabled,
  # matching pre-existing standalone behaviour (they must not drift apart from each other).
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6306','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6306','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6306)
   with socket.create_connection(('127.0.0.1',6306),timeout=5) as s:
@@ -93,7 +93,7 @@ def case_wildcard_announce_refused():
  # CONTROLLER ADDENDUM 1: cluster-enabled yes + a wildcard bind + no explicit cluster-announce-ip
  # must refuse to start rather than announce an address (0.0.0.0) that no peer can dial.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6307','--bind','0.0.0.0',
-                     '--cluster-enabled','yes','--loglevel','error'],
+                     '--cluster-enabled','yes','--loglevel','warning'],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
  try:
   try:
@@ -117,7 +117,7 @@ def case_explicit_wildcard_announce_ip_refused():
  # resolved announced host unconditionally.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6308','--bind','127.0.0.1',
                      '--cluster-enabled','yes','--cluster-announce-ip','0.0.0.0',
-                     '--loglevel','error'],
+                     '--loglevel','warning'],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
  try:
   try:
@@ -138,7 +138,7 @@ def case_config_set_announce_ip_rejects_wildcard():
  # CONFIG SET cluster-announce-ip used to accept any string while the two port parameters
  # beside it were range-checked. Reject the same wildcard forms the startup guard refuses.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6309','--bind','127.0.0.1',
-                     '--cluster-enabled','yes','--loglevel','error'])
+                     '--cluster-enabled','yes','--loglevel','warning'])
  try:
   wait_until_ready(6309)
   with socket.create_connection(('127.0.0.1',6309),timeout=5) as s:
@@ -186,7 +186,7 @@ def case_config_set_announce_ip_empty_rejected_when_bind_is_wildcard():
  # standing between the announced host and that wildcard bind. Emptying it must be refused.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6311','--bind','0.0.0.0',
                      '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
-                     '--loglevel','error'])
+                     '--loglevel','warning'])
  try:
   wait_until_ready(6311)
   with socket.create_connection(('127.0.0.1',6311),timeout=5) as s:
@@ -204,7 +204,7 @@ def case_wildcard_bind_with_explicit_announce_ip_starts():
  # the operator's own configuration, so the server must start normally.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6312','--bind','0.0.0.0',
                      '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
-                     '--loglevel','error'])
+                     '--loglevel','warning'])
  try:
   wait_until_ready(6312)
   with socket.create_connection(('127.0.0.1',6312),timeout=5) as s:
@@ -231,7 +231,7 @@ def case_announce_reregisters_after_cluster_touch():
  # (ensure_self_registered()) — CONFIG GET would show the new value while CLUSTER
  # NODES/SLOTS kept the old host/port/id. Order 1: touch CLUSTER first, then CONFIG SET.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6313','--bind','127.0.0.1',
-                     '--cluster-enabled','yes','--loglevel','error'])
+                     '--cluster-enabled','yes','--loglevel','warning'])
  try:
   wait_until_ready(6313)
   with socket.create_connection(('127.0.0.1',6313),timeout=5) as s:
@@ -255,7 +255,7 @@ def case_announce_reregisters_before_cluster_touch():
  # exist yet. The first CLUSTER call must build it from the already-updated settings, not
  # from whatever was live at startup.
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6314','--bind','127.0.0.1',
-                     '--cluster-enabled','yes','--loglevel','error'])
+                     '--cluster-enabled','yes','--loglevel','warning'])
  try:
   wait_until_ready(6314)
   with socket.create_connection(('127.0.0.1',6314),timeout=5) as s:

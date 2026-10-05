@@ -42,9 +42,9 @@ def main():
  # actual peer to point at rather than the old fictitious "remote" token, and the whole
  # CLUSTER command is gated on --cluster-enabled (cluster.c:5888-5891).
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6428','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  peer=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6567','--bind','127.0.0.1',
-   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','error'])
+   '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6428)
   wait_until_ready(6567)

@@ -135,7 +135,7 @@ def check_resp2_bulk_not_verbatim(s, *args):
 def main():
     p = subprocess.Popen([
         str(ROOT / "peadb-server"), "--port", str(PORT), "--bind", "127.0.0.1",
-        "--cluster-enabled", "yes", "--loglevel", "error",
+        "--cluster-enabled", "yes", "--loglevel", "warning",
     ])
     try:
         wait_until_ready(PORT)

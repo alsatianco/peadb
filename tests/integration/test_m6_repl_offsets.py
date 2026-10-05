@@ -45,7 +45,7 @@ def get_off(info):
  return int(m.group(1)) if m else None
 
 def main():
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6420','--bind','127.0.0.1','--loglevel','error'])
+ p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6420','--bind','127.0.0.1','--loglevel','warning'])
  try:
   wait_until_ready(6420)
   with socket.create_connection(('127.0.0.1',6420),timeout=2) as s:

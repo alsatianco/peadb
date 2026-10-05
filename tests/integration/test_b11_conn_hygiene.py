@@ -88,7 +88,7 @@ def is_closed(s):
 
 def test_timeout_config_roundtrip():
     port = 6580
-    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "error"])
+    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         expect(wait_up(port), "up")
         s = conn(port)
@@ -103,7 +103,7 @@ def test_timeout_config_roundtrip():
 def test_idle_reaped_active_survives():
     port = 6581
     p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                          "--loglevel", "error", "--timeout", "2"])
+                          "--loglevel", "warning", "--timeout", "2"])
     try:
         expect(wait_up(port), "up")
         idle = conn(port); active = conn(port)
@@ -124,7 +124,7 @@ def test_idle_reaped_active_survives():
 def test_subscriber_exempt():
     port = 6582
     p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                          "--loglevel", "error", "--timeout", "2"])
+                          "--loglevel", "warning", "--timeout", "2"])
     try:
         expect(wait_up(port), "up")
         sub = conn(port)
