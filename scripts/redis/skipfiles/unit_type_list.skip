@@ -1,9 +1,3 @@
-# When a key with an already-elapsed TTL is moved into place (SWAPDB) or created inside
-# a MULTI while a client blocks on it, Redis propagates a DEL for the lazily-expired key.
-# PeaDB's blocked-client wakeup path doesn't yet emit that DEL (expiry-propagation track,
-# compat/delta.md item 15).
-SWAPDB wants to wake blocked client, but the key already expired
-MULTI + LPUSH + EXPIRE + DEBUG SLEEP on blocked client, key already expired
 # Byte-exact listpack<->quicklist encoding-transition labels depend on the real
 # listpack layout; PeaDB approximates OBJECT ENCODING over hashtable/deque storage
 # (compat/delta.md item 13). List operations themselves are correct.

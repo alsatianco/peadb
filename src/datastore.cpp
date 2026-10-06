@@ -160,7 +160,7 @@ std::optional<std::int64_t> stream_cg_lag(const Entry::StreamT& st, const Entry:
 }
 }  // namespace
 
-DataStore::DataStore() : current_db_(0), dbs_(16), hidden_expired_(16) {}
+DataStore::DataStore() : current_db_(0), dbs_(16), hidden_expired_(16), replica_hidden_(16) {}
 
 bool DataStore::select_db(int db_index) {
   if (db_index < 0 || db_index >= static_cast<int>(dbs_.size())) return false;
@@ -187,19 +187,63 @@ void DataStore::unfreeze_time() {
 }
 
 DataStore::DB::iterator DataStore::remove_expired(DB& db, DB::iterator it) {
-  if (!expire_paused_) {
-    record_expired();
-    return db.erase(it);
-  }
   const auto next = std::next(it);
-  hidden_expired_[db_index_of(db)].insert(db.extract(it));
+  const std::size_t dbi = db_index_of(db);
+  if (replica_expiry_) {
+    replica_hidden_[dbi].insert(db.extract(it));
+    has_replica_hidden_ = true;
+    return next;
+  }
+  if (expire_paused_) {
+    hidden_expired_[dbi].insert(db.extract(it));
+    return next;
+  }
+  record_expired();
+  if (!lazy_expire_hook_) {
+    db.erase(it);
+    return next;
+  }
+  const std::string key = it->first;
+  db.erase(it);
+  lazy_expire_hook_(static_cast<int>(dbi), key);
   return next;
+}
+
+void DataStore::expire_met_keys(DB& db, const std::vector<std::string>& keys) {
+  if (replica_expiry_) return;  // a replica deletes nothing; the walk already skipped them
+  for (const auto& key : keys) expire_if_needed(db, key);
+}
+
+void DataStore::set_replica_expiry(bool replica) {
+  if (replica_expiry_ && !replica) restore_hidden_expired();
+  replica_expiry_ = replica;
+}
+
+void DataStore::restore_replica_hidden() {
+  has_replica_hidden_ = false;
+  for (std::size_t i = 0; i < dbs_.size(); ++i) {
+    auto& hidden = replica_hidden_[i];
+    while (!hidden.empty()) {
+      auto node = hidden.extract(hidden.begin());
+      if (dbs_[i].find(node.key()) == dbs_[i].end()) dbs_[i].insert(std::move(node));
+    }
+  }
+}
+
+std::optional<ValueType> DataStore::live_type(const std::string& key) const {
+  const auto& db = dbs_[current_db_];
+  const auto it = db.find(key);
+  if (it == db.end() || logically_expired(it->second)) return std::nullopt;
+  return it->second.type();
 }
 
 void DataStore::set_expire_paused(bool paused) {
   if (paused == expire_paused_) return;
   expire_paused_ = paused;
-  if (paused) return;
+  if (!paused) restore_paused_hidden();
+}
+
+void DataStore::restore_paused_hidden() {
   for (std::size_t i = 0; i < dbs_.size(); ++i) {
     auto& hidden = hidden_expired_[i];
     while (!hidden.empty()) {
@@ -213,9 +257,7 @@ void DataStore::set_expire_paused(bool paused) {
 
 bool DataStore::expire_if_needed(DB& db, const std::string& key) {
   const auto it = db.find(key);
-  if (it == db.end()) return false;
-  if (!it->second.expire_at_ms.has_value()) return false;
-  if (*it->second.expire_at_ms > now_ms()) return false;
+  if (it == db.end() || !logically_expired(it->second)) return false;
   remove_expired(db, it);
   return true;
 }
@@ -224,12 +266,32 @@ std::optional<std::string> DataStore::get(const std::string& key) {
   auto& db = dbs_[current_db_];
   auto it = db.find(key);
   if (it == db.end()) { record_miss(); return std::nullopt; }
-  if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now_ms()) {
+  if (logically_expired(it->second)) {
     remove_expired(db, it);
     record_miss();
     return std::nullopt;
   }
   record_hit();
+  return it->second.str();
+}
+
+std::optional<std::string> DataStore::get_string(const std::string& key, bool& wrongtype) {
+  wrongtype = false;
+  auto& db = dbs_[current_db_];
+  auto it = db.find(key);
+  if (it != db.end() && logically_expired(it->second)) {
+    remove_expired(db, it);
+    it = db.end();
+  }
+  if (it == db.end()) {
+    record_miss();
+    return std::nullopt;
+  }
+  record_hit();
+  if (it->second.type() != ValueType::String) {
+    wrongtype = true;
+    return std::nullopt;
+  }
   return it->second.str();
 }
 
@@ -312,13 +374,6 @@ std::string DataStore::type_of(const std::string& key) {
 bool DataStore::is_wrongtype_for_string(const std::string& key) {
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
-  auto it = db.find(key);
-  if (it == db.end()) return false;
-  return it->second.type() != ValueType::String;
-}
-
-bool DataStore::is_wrongtype_for_string_noexpire(const std::string& key) {
-  auto& db = dbs_[current_db_];
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::String;
@@ -414,31 +469,17 @@ bool DataStore::persist(const std::string& key) {
 
 std::vector<std::string> DataStore::keys(const std::string& pattern) {
   std::vector<std::string> out;
-  auto& db = dbs_[current_db_];
-  for (auto it = db.begin(); it != db.end();) {
-    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now_ms()) {
-      it = remove_expired(db, it);
-      continue;
-    }
-    if (fnmatch(pattern.c_str(), it->first.c_str(), 0) == 0) {
-      out.push_back(it->first);
-    }
-    ++it;
+  const auto& db = dbs_[current_db_];
+  const auto now = now_ms();
+  for (const auto& [key, e] : db) {
+    if (logically_expired(e, now)) continue;
+    if (fnmatch(pattern.c_str(), key.c_str(), 0) == 0) out.push_back(key);
   }
   return out;
 }
 
 void DataStore::for_each_key(const std::function<void(const std::string&)>& fn) {
-  auto& db = dbs_[current_db_];
-  const auto now = now_ms();
-  for (auto it = db.begin(); it != db.end();) {
-    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
-      it = remove_expired(db, it);
-      continue;
-    }
-    fn(it->first);
-    ++it;
-  }
+  for (const auto& [key, e] : dbs_[current_db_]) fn(key);
 }
 
 std::optional<std::string> DataStore::randomkey() {
@@ -447,16 +488,26 @@ std::optional<std::string> DataStore::randomkey() {
   static thread_local std::mt19937 rng{std::random_device{}()};
   const auto now = now_ms();
   const std::size_t num_buckets = db.bucket_count();
-  // Pick a random starting bucket and walk forward — O(1/load_factor) amortised
+  // Pick a random starting bucket and walk forward — O(1/load_factor) amortised. The expired keys
+  // met before the first live one are deleted after the walk, as dbRandomKey() deletes each
+  // expired key it picks (a replica keeps them, and only remembers the first one).
   const std::size_t start = rng() % num_buckets;
-  for (std::size_t i = 0; i < num_buckets; ++i) {
+  std::vector<std::string> expired;
+  std::optional<std::string> found;
+  for (std::size_t i = 0; i < num_buckets && !found; ++i) {
     const std::size_t bucket = (start + i) % num_buckets;
     for (auto it = db.begin(bucket); it != db.end(bucket); ++it) {
-      if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
-      return it->first;
+      if (!logically_expired(it->second, now)) {
+        found = it->first;
+        break;
+      }
+      if (!replica_expiry_ || expired.empty()) expired.push_back(it->first);
     }
   }
-  return std::nullopt;
+  // Every key of a replica's database has expired: Redis's dbRandomKey() then returns one of them.
+  if (!found && replica_expiry_ && !expired.empty()) return expired.front();
+  expire_met_keys(db, expired);
+  return found;
 }
 
 bool DataStore::rename(const std::string& src, const std::string& dst, bool nx_only) {
@@ -476,6 +527,7 @@ bool DataStore::swapdb(int a, int b) {
   if (a == b) return true;
   std::swap(dbs_[a], dbs_[b]);
   std::swap(hidden_expired_[a], hidden_expired_[b]);
+  std::swap(replica_hidden_[a], replica_hidden_[b]);
   return true;
 }
 
@@ -2805,7 +2857,7 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
       for (auto it = db.begin(bucket); it != db.end(bucket) && collected < samples; ++it) {
         const Entry& e = it->second;
         const bool has_ttl = e.expire_at_ms.has_value();
-        if (has_ttl && *e.expire_at_ms <= now) continue;  // already logically expired
+        if (logically_expired(e, now)) continue;
         if (volatile_only && !has_ttl) continue;
         Cand c{static_cast<int>((db_start + di) % ndb), it->first, e.lru,
                has_ttl ? *e.expire_at_ms : std::numeric_limits<std::int64_t>::max()};
@@ -2834,8 +2886,10 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
 std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() const {
   const auto& db = dbs_[current_db_];
   const auto now = now_ms();
-  // Keys hidden while expiry is paused are still in Redis's dict, so they count (with a TTL of 0).
-  std::size_t total = hidden_expired_[current_db_].size(), with_expiry = total;
+  // Keys hidden while expiry is paused, or by a replica's command, are still in Redis's dict, so
+  // they count (with a TTL of 0).
+  std::size_t total = hidden_expired_[current_db_].size() + replica_hidden_[current_db_].size();
+  std::size_t with_expiry = total;
   std::int64_t ttl_sum = 0;
   for (const auto& [k, e] : db) {
     ++total;
@@ -3059,15 +3113,27 @@ std::string entry_digest_payload(const Entry& e) {
 }
 }  // namespace
 
+namespace {
+std::string entry_digest(const Entry& e) {
+  std::ostringstream out;
+  out << std::hex << std::hash<std::string>{}(entry_digest_payload(e));
+  return out.str();
+}
+}  // namespace
+
 std::optional<std::string> DataStore::debug_digest_value(const std::string& key) {
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  const auto h = std::hash<std::string>{}(entry_digest_payload(it->second));
-  std::ostringstream out;
-  out << std::hex << h;
-  return out.str();
+  return entry_digest(it->second);
+}
+
+std::optional<std::string> DataStore::watch_digest(const std::string& key) const {
+  const auto& db = dbs_[current_db_];
+  const auto it = db.find(key);
+  if (it == db.end() || logically_expired(it->second)) return std::nullopt;
+  return entry_digest(it->second);
 }
 
 bool DataStore::key_exists_raw(const std::string& key) const {
@@ -3084,7 +3150,7 @@ std::string DataStore::debug_digest() {
   const auto now = now_ms();
   for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
     for (const auto& [key, e] : dbs_[dbi]) {
-      if (e.expire_at_ms.has_value() && *e.expire_at_ms <= now) continue;  // lazily expired
+      if (logically_expired(e, now)) continue;
       const auto payload = std::to_string(dbi) + "|" + key + "|" + entry_digest_payload(e);
       acc ^= std::hash<std::string>{}(payload);
     }
@@ -3121,13 +3187,10 @@ std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::siz
       // Collect expired keys in this bucket, then erase by key (local_iterator can't be passed to erase)
       std::vector<std::string> to_del;
       for (auto it = db.begin(bucket); it != db.end(bucket) && scanned < budget_per_db; ++it, ++scanned) {
-        if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
-          to_del.push_back(it->first);
-        }
+        if (logically_expired(it->second, now)) to_del.push_back(it->first);
       }
       for (const auto& k : to_del) {
-        db.erase(k);
-        record_expired();
+        remove_expired(db, db.find(k));
         expired.emplace_back(static_cast<int>(dbi), k);
       }
       bucket = (bucket + 1) % num_buckets;
@@ -3139,11 +3202,13 @@ std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::siz
 void DataStore::flushall() {
   for (auto& db : dbs_) db.clear();
   for (auto& hidden : hidden_expired_) hidden.clear();
+  for (auto& hidden : replica_hidden_) hidden.clear();
 }
 
 void DataStore::flushdb() {
   dbs_[current_db_].clear();
   hidden_expired_[current_db_].clear();
+  replica_hidden_[current_db_].clear();
 }
 
 // ── Lazyfree (background destruction of detached data) ──
@@ -3222,6 +3287,7 @@ void DataStore::flushdb_async() {
   std::swap(tmp, dbs_[current_db_]);   // O(1): live db becomes empty immediately
   lazyfree_enqueue(std::move(tmp));
   hidden_expired_[current_db_].clear();
+  replica_hidden_[current_db_].clear();
 }
 
 void DataStore::flushall_async() {
@@ -3231,10 +3297,12 @@ void DataStore::flushall_async() {
     lazyfree_enqueue(std::move(tmp));
   }
   for (auto& hidden : hidden_expired_) hidden.clear();
+  for (auto& hidden : replica_hidden_) hidden.clear();
 }
 
 std::size_t DataStore::dbsize() {
-  return dbs_[current_db_].size() + hidden_expired_[current_db_].size();
+  return dbs_[current_db_].size() + hidden_expired_[current_db_].size() +
+         replica_hidden_[current_db_].size();
 }
 
 namespace {
@@ -3274,10 +3342,16 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
 
   const bool is_pow2 = (num_buckets & (num_buckets - 1)) == 0;
 
+  // Redis's scanGenericCommand(): of the keys a call visits that match the pattern, the expired
+  // ones are deleted (whatever TYPE asks for), after the walk so no bucket iterator is invalidated.
+  std::vector<std::string> expired;
   auto emit_bucket = [&](std::uint64_t b) {
     for (auto it = db.begin(b); it != db.end(b); ++it) {
-      if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) continue;
       if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
+      if (logically_expired(it->second, now)) {
+        expired.push_back(it->first);
+        continue;
+      }
       if (!type.empty()) {
         std::string entry_type;
         switch (it->second.type()) {
@@ -3307,6 +3381,7 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
       ++b;
       if (out.size() >= count) break;
     }
+    expire_met_keys(db, expired);  // erase never rehashes, so the cursor stays valid
     return {(b >= num_buckets) ? 0 : b, out};
   }
 
@@ -3323,37 +3398,8 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
   }
 
   const std::uint64_t next = (buckets_visited >= num_buckets) ? 0 : bucket;
+  expire_met_keys(db, expired);
   return {next, out};
-}
-
-std::vector<std::string> DataStore::collect_expired_keys() {
-  std::vector<std::string> out;
-  // While expiry is paused nothing is deleted; SCAN and RANDOMKEY skip expired keys themselves.
-  if (expire_paused_) return out;
-  auto& db = dbs_[current_db_];
-  const auto now = now_ms();
-  for (auto it = db.begin(); it != db.end();) {
-    if (it->second.expire_at_ms.has_value() && *it->second.expire_at_ms <= now) {
-      out.push_back(it->first);
-      it = remove_expired(db, it);
-    } else {
-      ++it;
-    }
-  }
-  return out;
-}
-
-bool DataStore::lazy_expire_key(const std::string& key) {
-  auto& db = dbs_[current_db_];
-  auto it = db.find(key);
-  if (it == db.end()) return false;
-  if (!it->second.expire_at_ms.has_value()) return false;
-  if (*it->second.expire_at_ms > now_ms()) return false;
-  // Deleted and counted in expired_keys, as Redis counts a lazy expiry; or, while expiry is
-  // paused, hidden, so there is no DEL to propagate.
-  const bool deleted = !expire_paused_;
-  remove_expired(db, it);
-  return deleted;
 }
 
 DataStore& store() {

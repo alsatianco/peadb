@@ -197,6 +197,13 @@ std::int64_t g_dirty_at_last_save = 0;         // mutation_epoch when the last g
 std::int64_t g_dirty_before_bgsave = 0;        // mutation_epoch when the running BGSAVE forked
 bool g_stop_writes_on_bgsave_error = true;
 std::string g_replication_role = "master";
+// Redis's checkAlreadyExpired(): an expire time that has passed deletes the key at once (EXPIRE
+// and friends, GETEX EXAT/PXAT), propagated as DEL with a `del` event; but never while the AOF
+// loads or the master's stream applies, where the key keeps its past expire time and waits for
+// the active cycle or its master's DEL.
+bool already_expired(std::int64_t when_ms) {
+  return when_ms <= DataStore::now_ms() && !g_replaying_aof && g_replication_role != "slave";
+}
 std::string g_replication_master_host = "";
 int g_replication_master_port = 0;
 int g_server_port = 6379;
@@ -720,6 +727,7 @@ pid_t fork_child() {
   if (pid == 0) {
     log_in_forked_child();
     if (g_close_sockets_in_child_cb) g_close_sockets_in_child_cb();
+    store().set_lazy_expire_hook(nullptr);  // a child's deletions are its own; nothing propagates
   }
   return pid;
 }
@@ -990,6 +998,13 @@ void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::
   };
   auto it = m.find(cmd);
   if (it == m.end()) return;
+  if (it->second.second == "expire" && args.size() >= 2 && !store().key_exists_raw(args[1])) {
+    // An expire time in the past deleted the key (already_expired()), as Redis's
+    // expireGenericCommand() does, with a `del` event; a missing key replies 0 and sends nothing.
+    if (reply != nullptr && reply->rfind(":1\r\n", 0) == 0)
+      notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], db);
+    return;
+  }
   if (first_key > 0 && static_cast<std::size_t>(first_key) < args.size())
     notify_keyspace_event(it->second.first, it->second.second, args[static_cast<std::size_t>(first_key)], db);
   if (cmd == "RENAME" && args.size() >= 3)
@@ -1696,8 +1711,12 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     return store().pexpiretime(key);
   };
 
+  // Redis propagates EXPIRE and GETEX only when they changed the key: an EXPIRE answered 0 and a
+  // GETEX answered nil (a missing or expired key, whose own DEL is already queued) send nothing.
+  const bool unchanged =
+      reply_ptr != nullptr && (*reply_ptr == ":0\r\n" || *reply_ptr == "$-1\r\n");
   if (cmd == "GETEX") {
-    if (args.size() == 2) {
+    if (args.size() == 2 || unchanged) {
       emit = false;
     } else if (upper(args[2]) == "PERSIST") {
       if (key_exists(args[1])) out = {"PERSIST", args[1]};
@@ -1796,7 +1815,8 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     if (abs >= 0) out = {"SET", args[1], args[3], "PXAT", std::to_string(abs)};
   } else if ((cmd == "EXPIRE" || cmd == "PEXPIRE" || cmd == "EXPIREAT" || cmd == "PEXPIREAT") && args.size() >= 3) {
     const auto abs = abs_ttl(args[1]);
-    if (abs == -2) out = {"DEL", args[1]};
+    if (unchanged) emit = false;
+    else if (abs == -2) out = {"DEL", args[1]};
     else if (abs >= 0) out = {"PEXPIREAT", args[1], std::to_string(abs)};
     else emit = false;
   } else if (cmd == "RESTORE" && args.size() >= 4) {
@@ -1961,7 +1981,7 @@ void also_propagate(int db, std::vector<std::string> argv, int target, bool last
 // Redis's propagatePendingCommands(), run when the outermost execution unit ends. `top_args` is
 // the command that started the unit: SCAN and RANDOMKEY (CMD_TOUCHES_ARBITRARY_KEYS) send the
 // DELs of the expired keys they meet without MULTI/EXEC, because those keys are not one unit.
-void propagate_pending_commands(const std::vector<std::string>* top_args) {
+void propagate_pending_commands(const std::vector<std::string>* top_args, bool may_wrap) {
   if (g_also_propagate.empty()) return;
   if (g_also_propagate.size() == 1) {  // most commands: no transaction, nothing to gather
     const PendingPropagation& op = g_also_propagate.front();
@@ -1969,8 +1989,8 @@ void propagate_pending_commands(const std::vector<std::string>* top_args) {
     g_also_propagate.clear();
     return;
   }
-  const bool transaction =
-      !(top_args != nullptr && (redis_command_flags(*top_args) & kRedisCmdTouchesArbitraryKeys));
+  const bool transaction = may_wrap && !(top_args != nullptr && (redis_command_flags(*top_args) &
+                                                                  kRedisCmdTouchesArbitraryKeys));
   static const std::string kMulti = encode_command_resp({"MULTI"});
   static const std::string kExec = encode_command_resp({"EXEC"});
   constexpr int kBoth = kPropagateAof | kPropagateRepl;
@@ -1990,13 +2010,18 @@ void propagate_pending_commands(const std::vector<std::string>* top_args) {
 // the outermost unit ends, before its reply goes out.
 class ExecutionUnit {
  public:
-  explicit ExecutionUnit(const std::vector<std::string>* args) : args_(args) {
+  // `may_wrap` false: the writes go out together but each on its own, never in MULTI/EXEC (the
+  // active expiry cycle, as Redis's activeExpireCycle() propagates its DELs).
+  explicit ExecutionUnit(const std::vector<std::string>* args, bool may_wrap = true)
+      : args_(args), may_wrap_(may_wrap) {
     ++g_execution_nesting;
   }
   ~ExecutionUnit() {
-    if (--g_execution_nesting != 0 || g_also_propagate.empty()) return;
+    if (--g_execution_nesting != 0) return;
+    store().restore_hidden_expired();  // a replica keeps expired keys until its master's DEL
+    if (g_also_propagate.empty()) return;
     try {
-      propagate_pending_commands(args_);
+      propagate_pending_commands(args_, may_wrap_);
     } catch (const std::exception& e) {
       log(LogLevel::Warn, std::string("Failed to propagate the writes of a command: ") + e.what());
       g_also_propagate.clear();
@@ -2007,6 +2032,7 @@ class ExecutionUnit {
 
  private:
   const std::vector<std::string>* args_;
+  bool may_wrap_;
 };
 
 // A write a command made (Redis's call() → alsoPropagate()), as replicas and the AOF must run it
@@ -2022,16 +2048,23 @@ void propagate_write(const std::vector<std::string>& args, const SessionState& s
     if (target == 0) return;
   }
   std::vector<std::string> out;
-  if (!canonicalize_propagated_command(args, reply_ptr, out)) return;
+  {
+    // Its lookups only read back what the command did (Redis rewrites the command's argv), so
+    // they must not delete a key the command left with a past expire time (SET ... PXAT <past>).
+    const DataStore::LazyExpireDisabled no_lazy_expire(store());
+    if (!canonicalize_propagated_command(args, reply_ptr, out)) return;
+  }
   also_propagate(session.db_index, std::move(out), target, last_of_unit);
 }
 
-void append_lazy_expire_dels(const SessionState& session) {
-  const auto expired = store().collect_expired_keys();
-  for (const auto& key : expired) {
-    propagate_write({"DEL", key}, session, nullptr, kPropagateRepl);
-    notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, session.db_index);
-  }
+// Redis's deleteExpiredKeyAndPropagate() and propagateDeletion(), called by DataStore for each key
+// a master deletes because its TTL has passed (a lookup, SCAN, RANDOMKEY or the active cycle): the
+// DEL goes to the AOF and to the replicas whatever redis.set_repl() says (not through
+// propagate_write()), inside the open execution unit, so a write that meets an expired key goes out
+// as MULTI, DEL, the write, EXEC; then the `expired` event.
+void propagate_lazy_expire(int db, const std::string& key) {
+  also_propagate(db, {"DEL", key}, kPropagateAof | kPropagateRepl);
+  notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, db);
 }
 
 // fsync the parent directory of `path`. Required after an atomic rename to
@@ -4743,7 +4776,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (session.in_multi) return encode_error("WATCH inside MULTI is not allowed");
           session.watched_epoch = store().mutation_epoch();
           for (std::size_t i = 1; i < args.size(); ++i) {
-            session.watched_digests[args[i]] = store().debug_digest_value(args[i]);
+            session.watched_digests[args[i]] = store().watch_digest(args[i]);
           }
           return encode_simple("OK");
         }});
@@ -4769,7 +4802,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (!session.watched_digests.empty()) {
             bool changed = false;
             for (const auto& [key, digest] : session.watched_digests) {
-              if (store().debug_digest_value(key) != digest) {
+              if (store().watch_digest(key) != digest) {
                 changed = true;
                 break;
               }
@@ -5467,6 +5500,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             drop_queued_replica_commands();  // nothing from the old master runs after this
             const bool was_replica = g_replication_role == "slave";
             g_replication_role = "master";
+            store().set_replica_expiry(false);  // a master deletes expired keys and sends their DEL
             g_replication_master_host.clear();
             g_replication_master_port = 0;
             g_replica_stale = false;
@@ -5486,6 +5520,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           g_replication_master_host = host;
           g_replication_master_port = static_cast<int>(p);
           g_replication_role = "slave";
+          store().set_replica_expiry(true);  // a replica keeps expired keys until its master's DEL
           g_replica_stale = true;
           const std::uint64_t gen = g_repl_generation.fetch_add(1) + 1;
           drop_queued_replica_commands();  // nothing from the old master runs after this
@@ -5675,7 +5710,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             // real keyspace, exactly as the brief requires: no caching, no estimate. Unlike
             // store().keys("*"), for_each_key() hands out each key by reference instead of
             // building a vector copy of the whole keyspace first, so this is a single O(N)
-            // pass with no allocation instead of "materialise N strings, then scan them".
+            // pass with no allocation instead of "materialise N strings, then scan them". Like
+            // Redis's slot index it counts expired keys too, and deletes nothing.
             store().for_each_key([&](const std::string& k) {
               if (cluster_keyslot(k) == slot) ++count;
             });
@@ -6177,6 +6213,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (args.size() == 3 && upper(args[1]) == "OBJECT") {
             // Raw dict peek like Redis debugCommand: a logically-expired-but-unreaped
             // key still reports its object info instead of erroring/expiring.
+            const DataStore::LazyExpireDisabled raw_lookup(store());
             if (!store().key_exists_raw(args[2])) return encode_error("no such key");
             const auto enc = store().object_encoding(args[2]).value_or("raw");
             const auto dump = rdb_dump_key(args[2]);
@@ -6367,12 +6404,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("GET", CommandSpec{"GET", 2, {"readonly", "fast"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState& session, bool&) {
-          if (store().is_wrongtype_for_string_noexpire(args[1])) return wrongtype_error_reply();
-          if (store().lazy_expire_key(args[1])) {
-            propagate_write({"DEL", args[1]}, session, nullptr, kPropagateRepl);
-          }
-          auto v = store().get(args[1]);
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          bool wrongtype = false;
+          auto v = store().get_string(args[1], wrongtype);
+          if (wrongtype) return wrongtype_error_reply();
           return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
         }});
 
@@ -6504,7 +6539,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
           }
           return with_string_key(args[1], [&]() {
-            auto v = store().getex(args[1], exp, persist);
+            const bool expired_now = exp.has_value() && already_expired(*exp);
+            auto v = store().getex(args[1], expired_now ? std::nullopt : exp, persist);
+            if (v.has_value() && expired_now) store().del(args[1]);
             return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
           });
         }});
@@ -6793,6 +6830,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (xx && cur < 0) return encode_integer(0);
           if (gt && (cur < 0 || target <= cur)) return encode_integer(0);
           if (lt && cur >= 0 && target >= cur) return encode_integer(0);
+          if (already_expired(target)) return encode_integer(store().del(args[1]) ? 1 : 0);
           return encode_integer(store().expire(args[1], target) ? 1 : 0);
         }});
 
@@ -6823,6 +6861,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (xx && cur < 0) return encode_integer(0);
           if (gt && (cur < 0 || target <= cur)) return encode_integer(0);
           if (lt && cur >= 0 && target >= cur) return encode_integer(0);
+          if (already_expired(target)) return encode_integer(store().del(args[1]) ? 1 : 0);
           return encode_integer(store().expire(args[1], target) ? 1 : 0);
         }});
 
@@ -6852,6 +6891,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (xx && cur < 0) return encode_integer(0);
           if (gt && (cur < 0 || target <= cur)) return encode_integer(0);
           if (lt && cur >= 0 && target >= cur) return encode_integer(0);
+          if (already_expired(target)) return encode_integer(store().del(args[1]) ? 1 : 0);
           return encode_integer(store().expire(args[1], target) ? 1 : 0);
         }});
 
@@ -6876,6 +6916,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (xx && cur < 0) return encode_integer(0);
           if (gt && (cur < 0 || ms <= cur)) return encode_integer(0);
           if (lt && cur >= 0 && ms >= cur) return encode_integer(0);
+          if (already_expired(ms)) return encode_integer(store().del(args[1]) ? 1 : 0);
           return encode_integer(store().expire(args[1], ms) ? 1 : 0);
         }});
 
@@ -6914,14 +6955,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("RANDOMKEY", CommandSpec{"RANDOMKEY", 1, {"readonly", "fast"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState& session, bool&) {
-          append_lazy_expire_dels(session);
+        [](const std::vector<std::string>&, SessionState&, bool&) {
           const auto k = store().randomkey();
           return k.has_value() ? encode_bulk(*k) : encode_null(RespVersion::Resp2);
         }});
 
     t.emplace("SCAN", CommandSpec{"SCAN", -2, {"readonly"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
           std::uint64_t cursor = 0;
           try { cursor = static_cast<std::uint64_t>(std::stoull(args[1])); } catch (...) { return encode_error("invalid cursor"); }
           std::string match_pattern = "*";
@@ -6941,7 +6981,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_error("syntax error");
             }
           }
-          append_lazy_expire_dels(session);
           auto [next, keys] = store().scan(cursor, count, match_pattern, type_filter);
           std::vector<std::string> inner;
           inner.reserve(keys.size());
@@ -7798,7 +7837,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (store().is_wrongtype_for_list(src)) return wrongtype_error_reply();
 
           bool wrongtype = false;
-          if (store().is_wrongtype_for_list(dst) && store().llen(src, wrongtype) > 0) {
+          if (store().llen(src, wrongtype) > 0 && store().is_wrongtype_for_list(dst)) {
             return wrongtype_error_reply();  // src has data but dst is wrong type: source intact
           }
           std::optional<std::string> popped;
@@ -9335,6 +9374,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "USAGE") {
             if (args.size() < 3) return encode_error("wrong number of arguments for 'memory|usage' command");
             const auto& key = args[2];
+            // Redis's memoryCommand() reads the key raw: an expired key is measured, not deleted.
+            const DataStore::LazyExpireDisabled raw_lookup(store());
             if (store().type_of(key) == "none") return encode_null(RespVersion::Resp2);
             // Approximate memory usage — return a reasonable estimate
             const auto enc = store().object_encoding(key);
@@ -11870,7 +11911,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
         : static_cast<std::int64_t>(args.size()) + spec.last_key;
     for (std::int64_t i = spec.first_key;
          i <= last_idx && i < static_cast<std::int64_t>(args.size()); i += step) {
-      if (store().type_of(args[static_cast<std::size_t>(i)]) == "none") {
+      if (!store().live_type(args[static_cast<std::size_t>(i)]).has_value()) {
         notify_new_candidates.push_back(args[static_cast<std::size_t>(i)]);
       }
     }
@@ -11932,11 +11973,17 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     propagate_write(args, session, &reply,
                     publish ? kPropagateRepl : kPropagateAof | kPropagateRepl,
                     g_execution_nesting == 1);
-    // 'new' fires before the command's own event, mirroring Redis (dbAdd runs first).
-    for (const auto& k : notify_new_candidates) {
-      if (store().type_of(k) != "none") notify_keyspace_event(NOTIFY_NEW, "new", k, session.db_index);
+    {
+      // These checks read back what the command did (Redis sends the events from inside it), so
+      // a key it left with a past expire time is not deleted here.
+      const DataStore::LazyExpireDisabled no_lazy_expire(store());
+      // 'new' fires before the command's own event, mirroring Redis (dbAdd runs first).
+      for (const auto& k : notify_new_candidates) {
+        if (store().type_of(k) != "none")
+          notify_keyspace_event(NOTIFY_NEW, "new", k, session.db_index);
+      }
+      emit_keyspace_notifications(cmd_after, args, spec.first_key, session.db_index, &reply);
     }
-    emit_keyspace_notifications(cmd_after, args, spec.first_key, session.db_index, &reply);
     // Any write may satisfy a blocked client (BLPOP/BZPOPMIN/BLMOVE/XREAD…). Flag a
     // wakeup so the event loop rechecks blocked clients in THIS iteration instead of on
     // the next ~100ms poll. Cheap: the recheck early-returns when nothing is blocked.
@@ -12166,6 +12213,8 @@ bool client_has_subscriptions(int fd) {
   return sit != g_fd_shard_channels.end() && !sit->second.empty();
 }
 
+void configure_lazy_expire() { store().set_lazy_expire_hook(propagate_lazy_expire); }
+
 void configure_notify_keyspace_events(const std::string& spec) {
   g_notify_flags = parse_notify_flags(spec);
 }
@@ -12247,16 +12296,17 @@ void run_active_expire_cycle() {
   if (g_replication_role == "slave") return;
   if (paused_actions_with_update(kPauseExpire)) return;  // CLIENT PAUSE stops expiry
   const auto t0 = std::chrono::steady_clock::now();
-  auto expired = store().active_expire_cycle();
+  {
+    // Each deleted key's DEL (propagate_lazy_expire()) is gathered and written at the end in one
+    // AOF write and one backlog append, each DEL on its own, as Redis's beforeSleep() writes the
+    // DELs of a cycle (one write and, with appendfsync always, one fsync instead of one per key).
+    const ExecutionUnit unit(nullptr, /*may_wrap=*/false);
+    store().active_expire_cycle();
+  }
   // Record the cycle's wall time as an "expire-cycle" latency event (LATENCY monitor).
   const auto cycle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0).count();
   latency_add("expire-cycle", cycle_ms);
-  if (expired.empty()) return;
-  for (const auto& [dbidx, key] : expired) {
-    propagate_now(dbidx, {"DEL", key}, kPropagateRepl);  // not to the AOF yet (item 37)
-    notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, dbidx);
-  }
 }
 
 // Eviction cron: triggered from the event loop. Mirrors Redis's startEvictionTimeProc —
@@ -12336,6 +12386,10 @@ bool load_aof_file(const std::string& path, std::string& err) {
   std::size_t valid_before_multi = 0;
   SessionState session {};
   session.authenticated = true;  // internal replay must not be gated by requirepass
+  // No key expires while the AOF loads (Redis's keyIsExpired() while loading): the file was written
+  // while its keys were alive, so `SET k 5 PXAT <past>` then `INCR k` must give 6 (and expire),
+  // not a new key 1 without a TTL; the expired keys are deleted, with their DEL, after the load.
+  const DataStore::LazyExpireDisabled no_lazy_expire(store());
   g_replaying_aof = true;
   struct ReplayingAof {
     ~ReplayingAof() {
@@ -12697,6 +12751,31 @@ std::string try_unblock_client_impl(SessionState& session) {
                      : encode_null_array(session.resp_version);
   }
 
+  // Redis checks a woken key without deleting it (handleClientsBlockedOnKey()'s LOOKUP_NOEFFECTS
+  // lookup): a list, sorted-set or XREAD blocker runs only when one of its keys is a live key of
+  // its type,
+  // so a key that has expired keeps the client blocked, and its DEL waits for a command that meets
+  // it. (Redis looks at the time of the command that made the key ready, PeaDB at the time of the
+  // check: compat/delta.md item 75.)
+  // XREADGROUP is left out: a key that is gone must wake it with its error (Redis's
+  // unblock_on_nokey), so it reads, and an expired key it meets is deleted then.
+  const bool xread = session.blocked.type == BlockType::Stream &&
+                     !session.blocked.original_args.empty() &&
+                     upper(session.blocked.original_args[0]) == "XREAD";
+  if (session.blocked.type == BlockType::List || session.blocked.type == BlockType::ZSet || xread) {
+    const ValueType wanted = session.blocked.type == BlockType::List   ? ValueType::List
+                             : session.blocked.type == BlockType::ZSet ? ValueType::ZSet
+                                                                       : ValueType::Stream;
+    bool ready = false;
+    for (const auto& key : session.blocked.keys) {
+      if (store().live_type(key) == wanted) {
+        ready = true;
+        break;
+      }
+    }
+    if (!ready) return {};
+  }
+
   // Mutations applied on wakeup happen outside the dispatch chokepoint, so they must
   // propagate to the replication backlog and AOF explicitly (deterministic pop form).
   auto propagate = [&session](std::vector<std::string> cmd_args) {
@@ -12876,6 +12955,10 @@ std::string try_unblock_client_impl(SessionState& session) {
 
 std::string try_unblock_client(SessionState& session) {
   if (session.blocked.type == BlockType::None) return {};
+  // The client's keys are in its own database, not in the one the last command used (a client
+  // blocked in db 9 was served by a push to the same key name in db 1, and its pop was propagated
+  // under db 9).
+  store().select_db(session.db_index);
   // Capture the block context before try_unblock_client_impl clears it on serve/timeout.
   const std::vector<std::string> orig = session.blocked.original_args;
   const std::int64_t start_ms = session.blocked.block_start_ms;
@@ -12929,8 +13012,8 @@ void aof_cron(std::int64_t now) {
   if (g_appendfsync == "always" && g_aof_unsynced) aof_fsync_always();
   // The everysec fsync of new bytes (Redis's bio thread). Redis clears a failed fsync only with
   // the fsync of a later write; PeaDB also tries the fsync again every second while it fails,
-  // because no write may come: writes are refused then, and PeaDB writes no expiry DELs to the
-  // AOF (compat/delta.md items 35 and 37).
+  // because no write may come: writes are refused then, and only an expiring key's DEL would
+  // heal it (compat/delta.md item 35, plan decision D13).
   const bool due = (g_appendfsync == "everysec" && g_aof_unsynced) || g_aof_fsync_error;
   if (!due || now - g_last_aof_fsync_ms < 1000) return;
   g_aof_unsynced = false;
@@ -12989,7 +13072,10 @@ void drain_replica_cmd_queue() {
   }
   if (g_replica_cmd_held.empty()) return;
   // Apply on the event loop thread: g_replaying_aof suppresses AOF writes and
-  // backlog updates so master commands are not re-replicated or double-logged.
+  // backlog updates so master commands are not re-replicated or double-logged. No key expires
+  // for the master's commands (Redis's expireIfNeeded() for its master client): the master ran
+  // them while their keys were alive, and its DEL comes when it expires them.
+  const DataStore::LazyExpireDisabled no_lazy_expire(store());
   g_replaying_aof = true;
   bool close_flag = false;
   // A paused replica holds what its master sends, as Redis pauses its master client: the first

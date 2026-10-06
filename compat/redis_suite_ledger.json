@@ -45,10 +45,10 @@
       "last_counts": {
         "err": 0,
         "ignored": 4,
-        "ok": 68
+        "ok": 69
       },
       "mode": "native",
-      "skipfile_lines": 3
+      "skipfile_lines": 2
     },
     "unit/functions": {
       "last_counts": {
@@ -263,11 +263,11 @@
     "unit/type/list": {
       "last_counts": {
         "err": 0,
-        "ignored": 13,
-        "ok": 264
+        "ignored": 20,
+        "ok": 266
       },
       "mode": "native",
-      "skipfile_lines": 9
+      "skipfile_lines": 7
     },
     "unit/type/list-2": {
       "last_counts": {
