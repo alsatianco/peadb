@@ -1475,7 +1475,7 @@ std::string lua_engine_eval(const std::string& script,
       if (err_msg.find("ERR ") == 0 || err_msg.find("WRONGTYPE") == 0 ||
           err_msg.find("OOM ") == 0 || err_msg.find("NOSCRIPT") == 0 ||
           err_msg.find("BUSY ") == 0 || err_msg.find("NOREPLICAS") == 0 ||
-          err_msg.find("READONLY") == 0) {
+          err_msg.find("READONLY") == 0 || err_msg.find("MISCONF ") == 0) {
         result = enc_error_raw(err_msg);
       } else {
         // Check if the error starts with a dash (raw error)
@@ -1622,7 +1622,7 @@ std::string lua_engine_fcall(int callback_ref,
       if (result.size() < 2 || result.substr(result.size() - 2) != "\r\n") result += "\r\n";
     } else {
       static const char* kPfx[] = {"ERR ", "WRONGTYPE", "OOM ", "NOSCRIPT", "BUSY ",
-                                    "NOREPLICAS", "READONLY", "MASTERDOWN", "NOPERM"};
+                                    "NOREPLICAS", "READONLY", "MASTERDOWN", "NOPERM", "MISCONF "};
       bool known = false;
       for (auto* p : kPfx) if (m.rfind(p, 0) == 0) { known = true; break; }
       result = enc_error_raw(known ? m : ("ERR " + m));

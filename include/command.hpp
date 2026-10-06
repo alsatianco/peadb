@@ -258,6 +258,12 @@ extern std::function<int(const std::string& by, const std::string& val, int skip
 // delivers -UNBLOCKED; error=false delivers the command's timeout reply. Returns 1 if
 // a matching, currently-blocked client was found, else 0.
 extern std::function<int(std::uint64_t client_id, bool error)> g_client_unblock_cb;
+// Callback: closes the listening sockets and every client connection. Called only in a BGSAVE or
+// AOF rewrite child right after fork(), so the port is free and clients see their connection close
+// when the server dies while a child runs (Redis's closeChildUnusedResourceAfterFork() closes the
+// listeners; Redis keeps the client sockets and shuts them down when it closes one). Wired by
+// server.cpp (owns the fds).
+extern std::function<void()> g_close_sockets_in_child_cb;
 // Clear per-fd server-side registries (monitors, etc.) when a client disconnects.
 void on_client_disconnect(int fd);
 
