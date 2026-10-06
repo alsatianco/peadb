@@ -170,7 +170,10 @@ def case_announce_port_zero_accepted_without_warning():
  try:
   wait_until_ready(6310)
   with socket.create_connection(('127.0.0.1',6310),timeout=5) as s:
-   assert _cget(s,'cluster-announce-port')=='6310', _cget(s,'cluster-announce-port')
+   # CONFIG GET reports the configured 0, as Redis does; the fallback shows where the port is
+   # announced.
+   assert _cget(s,'cluster-announce-port')=='0', _cget(s,'cluster-announce-port')
+   assert ':6310@16310 ' in _self_nodes_line(s), _self_nodes_line(s)
  finally:
   p.terminate(); p.wait(timeout=10)
  out = p.stdout.read().decode(errors='replace')

@@ -415,6 +415,9 @@ class DataStore {
   // LFU (probabilistic log-increment counter). Touch is O(1).
   void touch_lru(Entry& e, bool lfu);
   void set_eviction_lfu(bool v) { eviction_lfu_ = v; }  // pick LRU vs LFU touch semantics
+  // lfu-log-factor: how slowly the LFU access counter grows (Redis default 10).
+  void set_lfu_log_factor(int v) { lfu_log_factor_ = v; }
+  int lfu_log_factor() const { return lfu_log_factor_; }
   void touch_key_for_eviction(const std::string& key);  // current db; no-op if absent
   struct EvictVictim { int db; std::string key; std::int64_t freed_bytes; };
   // Sample `samples` candidate keys across all DBs (allkeys-*) or only volatile keys
@@ -438,10 +441,10 @@ class DataStore {
   // config params). Storage stays hashtable-grade for now; OBJECT ENCODING honors these
   // limits + the per-entry sticky conversion flag so assert_encoding tests behave like
   // Redis. Real listpack/intset backends (Phase 6) will make the reporting honest.
-  struct EncodingLimits {
-    std::int64_t hash_entries = 128;
+  struct EncodingLimits {  // defaults are Redis 7.2.5's
+    std::int64_t hash_entries = 512;
     std::int64_t hash_value = 64;
-    std::int64_t list_size = 128;   // negative Redis size-classes are treated as 128
+    std::int64_t list_size = -2;  // > 0: entries per listpack; -1..-5: 4 KB..64 KB of entries
     std::int64_t set_intset = 512;
     std::int64_t set_entries = 128;
     std::int64_t set_value = 64;
@@ -489,6 +492,7 @@ class DataStore {
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
   EncodingLimits encoding_limits_;
   bool eviction_lfu_ = false;   // touch_key_for_eviction uses LFU semantics when true
+  int lfu_log_factor_ = 10;
   // Lazyfree worker state.
   std::thread lazyfree_thread_;
   std::mutex lazyfree_mu_;

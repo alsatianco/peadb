@@ -78,16 +78,20 @@ bool set_tcp_nodelay(int fd) {
   return setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes)) == 0;
 }
 
-// Enable TCP keepalive so half-open connections (peer vanished without FIN) are detected
-// and reaped by the kernel instead of lingering forever against maxclients.
-void set_tcp_keepalive(int fd) {
+// tcp-keepalive (Redis's anetKeepAlive()): half-open connections (the peer vanished without a
+// FIN) are found and closed by the kernel instead of lingering against maxclients. The first
+// probe goes after `interval` seconds of silence; on Linux two more follow interval/3 apart.
+void set_tcp_keepalive(int fd, int interval) {
   int yes = 1;
   setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
 #ifdef __linux__
-  int idle = 300, intvl = 30, cnt = 3;  // first probe after 5 min, then every 30s, 3 times
-  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+  int intvl = interval / 3 > 0 ? interval / 3 : 1;
+  int cnt = 3;
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &interval, sizeof(interval));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
   setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+#elif defined(__APPLE__)
+  setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &interval, sizeof(interval));
 #endif
 }
 
@@ -123,64 +127,50 @@ struct WriteBuf {
 
 } // namespace
 
+int adjust_open_files_limit(int max_clients) {
+  // PeaDB's own descriptors (listeners, AOF, RDB, replication, poller) beside the clients.
+  constexpr unsigned long long kFdReserve = 64;
+  auto rlim_to_ull = [](rlim_t value) -> unsigned long long {
+    if (value == RLIM_INFINITY) return std::numeric_limits<unsigned long long>::max();
+    return static_cast<unsigned long long>(value);
+  };
+  rlimit nofile {};
+  if (::getrlimit(RLIMIT_NOFILE, &nofile) != 0) {
+    log(LogLevel::Warn, "getrlimit(RLIMIT_NOFILE) failed: " + std::string(std::strerror(errno)));
+    return max_clients;
+  }
+  const unsigned long long desired = static_cast<unsigned long long>(max_clients) + kFdReserve;
+  if (rlim_to_ull(nofile.rlim_cur) < desired && rlim_to_ull(nofile.rlim_max) >= desired) {
+    rlimit raised = nofile;
+    raised.rlim_cur = static_cast<rlim_t>(desired);
+    if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
+      if (::getrlimit(RLIMIT_NOFILE, &nofile) != 0) nofile = raised;
+      log(LogLevel::Info, "raised nofile soft limit to " +
+                              std::to_string(rlim_to_ull(nofile.rlim_cur)) +
+                              " for maxclients compatibility");
+    } else {
+      log(LogLevel::Warn,
+          "failed to raise nofile soft limit: " + std::string(std::strerror(errno)));
+    }
+  }
+  const unsigned long long soft_now = rlim_to_ull(nofile.rlim_cur);
+  const unsigned long long capacity = soft_now > kFdReserve ? soft_now - kFdReserve : 1;
+  return static_cast<int>(std::min<unsigned long long>(
+      {capacity, static_cast<unsigned long long>(max_clients),
+       static_cast<unsigned long long>(std::numeric_limits<int>::max())}));
+}
+
 int run_server(const ServerConfig& config) {
   configure_max_clients(config.maxclients);
-  int max_clients = configured_max_clients();
-  constexpr unsigned long long kFdReserve = 64;
-
   {
-    auto rlim_to_ull = [](rlim_t value) -> unsigned long long {
-      if (value == RLIM_INFINITY) return std::numeric_limits<unsigned long long>::max();
-      return static_cast<unsigned long long>(value);
-    };
-
-    rlimit nofile {};
-    if (::getrlimit(RLIMIT_NOFILE, &nofile) == 0) {
-      const unsigned long long soft_before = rlim_to_ull(nofile.rlim_cur);
-      const unsigned long long hard_before = rlim_to_ull(nofile.rlim_max);
-      const unsigned long long desired = static_cast<unsigned long long>(max_clients) + kFdReserve;
-
-      if (soft_before < desired && hard_before >= desired) {
-        rlimit raised = nofile;
-        raised.rlim_cur = static_cast<rlim_t>(desired);
-        if (::setrlimit(RLIMIT_NOFILE, &raised) == 0) {
-          if (::getrlimit(RLIMIT_NOFILE, &nofile) != 0) {
-            nofile = raised;
-          }
-          log(LogLevel::Info,
-              "raised nofile soft limit to " +
-                  std::to_string(static_cast<unsigned long long>(nofile.rlim_cur)) +
-                  " for maxclients compatibility");
-        } else {
-          log(LogLevel::Warn,
-              "failed to raise nofile soft limit: " + std::string(std::strerror(errno)));
-        }
-      }
-
-      const unsigned long long soft_now = rlim_to_ull(nofile.rlim_cur);
-      unsigned long long capacity_ull = 1;
-      if (soft_now > kFdReserve) {
-        capacity_ull = soft_now - kFdReserve;
-      }
-      const unsigned long long int_max_ull =
-          static_cast<unsigned long long>(std::numeric_limits<int>::max());
-      const int capacity = static_cast<int>((capacity_ull > int_max_ull) ? int_max_ull : capacity_ull);
-
-      if (capacity < max_clients) {
-        configure_max_clients(capacity);
-        max_clients = configured_max_clients();
-        log(LogLevel::Warn,
-            "lowering effective maxclients to " + std::to_string(max_clients) +
-                " due to RLIMIT_NOFILE; increase ulimit -n to allow more clients");
-      }
-
-      log(LogLevel::Info,
-          "process nofile limit soft=" + std::to_string(rlim_to_ull(nofile.rlim_cur)) +
-              ", hard=" + std::to_string(rlim_to_ull(nofile.rlim_max)) +
-              ", effective maxclients=" + std::to_string(max_clients));
-    } else {
-      log(LogLevel::Warn, "getrlimit(RLIMIT_NOFILE) failed: " + std::string(std::strerror(errno)));
+    const int wanted = configured_max_clients();
+    const int allowed = adjust_open_files_limit(wanted);
+    if (allowed < wanted) {
+      configure_max_clients(allowed);
+      log(LogLevel::Warn, "lowering effective maxclients to " + std::to_string(allowed) +
+                              " due to RLIMIT_NOFILE; increase ulimit -n to allow more clients");
     }
+    log(LogLevel::Info, "effective maxclients=" + std::to_string(configured_max_clients()));
   }
 
   // `port 0` means no TCP listener, as in Redis (initListeners(), server.c).
@@ -554,7 +544,8 @@ int run_server(const ServerConfig& config) {
       std::size_t consumed = 0;
       while (true) {
         const std::string_view rem(input.data() + consumed, input.size() - consumed);
-        auto parsed = parse_one_command(rem, requirepass_is_set() && !session.authenticated);
+        auto parsed = parse_one_command(rem, requirepass_is_set() && !session.authenticated,
+                                        proto_max_bulk_len());
         if (!parsed.has_value()) break;
         g_total_commands_processed.fetch_add(1);
         self_dispatch_fd = session.fd;
@@ -794,7 +785,8 @@ int run_server(const ServerConfig& config) {
             break;
           }
 
-          if (g_connected_clients.load(std::memory_order_relaxed) >= max_clients) {
+          // Read on every accept, so CONFIG SET maxclients takes effect at once.
+          if (g_connected_clients.load(std::memory_order_relaxed) >= configured_max_clients()) {
             static constexpr const char kErrMaxClients[] = "-ERR max number of clients reached\r\n";
             const ssize_t wn = ::write(client_fd, kErrMaxClients, sizeof(kErrMaxClients) - 1);
             (void)wn;
@@ -824,7 +816,7 @@ int run_server(const ServerConfig& config) {
 
           if (!is_unix) {
             set_tcp_nodelay(client_fd);
-            set_tcp_keepalive(client_fd);
+            if (tcp_keepalive_seconds() > 0) set_tcp_keepalive(client_fd, tcp_keepalive_seconds());
           }
 
           if (!poller.add_read(client_fd)) {
@@ -848,11 +840,13 @@ int run_server(const ServerConfig& config) {
             sess.fd = client_fd;
             if (is_unix) {
               sess.addr = config.unixsocket + ":0";  // Redis reports <socketpath>:0
+              sess.is_local = true;
             } else {
               const auto* in4 = reinterpret_cast<const sockaddr_in*>(&client_addr);
               char ipbuf[INET_ADDRSTRLEN] = {0};
               inet_ntop(AF_INET, &in4->sin_addr, ipbuf, sizeof(ipbuf));
               sess.addr = std::string(ipbuf) + ":" + std::to_string(ntohs(in4->sin_port));
+              sess.is_local = (ntohl(in4->sin_addr.s_addr) >> 24) == 127;
             }
             const auto snow = DataStore::now_ms();
             sess.created_ms = snow;
@@ -924,11 +918,9 @@ int run_server(const ServerConfig& config) {
       auto& input = buffers[fd];
       input.append(buf, static_cast<std::size_t>(n));
 
-      // Cap the per-client query buffer so a slow/never-completing command (or a
-      // flood that never forms a full frame) cannot grow input without bound and
-      // OOM the single-process server. 1 GB leaves headroom above proto-max-bulk-len.
-      constexpr std::size_t kInputBufHardLimit = 1ULL * 1024 * 1024 * 1024;
-      if (input.size() > kInputBufHardLimit) {
+      // client-query-buffer-limit: a slow/never-completing command (or a flood that never
+      // forms a full frame) cannot grow input without bound and OOM the single-process server.
+      if (static_cast<std::int64_t>(input.size()) > client_query_buffer_limit()) {
         log(LogLevel::Warn, "client fd=" + std::to_string(fd) +
             " exceeded query buffer limit (" + std::to_string(input.size()) + " bytes); closing");
         close_client(fd);
@@ -946,7 +938,8 @@ int run_server(const ServerConfig& config) {
       std::size_t consumed_total = 0;
       while (true) {
         const std::string_view remaining(input.data() + consumed_total, input.size() - consumed_total);
-        auto parsed = parse_one_command(remaining, requirepass_is_set() && !session.authenticated);
+        auto parsed = parse_one_command(remaining, requirepass_is_set() && !session.authenticated,
+                                        proto_max_bulk_len());
         if (!parsed.has_value()) break;
 
         g_total_commands_processed.fetch_add(1);

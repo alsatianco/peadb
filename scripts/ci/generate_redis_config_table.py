@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate the table of Redis 7.2.5 configuration settings from the pinned source.
 
-The config file and command-line loader (``src/config.cpp``) must accept exactly the settings Redis accepts, check their values the way Redis does, and refuse everything else with Redis's own errors. Rather than hand-copy 180+ names, aliases, types, numeric ranges and enum values, we read them from the ``static_configs[]`` table in the pinned ``src/config.c`` (plus its ``configEnum`` arrays).
+The config file and command-line loader (``src/config.cpp``) must accept exactly the settings Redis accepts, check their values the way Redis does, and refuse everything else with Redis's own errors; ``CONFIG GET`` and ``CONFIG SET`` (``src/command.cpp``) must know every setting, its flags and its default. Rather than hand-copy 180+ names, aliases, types, numeric ranges, enum values, flags and defaults, we read them from the ``static_configs[]`` table in the pinned ``src/config.c`` (plus its ``configEnum`` arrays and the ``#define``s in ``src/server.h``).
 
 Output: ``include/redis_config_table.generated.hpp``. Re-run after bumping the Redis pin and commit the regenerated header.
 
@@ -30,6 +30,26 @@ IS_VALID_INDEX = {"Bool": 5, "String": 6, "SDS": 6, "Enum": 6}
 NUMERIC_IS_VALID_INDEX = 8
 # Settings compiled only with LOG_REQ_RES, which release builds of Redis do not define.
 SKIPPED_IFDEFS = {"LOG_REQ_RES"}
+# Field position of the default value per create*Config macro (0-based, after name).
+DEFAULT_INDEX = {"Bool": 4, "String": 5, "SDS": 5, "Enum": 5}
+NUMERIC_DEFAULT_INDEX = 6
+# The config flags CONFIG GET and CONFIG SET act on (server.h), and the bit each gets here.
+FLAG_BITS = (("IMMUTABLE_CONFIG", "kCfgImmutable"), ("PROTECTED_CONFIG", "kCfgProtected"),
+             ("DENY_LOADING_CONFIG", "kCfgDenyLoading"), ("HIDDEN_CONFIG", "kCfgHidden"),
+             ("SENSITIVE_CONFIG", "kCfgSensitive"))
+# Special settings keep their default outside static_configs[]: initServerConfig() (server.c) sets
+# them, or their getter reports live state. These are the values CONFIG GET prints on a Redis
+# 7.2.5 started with no config file. None means "no fixed default" (dir is the working directory).
+SPECIAL_DEFAULTS = {
+    "dir": None,
+    "save": "3600 1 300 100 60 10000",
+    "client-output-buffer-limit": "normal 0 0 0 slave 268435456 67108864 60 pubsub 33554432 8388608 60",
+    "oom-score-adj-values": "0 200 800",
+    "notify-keyspace-events": "",
+    "bind": "* -::*",
+    "replicaof": "",
+    "latency-tracking-info-percentiles": "50 99 99.9",
+}
 
 
 def split_args(text: str) -> list[str]:
@@ -75,11 +95,53 @@ def c_string(tok: str) -> str | None:
     return m.group(1)
 
 
-def parse_enums(src: str) -> dict[str, list[str]]:
+def parse_enums(src: str) -> dict[str, list[tuple[str, str]]]:
+    """Each configEnum array as (name, value token) pairs, in Redis's order."""
     enums = {}
     for m in re.finditer(r"configEnum (\w+)\[\] = \{(.*?)\{NULL, *0\}\s*\};", src, re.S):
-        enums[m.group(1)] = re.findall(r'\{"([^"]+)",', m.group(2))
+        enums[m.group(1)] = [(n, v.strip()) for n, v in re.findall(r'\{"([^"]+)",\s*([^}]+)\}', m.group(2))]
     return enums
+
+
+def parse_defines(text: str) -> dict[str, str]:
+    """Object-like #define NAME value lines (comments dropped)."""
+    defines = {}
+    for m in re.finditer(r"^#define\s+(\w+)\s+(.+?)\s*(?:/\*.*)?$", text, re.M):
+        defines[m.group(1)] = m.group(2).strip()
+    return defines
+
+
+def eval_numeric(expr: str, defines: dict[str, str]) -> int:
+    """A numeric default such as 512ll*1024*1024, 100<<20 or CONFIG_DEFAULT_HZ."""
+    e = expr.strip()
+    for _ in range(5):
+        e = re.sub(r"\b[A-Z_][A-Z0-9_]*\b", lambda m: f"({defines[m.group(0)]})" if m.group(0) in defines else m.group(0), e)
+    e = re.sub(r"(?<=\d)(?:ULL|ull|LL|ll|UL|ul|L|l|U|u)\b", "", e)
+    if not re.fullmatch(r"[\d\s()+\-*/<>]+", e):
+        raise ValueError(f"cannot evaluate numeric default {expr!r} (became {e!r})")
+    return int(eval(e))  # only digits and arithmetic operators remain
+
+
+def default_text(kind: str, args: list[str], flags: str, enums: dict, defines: dict[str, str]) -> str:
+    """The default as CONFIG GET prints it (boolConfigGet(), numericConfigGet(), ...)."""
+    if kind == "Bool":
+        return "yes" if eval_numeric(args[DEFAULT_INDEX[kind]], defines) else "no"
+    if kind in ("String", "SDS"):
+        tok = args[DEFAULT_INDEX[kind]].strip()
+        tok = defines.get(tok, tok)
+        return c_string(tok) or ""
+    if kind == "Enum":
+        tok = args[DEFAULT_INDEX[kind]].strip()
+        for name, value in enums[args[3]]:
+            if value == tok:
+                return name
+        raise ValueError(f"default {tok!r} of {c_string(args[0])} is not in enum {args[3]}")
+    value = eval_numeric(args[NUMERIC_DEFAULT_INDEX], defines)
+    if "PERCENT_CONFIG" in args[7] and value < 0:
+        return f"{-value}%"
+    if "OCTAL_CONFIG" in args[7]:
+        return format(value, "o")
+    return str(value)
 
 
 def parse_table(src: str) -> list[tuple[str, list[str]]]:
@@ -106,19 +168,25 @@ def parse_table(src: str) -> list[tuple[str, list[str]]]:
 
 
 def cxx_str(value: str | None) -> str:
-    return "nullptr" if value is None else f'"{value}"'
+    if value is None:
+        return "nullptr"
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def main() -> int:
     config_c = _resolve_redis_dir() / "src" / "config.c"
     src = config_c.read_text(encoding="utf-8")
     enums = parse_enums(src)
+    defines = parse_defines((_resolve_redis_dir() / "src" / "server.h").read_text(encoding="utf-8"))
+    defines.update(parse_defines(src))
     rows, used_enums = [], []
     for kind, args in parse_table(src):
         name, alias, flags = c_string(args[0]), c_string(args[1]), args[2]
         multi_arg = "MULTI_ARG_CONFIG" in flags
+        cfg_flags = [bit for f, bit in FLAG_BITS if f in flags]
         row = {"name": name, "alias": alias, "multi_arg": multi_arg, "lower": "0", "upper": "0",
-               "num_flags": "0", "unsigned": False, "enum": None, "is_valid": None}
+               "num_flags": "0", "unsigned": False, "enum": None, "is_valid": None,
+               "flags": " | ".join(cfg_flags) if cfg_flags else "0"}
         if kind == "Bool":
             row["type"] = "Bool"
         elif kind in ("String", "SDS"):
@@ -142,20 +210,26 @@ def main() -> int:
             row["is_valid"] = args[NUMERIC_IS_VALID_INDEX]
         elif kind == "Special":
             row["type"] = "Special"
+            if name not in SPECIAL_DEFAULTS:
+                raise ValueError(f"no default known for the special setting {name}: add it to SPECIAL_DEFAULTS")
         else:
             raise ValueError(f"unknown config kind {kind} for {name}")
         if kind in IS_VALID_INDEX:
             row["is_valid"] = args[IS_VALID_INDEX[kind]]
         if row["is_valid"] == "NULL":
             row["is_valid"] = None
+        row["default"] = SPECIAL_DEFAULTS[name] if kind == "Special" else default_text(kind, args, flags, enums, defines)
         rows.append(row)
+    unused = set(SPECIAL_DEFAULTS) - {r["name"] for r in rows if r["type"] == "Special"}
+    if unused:
+        raise ValueError(f"SPECIAL_DEFAULTS names settings that are not special: {sorted(unused)}")
 
     out = [
         "// AUTO-GENERATED by scripts/ci/generate_redis_config_table.py — DO NOT EDIT.",
         "// Source: upstream Redis 7.2.5 src/config.c (static_configs[] and its configEnum arrays):",
         "// every setting a config file or command line may name, with its alias, type, numeric",
-        "// range and enum values. Settings built only with LOG_REQ_RES are left out, as in a",
-        "// release build of Redis.",
+        "// range, enum values, flags and default. Settings built only with LOG_REQ_RES are left out,",
+        "// as in a release build of Redis.",
         "#pragma once",
         "",
         "#include <climits>",
@@ -173,6 +247,13 @@ def main() -> int:
         "inline constexpr int kNumPercent = 2;  // PERCENT_CONFIG: accepts N% (stored negative)",
         "inline constexpr int kNumOctal = 4;    // OCTAL_CONFIG: parsed in base 8",
         "",
+        "// Config flags (server.h) that CONFIG GET and CONFIG SET act on.",
+        "inline constexpr int kCfgImmutable = 1;    // IMMUTABLE_CONFIG: startup only",
+        "inline constexpr int kCfgProtected = 2;    // PROTECTED_CONFIG: needs enable-protected-configs",
+        "inline constexpr int kCfgDenyLoading = 4;  // DENY_LOADING_CONFIG: not while loading",
+        "inline constexpr int kCfgHidden = 8;       // HIDDEN_CONFIG: CONFIG GET <pattern> skips it",
+        "inline constexpr int kCfgSensitive = 16;   // SENSITIVE_CONFIG: value redacted in logs",
+        "",
         "struct RedisConfigSpec {",
         "  const char* name;",
         "  const char* alias;             // nullptr when the setting has no alias",
@@ -184,11 +265,13 @@ def main() -> int:
         "  long long upper;",
         "  const char* const* enum_names; // Enum only: allowed values in Redis's order, nullptr-terminated",
         "  const char* is_valid;          // name of Redis's extra validator function, or nullptr",
+        "  int flags;                     // kCfg* bits",
+        "  const char* default_value;     // as CONFIG GET prints it; nullptr when there is none (dir)",
         "};",
         "",
     ]
     for e in used_enums:
-        names = ", ".join(f'"{n}"' for n in enums[e])
+        names = ", ".join(f'"{n}"' for n, _ in enums[e])
         out.append(f"inline constexpr const char* kRedisEnum_{e}[] = {{{names}, nullptr}};")
     out += [
         "",
@@ -200,7 +283,8 @@ def main() -> int:
             f"    {{{cxx_str(r['name'])}, {cxx_str(r['alias'])}, RedisConfigType::{r['type']}, "
             f"{'true' if r['multi_arg'] else 'false'}, {r['num_flags']}, "
             f"{'true' if r['unsigned'] else 'false'}, static_cast<long long>({r['lower']}), "
-            f"static_cast<long long>({r['upper']}), {enum_ref}, {cxx_str(r['is_valid'])}}},"
+            f"static_cast<long long>({r['upper']}), {enum_ref}, {cxx_str(r['is_valid'])}, "
+            f"{r['flags']}, {cxx_str(r['default'])}}},"
         )
     out += [
         "};",

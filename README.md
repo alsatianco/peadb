@@ -109,9 +109,9 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `port` | `6379` | Listening port; `0` opens no TCP listener (then `unixsocket` is needed), as in Redis |
 | `bind` | `127.0.0.1` | Bind address; PeaDB listens on one address only (delta item 69) |
 | `loglevel` | `notice` | `debug`, `verbose`, `notice`, `warning` or `nothing` |
-| `dir` | `.` | Data directory for snapshots and AOF; it must exist |
+| `dir` | `.` | Data directory for snapshots and AOF; it must exist. PeaDB makes it the working directory, as Redis does, so later relative paths are inside it |
 | `dbfilename` | `dump.rdb` | RDB snapshot filename (a file name, not a path) |
-| `maxclients` | `10000` | Maximum concurrent client connections (`CONFIG SET maxclients` is not enforced, delta item 25) |
+| `maxclients` | `10000` | Maximum concurrent client connections; PeaDB raises the open-files limit to fit them, or lowers this value |
 | `appendonly` | `no` | Enable AOF persistence |
 | `appendfilename` | `appendonly.aof` | AOF filename (a file name, not a path) |
 | `appendfsync` | `everysec` | AOF fsync policy (`always` / `everysec` / `no`) |
@@ -119,12 +119,17 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `masterauth` | — | Password a replica sends to its master during sync |
 | `protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
 | `enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
+| `enable-protected-configs` | `no` | Allow `CONFIG SET dir` and `CONFIG SET dbfilename` (`yes`, or `local` for loopback and unix-socket clients) |
 | `rename-command` | — | `rename-command FROM TO` renames a command; `rename-command FROM ""` removes it, as in Redis |
 | `include` | — | Read another config file at this point; a path with `*`, `?` or `[` is a wildcard, and one that matches nothing is skipped |
 | `maxmemory` | `0` (off) | Memory limit (e.g. `100mb`, `2gb`); above it, keys are evicted per `maxmemory-policy`, else writes get `-OOM` — today every write, `DEL` included (delta item 39). The limit is checked against an estimate that is too low (delta item 38) |
 | `maxmemory-policy` | `noeviction` | `noeviction` \| `allkeys-lru` \| `allkeys-lfu` \| `allkeys-random` \| `volatile-lru` \| `volatile-lfu` \| `volatile-random` \| `volatile-ttl` (approximate sampling) |
 | `maxmemory-samples` | `5` | Keys sampled per eviction when choosing a victim (higher = more accurate, slower) |
+| `lfu-log-factor` | `10` | How slowly the LFU access counter grows (`OBJECT FREQ`); counters never decay (`lfu-decay-time` is always `0`) |
 | `timeout` | `0` (off) | Close clients idle longer than N seconds (replicas, blocked, MULTI, and pub/sub clients are exempt) |
+| `tcp-keepalive` | `300` | Seconds of silence before the first TCP keepalive probe on a new client connection; `0` turns keepalive off |
+| `proto-max-bulk-len` | `512mb` | Largest bulk argument a client may send, and largest string `SETRANGE`/`APPEND`/`SETBIT` may build |
+| `client-query-buffer-limit` | `1gb` | A client whose unread input grows past this is disconnected |
 | `tcp-backlog` | `511` | `listen(2)` backlog (Redis default) |
 | `unixsocket` | — | Also listen on an AF_UNIX socket path |
 | `unixsocketperm` | `0` | Octal file mode for the unix socket (e.g. `700`); `0` leaves the mode it was created with |
@@ -143,10 +148,10 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `hash-max-listpack-entries`, `hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`, `set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`, `zset-max-listpack-value` | Redis defaults | Encoding thresholds reported by `OBJECT ENCODING` |
 | `cluster-enabled` | `no` | Enable cluster mode; startup-only, like Redis's `IMMUTABLE_CONFIG` — `CONFIG SET cluster-enabled` is refused |
 | `cluster-announce-ip` | — | Address this node announces to peers/clients; empty falls back to `bind` — a documented simplification of Redis's live-connection auto-detection (see `docs/decisions/p5-cluster-addressing-and-version-provenance.md`). With `cluster-enabled yes`, the server refuses to start if this falls back to a wildcard (`0.0.0.0`, `::`, `*`, or empty) |
-| `cluster-announce-port` | — | Port this node announces; empty falls back to `port` |
-| `cluster-announce-bus-port` | — | Cluster bus port this node announces; empty falls back to the announced port + 10000 |
+| `cluster-announce-port` | `0` | Port this node announces; `0` falls back to `port` |
+| `cluster-announce-bus-port` | `0` | Cluster bus port this node announces; `0` falls back to the announced port + 10000 |
 
-Runtime configuration is available via `CONFIG GET` / `CONFIG SET` (in-memory only — there is no `CONFIG REWRITE`). `CONFIG SET` answers `OK` for unknown names (item 23) and for some known ones that it does not apply, such as `appendonly`, `dir` and `maxclients` (item 25).
+`CONFIG GET` and `CONFIG SET` work like Redis 7.2.5's: `CONFIG GET` knows every Redis setting and alias, and `CONFIG SET` takes several settings at once, all or nothing, with Redis's checks and error text (an unknown name, an immutable setting, a protected one such as `dir`, a bad value). The settings in the table above take effect at once, `appendonly yes` included, except `port` and `bind`, which PeaDB cannot change while it runs yet (delta item 25). For a Redis setting PeaDB does not apply, `CONFIG SET` refuses every value except the one that describes what PeaDB always does (so `rdbcompression yes` is refused); a setting with no such value keeps what it is given, has no effect, and gets a warning in the log (for example `hz` or `repl-ping-replica-period`). Delta item 24 lists these settings. Changes are in memory only: `CONFIG REWRITE` is not supported yet (item 25).
 
 ## Supported Commands
 

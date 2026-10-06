@@ -141,7 +141,8 @@ int main(int argc, char** argv) {
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
-  peadb::configure_persistence(config.dir, config.dbfilename, config.appendonly, config.appendfilename, config.appendfsync);
+  peadb::configure_persistence(config.dbfilename, config.appendonly, config.appendfilename,
+                               config.appendfsync);
   // Must run before the first command_table() build (AOF replay below builds it) so
   // rename-command directives take effect on the live table.
   peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
@@ -153,7 +154,7 @@ int main(int argc, char** argv) {
   peadb::configure_timeout(config.timeout);
   peadb::configure_tcp_backlog(config.tcp_backlog);
   peadb::configure_encoding_limits(config.raw);
-  peadb::configure_runtime_settings(config.raw);
+  peadb::configure_runtime_settings(config.raw, config_path);
   peadb::configure_client_output_buffer_limit(config.client_output_buffer_limit);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
@@ -210,7 +211,8 @@ int main(int argc, char** argv) {
 
   peadb::log(peadb::LogLevel::Info, "Server initialized");
 
-  const auto snap = std::filesystem::path(config.dir) / config.dbfilename;
+  // The config loader has made `dir` the working directory, as Redis does.
+  const std::filesystem::path snap = config.dbfilename;
   if (std::filesystem::exists(snap)) {
     std::string err;
     // A file with the "REDIS" magic is a native RDB: if it fails to load (e.g. CRC
@@ -238,7 +240,7 @@ int main(int argc, char** argv) {
   }
 
   if (config.appendonly) {
-    const auto aof = std::filesystem::path(config.dir) / config.appendfilename;
+    const std::filesystem::path aof = config.appendfilename;
     if (std::filesystem::exists(aof)) {
       std::string err;
       if (!peadb::load_aof_file(aof.string(), err)) {

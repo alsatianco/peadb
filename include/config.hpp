@@ -25,8 +25,7 @@ struct ServerConfig {
   std::string unixsocket;  // AF_UNIX listener path; empty = disabled
   int unixsocketperm = 0;  // mode for the unix socket file; 0 = leave the mode bind(2) gave it
   std::string log_level = "notice";  // a Redis loglevel name
-  std::string dir = ".";
-  std::string dbfilename = "dump.rdb";
+  std::string dbfilename = "dump.rdb";  // relative to `dir`, which the loader chdir()s into
   bool appendonly = false;
   std::string appendfilename = "appendonly.aof";
   std::string appendfsync = "everysec";
@@ -59,6 +58,34 @@ struct ServerConfig {
   // One line per Redis setting that PeaDB accepted but does not apply, for main.cpp to log.
   std::vector<std::string> warnings;
 };
+
+struct RedisConfigSpec;  // redis_config_table.generated.hpp
+
+// The Redis 7.2.5 setting called `name` (its name or its alias, in any case), or nullptr.
+const RedisConfigSpec* find_redis_config(const std::string& name);
+
+// The arguments CONFIG SET hands to a setting (performInterfaceSet() in config.c): a MULTI_ARG
+// setting's value is split at every single space, so an empty value gives no arguments; any
+// other setting gets the value as its only argument.
+std::vector<std::string> config_set_args(const RedisConfigSpec& spec, const std::string& value);
+
+// Redis's checks of one setting's arguments, shared by the config loader and CONFIG SET. On
+// success `value` is the checked value in the form CONFIG GET prints it (for
+// client-output-buffer-limit: only the classes given, the slave class named "replica").
+bool check_redis_config_value(const RedisConfigSpec& spec, const std::vector<std::string>& args,
+                              std::string& value, std::string& err);
+
+// A Redis setting that PeaDB does not apply but whose behaviour is one of its values: PeaDB
+// always does what `value` means, CONFIG GET reports `value`, and CONFIG SET refuses any other
+// value. In the config file, another value stops startup with `refuse` when that is set, and is
+// accepted with a warning otherwise (compat/delta.md item 24).
+struct FixedSetting {
+  const char* value;   // in the form CONFIG GET prints it
+  const char* refuse;  // nullptr when another value only gets a warning
+};
+
+// The fixed behaviour of the Redis setting `name` (its canonical name), or nullptr.
+const FixedSetting* peadb_fixed_setting(const std::string& name);
 
 // Redis's sdssplitargs (sds.c): splits one config line into arguments. "Double quotes" take the
 // escapes \n \r \t \b \a \xHH and \<any char>; 'single quotes' take \'. A closing quote must be

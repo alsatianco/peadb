@@ -99,7 +99,8 @@ def main() -> int:
             docs = send_cmd(s, "COMMAND", "DOCS")
             assert docs == {}
             cfg = send_cmd(s, "CONFIG", "GET", "*")
-            assert isinstance(cfg, list) and len(cfg) % 2 == 0
+            # RESP3 (HELLO 3 above): a map, as Redis replies
+            assert isinstance(cfg, dict) and "maxmemory" in cfg, cfg
             assert send_cmd(s, "CONFIG", "SET", "port", "6394") == "OK"
             server_info = send_cmd(s, "INFO")
             assert "redis_version:7.2.5" in server_info
