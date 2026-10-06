@@ -19,6 +19,7 @@ extern "C" int luaopen_bit(lua_State*);
 extern "C" int luaopen_struct(lua_State*);
 
 #include "lua_engine.hpp"
+#include "command_metadata.generated.hpp"
 #include "datastore.hpp"
 #include "errors.hpp"
 #include "protocol.hpp"
@@ -600,24 +601,14 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
     return enc_error_raw("ERR This Redis command is not allowed from script");
   }
 
-  // Check readonly context
-  if (g_lua_readonly) {
-    // Simple write-command check
-    static const std::vector<std::string> write_cmds = {
-        "SET", "DEL", "INCR", "DECR", "INCRBY", "DECRBY", "INCRBYFLOAT",
-        "EXPIRE", "PEXPIRE", "EXPIREAT", "PEXPIREAT", "SADD", "SREM",
-        "SPOP", "HSET", "HDEL", "LPUSH", "RPUSH", "LPOP", "RPOP",
-        "ZADD", "ZREM", "XADD", "MSET", "APPEND", "SETEX", "PSETEX",
-        "SETNX", "GETSET", "GETDEL", "SETRANGE", "SETBIT",
-        "UNLINK", "RENAME", "RENAMENX", "FLUSHDB", "FLUSHALL",
-    };
-    for (const auto& wc : write_cmds) {
-      if (cmd_upper == wc) {
-        record_lua_script_rejected_write(cmd_upper);
-        g_lua_last_error_from_redis = true;
-        return enc_error_raw("ERR Write commands are not allowed from read-only scripts.");
-      }
-    }
+  // A read-only script (no-writes, EVAL_RO, EVALSHA_RO, FCALL_RO) may not call a command that
+  // writes or may replicate, by Redis's command flags (scriptVerifyWriteCommandAllow, script.c),
+  // so PUBLISH and PFCOUNT are refused too and a script that runs during CLIENT PAUSE WRITE
+  // cannot change the data.
+  if (g_lua_readonly && (redis_command_flags(args) & (kRedisCmdWrite | kRedisCmdMayReplicate))) {
+    record_lua_script_rejected_write(cmd_upper);
+    g_lua_last_error_from_redis = true;
+    return enc_error_raw("ERR Write commands are not allowed from read-only scripts.");
   }
 
   bool close = false;

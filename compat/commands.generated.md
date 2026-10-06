@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 212, diff: 1, tested: 11, registered: 0
+Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -122,8 +122,8 @@ Total: **234** commands — full: 10, upstream: 212, diff: 1, tested: 11, regist
 | `PEXPIRE` | upstream | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py, test_p4_debug_verbs.py, test_p5_cluster_ownership.py |
 | `PEXPIREAT` | upstream | test_command_coverage_extras.py |
 | `PEXPIRETIME` | upstream | test_p1_expiretime_debug_digest.py |
-| `PFADD` | tested | test_b5_commands.py |
-| `PFCOUNT` | tested | test_b5_commands.py |
+| `PFADD` | upstream | test_b5_commands.py |
+| `PFCOUNT` | upstream | test_b5_commands.py |
 | `PFMERGE` | tested | test_b5_commands.py |
 | `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p4_subscribe_mode_gate.py, test_p5_acl_surface.py, test_p5_cluster_config.py, test_p5_cluster_ownership.py |
 | `PSETEX` | full | test_p1_expire_lazy_scan.py, test_p1_setex_psetex.py |

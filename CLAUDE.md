@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current work
 
-The active plan and the verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read its Part 0 first). A verified review on 2026-10-03 found silent data-loss defects; they are registered as `compat/delta.md` items 24–71 (items 24, 25 and 26 are fixed in part; the others are not fixed yet), and the statements below marked "not yet fixed" come from that review and name their item.
+The active plan and the verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read its Part 0 first). A verified review on 2026-10-03 found silent data-loss defects; they are registered as `compat/delta.md` items 24–71 (item 26 is fixed, items 24 and 25 are fixed in part; the others are not fixed yet), and the statements below marked "not yet fixed" come from that review and name their item.
 
 ## Build
 
@@ -102,7 +102,7 @@ Don't restate in prose what the code or `compat/delta.md` already owns (command 
 PeaDB is a Redis 7.2.5-compatible server written in C++20. For a fuller contributor-facing overview (execution model, data structures, persistence, replication, roadmap), see [`docs/architecture.md`](docs/architecture.md).
 
 - **`src/command.cpp`** — All Redis command handlers in one file (authoritative command list/count: `compat/commands.generated.md`). The command table is built once in `command_table()` (a static local). `handle_command()` is the main dispatcher.
-- **`src/server.cpp`** — Single-threaded epoll/kqueue event loop. Manages client sessions (`SessionState`), write buffers (`WriteBuf`), blocked clients, and deferred WAIT replies. Calls into command.cpp for every client command.
+- **`src/server.cpp`** — Single-threaded epoll/kqueue event loop. Manages client sessions (`SessionState`), write buffers (`WriteBuf`), blocked clients, clients held by `CLIENT PAUSE` (`SessionState::postponed`: the held command stays in the input buffer and runs again when the pause ends), and deferred WAIT replies. Calls into command.cpp for every client command.
 - **`src/datastore.cpp`** — In-memory key-value store (`DataStore`), 16 independent databases, all standard Redis data types (string, hash, list, set, zset, stream). Bucket-based SCAN cursor and random-start active expiry; SCAN and RANDOMKEY walk the whole database on every call, and SCAN can miss keys when the table grows during a scan (delta items 32 and 55, not yet fixed).
 - **`src/rdb.cpp`** — RDB binary format reader/writer. Non-stream types use real Redis type bytes, but the trailing CRC64 uses a wrong (non-reflected) table (`crc64_init`), so real Redis refuses PeaDB's RDB files, PeaDB refuses real Redis's, and cross-engine DUMP/RESTORE fails (delta item 27, not yet fixed). Streams are encoded under a **PeaDB-specific type byte (200)** via `DataStore::dump_stream`/`restore_stream` (entries + last-id + consumer groups + full PEL), so `SAVE`/`BGSAVE`/PSYNC handle stream datasets — but a PeaDB RDB containing streams is NOT loadable by real Redis (cross-engine stream migration uses AOF/bridge). See `compat/delta.md` items 2 & 5.
 - **`src/lua_engine.cpp`** — Lua 5.1 scripting (EVAL/EVALSHA/FCALL), wired back to `handle_command` for Redis call dispatch.
