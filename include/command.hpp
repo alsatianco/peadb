@@ -109,9 +109,11 @@ std::int64_t client_pause_end_ms();
 std::size_t command_count();
 std::vector<std::string> command_names();
 // dbfilename and appendfilename are relative to the working directory, which the config loader
-// changes to `dir` the way Redis does.
-void configure_persistence(const std::string& dbfilename, bool appendonly,
-                           const std::string& appendfilename, const std::string& appendfsync);
+// changes to `dir` the way Redis does. With appendonly on it opens the AOF, and returns Redis's
+// error text when it cannot (startup must stop then); otherwise it returns "".
+std::string configure_persistence(const std::string& dbfilename, bool appendonly,
+                                  const std::string& appendfilename,
+                                  const std::string& appendfsync);
 bool load_aof_file(const std::string& path, std::string& err);
 void aof_fsync_if_needed(std::int64_t now_ms);
 void reap_background_children();

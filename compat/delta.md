@@ -62,7 +62,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
     trigger a background BGSAVE via the event-loop cron; `SHUTDOWN [SAVE|NOSAVE]` saves on a
     clean shutdown. `stop-writes-on-bgsave-error` (default on) rejects writes with `-MISCONF`
     after a failed background save when save points are configured.
-- Missing: full Redis RDB parity (broader opcode/encoding coverage, edge-case behavior, and rarely-used features). Default ships no save points (set them or enable AOF for durability). Open defects from the 2026-10 review: items 27, 28, 29, 34, 51 and 53; item 49 lists every broken migration path.
+- Missing: full Redis RDB parity (broader opcode/encoding coverage, edge-case behavior, and rarely-used features). Default ships no save points (set them or enable AOF for durability). Open defects from the 2026-10 review: items 27, 29, 34, 51 and 53 (item 28 is fixed); item 49 lists every broken migration path.
 - Tracking: ongoing RDB parity hardening.
 
 3. AOF binary/semantic parity gaps
@@ -82,7 +82,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
   tolerates a truncated AOF tail (`aof-load-truncated`, default yes, logged) but treats
   mid-file corruption as fatal (refuses to start); AOF rewrite serialises zset scores
   with `%.17g` (round-trip) instead of `std::to_string` (which lost precision each rewrite).
-- Missing: full Redis-equivalent behavior/edge-case parity across entire command space. Open defects from the 2026-10 review: a tolerated torn tail is never cut off, so the next restart fails (item 30); the RDB and the AOF are both loaded on restart (item 28); the write-error flag is never cleared and `appendfsync always` acknowledges failed fsyncs (item 35); no MULTI/EXEC framing, and eviction DELs without SELECT (item 36); the write cost on the event loop (item 58); no automatic rewrite (item 59).
+- Missing: full Redis-equivalent behavior/edge-case parity across entire command space. Open defects from the 2026-10 review: a tolerated torn tail is never cut off, so the next restart fails (item 30); the write-error flag is never cleared and `appendfsync always` acknowledges failed fsyncs (item 35); no MULTI/EXEC framing, and eviction DELs without SELECT (item 36); the write cost on the event loop (item 58); no automatic rewrite (item 59).
 - Tracking tasks: broader compatibility hardening beyond current milestone.
 
 4. Modules ecosystem certification
@@ -460,7 +460,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
 - Missing: nothing for unknown names.
 ### Findings of the 2026-10 review (items 24–71)
 
-A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Item 26 is fixed (2026-10-06), and items 24, 25 and 33 are fixed in part (2026-10-05 and 2026-10-06); none of the other items 24–71 is fixed yet.** File:line references are as of `cb7194a`.
+A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Items 26 and 28 are fixed (2026-10-06), and items 24, 25 and 33 are fixed in part (2026-10-05 and 2026-10-06); none of the other items 24–71 is fixed yet.** File:line references are as of `cb7194a`.
 
 Evidence words used below: **reproduced** means run on live servers and re-checked by an independent verifier; **seen in code** means read in the code and re-checked, but not run; **code reading** means one reviewer's reading that nobody has re-checked yet. Speed and memory numbers were measured on macOS (libc++, libc malloc) and must be measured again on Linux.
 
@@ -502,13 +502,13 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Tracking: fix the table, add a known-answer unit test, keep loading files and payloads written with the old checksum, and add cross-load tests against the pinned Redis 7.2.5 in both directions.
 
 28. A restart with both `dump.rdb` and an AOF applies writes twice
-- Status: open defect. Evidence: reproduced.
+- Status: `full` (fixed 2026-10-06). Evidence: reproduced before the fix; the fix is checked against the pinned Redis 7.2.5 by `tests/integration/test_aof_load_parity.py`.
 - Owner: persistence-compat
-- Severity: critical
+- Severity: critical (before the fix)
 - Target milestone: R1
-- Implemented: an RDB alone and an AOF alone each load correctly.
-- Missing: with `appendonly yes` and a `dump.rdb` in `dir` (after any SAVE, BGSAVE, save point or SHUTDOWN SAVE), startup loads the RDB and then replays the whole AOF on top of it (`src/main.cpp:186-227`), so INCR, LPUSH, APPEND, XADD and every other non-idempotent write is applied twice on each restart. Redis loads only the AOF when AOF is on.
-- Tracking: load only the AOF when `appendonly yes`, and add a restart test with both files present.
+- Implemented: like Redis's `loadDataFromDisk()`, startup loads the AOF when `appendonly yes` and the RDB otherwise, never both (`src/main.cpp`). Before, with `appendonly yes` and a `dump.rdb` in `dir` (after any SAVE, BGSAVE, save point or SHUTDOWN SAVE), startup loaded the RDB and then replayed the whole AOF on top of it, so INCR, LPUSH, APPEND, XADD and every other non-idempotent write was applied twice on each restart. As in Redis, the RDB is not read even when the AOF is empty or new, so turning on `appendonly yes` in the config of a server that has only a `dump.rdb` starts it with no data; PeaDB also logs a warning that names the file it did not load and says to use `CONFIG SET appendonly yes` instead, which writes the data into the AOF. An AOF that cannot be opened stops startup with Redis's `Can't open the append-only file` text, where PeaDB used to start with no data and fail every write.
+- Missing: nothing for this item. The AOF is still PeaDB's single file, not Redis's `appendonlydir` with a manifest (item 3).
+- Tracking: none.
 
 29. Lists with 65,536 or more items are cut in RDB files and full sync
 - Status: open defect. Evidence: reproduced.
