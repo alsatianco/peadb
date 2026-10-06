@@ -587,7 +587,8 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
     }
   }
 
-  set(key, s, false, false, std::nullopt, false);
+  // Keep the TTL, like Redis's dbReplaceValue(); it is propagated as SET ... KEEPTTL.
+  set(key, s, false, false, std::nullopt, /*keep_ttl=*/true);
   ok = true;
   return s;
 }
@@ -1022,6 +1023,114 @@ std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t 
   return out;
 }
 
+DataStore::LsetResult DataStore::lset(const std::string& key, std::int64_t index,
+                                      const std::string& value) {
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return LsetResult::NoKey;
+  if (it->second.type() != ValueType::List) return LsetResult::WrongType;
+  auto& l = it->second.list();
+  const auto n = static_cast<std::int64_t>(l.size());
+  if (index < 0) index += n;
+  if (index < 0 || index >= n) return LsetResult::OutOfRange;
+  l[static_cast<std::size_t>(index)] = value;
+  return LsetResult::Ok;
+}
+
+std::int64_t DataStore::lrem(const std::string& key, std::int64_t count, const std::string& value,
+                             bool& wrongtype, bool& key_removed) {
+  wrongtype = false;
+  key_removed = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return 0;
+  if (it->second.type() != ValueType::List) {
+    wrongtype = true;
+    return 0;
+  }
+  auto& l = it->second.list();
+  // One compacting pass (a deque erase in the middle is O(N) per call). The limit is unsigned
+  // so that count == INT64_MIN does not overflow; like Redis it then removes every match.
+  std::uint64_t limit = std::numeric_limits<std::uint64_t>::max();  // count 0: every match
+  if (count > 0) limit = static_cast<std::uint64_t>(count);
+  if (count < 0) limit = 0 - static_cast<std::uint64_t>(count);
+  std::uint64_t removed = 0;
+  auto compact = [&](auto first, auto last) {
+    auto out = first;
+    for (auto in = first; in != last; ++in) {
+      if (removed < limit && *in == value) {
+        ++removed;
+        continue;
+      }
+      if (out != in) *out = std::move(*in);
+      ++out;
+    }
+    return out;
+  };
+  if (count >= 0) {
+    l.erase(compact(l.begin(), l.end()), l.end());
+  } else {
+    l.erase(l.begin(), compact(l.rbegin(), l.rend()).base());
+  }
+  if (l.empty()) {
+    db.erase(it);
+    key_removed = true;
+  }
+  return static_cast<std::int64_t>(removed);
+}
+
+std::int64_t DataStore::linsert(const std::string& key, bool before, const std::string& pivot,
+                                const std::string& value, bool& wrongtype) {
+  wrongtype = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return 0;
+  if (it->second.type() != ValueType::List) {
+    wrongtype = true;
+    return 0;
+  }
+  auto& l = it->second.list();
+  auto pos = std::find(l.begin(), l.end(), pivot);
+  if (pos == l.end()) return -1;
+  l.insert(before ? pos : std::next(pos), value);
+  return static_cast<std::int64_t>(l.size());
+}
+
+bool DataStore::ltrim(const std::string& key, std::int64_t start, std::int64_t stop,
+                      bool& wrongtype, bool& key_removed) {
+  wrongtype = false;
+  key_removed = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return false;
+  if (it->second.type() != ValueType::List) {
+    wrongtype = true;
+    return false;
+  }
+  auto& l = it->second.list();
+  // Index rules of Redis's ltrimCommand().
+  const auto n = static_cast<std::int64_t>(l.size());
+  if (start < 0) start += n;
+  if (stop < 0) stop += n;
+  if (start < 0) start = 0;
+  if (start > stop || start >= n) {
+    l.clear();
+  } else {
+    if (stop >= n) stop = n - 1;
+    l.erase(l.begin() + static_cast<std::ptrdiff_t>(stop + 1), l.end());
+    l.erase(l.begin(), l.begin() + static_cast<std::ptrdiff_t>(start));
+  }
+  if (l.empty()) {
+    db.erase(it);
+    key_removed = true;
+  }
+  return true;
+}
+
 std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::string>& members, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
@@ -1221,6 +1330,34 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   }
   r.score = mit->second;
   return r;
+}
+
+std::int64_t DataStore::zrem(const std::string& key, const std::vector<std::string>& members,
+                             bool& wrongtype, bool& key_removed) {
+  wrongtype = false;
+  key_removed = false;
+  auto& db = dbs_[current_db_];
+  expire_if_needed(db, key);
+  auto it = db.find(key);
+  if (it == db.end()) return 0;
+  if (it->second.type() != ValueType::ZSet) {
+    wrongtype = true;
+    return 0;
+  }
+  auto& entry = it->second;
+  std::int64_t removed = 0;
+  for (const auto& m : members) {
+    auto mit = entry.zset().find(m);
+    if (mit == entry.zset().end()) continue;
+    entry.zord().erase({mit->second, m});
+    entry.zset().erase(mit);
+    ++removed;
+  }
+  if (entry.zset().empty()) {
+    db.erase(it);
+    key_removed = true;
+  }
+  return removed;
 }
 
 std::vector<std::pair<std::string, double>> DataStore::zrange(

@@ -460,7 +460,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
 - Missing: nothing for unknown names.
 ### Findings of the 2026-10 review (items 24–71)
 
-A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Items 26, 27, 28 and 30 are fixed (2026-10-06), and items 24, 25, 33 and 34 are fixed in part (2026-10-05 and 2026-10-06); none of the other items 24–71 is fixed yet.** File:line references are as of `cb7194a`.
+A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Items 26, 27, 28, 29, 30 and 31 are fixed (2026-10-06), and items 24, 25, 33 and 34 are fixed in part (2026-10-05 and 2026-10-06); none of the other items 24–71 is fixed yet.** Items 72–74 were found later, while fixing item 31. File:line references are as of `cb7194a`.
 
 Evidence words used below: **reproduced** means run on live servers and re-checked by an independent verifier; **seen in code** means read in the code and re-checked, but not run; **code reading** means one reviewer's reading that nobody has re-checked yet. Speed and memory numbers were measured on macOS (libc++, libc malloc) and must be measured again on Linux.
 
@@ -528,14 +528,14 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Missing: nothing for this item. Before the fix, PeaDB did not cut the file and opened it for append as it was (`O_APPEND`), so new writes landed after the torn bytes, the next restart found corruption in the middle of the file and refused to start, and a repair by hand lost every write since the first restart. A file damaged that way by an older PeaDB still stops startup, at the offset of the torn command; `redis-check-aof --fix <file>` from Redis 7.2.5 cuts it there, which drops every command after it (checked on such a file).
 - Tracking: none.
 
-31. LTRIM, LSET, LREM, LINSERT, ZREM and ZREMRANGEBY* remove the key's TTL
-- Status: open defect. Evidence: reproduced.
+31. LTRIM, LSET, LREM, LINSERT, ZREM and ZREMRANGEBY* removed the key's TTL
+- Status: `full` (fixed 2026-10-06). Evidence: reproduced before the fix; the fix is checked against the pinned Redis 7.2.5 by `tests/integration/test_list_zset_ttl_parity.py` and `tests/unit/list_zset_in_place_test.cpp`.
 - Owner: datatypes-compat
-- Severity: critical
+- Severity: critical (before the fix)
 - Target milestone: R1
-- Implemented: the commands return the right replies and keep the right elements.
-- Missing: each handler copies the collection, deletes the key and writes it back (`src/command.cpp:8489` LSET, `:8525` LREM, `:8632` LINSERT, `:8660` LTRIM, `:8882` ZREMRANGEBYSCORE/RANK/LEX, `:8958` ZREM), which drops `expire_at_ms`, so a key that should expire lives for ever. The copy also makes them O(N) per call (item 56).
-- Tracking: change the collection in place inside `DataStore` (old plan Track 6 "in-place list ops"), and add a TTL test for each command.
+- Implemented: LSET, LREM, LINSERT, LTRIM, ZREM, ZREMRANGEBYSCORE, ZREMRANGEBYRANK and ZREMRANGEBYLEX change the list or sorted set in place (`DataStore::lset()`, `lrem()`, `linsert()`, `ltrim()` and `zrem()` in `src/datastore.cpp`), as Redis's `t_list.c` and `t_zset.c` do, so the key keeps its TTL, and they delete the key only when it becomes empty. INCRBYFLOAT dropped the TTL too (found while fixing this; PeaDB already replicated it as `SET … KEEPTTL`, so a replica kept a TTL that its master had lost); it now keeps it, as in Redis. Each of the eight commands now sends its keyspace events from its handler, in Redis's order: `del` after the command's own event when it empties the key (none was sent), `zremrangebyscore`, `zremrangebyrank` and `zremrangebylex` (no event was sent), `linsert` only when it inserted, and `ltrim` only when the list exists. They check their arguments in Redis's order: LTRIM and LREM parse their numbers, and LINSERT checks `BEFORE`/`AFTER`, before they look at the key, so the error for a bad number or word comes before `WRONGTYPE`. `LREM` with the count -9223372036854775808 removes every match, as in Redis (it removed none). The sorted-set range parser that ZRANGE, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT and ZREMRANGEBY* share (`zrange_select()` in `src/command.cpp`), and ZCOUNT, ZRANGEBYSCORE and ZREVRANGEBYSCORE, now read a score bound like Redis's `zslParseRange()` (`1abc` is refused, an empty bound is 0) and a lex bound like `zslParseLexRangeItem()` (an empty bound is refused), check the options, then the range, then the key, and refuse a repeated `REV`, `BYSCORE` or `BYLEX`. The edits no longer copy and rebuild the collection: 900 ZREM, LSET and LTRIM calls on 200,000-item collections take about 0.04 s, against about 10 s before (macOS).
+- Missing: nothing for this item. Before the fix, each of these commands copied the collection, deleted the key and wrote it back, which dropped its TTL, so a key that should expire lived for ever, on the master, on its replicas and after an AOF reload. Other commands still miss keyspace events (item 72), ZREMRANGEBY* still copy the sorted set to choose what to remove (item 56), integer arguments are still read more loosely than Redis reads them (item 73), and other sorted-set range edge cases differ (item 74). Deliberate difference: Redis 7.2.5 passes the LSET index to `listTypeReplaceAtIndex()` as a C `int`, so `LSET l 4294967296 x` sets the first item there and `LSET l 9223372036854775807 x` the last one; PeaDB answers `index out of range`, as Redis does for every index that fits in an `int` (copying the cut would change the wrong item).
+- Tracking: none.
 
 32. SCAN misses keys when the keyspace grows during a scan
 - Status: open defect. Evidence: reproduced.
@@ -760,8 +760,8 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Severity: high
 - Target milestone: R5
 - Implemented: the replies are correct.
-- Missing: commands that are O(1) or O(log N) in Redis copy the full collection first (`store().zrange/lrange/smembers/hgetall(..., 0, -1)`): ZCARD (`src/command.cpp:8714`), ZSCORE (`:8724`), ZRANK and ZREVRANK (`:8790`, `:8811`), ZINCRBY (`:8975`), ZREM (`:8947`, `:8958`, which also deletes and re-adds every remaining member), LINDEX (`:8465`), LSET (`:8482`), LTRIM (`:8660`), SRANDMEMBER (`:9376`) and HRANDFIELD (`:9589`). At 1M members, ZSCORE takes about 8 ms, ZREM 300–400 ms and HRANDFIELD about 46 ms, and each call blocks every client.
-- Tracking: read and change collections in place (old plan Track 6 ZRANK item; the in-place changes also fix item 31).
+- Missing: commands that are O(1) or O(log N) in Redis copy the full collection first (`store().zrange/lrange/smembers/hgetall(..., 0, -1)`): ZCARD (`src/command.cpp:8714`), ZSCORE (`:8724`), ZRANK and ZREVRANK (`:8790`, `:8811`), ZINCRBY (`:8975`), ZREMRANGEBYSCORE, ZREMRANGEBYRANK and ZREMRANGEBYLEX (they choose what to remove from a copy; the removal itself is in place since item 31), LINDEX (`:8465`), SRANDMEMBER (`:9376`) and HRANDFIELD (`:9589`). At 1M members, ZSCORE takes about 8 ms and HRANDFIELD about 46 ms, and each call blocks every client. ZREM, LSET and LTRIM change the collection in place since 2026-10-06 (item 31; ZREM took 300–400 ms at 1M members before).
+- Tracking: read collections in place (old plan Track 6 ZRANK item), and choose the ZREMRANGEBY* victims without a copy.
 
 57. Active expiry is too slow
 - Status: open defect. Evidence: reproduced (macOS).
@@ -897,3 +897,30 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Implemented: the replies have the right shape and size.
 - Missing: SPOP always takes the first element in hash order (`src/datastore.cpp:1107`), and ZRANDMEMBER, SRANDMEMBER and HRANDFIELD use `std::rand()` with no seed (for example `src/command.cpp:9173`, `:9202`, `:9383`, `:9405`), so the same data gives the same "random" picks on every rebuild and restart. Applications that use these commands for sampling, load spreading or picking winners get predictable results.
 - Tracking: use one seeded random generator for all of them.
+
+72. Keyspace events missing or wrong for many write commands
+- Status: open defect. Evidence: reproduced 2026-10-06 against the pinned Redis 7.2.5 (both engines with `notify-keyspace-events KEA`), while fixing item 31.
+- Owner: keyspace-compat
+- Severity: medium
+- Target milestone: R8
+- Implemented: the commands in the central event table (`emit_keyspace_notifications()` in `src/command.cpp`) send their event for the first key when they change it; `expired`, `evicted`, the `new` class and the stream group events are sent; and since item 31, LSET, LREM, LINSERT, LTRIM, ZREM and ZREMRANGEBY* send Redis's full sequence from their handlers.
+- Missing: the central table sends at most one event, for the command's first key, so: no other command sends `del` when it empties a key (reproduced for LPOP, RPOP, SREM, SPOP, HDEL and ZPOPMIN; Redis sends the command's event, then `del`), and EXPIRE with a time in the past sends `expire` where Redis sends `del`; LMOVE, RPOPLPUSH, SMOVE, LMPOP, BLMPOP, ZMPOP, BLPOP, BZPOPMIN, LPUSHX, RENAMENX, MOVE, GETEX, PFADD, PFMERGE, GEOADD, XSETID, XGROUP SETID and XGROUP DESTROY send no event at all, and neither do SINTERSTORE, SUNIONSTORE, ZUNIONSTORE, ZRANGESTORE, SORT … STORE and BITOP (nor `del` when an empty result deletes the destination); COPY sends `copy_to` for the source key instead of the destination, SETEX sends `set` without `expire`, and `ZADD … INCR` sends `zadd` instead of `zincr`. Commands missing from the table but not tried (for example RPUSHX, SDIFFSTORE, ZINTERSTORE, ZDIFFSTORE, GEOSEARCHSTORE) are likely the same (seen in code). Clients that keep a cache or an index in step with keyspace events miss these changes.
+- Tracking: send each command's events from its handler in Redis's order, as item 31 does for the list and sorted-set edits, with a parity test per command family; then remove the central table.
+
+73. Integer arguments are read more loosely than Redis reads them
+- Status: open defect. Evidence: reproduced 2026-10-06 against the pinned Redis 7.2.5, while fixing item 31.
+- Owner: datatypes-compat
+- Severity: high
+- Target milestone: R8
+- Implemented: well-formed integers are read correctly, and a number with text after it (`1 `, `1abc`) is refused as in Redis.
+- Missing: `parse_i64()` in `src/command.cpp` uses `std::stoll`, so it also takes a leading space or tab, a `+` sign, `-0` and leading zeros, where Redis's `string2ll()` answers `value is not an integer or out of range`. It serves about 120 call sites (indexes, counts, TTLs, ranges). Reproduced: `LTRIM l 5 ' 1'` answers `OK` and deletes the list (Redis refuses it and keeps the list), `LSET l -0 x` sets the first item, `EXPIRE k +100` and `SETEX k ' 100' v` set a TTL, and `LRANGE l 0 +1`, `LINDEX l ' 0'`, `GETRANGE k 0 01` and `ZRANGE z +0 1` answer with data. A client bug that sends such a value changes or deletes data on PeaDB where Redis refuses the command. Stored values have the same problem: `INCR` and friends read a stored `007` or `-0` (`DataStore::incrby()` uses `strtoll`).
+- Tracking: a `string2ll()` port for command arguments (the config loader keeps its own rules), then run every adopted suite.
+
+74. Sorted-set range commands: option edge cases
+- Status: open defect. Evidence: reproduced 2026-10-06 against the pinned Redis 7.2.5 (by the review of the item 31 fix; each was the same before that fix).
+- Owner: datatypes-compat
+- Severity: low
+- Target milestone: R8
+- Implemented: the range modes, `REV`, `LIMIT` and `WITHSCORES`, the bound parsing and the error order of `zrange_select()` (item 31).
+- Missing: a negative `LIMIT` offset is ignored, where Redis returns nothing (`ZRANGE z (1 4 BYSCORE LIMIT -1 2` gives two members on PeaDB, an empty array on Redis; ZRANGEBYSCORE and ZREVRANGEBYSCORE too); ZRANGEBYLEX accepts `REV` (Redis: `syntax error`); ZRANGEBYLEX and ZREVRANGEBYLEX with `WITHSCORES` answer `syntax error` instead of `syntax error, WITHSCORES not supported in combination with BYLEX`; ZRANGESTORE refuses a destination of another type with `WRONGTYPE`, and checks it before the options and the range, where Redis overwrites the destination; on a sorted set whose members do not all have the same score, ZRANGEBYLEX, ZLEXCOUNT and ZREMRANGEBYLEX test every member against the lex range, where Redis walks the members in score order from the first one in range and stops at the first one out of range (Redis documents the result as undefined then, but `ZREMRANGEBYLEX z [ (e` removed 4 members on PeaDB and none on Redis).
+- Tracking: give `zrange_select()` a fixed mode and direction for the legacy commands, like Redis's `zrangeGenericCommand()` arguments, and walk the ordered index for BYLEX as Redis does.

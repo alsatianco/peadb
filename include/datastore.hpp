@@ -239,6 +239,19 @@ class DataStore {
   std::optional<std::string> rpop(const std::string& key, bool& wrongtype);
   std::int64_t llen(const std::string& key, bool& wrongtype);
   std::vector<std::string> lrange(const std::string& key, std::int64_t start, std::int64_t stop, bool& wrongtype);
+  // In-place list edits, like Redis's t_list.c: the key keeps its Entry (TTL, LRU/LFU) and is
+  // deleted only when the list becomes empty, which `key_removed` reports.
+  enum class LsetResult { Ok, NoKey, WrongType, OutOfRange };
+  LsetResult lset(const std::string& key, std::int64_t index, const std::string& value);
+  // count > 0 removes from the head, count < 0 from the tail, 0 removes every match.
+  std::int64_t lrem(const std::string& key, std::int64_t count, const std::string& value,
+                    bool& wrongtype, bool& key_removed);
+  // Returns the new length, -1 when the pivot is not found, 0 when the key does not exist.
+  std::int64_t linsert(const std::string& key, bool before, const std::string& pivot,
+                       const std::string& value, bool& wrongtype);
+  // Returns false when the key does not exist.
+  bool ltrim(const std::string& key, std::int64_t start, std::int64_t stop, bool& wrongtype,
+             bool& key_removed);
   std::int64_t sadd(const std::string& key, const std::vector<std::string>& members, bool& wrongtype);
   std::int64_t srem(const std::string& key, const std::vector<std::string>& members, bool& wrongtype);
   bool sismember(const std::string& key, const std::string& member, bool& wrongtype);
@@ -257,6 +270,10 @@ class DataStore {
   };
   ZAddResult zadd_one(const std::string& key, double score, const std::string& member,
                       bool nx, bool xx, bool gt, bool lt, bool incr);
+  // Removes members in place (the key keeps its TTL); deletes the key when the zset becomes
+  // empty, which `key_removed` reports.
+  std::int64_t zrem(const std::string& key, const std::vector<std::string>& members,
+                    bool& wrongtype, bool& key_removed);
   std::vector<std::pair<std::string, double>> zrange(const std::string& key, std::int64_t start, std::int64_t stop,
                                                      bool withscores, bool& wrongtype);
   std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> zscan(
