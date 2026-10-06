@@ -15,12 +15,14 @@
 #include "logger.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <arpa/inet.h>
@@ -31,11 +33,18 @@ namespace peadb {
 
 namespace {
 bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
+bool g_rdb_checksum = true;               // rdbchecksum (startup-only, as in Redis)
 FunctionDumpFn g_function_dump_hook;      // returns every function library's source
 FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
 }  // namespace
 
 void rdb_set_skip_checksum_validation(bool skip) { g_skip_checksum_validation = skip; }
+void rdb_set_checksum(bool enabled) {
+  g_rdb_checksum = enabled;
+}
+bool rdb_checksum() {
+  return g_rdb_checksum;
+}
 
 void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load) {
   g_function_dump_hook = std::move(dump);
@@ -65,6 +74,9 @@ constexpr uint8_t RDB_OPCODE_EOF           = 255;
 constexpr uint8_t RDB_OPCODE_RESIZEDB      = 251;
 constexpr uint8_t RDB_OPCODE_AUX           = 250;
 constexpr uint8_t RDB_OPCODE_FUNCTION2     = 245;  // one string payload = one library's source
+constexpr uint8_t RDB_OPCODE_FUNCTION_PRE_GA = 246;  // Redis 7.0 release-candidate format
+constexpr uint8_t RDB_OPCODE_IDLE          = 248;  // LRU idle seconds of the next key
+constexpr uint8_t RDB_OPCODE_FREQ          = 249;  // LFU counter of the next key
 
 constexpr uint8_t RDB_TYPE_STRING   = 0;
 constexpr uint8_t RDB_TYPE_LIST     = 1;
@@ -94,38 +106,59 @@ constexpr uint8_t RDB_ENC_INT32 = 2;
 constexpr uint8_t RDB_ENC_LZF   = 3;
 
 constexpr int RDB_VERSION = 10;
+// The newest RDB version Redis 7.2.5 reads (its rdb.h RDB_VERSION): a file or a DUMP payload with
+// a newer one is refused, as Redis refuses it.
+constexpr int RDB_VERSION_MAX_LOAD = 11;
 
 // ── CRC64 ──────────────────────────────────────────────────────────────
-// Redis uses CRC-64/ECMA-182 (Jones). We implement a table-driven version.
+// Redis's crc64.c: CRC-64 with the Jones polynomial 0xad93d23594c935a9, reflected in and out,
+// initial value 0 and no final xor, so crc64(0, "123456789") == 0xe9c6d914c4b8d9ca. A reflected
+// (right-shift) table needs the bit-reversed polynomial, 0x95ac9329ac4bc9b5; using the polynomial
+// as written gave a different checksum, so neither engine could read the other's files (compat/
+// delta.md item 27). Eight tables let the loop take 8 bytes per step, as Redis's crcspeed.c does.
 
-static uint64_t crc64_tab[256];
-static bool crc64_initialized = false;
+constexpr uint64_t kCrc64ReflectedPoly = 0x95ac9329ac4bc9b5ULL;
 
-void crc64_init() {
-  if (crc64_initialized) return;
-  const uint64_t poly = 0xad93d23594c935a9ULL;
-  for (int i = 0; i < 256; ++i) {
-    uint64_t crc = static_cast<uint64_t>(i);
-    for (int j = 0; j < 8; ++j) {
-      if (crc & 1) crc = (crc >> 1) ^ poly;
-      else crc >>= 1;
+struct Crc64Tables {
+  uint64_t t[8][256];
+  Crc64Tables() {
+    for (int n = 0; n < 256; ++n) {
+      uint64_t crc = static_cast<uint64_t>(n);
+      for (int k = 0; k < 8; ++k) crc = (crc & 1) ? (crc >> 1) ^ kCrc64ReflectedPoly : crc >> 1;
+      t[0][n] = crc;
     }
-    crc64_tab[i] = crc;
+    // t[k][n] is the CRC of byte n followed by k zero bytes.
+    for (int n = 0; n < 256; ++n) {
+      for (int k = 1; k < 8; ++k) t[k][n] = t[0][t[k - 1][n] & 0xff] ^ (t[k - 1][n] >> 8);
+    }
   }
-  crc64_initialized = true;
-}
+};
 
-uint64_t crc64(uint64_t crc, const uint8_t* data, size_t len) {
-  crc64_init();
-  for (size_t i = 0; i < len; ++i) {
-    crc = crc64_tab[(crc ^ data[i]) & 0xff] ^ (crc >> 8);
+const Crc64Tables& crc64_tables() {
+  static const Crc64Tables tables;  // built once; C++ makes this initialization thread-safe
+  return tables;
+}
+}  // namespace
+
+uint64_t crc64(uint64_t crc, const void* data, size_t len) {
+  const auto& t = crc64_tables().t;
+  const auto* p = static_cast<const uint8_t*>(data);
+  while (len >= 8) {
+    uint64_t word;
+    std::memcpy(&word, p, 8);
+    if constexpr (std::endian::native == std::endian::big) word = __builtin_bswap64(word);
+    crc ^= word;
+    crc = t[7][crc & 0xff] ^ t[6][(crc >> 8) & 0xff] ^ t[5][(crc >> 16) & 0xff] ^
+          t[4][(crc >> 24) & 0xff] ^ t[3][(crc >> 32) & 0xff] ^ t[2][(crc >> 40) & 0xff] ^
+          t[1][(crc >> 48) & 0xff] ^ t[0][crc >> 56];
+    p += 8;
+    len -= 8;
   }
+  while (len-- > 0) crc = t[0][(crc ^ *p++) & 0xff] ^ (crc >> 8);
   return crc;
 }
 
-uint64_t crc64(uint64_t crc, const std::string& s) {
-  return crc64(crc, reinterpret_cast<const uint8_t*>(s.data()), s.size());
-}
+namespace {
 
 // ── Binary writer ──────────────────────────────────────────────────────
 
@@ -801,8 +834,8 @@ std::string rdb_build_string(std::string& err) {
   // EOF marker
   w.write_u8(RDB_OPCODE_EOF);
 
-  // CRC64
-  uint64_t checksum = crc64(0, reinterpret_cast<const uint8_t*>(w.data().data()), w.data().size());
+  // CRC64 of everything before it; with rdbchecksum no, Redis writes 0 ("no checksum") instead.
+  const uint64_t checksum = g_rdb_checksum ? crc64(0, w.data().data(), w.data().size()) : 0;
   w.write_u64_le(checksum);
 
   return w.data();
@@ -857,7 +890,8 @@ std::string rdb_save_to_string(std::string& err) {
 
 // ── RDB Load ───────────────────────────────────────────────────────────
 
-bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_crc) {
+bool rdb_load(const std::filesystem::path& path, std::string& err,
+              const std::function<void()>& before_replace) {
   err.clear();
 
   std::ifstream in(path, std::ios::binary);
@@ -884,27 +918,30 @@ bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_c
     err = "invalid RDB version";
     return false;
   }
-  if (rdb_ver < 1 || rdb_ver > 13) {
-    err = "unsupported RDB version " + std::to_string(rdb_ver);
+  if (rdb_ver < 1 || rdb_ver > RDB_VERSION_MAX_LOAD) {
+    err = "Can't handle RDB format version " + std::to_string(rdb_ver);
     return false;
   }
 
-  // Verify the trailing 8-byte CRC64 over all preceding bytes (matches the writer at
-  // rdb_build_string). A stored checksum of 0 means checksumming was disabled — skip then,
-  // like Redis. A mismatch means the file is corrupt: refuse to load it (the caller treats
-  // a corrupt REDIS-magic file as fatal rather than silently falling back to legacy).
-  // Only enforced for on-disk startup loads: the replication path may receive an RDB from a
-  // foreign master (real Redis), whose CRC-64 variant differs from PeaDB's and whose stream
-  // integrity is already covered by TCP + length framing + the parser.
-  if (verify_crc && filedata.size() >= 8) {
+  // The trailing CRC64 of a version 5+ file, checked like Redis's rdbLoadRio() unless
+  // rdbchecksum is no or DEBUG SET-SKIP-CHECKSUM-VALIDATION is on, for every load: startup,
+  // DEBUG RELOAD and a replica's full sync. A stored 0 means the file was saved without a
+  // checksum. Redis checks it after reading the keys; PeaDB checks it first, so a corrupt file
+  // never replaces the dataset in memory.
+  if (rdb_ver >= 5 && g_rdb_checksum && !g_skip_checksum_validation) {
     uint64_t stored = 0;
     const auto* tail = reinterpret_cast<const unsigned char*>(filedata.data() + filedata.size() - 8);
     for (int i = 0; i < 8; ++i) stored |= static_cast<uint64_t>(tail[i]) << (8 * i);
-    if (stored != 0) {
-      const uint64_t computed =
-          crc64(0, reinterpret_cast<const uint8_t*>(filedata.data()), filedata.size() - 8);
+    if (stored == 0) {
+      log(LogLevel::Info, "RDB file was saved with checksum disabled: no check performed.");
+    } else {
+      const uint64_t computed = crc64(0, filedata.data(), filedata.size() - 8);
       if (computed != stored) {
-        err = "RDB CRC64 checksum mismatch (file is corrupt)";
+        char msg[128];
+        std::snprintf(
+            msg, sizeof(msg), "Wrong RDB checksum expected: (%llx) but got (%llx). Aborting now.",
+            static_cast<unsigned long long>(computed), static_cast<unsigned long long>(stored));
+        err = msg;
         return false;
       }
     }
@@ -912,17 +949,47 @@ bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_c
 
   RdbReader r(filedata.data() + 9, filedata.size() - 9);
   auto& ds = store();
+  if (before_replace) before_replace();
   ds.flushall();
   const int prev_db = ds.current_db();
   ds.select_db(0);
 
   std::optional<int64_t> pending_expire;
+  // Like Redis, a file must end with the EOF opcode (and, from version 5, the 8-byte checksum
+  // after it): a file cut at a key boundary is an error even when the checksum is not checked.
+  bool saw_eof = false;
 
   while (!r.eof()) {
     uint8_t type;
     if (!r.read_u8(type)) break;
 
-    if (type == RDB_OPCODE_EOF) break;
+    if (type == RDB_OPCODE_EOF) {
+      saw_eof = true;
+      break;
+    }
+
+    // Written by a Redis with an LRU or LFU maxmemory-policy, before each key. Read and
+    // dropped: a loaded key starts with fresh eviction data, and eviction is approximate in
+    // PeaDB anyway (compat/delta.md item 12).
+    if (type == RDB_OPCODE_IDLE) {
+      uint64_t idle_seconds;
+      bool enc;
+      if (!r.read_length(idle_seconds, enc) || enc) {
+        err = "malformed IDLE";
+        ds.select_db(prev_db);
+        return false;
+      }
+      continue;
+    }
+    if (type == RDB_OPCODE_FREQ) {
+      uint8_t freq;
+      if (!r.read_u8(freq)) {
+        err = "malformed FREQ";
+        ds.select_db(prev_db);
+        return false;
+      }
+      continue;
+    }
 
     if (type == RDB_OPCODE_AUX) {
       std::string aux_key, aux_val;
@@ -1243,10 +1310,41 @@ bool rdb_load(const std::filesystem::path& path, std::string& err, bool verify_c
   }
 
   ds.select_db(prev_db);
+  if (!saw_eof || (rdb_ver >= 5 && r.remaining() < 8)) {
+    err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
+    return false;
+  }
   return true;
 }
 
 // ── DUMP / RESTORE ─────────────────────────────────────────────────────
+
+namespace {
+// Redis's DUMP footer (createDumpPayload()): the RDB version as 2 little-endian bytes, then the
+// CRC64 of everything before it as 8 little-endian bytes. DUMP always writes the checksum, even
+// with rdbchecksum no, as Redis does.
+std::string finish_dump_payload(std::string payload) {
+  payload.push_back(static_cast<char>(RDB_VERSION & 0xff));
+  payload.push_back(static_cast<char>((RDB_VERSION >> 8) & 0xff));
+  const uint64_t checksum = crc64(0, payload.data(), payload.size());
+  for (int i = 0; i < 8; ++i) payload.push_back(static_cast<char>((checksum >> (i * 8)) & 0xff));
+  return payload;
+}
+
+// Redis's verifyDumpPayload(), for RESTORE and FUNCTION RESTORE: the 10-byte footer is there, its
+// RDB version is one Redis 7.2.5 reads (checked even when DEBUG SET-SKIP-CHECKSUM-VALIDATION is
+// on), and the CRC64 matches unless that DEBUG setting is on.
+bool verify_dump_payload(const std::string& payload) {
+  if (payload.size() < 10) return false;
+  const auto* footer = reinterpret_cast<const unsigned char*>(payload.data() + payload.size() - 10);
+  const int rdbver = footer[0] | (footer[1] << 8);
+  if (rdbver > RDB_VERSION_MAX_LOAD) return false;
+  if (g_skip_checksum_validation) return true;
+  uint64_t stored = 0;
+  for (int i = 0; i < 8; ++i) stored |= static_cast<uint64_t>(footer[2 + i]) << (8 * i);
+  return crc64(0, payload.data(), payload.size() - 8) == stored;
+}
+}  // namespace
 
 std::string rdb_dump_key(const std::string& key) {
   auto& ds = store();
@@ -1303,15 +1401,51 @@ std::string rdb_dump_key(const std::string& key) {
   }
 
   // Redis DUMP format: <RDB payload> <rdb-version:LE u16> <crc64:LE u64>
-  // The RDB version used in DUMP is the Redis version (e.g., 10)
-  std::string payload = w.data();
-  payload.push_back(static_cast<char>(RDB_VERSION & 0xff));
-  payload.push_back(static_cast<char>((RDB_VERSION >> 8) & 0xff));
+  return finish_dump_payload(w.data());
+}
 
-  uint64_t checksum = crc64(0, reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
-  for (int i = 0; i < 8; ++i) payload.push_back(static_cast<char>((checksum >> (i * 8)) & 0xff));
+std::string rdb_dump_functions(const std::vector<std::string>& library_codes) {
+  // Redis's functionDumpCommand(): rdbSaveFunctions() (one FUNCTION2 opcode and source string
+  // per library), then the DUMP footer.
+  RdbWriter w;
+  for (const auto& code : library_codes) {
+    w.write_u8(RDB_OPCODE_FUNCTION2);
+    w.write_string(code);
+  }
+  return finish_dump_payload(w.data());
+}
 
-  return payload;
+bool rdb_parse_function_payload(const std::string& payload, std::vector<std::string>& library_codes,
+                                std::string& err) {
+  // Redis's functionRestoreCommand(), up to loading the libraries, with its error texts.
+  library_codes.clear();
+  if (!verify_dump_payload(payload)) {
+    err = "DUMP payload version or checksum are wrong";
+    return false;
+  }
+  RdbReader r(payload.data(), payload.size() - 10);
+  while (!r.eof()) {
+    uint8_t type = 0;
+    if (!r.read_u8(type)) {
+      err = "can not read data type";
+      return false;
+    }
+    if (type == RDB_OPCODE_FUNCTION_PRE_GA) {
+      err = "Pre-GA function format not supported";
+      return false;
+    }
+    if (type != RDB_OPCODE_FUNCTION2) {
+      err = "given type is not a function";
+      return false;
+    }
+    std::string code;
+    if (!r.read_string(code)) {
+      err = "Failed loading library payload";
+      return false;
+    }
+    library_codes.push_back(std::move(code));
+  }
+  return true;
 }
 
 bool rdb_restore_key(const std::string& key, const std::string& payload,
@@ -1328,23 +1462,9 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
   }
 
   // DUMP format: <type+data> <rdb-ver:u16 LE> <crc64:u64 LE>
-  if (payload.size() < 10) {
-    err = "DUMP payload is not valid";
+  if (!verify_dump_payload(payload)) {
+    err = "DUMP payload version or checksum are wrong";
     return false;
-  }
-
-  // Verify CRC (skippable via DEBUG SET-SKIP-CHECKSUM-VALIDATION, like Redis)
-  if (!g_skip_checksum_validation) {
-    size_t crc_offset = payload.size() - 8;
-    uint64_t stored_crc = 0;
-    for (int i = 0; i < 8; ++i) {
-      stored_crc |= static_cast<uint64_t>(static_cast<uint8_t>(payload[crc_offset + i])) << (i * 8);
-    }
-    uint64_t computed_crc = crc64(0, reinterpret_cast<const uint8_t*>(payload.data()), crc_offset);
-    if (stored_crc != computed_crc) {
-      err = "DUMP payload version or checksum are wrong";
-      return false;
-    }
   }
 
   // Strip the 2-byte version + 8-byte CRC
@@ -1368,23 +1488,23 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
 
   uint8_t type;
   if (!r.read_u8(type)) {
-    err = "DUMP payload is not valid";
+    err = "Bad data format";
     return false;
   }
 
   if (type == RDB_TYPE_STRING) {
     std::string val;
-    if (!r.read_string(val)) { err = "malformed string in DUMP"; return false; }
+    if (!r.read_string(val)) { err = "Bad data format"; return false; }
     ds.set(key, val, false, false, expire_at, false);
 
   } else if (type == RDB_TYPE_LIST) {
     uint64_t len;
     bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "malformed list in DUMP"; return false; }
+    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
     std::vector<std::string> items;
     for (uint64_t i = 0; i < len; ++i) {
       std::string val;
-      if (!r.read_string(val)) { err = "malformed list item in DUMP"; return false; }
+      if (!r.read_string(val)) { err = "Bad data format"; return false; }
       items.push_back(std::move(val));
     }
     bool wt = false;
@@ -1394,11 +1514,11 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
   } else if (type == RDB_TYPE_SET) {
     uint64_t len;
     bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "malformed set in DUMP"; return false; }
+    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
     std::vector<std::string> members;
     for (uint64_t i = 0; i < len; ++i) {
       std::string m;
-      if (!r.read_string(m)) { err = "malformed set member in DUMP"; return false; }
+      if (!r.read_string(m)) { err = "Bad data format"; return false; }
       members.push_back(std::move(m));
     }
     bool wt = false;
@@ -1408,11 +1528,11 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
   } else if (type == RDB_TYPE_HASH) {
     uint64_t len;
     bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "malformed hash in DUMP"; return false; }
+    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
     std::vector<std::pair<std::string, std::string>> fields;
     for (uint64_t i = 0; i < len; ++i) {
       std::string f, v;
-      if (!r.read_string(f) || !r.read_string(v)) { err = "malformed hash field in DUMP"; return false; }
+      if (!r.read_string(f) || !r.read_string(v)) { err = "Bad data format"; return false; }
       fields.push_back({std::move(f), std::move(v)});
     }
     bool wt = false;
@@ -1422,15 +1542,15 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
   } else if (type == RDB_TYPE_ZSET_2 || type == RDB_TYPE_ZSET) {
     uint64_t len;
     bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "malformed zset in DUMP"; return false; }
+    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
     for (uint64_t i = 0; i < len; ++i) {
       std::string member;
-      if (!r.read_string(member)) { err = "malformed zset member in DUMP"; return false; }
+      if (!r.read_string(member)) { err = "Bad data format"; return false; }
       double score;
       if (type == RDB_TYPE_ZSET_2) {
-        if (!r.read_double_binary(score)) { err = "malformed zset score in DUMP"; return false; }
+        if (!r.read_double_binary(score)) { err = "Bad data format"; return false; }
       } else {
-        if (!r.read_double_old(score)) { err = "malformed zset score in DUMP"; return false; }
+        if (!r.read_double_old(score)) { err = "Bad data format"; return false; }
       }
       ds.zadd_one(key, score, member, false, false, false, false, false);
     }

@@ -139,4 +139,8 @@ if(BUILD_TESTING)
   add_executable(sha256_test tests/unit/sha256_test.cpp)
   target_link_libraries(sha256_test PRIVATE peadb_core)
   add_test(NAME sha256_test COMMAND sha256_test)
+
+  add_executable(rdb_crc64_test tests/unit/rdb_crc64_test.cpp)
+  target_link_libraries(rdb_crc64_test PRIVATE peadb_core)
+  add_test(NAME rdb_crc64_test COMMAND rdb_crc64_test)
 endif()
