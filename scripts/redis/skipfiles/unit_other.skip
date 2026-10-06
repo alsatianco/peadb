@@ -13,7 +13,3 @@ Don't rehash if redis has child process
 # proc-title-template / setproctitle is not implemented; the assertions only run on Linux (the
 # test is a no-op elsewhere). Tracked as an ops-parity gap.
 Process title set as expected
-# FLUSHALL does not perform a foreground save that zeroes rdb_changes_since_last_save when save
-# points are configured (Redis does). The dirty counter is command-granular (delta item 18), so
-# the exact "== 0" assertion is out of reach; the counterpart "should not reset" test passes.
-FLUSHALL should reset the dirty counter to 0 if we enable save

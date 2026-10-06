@@ -129,8 +129,14 @@ bool g_aof_load_truncated = true;   // tolerate an incomplete final command on l
 std::int64_t g_last_aof_fsync_ms = 0;
 std::atomic<pid_t> g_bgsave_child_pid{0};
 std::atomic<bool> g_bgsave_in_progress{false};
-std::int64_t g_bgsave_start_time = 0;
+std::int64_t g_bgsave_start_time = 0;  // ms, while a BGSAVE child runs
 std::string g_last_bgsave_status = "ok";
+// Redis's lastbgsave_try (Unix seconds of the last BGSAVE attempt, 0 = never), rdb_save_time_last
+// (seconds the last BGSAVE child ran, -1 = none yet), stat_rdb_saves and rdb_bgsave_scheduled.
+std::int64_t g_lastbgsave_try = 0;
+std::int64_t g_rdb_save_time_last = -1;
+std::int64_t g_stat_rdb_saves = 0;
+bool g_rdb_bgsave_scheduled = false;
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
 // A shutdown asked for by SIGTERM or SIGINT (Redis's server.shutdown_asap and last_sig_received):
@@ -177,8 +183,8 @@ std::int64_t g_last_save_time = 0;
 // ── Save points (BGSAVE thresholds) ──
 std::vector<std::pair<std::int64_t, std::int64_t>> g_save_params;  // (seconds, changes)
 std::string g_save_spec;                       // raw "sec changes ..." for CONFIG GET
-std::int64_t g_dirty_at_last_save = 0;         // mutation_epoch snapshot at last save start
-std::int64_t g_dirty_before_bgsave = 0;        // g_dirty_at_last_save before the running BGSAVE
+std::int64_t g_dirty_at_last_save = 0;         // mutation_epoch when the last good save started
+std::int64_t g_dirty_before_bgsave = 0;        // mutation_epoch when the running BGSAVE forked
 bool g_stop_writes_on_bgsave_error = true;
 std::string g_replication_role = "master";
 std::string g_replication_master_host = "";
@@ -655,53 +661,137 @@ inline bool noreplicas_should_reject() {
   const int connected = g_count_connected_replicas ? g_count_connected_replicas() : 0;
   return connected < g_config_min_replicas_to_write;
 }
-// stop-writes-on-bgsave-error: refuse writes when persistence is failing, so the
-// server does not keep accepting data it cannot durably store.
-inline bool misconf_should_reject() {
-  if (g_appendonly && g_aof_write_error) return true;
-  if (g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err") return true;
-  return false;
+// Redis's writeCommandsDeniedByDiskError() and writeCommandsGetDiskErrorMessage(): the -MISCONF
+// reply that refuses writes while persistence is failing, so the server does not keep accepting
+// data it cannot store; empty when writes are allowed. Redis also refuses PING then; PeaDB does so
+// only for a failed BGSAVE (rdb_save_failing()), which clears after the next good save, because
+// nothing clears the AOF write error yet (compat/delta.md item 35).
+bool rdb_save_failing() {
+  return g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err";
 }
-// Fork a child to write the RDB. Shared by the BGSAVE command and the save-point
-// cron. Resets the dirty baseline at save start. Returns false on fork error.
+std::string misconf_reply() {
+  if (rdb_save_failing()) {
+    return "-MISCONF Redis is configured to save RDB snapshots, but it's currently unable to "
+           "persist to disk. Commands that may modify the data set are disabled, because this "
+           "instance is configured to report errors during writes if RDB snapshotting fails "
+           "(stop-writes-on-bgsave-error option). Please check the Redis logs for details about "
+           "the RDB error.\r\n";
+  }
+  if (g_appendonly && g_aof_write_error) {
+    return "-MISCONF Errors writing to the persistence layer (RDB/AOF). Writes are disabled "
+           "(stop-writes-on-bgsave-error). Check the server logs.\r\n";
+  }
+  return {};
+}
+
+// Redis's hasActiveChildProcess(): a BGSAVE or AOF rewrite child is running.
+bool has_active_child_process() {
+  return g_bgsave_in_progress.load() || g_bgrewrite_in_progress.load();
+}
+
+// Redis's redisFork() for the BGSAVE and AOF rewrite children. In the child it makes logging
+// lock-free and drops the listeners and client sockets (closeChildUnusedResourceAfterFork()).
+pid_t fork_child() {
+  log_before_fork();
+  const pid_t pid = ::fork();
+  if (pid == 0) {
+    log_in_forked_child();
+    if (g_close_sockets_in_child_cb) g_close_sockets_in_child_cb();
+  }
+  return pid;
+}
+
+// The end of Redis's rdbSave() after a good foreground save (SAVE, FLUSHALL with save points,
+// DEBUG RELOAD, the final save of a shutdown): the changes since the save start count again from
+// zero and the save time moves.
+void note_rdb_saved(std::int64_t epoch_at_start) {
+  log(LogLevel::Info, "DB saved on disk");
+  g_dirty_at_last_save = epoch_at_start;
+  g_last_save_time = now_ms() / 1000;
+  g_last_bgsave_status = "ok";
+}
+
+// Redis's rdbSaveBackground(): forks a child that writes the RDB, for the BGSAVE command and the
+// save points. A failed fork() marks the BGSAVE as failed (rdb_last_bgsave_status:err, so writes
+// are refused while save points are set) and is logged. The change count and the save time move
+// only when the child succeeds (reap_background_children()). Returns false when no child started.
 bool do_bgsave_fork() {
-  if (g_bgsave_in_progress.load()) return false;
+  if (has_active_child_process()) return false;
+  ++g_stat_rdb_saves;
+  g_dirty_before_bgsave = static_cast<std::int64_t>(store().mutation_epoch());
+  g_lastbgsave_try = now_ms() / 1000;
   const auto fork_t0 = std::chrono::steady_clock::now();
-  pid_t pid = fork();
-  if (pid < 0) return false;
+  const pid_t pid = fork_child();
   if (pid == 0) {
     std::string err;
-    bool ok = rdb_save(g_snapshot_path, err);
+    const bool ok = rdb_save(g_snapshot_path, err);
+    if (ok) {
+      log(LogLevel::Info, "DB saved on disk");
+    } else {
+      log(LogLevel::Warn, err);
+    }
     _exit(ok ? 0 : 1);
+  }
+  if (pid < 0) {
+    g_last_bgsave_status = "err";
+    log(LogLevel::Warn, "Can't save in background: fork: " + std::string(std::strerror(errno)));
+    return false;
   }
   g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - fork_t0).count();
   ++g_total_forks;
+  log(LogLevel::Info, "Background saving started by pid " + std::to_string(pid));
   g_bgsave_in_progress.store(true);
   g_bgsave_child_pid.store(pid);
   g_bgsave_start_time = now_ms();
-  g_dirty_before_bgsave = g_dirty_at_last_save;
-  g_dirty_at_last_save = static_cast<std::int64_t>(store().mutation_epoch());
   return true;
 }
 
-// Redis's killRDBChild() and rdbRemoveTempFile() for a shutdown: stops a running BGSAVE and
-// deletes its temp-<child pid>.rdb. The child is waited for, so it cannot rename an older snapshot
-// over the final save that follows. Stopping it does not count as a failed BGSAVE (Redis kills it
-// with SIGUSR1 for that reason).
+// Redis's backgroundSaveDoneHandlerDisk() for a BGSAVE child that ended with `status`: only a good
+// save moves the save time and takes the changes made before the fork off the count; a failed one
+// sets the error status. A child stopped by a signal could not delete its temp file. `stopped` is
+// set when the server killed the child itself, which, like Redis's SIGUSR1, is not an error.
+void bgsave_done(pid_t pid, int status, bool stopped) {
+  if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    log(LogLevel::Info, "Background saving terminated with success");
+    g_dirty_at_last_save = g_dirty_before_bgsave;
+    g_last_save_time = now_ms() / 1000;
+    g_last_bgsave_status = "ok";
+  } else if (WIFEXITED(status)) {
+    log(LogLevel::Warn, "Background saving error");
+    g_last_bgsave_status = "err";
+  } else {
+    const int sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
+    log(LogLevel::Warn, "Background saving terminated by signal " + std::to_string(sig));
+    rdb_remove_temp_file(pid);
+    if (!stopped && sig != SIGUSR1) g_last_bgsave_status = "err";
+  }
+  g_rdb_save_time_last = now_ms() / 1000 - g_bgsave_start_time / 1000;
+  g_bgsave_child_pid.store(0);
+  g_bgsave_in_progress.store(false);
+}
+
+// Redis's killRDBChild() and rdbRemoveTempFile(), for a shutdown and FLUSHALL: stops a running
+// BGSAVE and deletes its temp-<child pid>.rdb. The child is waited for, so it cannot rename an
+// older snapshot over a save that follows. Stopping it is not a failed BGSAVE: the status stays,
+// and the changes since the last good save still count. A child that had already ended counts as
+// it ended.
 void kill_rdb_child() {
   const pid_t pid = g_bgsave_child_pid.load();
   if (!g_bgsave_in_progress.load() || pid <= 0) return;
   ::kill(pid, SIGKILL);
   int status = 0;
-  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  pid_t waited = 0;
+  while ((waited = ::waitpid(pid, &status, 0)) < 0 && errno == EINTR) {
   }
+  if (waited == pid) {
+    bgsave_done(pid, status, /*stopped=*/true);
+    return;
+  }
+  // Already reaped elsewhere, so how it ended is unknown: count it as stopped.
   rdb_remove_temp_file(pid);
   g_bgsave_child_pid.store(0);
   g_bgsave_in_progress.store(false);
-  // Nothing was saved: the changes since the last good save still count for the save points, in
-  // case the shutdown then fails and the server keeps running.
-  g_dirty_at_last_save = g_dirty_before_bgsave;
 }
 
 // ── SLOWLOG / LATENCY recording ──
@@ -1014,6 +1104,7 @@ std::function<int(std::int64_t)> g_count_synced_replicas;
 std::function<int()> g_count_connected_replicas;
 std::function<int()> g_blocked_clients_cb;
 std::function<int(const std::string&, const std::string&, int)> g_client_kill_cb;
+std::function<void()> g_close_sockets_in_child_cb;
 std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
 std::function<std::string()> g_client_list_callback;
@@ -2003,7 +2094,7 @@ bool aof_rewrite_limited() {
 // meanwhile and renames it over the AOF.
 bool start_aof_rewrite() {
   const auto fork_t0 = std::chrono::steady_clock::now();
-  const pid_t pid = fork();
+  const pid_t pid = fork_child();
   if (pid < 0) {
     log(LogLevel::Warn, "Can't rewrite append only file in background: fork: " +
                             std::string(std::strerror(errno)));
@@ -2011,7 +2102,9 @@ bool start_aof_rewrite() {
   }
   if (pid == 0) {
     std::string err;
-    _exit(rewrite_aof_file(err) ? 0 : 1);
+    const bool ok = rewrite_aof_file(err);
+    if (!ok) log(LogLevel::Warn, err);
+    _exit(ok ? 0 : 1);
   }
   g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - fork_t0).count();
@@ -4051,6 +4144,30 @@ bool command_may_replicate(const std::string& cmd, const std::vector<std::string
   return (redis_command_flags(args) & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
 }
 
+// Whether a command writes, the way Redis's processCommand() reads CMD_WRITE from
+// getCommandFlags() for the -MISCONF check: the command's own flag, or, for a script or function
+// that declares flags, "writes" unless they include no-writes (scriptFlagsToCmdFlags()). EVAL
+// without a shebang is not a write here; its writes are checked one by one when they run.
+bool command_writes(const std::string& cmd, const std::vector<std::string>& args) {
+  const bool eval = cmd == "EVAL" || cmd == "EVAL_RO";
+  const bool evalsha = cmd == "EVALSHA" || cmd == "EVALSHA_RO";
+  if ((eval || evalsha) && args.size() >= 2) {
+    const std::string* body = &args[1];
+    if (evalsha) {
+      const auto it =
+          args[1].size() == 40 ? g_script_cache.find(lower(args[1])) : g_script_cache.end();
+      body = it == g_script_cache.end() ? nullptr : &it->second;
+    }
+    if (body != nullptr) {
+      const auto she = parse_script_shebang(*body);
+      if (she.has_shebang && she.err.empty()) return (she.flags & kFuncNoWrites) == 0;
+    }
+  } else if ((cmd == "FCALL" || cmd == "FCALL_RO") && args.size() >= 2) {
+    if (const auto flags = function_flags(args[1])) return (*flags & kFuncNoWrites) == 0;
+  }
+  return (redis_command_flags(args) & kRedisCmdWrite) != 0;
+}
+
 // Whether CLIENT PAUSE holds this command (processCommand): everything under ALL; under WRITE
 // a command that writes or may replicate, or an EXEC whose transaction holds one.
 bool pause_applies(const std::string& cmd, const std::vector<std::string>& args,
@@ -4868,6 +4985,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "rdb_bgsave_in_progress:" + std::to_string(g_bgsave_in_progress.load() ? 1 : 0) + "\r\n"
                    "rdb_last_save_time:" + std::to_string(g_last_save_time) + "\r\n"
                    "rdb_last_bgsave_status:" + g_last_bgsave_status + "\r\n"
+                   "rdb_last_bgsave_time_sec:" + std::to_string(g_rdb_save_time_last) + "\r\n"
+                   "rdb_current_bgsave_time_sec:" +
+                       std::to_string(g_bgsave_in_progress.load()
+                                          ? now_ms() / 1000 - g_bgsave_start_time / 1000
+                                          : -1) + "\r\n"
+                   "rdb_saves:" + std::to_string(g_stat_rdb_saves) + "\r\n"
                    "aof_enabled:" + std::to_string(g_appendonly ? 1 : 0) + "\r\n"
                    "aof_rewrite_in_progress:" + std::to_string(g_bgrewrite_in_progress.load() ? 1 : 0) + "\r\n"
                    "aof_rewrite_scheduled:" + std::to_string(g_aof_rewrite_scheduled) + "\r\n"
@@ -4977,18 +5100,48 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           // A BGSAVE that ends after this SAVE would rename its older snapshot over it.
           if (g_bgsave_in_progress.load())
             return encode_error("Background save already in progress");
+          ++g_stat_rdb_saves;
+          // saveCommand(): the reason is logged, the client gets a bare -ERR.
+          const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
           std::string err;
-          if (!rdb_save(g_snapshot_path, err)) return encode_error(err);
-          g_last_save_time = now_ms() / 1000;
-          g_dirty_at_last_save = static_cast<std::int64_t>(store().mutation_epoch());
+          if (!rdb_save(g_snapshot_path, err)) {
+            log(LogLevel::Warn, err);
+            return std::string("-ERR\r\n");
+          }
+          note_rdb_saved(epoch);
           return encode_simple("OK");
         }});
 
-    t.emplace("BGSAVE", CommandSpec{"BGSAVE", 1, {"admin", "noscript"}, 0, 0, 0,
-        [](const std::vector<std::string>&, SessionState&, bool&) {
+    // BGSAVE [SCHEDULE] (bgsaveCommand()): one child at a time, so while an AOF rewrite runs a
+    // BGSAVE is refused, or with SCHEDULE started by the cron once the rewrite ends; inside
+    // MULTI/EXEC it always waits until EXEC ends, so the snapshot never holds half a transaction.
+    t.emplace("BGSAVE", CommandSpec{"BGSAVE", -1, {"admin", "noscript"}, 0, 0, 0,
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          bool schedule = false;
+          if (args.size() > 1) {
+            if (args.size() == 2 && upper(args[1]) == "SCHEDULE") {
+              schedule = true;
+            } else {
+              return encode_error("syntax error");
+            }
+          }
           if (g_bgsave_in_progress.load()) return encode_error("Background save already in progress");
-          if (!do_bgsave_fork()) return encode_error("Background save failed: fork error");
+          if (has_active_child_process() || g_executing_exec) {
+            if (schedule || g_executing_exec) {
+              g_rdb_bgsave_scheduled = true;
+              return encode_simple("Background saving scheduled");
+            }
+            return encode_error(
+                "Another child process is active (AOF?): can't BGSAVE right now. Use BGSAVE "
+                "SCHEDULE in order to schedule a BGSAVE whenever possible.");
+          }
+          if (!do_bgsave_fork()) return std::string("-ERR\r\n");
           return encode_simple("Background saving started");
+        }});
+
+    t.emplace("LASTSAVE", CommandSpec{"LASTSAVE", 1, {"loading", "stale", "fast"}, 0, 0, 0,
+        [](const std::vector<std::string>&, SessionState&, bool&) {
+          return encode_integer(g_last_save_time);
         }});
 
     t.emplace("BGREWRITEAOF", CommandSpec{"BGREWRITEAOF", 1, {"admin", "noscript"}, 0, 0, 0,
@@ -5668,6 +5821,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_cmd_latency_hist.clear();  // LATENCY HISTOGRAM resets with commandstats
             g_errorstats.clear();
             g_total_error_replies = 0;
+            g_stat_rdb_saves = 0;
             return encode_simple("OK");
           }
           if (sub == "REWRITE") {
@@ -5733,7 +5887,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               else if (o == "MERGE") merge = true;
             }
             std::string err;
-            if (!nosave && !rdb_save(g_snapshot_path, err)) return encode_error("Error saving RDB: " + err);
+            if (!nosave) {
+              const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
+              if (!rdb_save(g_snapshot_path, err)) {
+                log(LogLevel::Warn, err);
+                return std::string("-ERR\r\n");
+              }
+              note_rdb_saved(epoch);
+            }
             if (!noflush) {
               store().flushall();
               functions_flush_all();
@@ -6739,6 +6900,21 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             else if (m != "SYNC") return encode_error("syntax error");
           }
           if (async) store().flushall_async(); else store().flushall();
+          // flushAllDataAndResetRDB(): a running BGSAVE holds the data from before the FLUSHALL,
+          // so it is stopped; with save points the empty dataset is saved at once, so a restart
+          // cannot bring the flushed keys back.
+          kill_rdb_child();
+          if (!g_save_params.empty()) {
+            std::string err;
+            if (rdb_save(g_snapshot_path, err)) {
+              // The dispatch counts this FLUSHALL as one change when it returns, and Redis's
+              // rdbSave() leaves the change count at 0 after a FLUSHALL, so the count restarts
+              // after this command.
+              note_rdb_saved(static_cast<std::int64_t>(store().mutation_epoch()) + 1);
+            } else {
+              log(LogLevel::Warn, err);
+            }
+          }
           return encode_simple("OK");
         }});
 
@@ -11211,6 +11387,15 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       session.multi_dirty = true;
       return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
     }
+    // processCommand() checks a command before it queues it, as at the top level below; not a
+    // transaction from the master stream or the AOF.
+    if (std::string misconf = g_replaying_aof ? std::string() : misconf_reply();
+        !misconf.empty() && ((cmd == "PING" && rdb_save_failing()) || command_writes(cmd, args))) {
+      session.multi_dirty = true;
+      record_cmd_rejected(cmd);
+      record_error_stat("MISCONF");
+      return misconf;
+    }
     // Redis checks CLIENT PAUSE before it queues, so a write sent inside MULTI waits too.
     if (pause_holds(cmd, args, session)) {
       session.postponed = true;
@@ -11256,14 +11441,6 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   const bool is_script_dispatch =
       cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
       cmd == "FCALL" || cmd == "FCALL_RO";
-  if (spec_is_write && misconf_should_reject() && !g_replaying_aof &&
-      cmd != "CONFIG" && !is_script_dispatch) {
-    ++top_stat.rejected_calls;
-    record_error_stat("MISCONF");
-    if (in_lua_script_context()) g_script_inner_error_seen = true;
-    return std::string("-MISCONF Errors writing to the persistence layer (RDB/AOF). "
-                       "Writes are disabled (stop-writes-on-bgsave-error). Check the server logs.\r\n");
-  }
   if (spec_is_write && oom_should_reject() && !g_script_allow_oom &&
       cmd != "CONFIG" && !is_script_dispatch &&
       cmd != "FLUSHALL" && cmd != "FLUSHDB") {
@@ -11271,6 +11448,36 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     record_error_stat("OOM");
     if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+  }
+  // After the OOM check, as in Redis's processCommand(): while persistence is failing it refuses
+  // writes, PING, and an EXEC whose transaction writes (execCommandAbort() discards it). The
+  // commands EXEC runs are not checked again; a script's writes are (scriptCall()).
+  if (!g_replaying_aof && !(g_executing_exec && !in_lua_script_context())) {
+    std::string misconf = misconf_reply();
+    if (!misconf.empty()) {
+      bool refuse = (cmd == "PING" && !in_lua_script_context() && rdb_save_failing()) ||
+                    command_writes(cmd, args);
+      if (cmd == "EXEC" && session.in_multi) {
+        for (const auto& q : session.queued) {
+          if (!q.empty() && command_writes(upper(q[0]), q)) refuse = true;
+        }
+      }
+      if (refuse) {
+        ++top_stat.rejected_calls;
+        // execCommandAbort() replies -EXECABORT, so Redis counts that error, not MISCONF.
+        record_error_stat(cmd == "EXEC" && session.in_multi ? "EXECABORT" : "MISCONF");
+        if (in_lua_script_context()) g_script_inner_error_seen = true;
+        if (cmd == "EXEC" && session.in_multi) {
+          session.in_multi = false;
+          session.multi_dirty = false;
+          session.queued.clear();
+          session.watched_epoch.reset();
+          session.watched_digests.clear();
+          return "-EXECABORT Transaction discarded because of: " + misconf.substr(1);
+        }
+        return misconf;
+      }
+    }
   }
   if (spec_is_write && noreplicas_should_reject() &&
       !is_script_dispatch &&
@@ -11795,21 +12002,29 @@ void run_eviction_cycle() {
   evict_to_fit();
 }
 
-// Save-point cron: triggered from the event loop. Fires BGSAVE when any configured
-// (seconds, changes) threshold is met. Cheap O(1) check using mutation_epoch as the
-// dirty counter.
+// Save-point cron, run from the event loop (the BGSAVE part of Redis's serverCron()): starts a
+// BGSAVE when a (seconds, changes) save point is reached, then one asked for by BGSAVE SCHEDULE or
+// inside MULTI/EXEC. Never while a child runs; after a failed BGSAVE, only once
+// CONFIG_BGSAVE_RETRY_DELAY (5 s) has passed since the last try. O(1): mutation_epoch is the
+// change counter.
 void background_save_cron() {
   if (g_pause_cron) return;  // DEBUG PAUSE-CRON
-  if (g_save_params.empty() || g_bgsave_in_progress.load()) return;
+  if (has_active_child_process()) return;
+  constexpr std::int64_t kBgsaveRetryDelaySeconds = 5;
   const std::int64_t now_s = now_ms() / 1000;
+  const bool may_try =
+      g_last_bgsave_status == "ok" || now_s - g_lastbgsave_try > kBgsaveRetryDelaySeconds;
   const std::int64_t dirty = static_cast<std::int64_t>(store().mutation_epoch()) - g_dirty_at_last_save;
   // No early return when nothing changed: `save 60 0` saves every 60 s, as in Redis.
   for (const auto& [sec, changes] : g_save_params) {
-    if (dirty >= changes && (now_s - g_last_save_time) >= sec) {
+    if (dirty >= changes && now_s - g_last_save_time > sec && may_try) {
+      log(LogLevel::Info,
+          std::to_string(changes) + " changes in " + std::to_string(sec) + " seconds. Saving...");
       do_bgsave_fork();
-      break;
+      return;
     }
   }
+  if (g_rdb_bgsave_scheduled && may_try && do_bgsave_fork()) g_rdb_bgsave_scheduled = false;
 }
 
 std::string configure_persistence(const std::string& dbfilename, bool appendonly,
@@ -12081,8 +12296,11 @@ bool prepare_for_shutdown(int flags) {
   }
   if ((!g_save_params.empty() && !nosave) || save) {
     log(LogLevel::Info, "Saving the final RDB snapshot before exiting.");
+    const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
     std::string err;
-    if (!rdb_save(g_snapshot_path, err)) {
+    if (rdb_save(g_snapshot_path, err)) {
+      note_rdb_saved(epoch);
+    } else {
       log(LogLevel::Warn, err);
       if (!force) {
         log(LogLevel::Warn, "Error trying to save the DB, can't exit.");
@@ -12792,14 +13010,7 @@ void reap_background_children() {
   if (g_bgsave_in_progress.load()) {
     int status = 0;
     pid_t pid = g_bgsave_child_pid.load();
-    if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
-      // A child stopped by a signal could not delete its temp file (backgroundSaveDoneHandler()).
-      if (WIFSIGNALED(status)) rdb_remove_temp_file(pid);
-      g_last_bgsave_status = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? "ok" : "err";
-      g_last_save_time = now_ms() / 1000;
-      g_bgsave_child_pid.store(0);
-      g_bgsave_in_progress.store(false);
-    }
+    if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) bgsave_done(pid, status, false);
   }
   if (g_bgrewrite_in_progress.load()) {
     int status = 0;

@@ -133,11 +133,11 @@
     "unit/other": {
       "last_counts": {
         "err": 0,
-        "ignored": 7,
-        "ok": 24
+        "ignored": 6,
+        "ok": 25
       },
       "mode": "native",
-      "skipfile_lines": 5
+      "skipfile_lines": 4
     },
     "unit/pause": {
       "last_counts": {

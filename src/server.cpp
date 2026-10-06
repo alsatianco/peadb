@@ -516,6 +516,16 @@ int run_server(const ServerConfig& config) {
     g_connected_clients.fetch_sub(1);
   };
 
+  // In a BGSAVE or AOF rewrite child only: it never serves a client, so it drops its copies of the
+  // listeners and the client sockets (close() alone: the parent's copies stay open and working).
+  g_close_sockets_in_child_cb = [&]() {
+    if (listen_fd >= 0) ::close(listen_fd);
+    if (unix_fd >= 0) ::close(unix_fd);
+    if (cbus_fd >= 0) ::close(cbus_fd);
+    for (const auto& entry : cbus_buffers) ::close(entry.first);
+    for (const auto& entry : sessions) ::close(entry.first);
+  };
+
   // CLIENT KILL: close clients matching a filter, except skip_fd (the caller, which
   // closes itself via should_close). Safe to erase here — the event loop skips fds no
   // longer in `sessions` at the top of each ready-fd iteration.
