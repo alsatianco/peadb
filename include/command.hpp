@@ -87,6 +87,9 @@ struct SessionState {
   std::int64_t last_interaction_ms = 0;   // last command time (for idle)
   std::string last_cmd;                   // last command name (lowercased)
   bool is_monitor = false;                // client issued MONITOR
+  // Set by the event loop before each command: earlier replies to this client are not sent yet
+  // (Redis's clientHasPendingReplies(), which SCRIPT DEBUG checks).
+  bool has_pending_replies = false;
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);

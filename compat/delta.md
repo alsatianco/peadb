@@ -291,8 +291,8 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
 - Target milestone: P1 suite burn-down
 - Implemented: bundled Lua 5.1.5 on every platform. It is stock 5.1.5, not the patched copy Redis embeds, so table order for long string keys differs (item 62), and `cjson`/`cmsgpack`/`bit`/`struct` are PeaDB's own code whose output differs in places (item 63);
   `redis.replicate_commands()` (no-op true), `redis.set_repl()` + `REPL_*` constants
-  honored by both the replica and AOF propagation paths; `SCRIPT DEBUG yes|sync|no`
-  accepted (LDB itself not implemented, and scripts then run with real effects — item 26); HELLO/AUTH/RESET/QUIT allowed while a script
+  honored by both the replica and AOF propagation paths; `SCRIPT DEBUG NO`, with
+  `YES` and `SYNC` refused because there is no debugger (item 26); HELLO/AUTH/RESET/QUIT allowed while a script
   is BUSY. Full Lua function libraries: `FUNCTION LOAD [REPLACE]/DELETE/FLUSH/LIST
   [LIBRARYNAME][WITHCODE]/STATS/DUMP/RESTORE/KILL/HELP`, `FCALL`/`FCALL_RO`, the shebang
   metadata parser, `redis.register_function` (positional + named args) with the
@@ -302,7 +302,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
   effects replicated); FCALL of a no-writes function runs on a read-only replica while a
   write function is rejected; OOM/allow-oom gating; `COMMAND GETKEYS` on FCALL/FCALL_RO.
 - Missing: each of these is a skipfile line in `scripts/redis/skipfiles/unit_scripting.skip`
-  or `unit_functions.skip` — the LDB debugger session protocol; SCRIPT KILL's UNKILLABLE
+  or `unit_functions.skip` — the LDB debugger session protocol (`SCRIPT DEBUG YES` and `SYNC` are refused, and `scripts/redis/suite-native.patch` wraps the one upstream `SCRIPT DEBUG SYNC` call that sits outside any test, so the refusal does not abort `unit/scripting`); SCRIPT KILL's UNKILLABLE
   distinction for scripts that already wrote; timed-out pure-Lua scripts staying BUSY
   instead of aborting; CLIENT LIST from inside a running script observing concurrent
   sessions; replica handshakes completing while a script blocks the loop; MASTERDOWN
@@ -398,7 +398,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
 - Missing: the multi-key `KEYS k1 k2 …` form and Redis's target-connection caching/idle-release.
   The `unit/dump` multi-key + connection-caching MIGRATE tests remain skipfile-tracked
   (`scripts/redis/skipfiles/unit_dump.skip`).
-- Open defect (2026-10 review): the single-key form works only between PeaDB servers; MIGRATE to a real, non-cluster Redis always fails because PeaDB sends ASKING first, and the checksum does not match across engines (items 27 and 51).
+- Open defect (2026-10 review): the single-key form works only between PeaDB servers, because the checksum and the value encodings do not match across engines (items 27 and 51). Since 2026-10-06 PeaDB no longer sends ASKING to a target when it does not run in cluster mode (item 26).
 - Tracking: cluster/migration hardening in Phase 4.
 
 20. Unsorted GEORADIUS/GEOSEARCH result ordering (geohash-score order, not cell-scan order)
@@ -460,7 +460,7 @@ Limits of this signal (found by the 2026-10 review): none of the 26 upstream `in
 - Missing: nothing for unknown names.
 ### Findings of the 2026-10 review (items 24–71)
 
-A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Item 24 is fixed in part (2026-10-05); none of the other items 24–71 is fixed yet.** File:line references are as of `cb7194a`.
+A verified review of `cb7194a` (2026-09-30 to 2026-10-03) compared PeaDB with the pinned Redis 7.2.5 in seven areas: registry, security, cluster, infra, commands, scale and durability. The commands area did not finish, so per-command behavior outside the adopted upstream suites is not reviewed yet. Two independent verifiers re-checked the 54 most serious items: 44 held exactly, 10 were real but narrower (the narrower claim is used here), and none was disproved. Items 24–71 register what it found, and the older items above that it proved wrong are corrected in place. **Items 24 and 25 are fixed in part (2026-10-05 and 2026-10-06), and so is item 26 (2026-10-06); none of the other items 24–71 is fixed yet.** File:line references are as of `cb7194a`.
 
 Evidence words used below: **reproduced** means run on live servers and re-checked by an independent verifier; **seen in code** means read in the code and re-checked, but not run; **code reading** means one reviewer's reading that nobody has re-checked yet. Speed and memory numbers were measured on macOS (libc++, libc malloc) and must be measured again on Linux.
 
@@ -484,13 +484,13 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Missing: `CONFIG SET port` and `CONFIG SET bind` are refused unless the value stays the same, because PeaDB cannot move its listener while it runs (Redis can). `CONFIG REWRITE` with a config file is refused (`CONFIG REWRITE is not supported by PeaDB yet`), so `CONFIG SET` changes do not survive a restart. The AOF that `appendonly yes` turns on is PeaDB's single file, not Redis's `appendonlydir` with a manifest (item 3). On a replica it does not hold the replicated writes (item 45). The writes made during a rewrite are kept in memory up to 256 MiB; past that the rewrite is dropped and, while `appendonly yes` waits for its first rewrite, tried again, so under a very high write rate the AOF may never come on although `INFO` shows `aof_enabled:1` (Redis 7 writes them to a new file instead; seen in code). `BGREWRITEAOF` while the AOF is off throws the rewrite away and reports `aof_last_bgrewrite_status:err`, where Redis writes a new AOF (seen in code). As in Redis, an AOF that is on keeps writing to its old file after `CONFIG SET dir` until the next rewrite, and a rewrite running during that `CONFIG SET dir` fails because its temporary file is in the old directory.
 - Tracking: move the listener at runtime for `port`/`bind`; write `CONFIG REWRITE`.
 26. Commands that reply `OK` but do nothing
-- Status: open defect. Evidence: reproduced.
+- Status: `partial` (fixed in part 2026-10-06: `ASKING`, `READONLY`, `READWRITE` and `SCRIPT DEBUG` now follow Redis; `CLIENT PAUSE` is still open). Evidence: reproduced before the fix; the fix is checked against the pinned Redis 7.2.5 by `tests/integration/test_noop_replies_parity.py`.
 - Owner: ops-compat
 - Severity: high
 - Target milestone: R0
-- Implemented: the commands are registered, so clients that send them do not get an unknown-command error.
-- Missing: `CLIENT PAUSE` and `CLIENT UNPAUSE` return `OK` and pause nothing (`src/command.cpp:8168-8170`): a write on another connection runs at once, where Redis waits, and the arguments are not checked (`CLIENT PAUSE notanumber` returns `OK`), so switchover steps that rely on a pause are not safe. `SCRIPT DEBUG YES` and `SYNC` return `OK` (`src/command.cpp:3710-3714`) and start no debug session; after `YES` the next script runs with real, kept effects, where Redis runs it in a forked debug session whose writes are thrown away. `ASKING`, `READONLY` and `READWRITE` return `OK` when cluster mode is off (`src/command.cpp:4579-4595`), where Redis returns "This instance has cluster support disabled"; the ASKING case also breaks MIGRATE to a real Redis (item 51). `SHUTDOWN ABORT` is in item 33.
-- Tracking: implement each command or refuse it with a clear error (old plan Task 1.8 for CLIENT PAUSE).
+- Implemented: without cluster mode, `ASKING`, `READONLY` and `READWRITE` are refused with Redis's "This instance has cluster support disabled", and `MIGRATE` sends `ASKING` before `RESTORE` only when PeaDB runs in cluster mode (Redis sends `RESTORE-ASKING` only then), so a `MIGRATE` to a server without cluster mode no longer fails on that step. `SCRIPT DEBUG` checks its arguments like Redis (`wrong number of arguments for 'script|debug' command`, `Use SCRIPT DEBUG YES/SYNC/NO`, and `SCRIPT DEBUG must be called outside a pipeline` inside a transaction or after another command in the same pipeline), `SCRIPT DEBUG NO` replies `OK`, and `SCRIPT DEBUG YES` and `SYNC` are refused with "SCRIPT DEBUG YES and SYNC are not supported by PeaDB yet (it has no Lua debugger)", so no script runs with kept effects when its writer expected a debug session (the debugger itself is item 14).
+- Missing: `CLIENT PAUSE` and `CLIENT UNPAUSE` return `OK` and pause nothing (the `PAUSE`/`UNPAUSE` branch of the `CLIENT` handler in `src/command.cpp`): a write on another connection runs at once, where Redis waits, and the arguments are not checked (`CLIENT PAUSE notanumber` returns `OK`), so switchover steps that rely on a pause are not safe. `SHUTDOWN ABORT` is in item 33.
+- Tracking: implement `CLIENT PAUSE` like Redis (old plan Task 1.8) and adopt the upstream `unit/pause` suite.
 
 27. RDB CRC64 checksum uses the wrong table
 - Status: open defect. Evidence: reproduced.
@@ -714,8 +714,8 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Severity: high
 - Target milestone: R3
 - Implemented: DUMP, RESTORE and MIGRATE work between PeaDB servers for strings, lists, sets, hashes and zsets (item 19 covers the advanced MIGRATE options).
-- Missing: `MIGRATE` to a real, non-cluster Redis always fails, because PeaDB sends `ASKING` first (`src/command.cpp:5970-6066`), treats Redis's "cluster support disabled" error as fatal and reports "IOERR error or timeout writing to target instance"; Redis sends `RESTORE-ASKING` only in cluster mode. `DUMP` of an existing stream returns nil and `MIGRATE` of one returns NOKEY (`:5913-5918`; `rdb_dump_key` has no stream case, `src/rdb.cpp:1251-1302`), so tools think the key does not exist. `RESTORE` accepts only the plain string, list, set, hash and zset types (`src/rdb.cpp:1317-1441`) and rejects the listpack, intset, quicklist and stream encodings that real Redis DUMP produces ("Bad data format"). The checksum bug (item 27) comes on top of all of this.
-- Tracking: send ASKING only to a cluster target, add stream DUMP, and decode Redis's compact encodings (together with RDB v11 load, item 2).
+- Missing: `MIGRATE` to a real Redis fails because of the checksum and encoding gaps below; the `ASKING` it used to send first to a non-cluster target, which Redis refuses, is fixed (2026-10-06, item 26: PeaDB sends `ASKING` only in cluster mode, where Redis sends `RESTORE-ASKING`, which PeaDB does not have yet, item 68). `DUMP` of an existing stream returns nil and `MIGRATE` of one returns NOKEY (`:5913-5918`; `rdb_dump_key` has no stream case, `src/rdb.cpp:1251-1302`), so tools think the key does not exist. `RESTORE` accepts only the plain string, list, set, hash and zset types (`src/rdb.cpp:1317-1441`) and rejects the listpack, intset, quicklist and stream encodings that real Redis DUMP produces ("Bad data format"). The checksum bug (item 27) comes on top of all of this.
+- Tracking: add stream DUMP, and decode Redis's compact encodings (together with RDB v11 load, item 2).
 
 52. The RDB bridge scripts fail silently
 - Status: open defect. Evidence: seen in code.

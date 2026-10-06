@@ -542,6 +542,7 @@ int run_server(const ServerConfig& config) {
       std::string batch;
       bool sc = false;
       std::size_t consumed = 0;
+      const bool output_pending = !write_buffers[fd].empty();
       while (true) {
         const std::string_view rem(input.data() + consumed, input.size() - consumed);
         auto parsed = parse_one_command(rem, requirepass_is_set() && !session.authenticated,
@@ -549,6 +550,7 @@ int run_server(const ServerConfig& config) {
         if (!parsed.has_value()) break;
         g_total_commands_processed.fetch_add(1);
         self_dispatch_fd = session.fd;
+        session.has_pending_replies = output_pending || !batch.empty();
         batch += safe_handle_command(parsed->args, session, sc);
         batch += self_pubsub_pending;  // self-directed messages come after the reply
         self_pubsub_pending.clear();
@@ -936,6 +938,7 @@ int run_server(const ServerConfig& config) {
       const bool was_replica = session.replica_stream;
 
       std::size_t consumed_total = 0;
+      const bool output_pending = !write_buffers[fd].empty();
       while (true) {
         const std::string_view remaining(input.data() + consumed_total, input.size() - consumed_total);
         auto parsed = parse_one_command(remaining, requirepass_is_set() && !session.authenticated,
@@ -944,6 +947,7 @@ int run_server(const ServerConfig& config) {
 
         g_total_commands_processed.fetch_add(1);
         self_dispatch_fd = session.fd;
+        session.has_pending_replies = output_pending || !batch_reply.empty();
         const std::string reply = safe_handle_command(parsed->args, session, should_close);
         batch_reply += reply;
         batch_reply += self_pubsub_pending;  // self-directed messages come after the reply
