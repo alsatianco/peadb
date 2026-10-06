@@ -2,7 +2,3 @@
 All time-to-live(TTL) in commands are propagated as absolute timestamp in milliseconds in AOF
 # Writable replicas (replica-read-only no) + replica self-expiry unsupported — delta.md item 8 note.
 expired key which is created in writeable replicas should be deleted by active expiry
-# RNG-dependent: RANDOMKEY hits a random subset of already-expired keys, so the count of
-# propagated DELs varies run-to-run (delta.md item 15, lazy-expire propagation). Deterministic
-# lazy-expire-DEL propagation lands with the expiry-propagation track.
-RANDOMKEY: Lazy-expire should not be wrapped in MULTI/EXEC

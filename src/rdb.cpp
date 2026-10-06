@@ -827,6 +827,10 @@ void write_quicklist(RdbWriter& w, const std::vector<std::string>& items, std::i
 std::string rdb_build_string(std::string& err, bool key_save_delay) {
   err.clear();
   auto& ds = store();
+  // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
+  // saving deletes nothing, so no key leaves the dataset without its DEL (compat/delta.md item 37).
+  // A master that loads the file leaves them out; a replica keeps them until its master's DEL.
+  const DataStore::LazyExpireDisabled no_lazy_expire(ds);
 
   RdbWriter w;
 
@@ -874,7 +878,7 @@ std::string rdb_build_string(std::string& err, bool key_save_delay) {
     // Count keys with expire
     size_t expire_count = 0;
     for (const auto& k : all_keys) {
-      if (ds.pttl(k) >= 0) ++expire_count;
+      if (ds.pexpiretime(k) >= 0) ++expire_count;
     }
     w.write_length(expire_count);
 
@@ -1123,6 +1127,10 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   auto& ds = store();
   if (before_replace) before_replace();
   ds.flushall();
+  // No key expires while the file loads (Redis's keyIsExpired() while loading); a master leaves out
+  // the keys that have expired already, a replica keeps them until its master's DEL (below).
+  const DataStore::LazyExpireDisabled no_lazy_expire(ds);
+  const std::int64_t load_now = DataStore::now_ms();
   const int prev_db = ds.current_db();
   ds.select_db(0);
 
@@ -1506,6 +1514,8 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       ds.select_db(prev_db);
       return false;
     }
+    // Redis's rdbLoadRio(): a master does not load a key that has already expired.
+    if (expire_at && *expire_at < load_now && !ds.replica_expiry()) ds.del(key);
   }
 
   ds.select_db(prev_db);
@@ -1682,8 +1692,12 @@ bool rdb_restore_key(const std::string& key, const std::string& payload,
     }
   }
   // An already-expired absolute TTL means the key must NOT be stored (Redis restoreCommand):
-  // any existing key was already removed above by REPLACE; return OK without recreating it.
-  if (expire_at && *expire_at <= DataStore::now_ms()) return true;
+  // any existing key was already removed above by REPLACE; return OK without recreating it. Not
+  // while the AOF loads or on a replica (Redis's checkAlreadyExpired()): there the key keeps its
+  // past expire time, so a later write in the stream applies to it (compat/delta.md item 37).
+  if (expire_at && *expire_at <= DataStore::now_ms() && !ds.lazy_expire_disabled() &&
+      !ds.replica_expiry())
+    return true;
 
   uint8_t type;
   if (!r.read_u8(type)) {

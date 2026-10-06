@@ -171,6 +171,7 @@ int main(int argc, char** argv) {
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);
+  peadb::configure_lazy_expire();
   peadb::configure_cluster(config.cluster_enabled, config.bind, config.port, config.cluster_announce_ip,
                            config.cluster_announce_port, config.cluster_announce_bus_port);
   // Builds the command table, so every configure_* call that it depends on must come first.

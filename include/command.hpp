@@ -190,6 +190,9 @@ std::string client_output_buffer_limit_str();         // current config as a CON
 void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
 void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb"
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
+// Makes a master propagate the DEL and send the `expired` event of each key DataStore deletes
+// because its TTL has passed (compat/delta.md item 37). Called once, before any data loads.
+void configure_lazy_expire();
 void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
 void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)
 void run_eviction_cycle();       // event-loop background eviction when over maxmemory (master only)

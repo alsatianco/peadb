@@ -172,6 +172,9 @@ class DataStore {
   int current_db() const;
 
   std::optional<std::string> get(const std::string& key);
+  // GET: one lookup that also reports a key of another type (counted as a hit, as Redis's
+  // lookupKeyRead() counts it before checkType()).
+  std::optional<std::string> get_string(const std::string& key, bool& wrongtype);
   bool set(const std::string& key, const std::string& value, bool nx, bool xx,
            std::optional<std::int64_t> expire_at_ms, bool keep_ttl);
   std::optional<std::string> getdel(const std::string& key);
@@ -182,7 +185,6 @@ class DataStore {
   std::size_t exists(const std::vector<std::string>& keys);
   std::string type_of(const std::string& key);
   bool is_wrongtype_for_string(const std::string& key);
-  bool is_wrongtype_for_string_noexpire(const std::string& key);
   bool is_wrongtype_for_hash(const std::string& key);
   bool is_wrongtype_for_list(const std::string& key);
   bool is_wrongtype_for_set(const std::string& key);
@@ -197,20 +199,20 @@ class DataStore {
   bool expire(const std::string& key, std::int64_t expire_at_ms);
   bool persist(const std::string& key);
 
+  // Redis's keysCommand(): the keys that match, without the expired ones, which stay in place
+  // (KEYS deletes nothing and propagates nothing).
   std::vector<std::string> keys(const std::string& pattern);
-  // Walks every live key of the current database, calling `fn` with each `const
-  // std::string&` in turn — no vector, no per-key copy. Expiry handling matches
-  // keys("*") exactly (a key past its TTL is lazily reaped and excluded, not just
-  // skipped), so callers see the same keyset KEYS/DBSIZE would report at this instant.
-  // For callers (e.g. CLUSTER COUNTKEYSINSLOT/GETKEYSINSLOT) that only need to look at
-  // every key once, not collect them all.
+  // Walks every key of the current database, expired ones too, calling `fn` with each `const
+  // std::string&` in turn — no vector, no per-key copy, and nothing is deleted, like a walk of
+  // Redis's slot index (CLUSTER COUNTKEYSINSLOT/GETKEYSINSLOT count and list expired keys).
   //
-  // Contract: `fn` must not mutate this DataStore (directly, or through any callback
-  // back into it) and must not retain the passed reference past the call — it aliases
-  // the live map entry's key, not a copy. The walk reaps expired keys as it goes with
-  // `it = db.erase(it)`, so a callback that inserted, erased, or expired a key would
-  // invalidate the iterator mid-walk and the reference along with it.
+  // Contract: `fn` must not mutate this DataStore (directly, or through any callback back into
+  // it) and must not retain the passed reference past the call — it aliases the live map entry's
+  // key, not a copy.
   void for_each_key(const std::function<void(const std::string&)>& fn);
+  // Redis's dbRandomKey(): a random live key. On a master the expired keys met on the way are
+  // deleted (see Lazy expiry below); on a replica, where nothing is deleted, an expired key is
+  // returned when every key has expired, as Redis does.
   std::optional<std::string> randomkey();
 
   bool rename(const std::string& src, const std::string& dst, bool nx_only);
@@ -405,10 +407,9 @@ class DataStore {
   void flushall_async();
   void flushdb_async();
   std::size_t dbsize();
-  std::vector<std::string> collect_expired_keys();
-  bool lazy_expire_key(const std::string& key);
-  // Returns the (db_index, key) pairs physically removed this cycle so the caller
-  // (master) can propagate DEL to replicas/AOF and keep replicas in sync.
+  // Deletes expired keys of every database within the budget, each through the lazy-expire hook
+  // (so its DEL and `expired` event go out at once, as Redis's activeExpireCycle() sends them),
+  // and returns the (db_index, key) pairs it deleted. Only a master runs it.
   std::vector<std::pair<int, std::string>> active_expire_cycle(std::size_t budget_per_db = 64);
   std::pair<std::uint64_t, std::vector<std::string>> scan(std::uint64_t cursor, std::size_t count, const std::string& match = "*", const std::string& type = "");
   std::uint64_t mutation_epoch() const;
@@ -424,6 +425,47 @@ class DataStore {
   // active expiry cycle expires them with their DEL then.
   void set_expire_paused(bool paused);
   bool expire_paused() const { return expire_paused_; }
+
+  // ── Lazy expiry (Redis's expireIfNeeded()) ──
+  // What a command does with a key whose TTL has passed (strictly: now > expire time, like
+  // keyIsExpired()). On a master it deletes the key, counts it in expired_keys and calls the
+  // lazy-expire hook, which propagates the DEL to the AOF and the replicas and sends the `expired`
+  // event (Redis's deleteExpiredKeyAndPropagate()); inside a command the DEL joins the command's
+  // execution unit, before the command's own write. On a replica (set_replica_expiry(true)) the
+  // key is only hidden from the command and kept, because its master's DEL decides: a replica
+  // whose clock runs ahead, or whose stream lags, must not drop a key its master kept alive. The
+  // keys a command hid go back when the command ends (restore_hidden_expired()). While lazy expiry
+  // is disabled (LazyExpireDisabled: loading the AOF or an RDB, applying the master's stream,
+  // writing an RDB) no key counts as expired, as in Redis while loading and for its master client.
+  using LazyExpireHook = std::function<void(int db, const std::string& key)>;
+  void set_lazy_expire_hook(LazyExpireHook hook) { lazy_expire_hook_ = std::move(hook); }
+  void set_replica_expiry(bool replica);
+  bool replica_expiry() const { return replica_expiry_; }
+  bool lazy_expire_disabled() const { return lazy_expire_disabled_ > 0; }
+  void restore_hidden_expired() {
+    if (has_replica_hidden_) restore_replica_hidden();
+  }
+  class LazyExpireDisabled {
+   public:
+    explicit LazyExpireDisabled(DataStore& ds) : ds_(ds) {
+      if (ds_.lazy_expire_disabled_++ != 0) return;
+      // Every key is back in its database, so an RDB save writes the keys a replica's command or
+      // a pause hid too; a later lookup hides them again.
+      ds_.restore_hidden_expired();
+      if (ds_.expire_paused_) ds_.restore_paused_hidden();  // the pause's map is empty otherwise
+    }
+    ~LazyExpireDisabled() { --ds_.lazy_expire_disabled_; }
+    LazyExpireDisabled(const LazyExpireDisabled&) = delete;
+    LazyExpireDisabled& operator=(const LazyExpireDisabled&) = delete;
+
+   private:
+    DataStore& ds_;
+  };
+  // Lookups without any effect (Redis's LOOKUP_NOEFFECTS): an expired key reads as missing and is
+  // neither deleted nor propagated. live_type() is the check a blocked client's wakeup makes;
+  // watch_digest() is what WATCH and EXEC compare (Redis's watch code only asks keyIsExpired()).
+  std::optional<ValueType> live_type(const std::string& key) const;
+  std::optional<std::string> watch_digest(const std::string& key) const;
 
   // Observability counters
   std::int64_t stat_expired_keys() const { return stat_expired_keys_.load(); }
@@ -502,10 +544,26 @@ class DataStore {
  private:
   using DB = std::unordered_map<std::string, Entry>;
 
+  // Redis's keyIsExpired(): the key has a TTL that has passed, and lazy expiry is not disabled.
+  bool logically_expired(const Entry& e, std::int64_t now) const {
+    return e.expire_at_ms.has_value() && now > *e.expire_at_ms && lazy_expire_disabled_ == 0;
+  }
+  // The same for one lookup: the clock is read only for a key that has a TTL (the hot path, since
+  // most keys have none).
+  bool logically_expired(const Entry& e) const {
+    return e.expire_at_ms.has_value() && logically_expired(e, now_ms());
+  }
+  // Redis's expireIfNeeded(): true when `key` has expired, after removing it (remove_expired()).
   bool expire_if_needed(DB& db, const std::string& key);
-  // Removes the expired entry at `it` from `db`: deletes it and counts it in expired_keys, or,
-  // while expiry is paused, hides it (see set_expire_paused()). Returns the next iterator.
+  // Removes the expired entry at `it` from `db`: on a replica hides it until the command ends;
+  // while expiry is paused hides it until the pause ends (see set_expire_paused()); otherwise
+  // deletes it, counts it in expired_keys and calls the lazy-expire hook. Returns the next
+  // iterator.
   DB::iterator remove_expired(DB& db, DB::iterator it);
+  // The expired keys a walk met (SCAN, RANDOMKEY) go through expire_if_needed() after it.
+  void expire_met_keys(DB& db, const std::vector<std::string>& keys);
+  void restore_replica_hidden();
+  void restore_paused_hidden();
   std::size_t db_index_of(const DB& db) const { return static_cast<std::size_t>(&db - dbs_.data()); }
   // Background lazyfree: a worker thread destructs detached maps off the event loop.
   void ensure_lazyfree_thread();
@@ -519,6 +577,11 @@ class DataStore {
   std::vector<DB> dbs_;
   bool expire_paused_ = false;
   std::vector<DB> hidden_expired_;  // per database: expired keys hidden while expiry is paused
+  LazyExpireHook lazy_expire_hook_;
+  bool replica_expiry_ = false;
+  int lazy_expire_disabled_ = 0;
+  std::vector<DB> replica_hidden_;  // per database: expired keys a replica's command hid
+  bool has_replica_hidden_ = false;
   std::uint64_t mutation_epoch_ = 0;
   mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
