@@ -124,7 +124,17 @@ inline bool must_obey_client() { return g_replaying_aof; }
 thread_local bool g_block_disabled = false;
 int g_aof_fd = -1;
 std::string g_appendfsync = "everysec";
+// Redis's aof_last_write_status/aof_last_write_errno and aof_bio_fsync_status/aof_bio_fsync_errno:
+// a failed AOF write or everysec fsync refuses writes (-MISCONF) until a later write, or a later
+// fsync of new data, works (compat/delta.md item 35).
 bool g_aof_write_error = false;
+int g_aof_last_write_errno = 0;
+bool g_aof_fsync_error = false;
+int g_aof_fsync_errno = 0;
+// Redis's aof_buf after a failed write: the bytes the AOF file still has to get, in order. Every
+// later append and aof_cron() write them first.
+std::string g_aof_buf;
+bool g_aof_unsynced = false;  // bytes written since the last fsync (aof_last_incr_fsync_offset)
 bool g_aof_load_truncated = true;   // tolerate an incomplete final command on load
 std::int64_t g_last_aof_fsync_ms = 0;
 std::atomic<pid_t> g_bgsave_child_pid{0};
@@ -350,6 +360,9 @@ bool g_replica_stale = false;
 std::atomic<std::uint64_t> g_repl_generation{0};
 std::atomic<bool> g_loading_replication{false};
 bool g_script_allow_oom = false;
+// Redis's SCRIPT_WRITE_DIRTY: the running script has already passed a write command, so the disk
+// error check no longer refuses its writes (a script must not stop half applied).
+bool g_script_write_dirty = false;
 bool g_script_inner_error_seen = false;
 // A cluster node PeaDB knows about. Index 0 of g_cluster_nodes is always self — see
 // ensure_self_registered() below. The id is derived deterministically from the announced
@@ -662,24 +675,21 @@ inline bool noreplicas_should_reject() {
   return connected < g_config_min_replicas_to_write;
 }
 // Redis's writeCommandsDeniedByDiskError() and writeCommandsGetDiskErrorMessage(): the -MISCONF
-// reply that refuses writes while persistence is failing, so the server does not keep accepting
-// data it cannot store; empty when writes are allowed. Redis also refuses PING then; PeaDB does so
-// only for a failed BGSAVE (rdb_save_failing()), which clears after the next good save, because
-// nothing clears the AOF write error yet (compat/delta.md item 35).
-bool rdb_save_failing() {
-  return g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err";
-}
+// reply that refuses writes (and PING) while persistence is failing, so the server does not keep
+// accepting data it cannot store; empty when writes are allowed. A failed BGSAVE clears after the
+// next good save, an AOF error after the next good write or fsync.
 std::string misconf_reply() {
-  if (rdb_save_failing()) {
+  if (g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err") {
     return "-MISCONF Redis is configured to save RDB snapshots, but it's currently unable to "
            "persist to disk. Commands that may modify the data set are disabled, because this "
            "instance is configured to report errors during writes if RDB snapshotting fails "
            "(stop-writes-on-bgsave-error option). Please check the Redis logs for details about "
            "the RDB error.\r\n";
   }
-  if (g_appendonly && g_aof_write_error) {
-    return "-MISCONF Errors writing to the persistence layer (RDB/AOF). Writes are disabled "
-           "(stop-writes-on-bgsave-error). Check the server logs.\r\n";
+  if (g_appendonly && (g_aof_write_error || g_aof_fsync_error)) {
+    // With only the fsync failing, Redis reports the fsync's errno.
+    const int err = g_aof_write_error ? g_aof_last_write_errno : g_aof_fsync_errno;
+    return "-MISCONF Errors writing to the AOF file: " + std::string(std::strerror(err)) + "\r\n";
   }
   return {};
 }
@@ -1493,7 +1503,9 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
   g_busy_is_function = true;
   // allow-oom lets the function's inner writes bypass the per-command OOM gate.
   const bool prev_allow_oom = g_script_allow_oom;
+  const bool prev_write_dirty = g_script_write_dirty;
   if (entry->flags & kFuncAllowOom) g_script_allow_oom = true;
+  g_script_write_dirty = false;
   const int callback_ref = entry->callback_ref;
   // Freeze time for the duration of the call (Redis behavior — a key's logical expiry does not
   // advance mid-function, so TIME is stable and PX-expiring keys survive an inner DEBUG SLEEP).
@@ -1501,6 +1513,7 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
   const auto out = lua_engine_fcall(callback_ref, keys, argv, session, readonly);
   store().unfreeze_time();
   g_script_allow_oom = prev_allow_oom;
+  g_script_write_dirty = prev_write_dirty;
   g_script_current_session = nullptr;
   return out;
 }
@@ -2003,25 +2016,132 @@ void append_aof_command(const std::vector<std::string>& args, const SessionState
   append_aof(out);
 }
 
+// Redis's aofWrite(): write(2) until every byte is in or a call fails. Returns the bytes written,
+// or -1 (errno set) when none were.
+ssize_t aof_write(int fd, const char* buf, std::size_t len) {
+  ssize_t total = 0;
+  while (len > 0) {
+    const ssize_t n = ::write(fd, buf, len);
+    if (n < 0 && errno == EINTR) continue;
+    if (n <= 0) {
+      if (n == 0) errno = ENOSPC;  // Redis would loop for ever here
+      return total > 0 ? total : -1;
+    }
+    buf += n;
+    len -= static_cast<std::size_t>(n);
+    total += n;
+  }
+  return total;
+}
+
+// With appendfsync always a client may get its reply only once the command is on disk. When that
+// cannot be, Redis exits: the command has run and its reply is waiting, so going on would tell
+// the client that data which is not on disk is safe. _exit(), because other threads still run.
+[[noreturn]] void exit_for_aof_error(const std::string& line) {
+  log(LogLevel::Warn, line);
+  ::_exit(1);
+}
+
+void aof_fsync_always() {
+  if (::fsync(g_aof_fd) == -1) {
+    exit_for_aof_error("Can't persist AOF for fsync error when the AOF fsync policy is 'always': " +
+                       std::string(std::strerror(errno)) + ". Exiting...");
+  }
+  g_aof_unsynced = false;
+  g_aof_fsync_error = false;
+  g_last_aof_fsync_ms = now_ms();
+}
+
+// Redis's flushAppendOnlyFile() for PeaDB's AOF, which writes each command at once: writes what
+// an earlier failed write left in g_aof_buf, then `payload`. A write that fails (or is short, and
+// is then cut off the file again with ftruncate(), so the file never ends inside a command) keeps
+// the bytes that are not in the file in g_aof_buf, sets the write error (logged at most once per
+// 30 s) and, with appendfsync always, exits; the next good write clears the error.
+void flush_append_only_file(std::string_view payload) {
+  if (!g_aof_buf.empty() && !payload.empty()) {
+    g_aof_buf.append(payload);
+    payload = {};
+  }
+  const std::string_view data = g_aof_buf.empty() ? payload : std::string_view(g_aof_buf);
+  if (data.empty()) return;
+  if (g_aof_fd < 0) open_aof_fd();
+  const ssize_t written = g_aof_fd < 0 ? -1 : aof_write(g_aof_fd, data.data(), data.size());
+  const int write_errno = errno;
+  if (written == static_cast<ssize_t>(data.size())) {
+    if (g_aof_write_error) {
+      log(LogLevel::Info, "AOF write error looks solved, PeaDB can write again.");
+      g_aof_write_error = false;
+    }
+    g_aof_buf.clear();
+    g_aof_unsynced = true;
+    if (g_appendfsync == "always") aof_fsync_always();
+    return;
+  }
+  constexpr std::int64_t kAofWriteLogErrorRate = 30;  // AOF_WRITE_LOG_ERROR_RATE, seconds
+  static std::int64_t last_write_error_log = 0;
+  const std::int64_t now_s = now_ms() / 1000;
+  const bool can_log = now_s - last_write_error_log > kAofWriteLogErrorRate;
+  if (can_log) last_write_error_log = now_s;
+  std::size_t kept_from = 0;  // the bytes of `data` that are in the file
+  if (written < 0) {
+    if (can_log) {
+      log(LogLevel::Warn,
+          "Error writing to the AOF file: " + std::string(std::strerror(write_errno)));
+    }
+    g_aof_last_write_errno = write_errno;
+  } else {
+    if (can_log) {
+      log(LogLevel::Warn,
+          "Short write while writing to the AOF file: (nwritten=" + std::to_string(written) +
+              ", expected=" + std::to_string(data.size()) + ")");
+    }
+    // The file grew by `written` bytes from this write alone (one writer, O_APPEND).
+    struct stat st {};
+    int cut_errno = 0;
+    if (::fstat(g_aof_fd, &st) != 0) {
+      cut_errno = errno;
+    } else if (st.st_size < written) {
+      cut_errno = EINVAL;
+    } else if (::ftruncate(g_aof_fd, st.st_size - written) != 0) {
+      cut_errno = errno;
+    }
+    if (cut_errno != 0) {
+      if (can_log) {
+        log(LogLevel::Warn,
+            "Could not remove short write from the append-only file.  PeaDB may "
+            "refuse to load the AOF the next time it starts.  ftruncate: " +
+                std::string(std::strerror(cut_errno)));
+      }
+      kept_from = static_cast<std::size_t>(written);
+      g_aof_unsynced = true;
+    }
+    g_aof_last_write_errno = ENOSPC;
+  }
+  if (g_appendfsync == "always") {
+    exit_for_aof_error(
+        "Can't recover from AOF write error when the AOF fsync policy is 'always'. "
+        "Exiting...");
+  }
+  g_aof_write_error = true;
+  if (data.data() == g_aof_buf.data()) {
+    g_aof_buf.erase(0, kept_from);
+  } else {
+    g_aof_buf.assign(data.substr(kept_from));
+  }
+}
+
 void append_aof(const std::vector<std::string>& args) {
   if (!g_appendonly || g_replaying_aof) return;
   const auto payload = encode_command_resp(args);
   // While the AOF waits for its first rewrite (CONFIG SET appendonly yes) there is no file to
-  // append to yet: the command goes only to the rewrite buffer below.
+  // append to yet: the command goes only to the rewrite buffer below. After a failed write the
+  // bytes wait, and aof_cron() tries them once per event-loop pass, as Redis's beforeSleep() does.
+  // With appendfsync always the write is tried at once, so the client never gets a reply first.
   if (g_aof_state == AofState::On) {
-    if (g_aof_fd < 0) open_aof_fd();
-    if (g_aof_fd < 0) { g_aof_write_error = true; return; }
-    const ssize_t written = ::write(g_aof_fd, payload.data(), payload.size());
-    if (written < 0 || static_cast<std::size_t>(written) != payload.size()) {
-      g_aof_write_error = true;
-      return;
-    }
-    // In the strongest durability mode, a failed fsync means the just-written command
-    // is NOT durable — surface it (don't silently swallow, matching the strict
-    // fail-on-fsync posture used for RDB/AOF-rewrite).
-    if (g_appendfsync == "always" && ::fsync(g_aof_fd) != 0) {
-      g_aof_write_error = true;
-      log(LogLevel::Error, "AOF fsync (always) failed: " + std::string(std::strerror(errno)));
+    if (g_aof_write_error && g_appendfsync != "always") {
+      g_aof_buf.append(payload);
+    } else {
+      flush_append_only_file(payload);
     }
   }
   // Buffer for BGREWRITEAOF diff: commands written while child is rewriting
@@ -2141,7 +2261,6 @@ bool start_append_only(std::string& err) {
   kill_aof_rewrite_child();
   g_appendonly = true;
   g_aof_state = AofState::WaitRewrite;
-  g_aof_write_error = false;  // Redis also forgets an earlier AOF write error here
   if (!start_aof_rewrite()) {
     g_appendonly = false;
     g_aof_state = AofState::Off;
@@ -2150,11 +2269,22 @@ bool start_append_only(std::string& err) {
     err = "Unable to turn on AOF. Check server logs.";
     return false;
   }
+  // The new AOF starts from the dataset, so an earlier error no longer counts.
+  if (g_aof_fsync_error) {
+    log(LogLevel::Warn, "AOF reopen, just ignore the AOF fsync error in bio job");
+    g_aof_fsync_error = false;
+  }
+  if (g_aof_write_error) {
+    log(LogLevel::Warn, "AOF reopen, just ignore the last error.");
+    g_aof_write_error = false;
+  }
   return true;
 }
 
-// CONFIG SET appendonly no (stopAppendOnly()).
+// CONFIG SET appendonly no (stopAppendOnly()). Bytes a failed write left are dropped (the AOF is
+// off), but the write and fsync errors stay for INFO until the AOF is turned on again.
 void stop_append_only() {
+  if (g_aof_state == AofState::On) flush_append_only_file({});
   if (g_aof_fd >= 0) {
     if (::fsync(g_aof_fd) != 0) {
       log(LogLevel::Warn, "Fail to fsync the AOF file: " + std::string(std::strerror(errno)));
@@ -2163,6 +2293,8 @@ void stop_append_only() {
     g_aof_fd = -1;
   }
   g_last_aof_db = -1;
+  g_aof_buf.clear();
+  g_aof_unsynced = false;
   g_appendonly = false;
   g_aof_state = AofState::Off;
   g_aof_rewrite_scheduled = false;
@@ -4262,11 +4394,14 @@ std::string eval_script(const std::string& source, const std::vector<std::string
   g_script_current_session = &session;
   const bool prev_readonly = g_script_readonly_context;
   const bool prev_allow_oom = g_script_allow_oom;
+  const bool prev_write_dirty = g_script_write_dirty;
   if (no_writes) g_script_readonly_context = true;
   if (allow_oom) g_script_allow_oom = true;
+  g_script_write_dirty = false;
   const auto out = eval_miniscript(script_body, keys, argv);
   g_script_readonly_context = prev_readonly;
   g_script_allow_oom = prev_allow_oom;
+  g_script_write_dirty = prev_write_dirty;
   g_script_current_session = nullptr;
   return out;
 }
@@ -4997,7 +5132,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "aof_last_bgrewrite_status:" + g_aof_last_bgrewrite_status + "\r\n"
                    "aof_rewrites_consecutive_failures:" +
                        std::to_string(g_aofrw_consecutive_failures) + "\r\n"
-                   "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n"
+                   "aof_last_write_status:" +
+                       std::string(g_aof_write_error || g_aof_fsync_error ? "err" : "ok") + "\r\n"
                    "aof_rewrite_buffer_length:" + std::to_string(g_aof_rewrite_buf.size()) + "\r\n\r\n";
           }
           if (want("STATS")) {
@@ -5920,6 +6056,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                  " lru_seconds_idle:" + std::to_string(idle));
           }
           if (args.size() == 2 && upper(args[1]) == "LOADAOF") {
+            // Redis's flushAppendOnlyFile(1) first. Bytes the file still cannot take would be
+            // lost from memory by the reload and written after it, so PeaDB refuses then.
+            if (g_aof_state == AofState::On) flush_append_only_file({});
+            if (!g_aof_buf.empty()) return misconf_reply();
             if (g_aof_fd >= 0) ::fsync(g_aof_fd);
             if (std::filesystem::exists(g_aof_path)) {
               store().flushall();
@@ -11390,7 +11530,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     // processCommand() checks a command before it queues it, as at the top level below; not a
     // transaction from the master stream or the AOF.
     if (std::string misconf = g_replaying_aof ? std::string() : misconf_reply();
-        !misconf.empty() && ((cmd == "PING" && rdb_save_failing()) || command_writes(cmd, args))) {
+        !misconf.empty() && (cmd == "PING" || command_writes(cmd, args))) {
       session.multi_dirty = true;
       record_cmd_rejected(cmd);
       record_error_stat("MISCONF");
@@ -11451,12 +11591,15 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   // After the OOM check, as in Redis's processCommand(): while persistence is failing it refuses
   // writes, PING, and an EXEC whose transaction writes (execCommandAbort() discards it). The
-  // commands EXEC runs are not checked again; a script's writes are (scriptCall()).
-  if (!g_replaying_aof && !(g_executing_exec && !in_lua_script_context())) {
+  // commands EXEC runs are not checked again; a script's writes are (scriptCall()), until its
+  // first write (scriptVerifyWriteCommandAllow()): PeaDB writes the AOF per command, so the first
+  // write of a script can be the one that fails.
+  const bool in_script = in_lua_script_context();
+  if (!g_replaying_aof && !(g_executing_exec && !in_script) &&
+      !(in_script && g_script_write_dirty)) {
     std::string misconf = misconf_reply();
     if (!misconf.empty()) {
-      bool refuse = (cmd == "PING" && !in_lua_script_context() && rdb_save_failing()) ||
-                    command_writes(cmd, args);
+      bool refuse = (cmd == "PING" && !in_script) || command_writes(cmd, args);
       if (cmd == "EXEC" && session.in_multi) {
         for (const auto& q : session.queued) {
           if (!q.empty() && command_writes(upper(q[0]), q)) refuse = true;
@@ -11466,7 +11609,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
         ++top_stat.rejected_calls;
         // execCommandAbort() replies -EXECABORT, so Redis counts that error, not MISCONF.
         record_error_stat(cmd == "EXEC" && session.in_multi ? "EXECABORT" : "MISCONF");
-        if (in_lua_script_context()) g_script_inner_error_seen = true;
+        if (in_script) g_script_inner_error_seen = true;
         if (cmd == "EXEC" && session.in_multi) {
           session.in_multi = false;
           session.multi_dirty = false;
@@ -11479,6 +11622,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       }
     }
   }
+  if (in_script && !g_script_write_dirty && command_writes(cmd, args)) g_script_write_dirty = true;
   if (spec_is_write && noreplicas_should_reject() &&
       !is_script_dispatch &&
       cmd != "CONFIG" && cmd != "REPLICAOF" && cmd != "SLAVEOF") {
@@ -12288,10 +12432,21 @@ bool prepare_for_shutdown(int flags) {
     log(LogLevel::Warn, "There is a child rewriting the AOF. Killing it!");
     kill_aof_rewrite_child();
   }
-  // Flush the AOF so the everysec window is not lost on a clean shutdown.
-  if (g_aof_state != AofState::Off && g_aof_fd >= 0) {
+  // Write what a failed AOF write left and fsync, so the everysec window is not lost.
+  if (g_aof_state != AofState::Off) {
     log(LogLevel::Info, "Calling fsync() on the AOF file.");
-    if (::fsync(g_aof_fd) != 0)
+    if (g_aof_state == AofState::On) flush_append_only_file({});
+    // Redis exits even when the AOF still cannot take those bytes, and so loses writes it has
+    // acknowledged; PeaDB refuses, as for a final RDB save that fails, so they stay in memory
+    // until the disk works again (compat/delta.md item 35).
+    if (!g_aof_buf.empty()) {
+      if (!force) {
+        log(LogLevel::Warn, "Error trying to write the AOF, can't exit.");
+        return fail();
+      }
+      log(LogLevel::Warn, "Error trying to write the AOF. Exit anyway.");
+    }
+    if (g_aof_fd >= 0 && ::fsync(g_aof_fd) != 0)
       log(LogLevel::Warn, std::string("Fail to fsync the AOF file: ") + std::strerror(errno) + ".");
   }
   if ((!g_save_params.empty() && !nosave) || save) {
@@ -12636,14 +12791,31 @@ std::vector<std::string> command_names() {
   return names;
 }
 
-void aof_fsync_if_needed(std::int64_t now) {
-  if (!g_appendonly || g_aof_fd < 0 || g_appendfsync != "everysec") return;
-  if (now - g_last_aof_fsync_ms >= 1000) {
-    if (::fsync(g_aof_fd) != 0) {
-      g_aof_write_error = true;
-      log(LogLevel::Error, "AOF fsync (everysec) failed: " + std::string(std::strerror(errno)));
+void aof_cron(std::int64_t now) {
+  if (g_aof_state != AofState::On) return;
+  // beforeSleep() and serverCron(): what a failed write left is written again on every pass.
+  if (!g_aof_buf.empty()) flush_append_only_file({});
+  if (g_aof_fd < 0) return;
+  // Bytes written before CONFIG SET appendfsync always.
+  if (g_appendfsync == "always" && g_aof_unsynced) aof_fsync_always();
+  // The everysec fsync of new bytes (Redis's bio thread). Redis clears a failed fsync only with
+  // the fsync of a later write; PeaDB also tries the fsync again every second while it fails,
+  // because no write may come: writes are refused then, and PeaDB writes no expiry DELs to the
+  // AOF (compat/delta.md items 35 and 37).
+  const bool due = (g_appendfsync == "everysec" && g_aof_unsynced) || g_aof_fsync_error;
+  if (!due || now - g_last_aof_fsync_ms < 1000) return;
+  g_aof_unsynced = false;
+  g_last_aof_fsync_ms = now;
+  // EBADF and EINVAL do not count as a failed fsync, as in Redis.
+  if (::fsync(g_aof_fd) == -1 && errno != EBADF && errno != EINVAL) {
+    const int fsync_errno = errno;
+    if (!g_aof_fsync_error) {
+      log(LogLevel::Warn, "Fail to fsync the AOF file: " + std::string(std::strerror(fsync_errno)));
     }
-    g_last_aof_fsync_ms = now;
+    g_aof_fsync_error = true;
+    g_aof_fsync_errno = fsync_errno;
+  } else {
+    g_aof_fsync_error = false;
   }
 }
 
@@ -13070,6 +13242,16 @@ void reap_background_children() {
             g_aof_last_bgrewrite_status = dir_durable ? "ok" : "err";
             g_aofrw_consecutive_failures = 0;
             open_aof_fd();  // reopen on the new inode
+            // The new file, written and synced, holds every write: what a failed write left in
+            // g_aof_buf is in the dataset the child saved or in the rewrite buffer, so writing
+            // it again would apply it twice. A good rewrite ends an earlier write or fsync error.
+            g_aof_buf.clear();
+            g_aof_unsynced = false;
+            g_aof_fsync_error = false;
+            if (g_aof_write_error) {
+              log(LogLevel::Info, "AOF write error looks solved, PeaDB can write again.");
+              g_aof_write_error = false;
+            }
             if (g_aof_state == AofState::WaitRewrite) {
               g_aof_state = AofState::On;  // CONFIG SET appendonly yes is now in effect
               log(LogLevel::Info, "Background AOF rewrite finished successfully; the AOF is on");

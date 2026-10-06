@@ -115,7 +115,8 @@ std::string configure_persistence(const std::string& dbfilename, bool appendonly
                                   const std::string& appendfilename,
                                   const std::string& appendfsync);
 bool load_aof_file(const std::string& path, std::string& err);
-void aof_fsync_if_needed(std::int64_t now_ms);
+// Each event-loop pass: writes again what a failed AOF write left, and runs the everysec fsync.
+void aof_cron(std::int64_t now_ms);
 void reap_background_children();
 void configure_runtime_port(int port);
 void configure_max_clients(int max_clients);
