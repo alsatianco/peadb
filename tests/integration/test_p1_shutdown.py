@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Test the SHUTDOWN command.
 
-Verifies that SHUTDOWN causes the server to terminate gracefully.
+Verifies that SHUTDOWN causes the server to terminate gracefully, closing the connection without a reply as Redis does.
 """
 import pathlib
 import socket
@@ -67,8 +67,9 @@ def main():
         with socket.create_connection(("127.0.0.1", 6549), timeout=2) as s:
             assert cmd(s, "SET", "k", "v") == "OK"
             assert cmd(s, "GET", "k") == "v"
-            resp = cmd(s, "SHUTDOWN", "NOSAVE")
-            assert resp == "OK"
+            # Like Redis, a successful SHUTDOWN sends no reply: the connection just closes.
+            s.sendall(b"*2\r\n$8\r\nSHUTDOWN\r\n$6\r\nNOSAVE\r\n")
+            assert s.recv(64) == b"", "SHUTDOWN NOSAVE should close the connection with no reply"
 
         # Server should exit within a reasonable time
         rc = p.wait(timeout=5)
