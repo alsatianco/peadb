@@ -347,10 +347,20 @@ inline void backlog_append(const std::string& data) {
     g_repl_backlog.append(data);
     g_master_repl_offset = g_repl_backlog.total;
 }
-std::vector<std::string> g_exec_replication_events;
-bool g_capture_exec_replication = false;
-int g_exec_last_repl_db = -1;
-int g_exec_write_event_count = 0;
+// Where a write goes (Redis's PROPAGATE_AOF and PROPAGATE_REPL).
+constexpr int kPropagateAof = 1;
+constexpr int kPropagateRepl = 2;
+// A write waiting for the end of its execution unit (Redis's redisOp in server.also_propagate).
+struct PendingPropagation {
+  int db;
+  std::vector<std::string> argv;
+  int target;
+};
+std::vector<PendingPropagation> g_also_propagate;
+// How deep the running commands nest (Redis's server.execution_nesting): EXEC and scripts run
+// their commands inside the command that started them, and everything they propagate is written
+// when the outermost one ends (propagate_pending_commands()).
+int g_execution_nesting = 0;
 bool g_executing_exec = false;
 int g_last_repl_db = 0;
 bool g_replica_stale = false;
@@ -654,23 +664,26 @@ void unpause_clients() {
 // maxmemory-policy; reject writes with -OOM only if still over budget (true noeviction,
 // or nothing left to evict). The caller gates on the `write` flag, so DEL and other writes
 // that free memory are refused too (no denyoom flag yet: compat/delta.md item 39).
+// Never for the AOF or the master stream, and never on a replica (Redis's mustObeyClient(), and
+// isSafeToPerformEvictions() with replica-ignore-maxmemory yes, PeaDB's fixed value).
 inline bool oom_should_reject() {
   if (g_config_maxmemory <= 0) return false;
+  if (g_replaying_aof || g_replication_role == "slave") return false;
   // While CLIENT PAUSE stops eviction Redis neither evicts nor refuses with -OOM
   // (isSafeToPerformEvictions); a held write is checked again when it runs after the pause.
   if (paused_actions_with_update(kPauseEvict)) return false;
   if (store().used_memory() <= g_config_maxmemory) return false;
-  if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction &&
-      g_replication_role != "slave" && !g_replaying_aof) {
-    evict_to_fit();
-  }
+  if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction) evict_to_fit();
   return store().used_memory() > g_config_maxmemory;
 }
 // min-replicas-to-write: reject writes only when FEWER than the required number of
 // replicas are actually connected (the previous code rejected whenever the knob was
 // set at all, blocking writes even with healthy replicas — a footgun).
+// Never for the AOF or the master stream, and never on a replica (Redis's mustObeyClient() and
+// checkGoodReplicasStatus()).
 inline bool noreplicas_should_reject() {
   if (g_config_min_replicas_to_write <= 0) return false;
+  if (g_replaying_aof || g_replication_role == "slave") return false;
   const int connected = g_count_connected_replicas ? g_count_connected_replicas() : 0;
   return connected < g_config_min_replicas_to_write;
 }
@@ -1807,6 +1820,14 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     // These handlers propagate their effect explicitly as deterministic LPOP/RPOP or
     // ZPOPMIN/ZPOPMAX (both on the immediate and the unblock paths).
     emit = false;
+  } else if (cmd == "BLMOVE" && args.size() == 6) {
+    // Served at once (a blocked one is propagated when it is woken): Redis rewrites it to LMOVE,
+    // so a replica or the AOF never blocks on it.
+    out = {"LMOVE", args[1], args[2], args[3], args[4]};
+  } else if (cmd == "BRPOPLPUSH") {
+    // Runs as BLMOVE through handle_command(), which propagates the move; propagating
+    // BRPOPLPUSH as well moved a second element on replicas and on AOF replay.
+    emit = false;
   } else if (cmd == "XREADGROUP") {
     emit = false;
   } else if (cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "FCALL" || cmd == "FCALL_RO") {
@@ -1858,35 +1879,157 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
   return true;
 }
 
-void append_replication_event(const std::vector<std::string>& args, const SessionState& session,
-                              const std::string* reply_ptr = nullptr) {
-  if (args.empty()) return;
-  if (g_replaying_aof) return;  // Suppress replication broadcast while replaying from master or AOF
-  std::vector<std::string> out;
-  if (!canonicalize_propagated_command(args, reply_ptr, out)) return;
-  // redis.set_repl(REPL_NONE/REPL_AOF) suppresses replica propagation of the script's
-  // subsequent effects — both the captured (EXEC) and direct backlog paths.
-  if (in_lua_script_context() && !(g_script_repl_flags & 2)) return;
-  if (g_capture_exec_replication) {
-    if (g_exec_last_repl_db != session.db_index) {
-      g_exec_replication_events.push_back(encode_command_resp({"SELECT", std::to_string(session.db_index)}));
-      g_exec_last_repl_db = session.db_index;
+// ── Propagation of writes to the AOF and the replicas ──────────────────────────
+// Redis's alsoPropagate() and propagatePendingCommands(): the writes a command makes, and those
+// of the commands it runs (EXEC, scripts, functions), are queued while it runs and written to the
+// AOF and the replication backlog when it ends, each stream in one write, wrapped in MULTI/EXEC
+// when there is more than one. So a crash, a torn AOF tail or a cut replica link never leaves
+// half of a transaction or script applied: the AOF loader drops an unfinished MULTI (item 30).
+
+void append_aof_payload(std::string_view payload);  // defined below
+
+// Redis's shouldPropagate(): the AOF takes writes while it is on or waits for its first rewrite,
+// the replicas unless this server is a replica itself (its stream comes from its master).
+bool should_propagate(int target) {
+  return ((target & kPropagateAof) && g_appendonly) ||
+         ((target & kPropagateRepl) && g_replication_role != "slave");
+}
+
+// Redis's propagateNow() for one command, `resp` encoded: adds it to the AOF and replica bytes
+// for the targets that take it, after a SELECT when the stream is in another database. MULTI and
+// EXEC pass db -1 and never need one: the SELECT goes inside the transaction, as in Redis.
+void feed_propagation(int db, const std::string& resp, int target, std::string& aof,
+                      std::string& repl) {
+  if ((target & kPropagateAof) && g_appendonly) {
+    if (db >= 0 && db != g_last_aof_db) {
+      aof += encode_command_resp({"SELECT", std::to_string(db)});
+      g_last_aof_db = db;
     }
-    g_exec_replication_events.push_back(encode_command_resp(out));
-    ++g_exec_write_event_count;
+    aof += resp;
+  }
+  if ((target & kPropagateRepl) && g_replication_role != "slave") {
+    if (db >= 0 && db != g_last_repl_db) {
+      repl += encode_command_resp({"SELECT", std::to_string(db)});
+      g_last_repl_db = db;
+    }
+    repl += resp;
+  }
+}
+
+// The AOF first, as Redis's beforeSleep() writes it before the replicas get their bytes: with
+// appendfsync always a failed write exits before anything goes out.
+void write_propagation(const std::string& aof, const std::string& repl) {
+  if (!aof.empty()) append_aof_payload(aof);
+  if (!repl.empty()) backlog_append(repl);
+}
+
+// Writes one command at once (Redis's propagateNow()), encoded once for both streams.
+void propagate_now(int db, const std::vector<std::string>& argv, int target) {
+  const bool to_aof = (target & kPropagateAof) && g_appendonly;
+  const bool to_repl = (target & kPropagateRepl) && g_replication_role != "slave";
+  if (!to_aof && !to_repl) return;
+  const std::string resp = encode_command_resp(argv);
+  if (to_aof) {
+    if (db == g_last_aof_db) {
+      append_aof_payload(resp);
+    } else {
+      g_last_aof_db = db;
+      append_aof_payload(encode_command_resp({"SELECT", std::to_string(db)}) + resp);
+    }
+  }
+  if (to_repl) {
+    if (db != g_last_repl_db) {
+      backlog_append(encode_command_resp({"SELECT", std::to_string(db)}));
+      g_last_repl_db = db;
+    }
+    backlog_append(resp);
+  }
+}
+
+// Redis's alsoPropagate(): inside an execution unit the write waits for its end, otherwise
+// (evictions, active expiry, the event loop) it is written at once. `last_of_unit` says nothing
+// can follow it in the unit (the outermost command's own write), so when nothing waits before
+// it either it is the unit's only write and goes out at once, as the unit's end would send it.
+void also_propagate(int db, std::vector<std::string> argv, int target, bool last_of_unit = false) {
+  if (g_execution_nesting == 0 || (last_of_unit && g_also_propagate.empty())) {
+    propagate_now(db, argv, target);  // checks the targets itself
     return;
   }
-  if (session.db_index != g_last_repl_db) {
-    backlog_append(encode_command_resp({"SELECT", std::to_string(session.db_index)}));
-    g_last_repl_db = session.db_index;
+  if (should_propagate(target)) g_also_propagate.push_back({db, std::move(argv), target});
+}
+
+// Redis's propagatePendingCommands(), run when the outermost execution unit ends. `top_args` is
+// the command that started the unit: SCAN and RANDOMKEY (CMD_TOUCHES_ARBITRARY_KEYS) send the
+// DELs of the expired keys they meet without MULTI/EXEC, because those keys are not one unit.
+void propagate_pending_commands(const std::vector<std::string>* top_args) {
+  if (g_also_propagate.empty()) return;
+  if (g_also_propagate.size() == 1) {  // most commands: no transaction, nothing to gather
+    const PendingPropagation& op = g_also_propagate.front();
+    propagate_now(op.db, op.argv, op.target);
+    g_also_propagate.clear();
+    return;
   }
-  backlog_append(encode_command_resp(out));
+  const bool transaction =
+      !(top_args != nullptr && (redis_command_flags(*top_args) & kRedisCmdTouchesArbitraryKeys));
+  static const std::string kMulti = encode_command_resp({"MULTI"});
+  static const std::string kExec = encode_command_resp({"EXEC"});
+  constexpr int kBoth = kPropagateAof | kPropagateRepl;
+  std::string aof;
+  std::string repl;
+  if (transaction) feed_propagation(-1, kMulti, kBoth, aof, repl);
+  for (const auto& op : g_also_propagate) {
+    feed_propagation(op.db, encode_command_resp(op.argv), op.target, aof, repl);
+  }
+  if (transaction) feed_propagation(-1, kExec, kBoth, aof, repl);
+  g_also_propagate.clear();
+  write_propagation(aof, repl);
+}
+
+// Redis's enterExecutionUnit()/exitExecutionUnit() with postExecutionUnitOperations(), around a
+// command (handle_command()) and a blocked client's wakeup: what runs inside is propagated when
+// the outermost unit ends, before its reply goes out.
+class ExecutionUnit {
+ public:
+  explicit ExecutionUnit(const std::vector<std::string>* args) : args_(args) {
+    ++g_execution_nesting;
+  }
+  ~ExecutionUnit() {
+    if (--g_execution_nesting != 0 || g_also_propagate.empty()) return;
+    try {
+      propagate_pending_commands(args_);
+    } catch (const std::exception& e) {
+      log(LogLevel::Warn, std::string("Failed to propagate the writes of a command: ") + e.what());
+      g_also_propagate.clear();
+    }
+  }
+  ExecutionUnit(const ExecutionUnit&) = delete;
+  ExecutionUnit& operator=(const ExecutionUnit&) = delete;
+
+ private:
+  const std::vector<std::string>* args_;
+};
+
+// A write a command made (Redis's call() → alsoPropagate()), as replicas and the AOF must run it
+// (canonicalize_propagated_command()). A script's redis.set_repl() drops targets: bit 1 keeps the
+// AOF, bit 2 the replicas. Nothing is propagated while the AOF or the master stream is applied.
+void propagate_write(const std::vector<std::string>& args, const SessionState& session,
+                     const std::string* reply_ptr, int target = kPropagateAof | kPropagateRepl,
+                     bool last_of_unit = false) {
+  if (args.empty() || g_replaying_aof) return;
+  if (in_lua_script_context()) {
+    if (!(g_script_repl_flags & 1)) target &= ~kPropagateAof;
+    if (!(g_script_repl_flags & 2)) target &= ~kPropagateRepl;
+    if (target == 0) return;
+  }
+  std::vector<std::string> out;
+  if (!canonicalize_propagated_command(args, reply_ptr, out)) return;
+  also_propagate(session.db_index, std::move(out), target, last_of_unit);
 }
 
 void append_lazy_expire_dels(const SessionState& session) {
   const auto expired = store().collect_expired_keys();
   for (const auto& key : expired) {
-    append_replication_event({"DEL", key}, session);
+    propagate_write({"DEL", key}, session, nullptr, kPropagateRepl);
     notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, session.db_index);
   }
 }
@@ -1995,25 +2138,6 @@ bool truncate_file(const std::string& path, std::size_t size, std::string& err) 
   if (!ok) err = std::strerror(errno);
   ::close(fd);
   return ok;
-}
-
-void append_aof(const std::vector<std::string>& args);  // defined below
-
-// Canonicalizing AOF append for a dispatched client write: same deterministic rewrite
-// as the replication stream, plus SELECT lines on db change so multi-db datasets
-// replay into the right database.
-void append_aof_command(const std::vector<std::string>& args, const SessionState& session,
-                        const std::string* reply_ptr) {
-  if (!g_appendonly || g_replaying_aof || args.empty()) return;
-  // redis.set_repl(REPL_NONE/REPL_SLAVE) suppresses AOF propagation of script effects.
-  if (in_lua_script_context() && !(g_script_repl_flags & 1)) return;
-  std::vector<std::string> out;
-  if (!canonicalize_propagated_command(args, reply_ptr, out)) return;
-  if (session.db_index != g_last_aof_db) {
-    append_aof({"SELECT", std::to_string(session.db_index)});
-    g_last_aof_db = session.db_index;
-  }
-  append_aof(out);
 }
 
 // Redis's aofWrite(): write(2) until every byte is in or a call fails. Returns the bytes written,
@@ -2130,9 +2254,10 @@ void flush_append_only_file(std::string_view payload) {
   }
 }
 
-void append_aof(const std::vector<std::string>& args) {
-  if (!g_appendonly || g_replaying_aof) return;
-  const auto payload = encode_command_resp(args);
+// Adds the AOF bytes of one execution unit (propagate_pending_commands()) to the file and, while
+// a rewrite runs, to its buffer; a whole unit always lands in both, never half of it.
+void append_aof_payload(std::string_view payload) {
+  if (!g_appendonly || g_replaying_aof || payload.empty()) return;
   // While the AOF waits for its first rewrite (CONFIG SET appendonly yes) there is no file to
   // append to yet: the command goes only to the rewrite buffer below. After a failed write the
   // bytes wait, and aof_cron() tries them once per event-loop pass, as Redis's beforeSleep() does.
@@ -2161,10 +2286,13 @@ void append_aof(const std::vector<std::string>& args) {
 }
 
 // Eviction loop (maxmemory-policy). Evicts sampled keys until used memory is back under
-// the limit or nothing is evictable. Each evicted key is propagated like a server-issued
-// deletion: a DEL to the replication backlog (with SELECT on db change, so replicas stay
-// in sync) and to the AOF (bare DEL — the live AOF is db-agnostic, and DEL of an absent
-// key is a harmless no-op on replay), plus an "evicted" keyspace notification.
+// the limit or nothing is evictable. Each evicted key is propagated like Redis's
+// propagateDeletion(): a DEL to the AOF and the replicas, each after a SELECT of the key's
+// database when the stream is in another one (a script's redis.set_repl() does not apply), plus
+// an "evicted" keyspace notification. Redis evicts only before a command runs, so each DEL is
+// written at once; PeaDB also evicts in the OOM check of each command that EXEC or a script runs
+// (item 39), and once that unit has queued a write the DEL joins it, so the streams keep the
+// order in which the keys changed.
 void evict_to_fit() {
   // Bound the loop so a pathological config can never spin forever; in practice it exits
   // as soon as used_memory drops under the limit (evict_one keeps the cache live).
@@ -2173,12 +2301,12 @@ void evict_to_fit() {
     if (++guard > 10'000'000) break;
     auto victim = store().evict_one(g_maxmemory_policy, g_maxmemory_samples);
     if (!victim) break;  // nothing evictable (e.g. volatile-* with no TTL keys)
-    if (victim->db != g_last_repl_db) {
-      backlog_append(encode_command_resp({"SELECT", std::to_string(victim->db)}));
-      g_last_repl_db = victim->db;
+    constexpr int kBoth = kPropagateAof | kPropagateRepl;
+    if (g_also_propagate.empty()) {
+      propagate_now(victim->db, {"DEL", victim->key}, kBoth);
+    } else {
+      also_propagate(victim->db, {"DEL", victim->key}, kBoth);
     }
-    backlog_append(encode_command_resp({"DEL", victim->key}));
-    append_aof({"DEL", victim->key});
     notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key, victim->db);
   }
 }
@@ -2216,6 +2344,7 @@ bool start_aof_rewrite() {
   const auto fork_t0 = std::chrono::steady_clock::now();
   const pid_t pid = fork_child();
   if (pid < 0) {
+    g_aof_last_bgrewrite_status = "err";
     log(LogLevel::Warn, "Can't rewrite append only file in background: fork: " +
                             std::string(std::strerror(errno)));
     return false;
@@ -2257,17 +2386,39 @@ void kill_aof_rewrite_child() {
 // CONFIG SET appendonly yes (startAppendOnly()): the AOF starts with a rewrite of the current
 // dataset, and every write from now on is kept for it.
 bool start_append_only(std::string& err) {
-  // A rewrite started while the AOF was off has not kept the writes made since it started.
-  kill_aof_rewrite_child();
   g_appendonly = true;
   g_aof_state = AofState::WaitRewrite;
-  if (!start_aof_rewrite()) {
-    g_appendonly = false;
-    g_aof_state = AofState::Off;
-    log(LogLevel::Warn, "PeaDB needs to enable the AOF but can't trigger a background AOF "
-                        "rewrite operation. Check the above logs for more info about the error.");
-    err = "Unable to turn on AOF. Check server logs.";
-    return false;
+  // A rewrite started while the AOF was off has not kept the writes made since it started, so its
+  // file can never become the AOF: stop it, here even when the new rewrite has to wait.
+  const bool rewrite_running = g_bgrewrite_in_progress.load();
+  if (rewrite_running) kill_aof_rewrite_child();
+  if (g_bgsave_in_progress.load()) {
+    g_aof_rewrite_scheduled = true;
+    log(LogLevel::Info,
+        "AOF was enabled but there is already another background operation. An "
+        "AOF background was scheduled to start when possible.");
+  } else if (g_executing_exec) {
+    // As for BGREWRITEAOF inside EXEC: the transaction's writes are in the AOF only once EXEC
+    // ends, so the rewrite starts after it, from the cron.
+    g_aof_rewrite_scheduled = true;
+    log(LogLevel::Info,
+        "AOF was enabled during a transaction. An AOF background was scheduled to "
+        "start when possible.");
+  } else {
+    if (rewrite_running) {
+      log(LogLevel::Info,
+          "AOF was enabled but there is already an AOF rewriting in background. "
+          "Stopping background AOF and starting a rewrite now.");
+    }
+    if (!start_aof_rewrite()) {
+      g_appendonly = false;
+      g_aof_state = AofState::Off;
+      log(LogLevel::Warn,
+          "PeaDB needs to enable the AOF but can't trigger a background AOF "
+          "rewrite operation. Check the above logs for more info about the error.");
+      err = "Unable to turn on AOF. Check server logs.";
+      return false;
+    }
   }
   // The new AOF starts from the dataset, so an earlier error no longer counts.
   if (g_aof_fsync_error) {
@@ -4637,20 +4788,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.in_multi = false;
           session.multi_dirty = false;
           session.queued.clear();
-          std::vector<std::string> replies;
-          replies.reserve(queued.size());
-          bool has_replof = false;
-          for (const auto& q : queued) {
-            if (!q.empty()) {
-              const auto qc = upper(q[0]);
-              if (qc == "REPLICAOF" || qc == "SLAVEOF") { has_replof = true; break; }
-            }
-          }
-          g_capture_exec_replication = true;
-          g_exec_replication_events.clear();
-          g_exec_last_repl_db = g_last_repl_db;
-          g_exec_write_event_count = 0;
-          g_executing_exec = true;
+          session.watched_epoch.reset();
+          session.watched_digests.clear();
           const auto& table = command_table();
           bool has_write = false;
           bool has_read = false;
@@ -4662,55 +4801,36 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it->second.is_write()) has_write = true;
             else has_read = true;
           }
+          // oom_should_reject() and noreplicas_should_reject() never refuse the AOF or the master
+          // stream (Redis's mustObeyClient()), so a transaction they replay is never dropped.
           if (has_write && noreplicas_should_reject()) {
-            g_executing_exec = false;
-            g_capture_exec_replication = false;
-            g_exec_replication_events.clear();
-            g_exec_write_event_count = 0;
-            session.watched_epoch.reset();
-            session.watched_digests.clear();
             return std::string("-EXECABORT Transaction discarded because of previous errors: NOREPLICAS Not enough good replicas to write.\r\n");
           }
           if (has_write && oom_should_reject()) {
-            g_executing_exec = false;
-            g_capture_exec_replication = false;
-            g_exec_replication_events.clear();
-            g_exec_write_event_count = 0;
-            session.watched_epoch.reset();
-            session.watched_digests.clear();
             return std::string("-EXECABORT Transaction discarded because of previous errors: OOM command not allowed when used memory > 'maxmemory'.\r\n");
           }
-          if (has_read && g_replication_role == "slave" && !g_config_replica_serve_stale_data && g_replica_stale) {
-            g_executing_exec = false;
-            g_capture_exec_replication = false;
-            g_exec_replication_events.clear();
-            g_exec_write_event_count = 0;
-            session.watched_epoch.reset();
-            session.watched_digests.clear();
+          if (has_read && !g_replaying_aof && g_replication_role == "slave" &&
+              !g_config_replica_serve_stale_data && g_replica_stale) {
             return std::string("-EXECABORT Transaction discarded because of previous errors: MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n");
           }
+          // The commands' writes join EXEC's execution unit, which wraps them in MULTI/EXEC for the
+          // AOF and the replicas when there is more than one (propagate_pending_commands()). A
+          // REPLICAOF inside the transaction makes this server a replica before the unit ends,
+          // so, as in Redis, the replicas it had get none of it.
+          struct ExecutingExec {
+            ExecutingExec() {
+              g_executing_exec = true;
+            }
+            ~ExecutingExec() {
+              g_executing_exec = false;
+            }
+          } executing;
+          std::vector<std::string> replies;
+          replies.reserve(queued.size());
           for (const auto& q : queued) {
             bool close = false;
             replies.push_back(handle_command(q, session, close));
           }
-          g_executing_exec = false;
-          g_capture_exec_replication = false;
-          if (!has_replof && g_exec_write_event_count > 1) {
-            backlog_append(encode_command_resp({"MULTI"}));
-            for (const auto& ev : g_exec_replication_events) backlog_append(ev);
-            backlog_append(encode_command_resp({"EXEC"}));
-            g_last_repl_db = g_exec_last_repl_db;
-          } else if (!has_replof && g_exec_write_event_count == 1 && !g_exec_replication_events.empty()) {
-            if (g_exec_last_repl_db != g_last_repl_db) {
-              backlog_append(encode_command_resp({"SELECT", std::to_string(g_exec_last_repl_db)}));
-            }
-            backlog_append(g_exec_replication_events.back());
-            g_last_repl_db = g_exec_last_repl_db;
-          }
-          g_exec_replication_events.clear();
-          g_exec_write_event_count = 0;
-          session.watched_epoch.reset();
-          session.watched_digests.clear();
           return encode_array(replies);
         }});
 
@@ -5285,7 +5405,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (g_bgrewrite_in_progress.load())
             return encode_error("Background append only file rewriting already in progress");
           g_aofrw_consecutive_failures = 0;  // a rewrite asked for by hand is not held back
-          if (!start_aof_rewrite()) return encode_error("BGREWRITEAOF failed: fork error");
+          // Redis's bgrewriteaofCommand(): beside a BGSAVE child, or inside EXEC, the rewrite
+          // starts from the cron (reap_background_children()) once no child runs and the
+          // transaction is in the AOF; forked inside EXEC, the child's dataset would hold the
+          // transaction's first writes and the rewrite buffer them again. A script is treated
+          // like EXEC for the same reason (Redis refuses BGREWRITEAOF there, item 14).
+          if (has_active_child_process() || g_executing_exec || in_lua_script_context()) {
+            g_aof_rewrite_scheduled = true;
+            return encode_simple("Background append only file rewriting scheduled");
+          }
+          if (!start_aof_rewrite()) {
+            return encode_error(
+                "Can't execute an AOF background rewriting. Please check the server logs for "
+                "more information.");
+          }
           return encode_simple("Background append only file rewriting started");
         }});
 
@@ -6237,7 +6370,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           if (store().is_wrongtype_for_string_noexpire(args[1])) return wrongtype_error_reply();
           if (store().lazy_expire_key(args[1])) {
-            append_replication_event({"DEL", args[1]}, session);
+            propagate_write({"DEL", args[1]}, session, nullptr, kPropagateRepl);
           }
           auto v = store().get(args[1]);
           return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
@@ -7084,8 +7217,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             std::string name, err;
             if (!load_function_library(args[i], replace, name, err)) return encode_error(err);
-            append_replication_event({"FUNCTION", "LOAD", "REPLACE", args[i]}, session);
-            append_aof({"FUNCTION", "LOAD", "REPLACE", args[i]});
+            propagate_write({"FUNCTION", "LOAD", "REPLACE", args[i]}, session, nullptr);
             store().increment_mutation_epoch();
             return encode_bulk(name);
           }
@@ -7095,8 +7227,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it == g_libraries.end()) return encode_error("Library not found");
             for (auto& f : it->second.functions) { g_func_index.erase(lower(f.name)); lua_engine_unref_function(f.callback_ref); }
             g_libraries.erase(it);
-            append_replication_event({"FUNCTION", "DELETE", args[2]}, session);
-            append_aof({"FUNCTION", "DELETE", args[2]});
+            propagate_write({"FUNCTION", "DELETE", args[2]}, session, nullptr);
             store().increment_mutation_epoch();
             return encode_simple("OK");
           }
@@ -7104,8 +7235,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (args.size() > 3) return encode_error("unknown subcommand or wrong number of arguments for 'flush'. Try FUNCTION HELP.");
             if (args.size() == 3) { const auto m = upper(args[2]); if (m != "SYNC" && m != "ASYNC") return encode_error("FUNCTION FLUSH only supports SYNC|ASYNC"); }
             functions_flush_all();
-            append_replication_event({"FUNCTION", "FLUSH"}, session);
-            append_aof({"FUNCTION", "FLUSH"});
+            propagate_write({"FUNCTION", "FLUSH"}, session, nullptr);
             store().increment_mutation_epoch();
             return encode_simple("OK");
           }
@@ -7173,8 +7303,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             std::string err;
             if (!functions_restore(args[2], policy, err)) return encode_error(err);
-            append_replication_event({"FUNCTION", "RESTORE", args[2], policy}, session);
-            append_aof({"FUNCTION", "RESTORE", args[2], policy});
+            propagate_write({"FUNCTION", "RESTORE", args[2], policy}, session, nullptr);
             store().increment_mutation_epoch();
             return encode_simple("OK");
           }
@@ -7746,8 +7875,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               ++popped;
             }
             const std::vector<std::string> eff{left ? "LPOP" : "RPOP", key, std::to_string(popped)};
-            append_replication_event(eff, session, nullptr);
-            append_aof_command(eff, session, nullptr);
+            propagate_write(eff, session, nullptr);
             return encode_array({encode_bulk(key), encode_array(enc)});
           }
           if (g_in_lua_script || g_executing_exec || g_block_disabled) return encode_null_array(session.resp_version);
@@ -7797,8 +7925,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (vals.empty()) continue;
             const std::vector<std::string> eff{max ? "ZPOPMAX" : "ZPOPMIN", key,
                                                std::to_string(vals.size())};
-            append_replication_event(eff, session, nullptr);
-            append_aof_command(eff, session, nullptr);
+            propagate_write(eff, session, nullptr);
             std::vector<std::string> pairs;
             for (const auto& [m, s] : vals) {
               pairs.push_back(encode_array({encode_bulk(m), encode_double(s, session.resp_version)}));
@@ -8227,8 +8354,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (vals.empty()) continue;
             const std::vector<std::string> eff{max ? "ZPOPMAX" : "ZPOPMIN", key,
                                                std::to_string(vals.size())};
-            append_replication_event(eff, session, nullptr);
-            append_aof_command(eff, session, nullptr);
+            propagate_write(eff, session, nullptr);
             // Redis replies [key, [[member, score], ...]] — nested pairs, not flat;
             // scores are RESP3 doubles for RESP3 clients.
             std::vector<std::string> pairs;
@@ -8684,8 +8810,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           // XREADGROUP is not propagated verbatim (canonicalize sets emit=false); instead we
           // propagate its deterministic effects to BOTH the AOF and the replication backlog.
           auto propagate = [&](std::vector<std::string> cmd) {
-            append_replication_event(cmd, session, nullptr);
-            append_aof_command(cmd, session, nullptr);
+            propagate_write(cmd, session, nullptr);
           };
           // For a NOACK read there is no XCLAIM to carry the consumer, so a newly-created
           // consumer is propagated as XGROUP CREATECONSUMER up front (Redis creates it when
@@ -9666,8 +9791,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (popped.empty()) continue;
             const std::vector<std::string> eff{dir == "LEFT" ? "LPOP" : "RPOP", key,
                                                std::to_string(popped.size())};
-            append_replication_event(eff, session, nullptr);
-            append_aof_command(eff, session, nullptr);
+            propagate_write(eff, session, nullptr);
             std::vector<std::string> enc;
             for (const auto& v : popped) enc.push_back(encode_bulk(v));
             return encode_array({encode_bulk(key), encode_array(enc)});
@@ -11756,6 +11880,9 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // clobbers — snapshot the name for everything after the handler call. Command names
   // fit in SSO, so this never heap-allocates.
   const std::string cmd_after = cmd;
+  // What the command propagates, with the writes of the commands it runs (EXEC, scripts), is
+  // written when the outermost one ends, before its reply goes out.
+  const ExecutionUnit unit(&args);
   const auto t_start = std::chrono::steady_clock::now();
   const std::string reply = spec.handler(args, session, should_close);
   const std::int64_t exec_usec = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -11797,10 +11924,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // BLPOP/XREADGROUP would be wrongly written to the AOF / dirtied / notified.
   if (spec_is_write && !is_error_reply(reply) && session.blocked.type == BlockType::None) {
     store().increment_mutation_epoch();
-    // g_master_repl_offset is updated inside append_replication_event → backlog_append
-    // via g_master_repl_offset = g_repl_backlog.total (absolute set, not increment).
-    append_replication_event(args, session, &reply);
-    append_aof_command(args, session, &reply);
+    // Queued for the AOF and the replicas until the execution unit ends (`unit` above), which
+    // advances g_master_repl_offset in backlog_append(). PUBLISH and SPUBLISH go to the replicas
+    // only, as Redis's forceCommandPropagation(c, PROPAGATE_REPL) sends them.
+    // The outermost command's write is the last of its unit: nothing after this propagates.
+    const bool publish = cmd_after == "PUBLISH" || cmd_after == "SPUBLISH";
+    propagate_write(args, session, &reply,
+                    publish ? kPropagateRepl : kPropagateAof | kPropagateRepl,
+                    g_execution_nesting == 1);
     // 'new' fires before the command's own event, mirroring Redis (dbAdd runs first).
     for (const auto& k : notify_new_candidates) {
       if (store().type_of(k) != "none") notify_keyspace_event(NOTIFY_NEW, "new", k, session.db_index);
@@ -12123,11 +12254,7 @@ void run_active_expire_cycle() {
   latency_add("expire-cycle", cycle_ms);
   if (expired.empty()) return;
   for (const auto& [dbidx, key] : expired) {
-    if (dbidx != g_last_repl_db) {
-      backlog_append(encode_command_resp({"SELECT", std::to_string(dbidx)}));
-      g_last_repl_db = dbidx;
-    }
-    backlog_append(encode_command_resp({"DEL", key}));
+    propagate_now(dbidx, {"DEL", key}, kPropagateRepl);  // not to the AOF yet (item 37)
     notify_keyspace_event(NOTIFY_EXPIRED, "expired", key, dbidx);
   }
 }
@@ -12574,8 +12701,7 @@ std::string try_unblock_client_impl(SessionState& session) {
   // propagate to the replication backlog and AOF explicitly (deterministic pop form).
   auto propagate = [&session](std::vector<std::string> cmd_args) {
     store().increment_mutation_epoch();
-    append_replication_event(cmd_args, session, nullptr);
-    append_aof_command(cmd_args, session, nullptr);
+    propagate_write(cmd_args, session, nullptr);
   };
   auto clear_block = [&session]() {
     unregister_key_waiter(session.fd);
@@ -12753,6 +12879,9 @@ std::string try_unblock_client(SessionState& session) {
   // Capture the block context before try_unblock_client_impl clears it on serve/timeout.
   const std::vector<std::string> orig = session.blocked.original_args;
   const std::int64_t start_ms = session.blocked.block_start_ms;
+  // A woken command is its own execution unit, as in Redis, so the writes it propagates (a woken
+  // XREADGROUP's XCLAIMs and group id) are wrapped together.
+  const ExecutionUnit unit(&orig);
   std::string reply = try_unblock_client_impl(session);
   // A non-empty reply means the blocking command finally completed (served or timed out):
   // Redis logs it to the slow log now, with the full block span and its original argv (not the
@@ -12820,10 +12949,15 @@ void aof_cron(std::int64_t now) {
 }
 
 void drain_replica_cmd_queue() {
+  // The session that applies the master's stream; like Redis's master client it is new for each
+  // full sync, so a MULTI whose EXEC never came before the old link broke is dropped (the master
+  // ran the transaction whole, and the new dataset holds it).
+  static SessionState repl_session;
   // Apply any pending replica RDB load on the event loop thread before processing
   // queued commands. Running rdb_load() here serializes flushall+restore with all
   // event-loop reads/writes, eliminating the race against the streaming thread.
   if (g_replica_load_pending.load()) {
+    repl_session = SessionState{};
     std::string path;
     {
       std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
@@ -12857,7 +12991,6 @@ void drain_replica_cmd_queue() {
   // Apply on the event loop thread: g_replaying_aof suppresses AOF writes and
   // backlog updates so master commands are not re-replicated or double-logged.
   g_replaying_aof = true;
-  static SessionState repl_session;
   bool close_flag = false;
   // A paused replica holds what its master sends, as Redis pauses its master client: the first
   // command the pause holds and everything after it wait, in order, until the pause ends.
@@ -13293,8 +13426,10 @@ void reap_background_children() {
       }
     }
   }
-  if (g_aof_rewrite_scheduled && g_aof_state == AofState::WaitRewrite &&
-      !g_bgrewrite_in_progress.load() && !aof_rewrite_limited() && !start_aof_rewrite()) {
+  // Redis's serverCron(): a rewrite asked for beside another child or inside EXEC, or the first
+  // rewrite of CONFIG SET appendonly yes, starts once no child runs.
+  if (g_aof_rewrite_scheduled && !has_active_child_process() && !aof_rewrite_limited() &&
+      !start_aof_rewrite()) {
     ++g_aofrw_consecutive_failures;
   }
 }

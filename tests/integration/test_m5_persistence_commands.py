@@ -60,7 +60,9 @@ def main():
     assert cmd(s,'SET','a','1')=='OK'
     assert cmd(s,'SAVE')=='OK'
     assert cmd(s,'BGSAVE')=='Background saving started'
-    assert cmd(s,'BGREWRITEAOF')=='Background append only file rewriting started'
+    # Like Redis, one child at a time: while the BGSAVE child still runs the rewrite is scheduled.
+    assert cmd(s,'BGREWRITEAOF') in ('Background append only file rewriting started',
+                                     'Background append only file rewriting scheduled')
     info=cmd(s,'INFO','persistence')
     assert 'rdb_last_save_time:' in info
   finally:
