@@ -771,7 +771,7 @@ int run_server(const ServerConfig& config) {
       run_active_expire_cycle();  // master expires + propagates DEL; replica is a no-op
       last_active_expire_ms = loop_now_ms;
     }
-    aof_fsync_if_needed(loop_now_ms);
+    aof_cron(loop_now_ms);
     background_save_cron();
     run_eviction_cycle();  // background eviction when over maxmemory (e.g. lowered via CONFIG SET)
     reap_background_children();
