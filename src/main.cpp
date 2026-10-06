@@ -58,6 +58,7 @@ static void install_crash_handlers() {
 
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
+  std::signal(SIGHUP, SIG_IGN);  // as in Redis (initServer, server.c)
   std::signal(SIGTERM, signal_handler);
   std::signal(SIGINT, signal_handler);
   install_crash_handlers();

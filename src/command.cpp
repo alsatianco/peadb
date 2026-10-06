@@ -4065,27 +4065,63 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_simple("OK");
         }});
 
+    // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]: Redis's shutdownCommand() (db.c) and
+    // finishShutdown() (server.c). PeaDB never waits for replicas before it exits (no
+    // shutdown-timeout, compat/delta.md item 33), so a shutdown is never in progress: NOW changes
+    // nothing and ABORT always finds nothing to abort.
     t.emplace("SHUTDOWN", CommandSpec{"SHUTDOWN", -1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool& close) {
-          // Default: save iff save points are configured (matches Redis).
-          bool do_save = !g_save_params.empty();
+          bool nosave = false, save = false, now = false, force = false, abort = false;
           for (std::size_t i = 1; i < args.size(); ++i) {
-            const auto o = upper(args[i]);
-            if (o == "NOSAVE") do_save = false;
-            else if (o == "SAVE") do_save = true;
-            else if (o == "NOW" || o == "FORCE" || o == "ABORT") { /* accepted, no-op */ }
+            const auto o = lower(args[i]);
+            if (o == "nosave") nosave = true;
+            else if (o == "save") save = true;
+            else if (o == "now") now = true;
+            else if (o == "force") force = true;
+            else if (o == "abort") abort = true;
             else return encode_error("syntax error");
           }
-          if (do_save) {
-            std::string err;
-            if (!rdb_save(g_snapshot_path, err))
-              return encode_error("Errors trying to SHUTDOWN. Check logs.");
+          if ((abort && (nosave || save || now || force)) || (nosave && save))
+            return encode_error("syntax error");
+          if (abort) return encode_error("No shutdown in progress.");
+          // A script that timed out: only SHUTDOWN NOSAVE may stop the server.
+          if (!nosave && g_script_busy.load()) return busy_script_error_reply();
+          log(LogLevel::Info, "User requested shutdown...");
+          auto fail = [] {
+            log(LogLevel::Warn, "Errors trying to shut down the server. Check the logs for more information.");
+            return encode_error("Errors trying to SHUTDOWN. Check logs.");
+          };
+          // CONFIG SET appendonly yes is still writing the first AOF: exiting now would leave no
+          // AOF with the data.
+          if (g_aof_state == AofState::WaitRewrite) {
+            if (!force) {
+              log(LogLevel::Warn, "Writing initial AOF, can't exit.");
+              return fail();
+            }
+            log(LogLevel::Warn, "Writing initial AOF. Exit anyway.");
           }
           // Flush the AOF so the everysec window is not lost on a clean shutdown.
-          if (g_appendonly && g_aof_fd >= 0) ::fsync(g_aof_fd);
+          if (g_appendonly && g_aof_fd >= 0) {
+            log(LogLevel::Info, "Calling fsync() on the AOF file.");
+            if (::fsync(g_aof_fd) != 0)
+              log(LogLevel::Warn, std::string("Fail to fsync the AOF file: ") + std::strerror(errno) + ".");
+          }
+          if ((!g_save_params.empty() && !nosave) || save) {
+            log(LogLevel::Info, "Saving the final RDB snapshot before exiting.");
+            std::string err;
+            if (!rdb_save(g_snapshot_path, err)) {
+              log(LogLevel::Warn, "Failed saving the DB: " + err);
+              if (!force) {
+                log(LogLevel::Warn, "Error trying to save the DB, can't exit.");
+                return fail();
+              }
+              log(LogLevel::Warn, "Error trying to save the DB. Exit anyway.");
+            }
+          }
+          log(LogLevel::Warn, "PeaDB is now ready to exit, bye bye...");
           request_shutdown();
           close = true;
-          return encode_simple("OK");
+          return std::string();  // like Redis, no reply: the client sees the connection close
         }});
 
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
@@ -11757,6 +11793,10 @@ void configure_persistence(const std::string& dbfilename, bool appendonly,
                            const std::string& appendfilename, const std::string& appendfsync) {
   // Both names are relative to the working directory, which the config loader set to `dir`.
   g_snapshot_path = dbfilename;
+  // "At startup we consider the DB saved" (Redis's initServer): save points count from now, so
+  // `save 3600 1` waits an hour instead of saving after the first write, and INFO's
+  // rdb_last_save_time is the start time, not 0.
+  g_last_save_time = now_ms() / 1000;
   g_appendonly = appendonly;
   g_aof_state = appendonly ? AofState::On : AofState::Off;
   g_aof_path = appendfilename;
