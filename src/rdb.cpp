@@ -14,9 +14,13 @@
 #include "datastore.hpp"
 #include "logger.hpp"
 
+#include <cerrno>
 #include <cstdint>
+#include <cstdlib>
+#include <ctime>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -34,6 +38,7 @@ namespace peadb {
 namespace {
 bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
 bool g_rdb_checksum = true;               // rdbchecksum (startup-only, as in Redis)
+int g_rdb_key_save_delay = 0;             // rdb-key-save-delay (hidden Redis setting, for tests)
 FunctionDumpFn g_function_dump_hook;      // returns every function library's source
 FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
 }  // namespace
@@ -44,6 +49,25 @@ void rdb_set_checksum(bool enabled) {
 }
 bool rdb_checksum() {
   return g_rdb_checksum;
+}
+void rdb_set_key_save_delay(int usec) {
+  g_rdb_key_save_delay = usec;
+}
+int rdb_key_save_delay() {
+  return g_rdb_key_save_delay;
+}
+
+void debug_delay(int usec) {
+  // Redis's debugDelay(): a negative value sleeps 1 microsecond once in every -usec calls.
+  if (usec < 0) usec = (std::rand() % -usec) == 0 ? 1 : 0;
+  if (usec <= 0) return;
+  timespec left{usec / 1000000, static_cast<long>(usec % 1000000) * 1000};
+  while (::nanosleep(&left, &left) != 0 && errno == EINTR) {
+  }
+}
+
+std::string rdb_temp_file_name(const std::filesystem::path& path, pid_t pid) {
+  return (path.parent_path() / ("temp-" + std::to_string(pid) + ".rdb")).string();
 }
 
 void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load) {
@@ -681,7 +705,10 @@ class ListpackReader {
 // ── RDB Save ───────────────────────────────────────────────────────────
 
 namespace {
-std::string rdb_build_string(std::string& err) {
+// `key_save_delay`: wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
+// Only the file saves wait: Redis builds a full sync in a child, but PeaDB builds it on the event
+// loop (compat/delta.md item 46), where a wait would stop every client.
+std::string rdb_build_string(std::string& err, bool key_save_delay) {
   err.clear();
   auto& ds = store();
 
@@ -736,6 +763,12 @@ std::string rdb_build_string(std::string& err) {
     w.write_length(expire_count);
 
     for (const auto& key : all_keys) {
+      struct DelayAfterKey {
+        int usec;
+        ~DelayAfterKey() {
+          if (usec != 0) debug_delay(usec);
+        }
+      } delay_after_key{key_save_delay ? g_rdb_key_save_delay : 0};
       // Expire
       auto pttl_val = ds.pexpiretime(key);
       if (pttl_val >= 0) {
@@ -844,32 +877,59 @@ std::string rdb_build_string(std::string& err) {
 
 bool rdb_save(const std::filesystem::path& path, std::string& err) {
   err.clear();
-  std::string data = rdb_build_string(err);
-  if (!err.empty()) return false;
-
-  // Write to a temp file on the same filesystem, then atomically rename
-  const std::string tmp_path = path.string() + ".tmp";
+  auto cwd = [] {
+    std::error_code ec;
+    const auto dir = std::filesystem::current_path(ec);
+    return ec ? std::string("unknown") : dir.string();
+  };
+  // Like Redis's rdbSave(): the data goes to temp-<pid>.rdb next to the dump and is renamed over
+  // it. The pid keeps the BGSAVE child, a foreground SAVE and a shutdown's final save off each
+  // other's file, and lets a shutdown delete the file of a BGSAVE child it stops. The file is
+  // created before the keys are serialized, as Redis creates it before it writes the first key.
+  const std::string tmp_path = rdb_temp_file_name(path, ::getpid());
   const int fd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
-  if (fd < 0) { err = "cannot open RDB tmp file for writing"; return false; }
+  if (fd < 0) {
+    err = "Failed opening the temp RDB file " + tmp_path + " (in server root dir " + cwd() +
+          ") for saving: " + std::strerror(errno);
+    return false;
+  }
+  std::string data;
+  try {
+    data = rdb_build_string(err, /*key_save_delay=*/true);
+  } catch (const std::exception& e) {  // e.g. out of memory: the whole file is built in memory
+    err = std::string("Error saving DB: ") + e.what();
+  }
+  if (!err.empty()) {
+    ::close(fd);
+    ::unlink(tmp_path.c_str());
+    return false;
+  }
 
+  auto write_error = [&] {
+    err = std::string("Write error saving DB on disk: ") + std::strerror(errno);
+    ::close(fd);
+    ::unlink(tmp_path.c_str());
+    return false;
+  };
   std::size_t written = 0;
   while (written < data.size()) {
     const ssize_t rc = ::write(fd, data.data() + written, data.size() - written);
-    if (rc <= 0) { ::close(fd); ::unlink(tmp_path.c_str()); err = "RDB write error"; return false; }
+    if (rc < 0 && errno == EINTR) continue;
+    if (rc <= 0) {
+      if (rc == 0) errno = EIO;
+      return write_error();
+    }
     written += static_cast<std::size_t>(rc);
   }
   // Fail fast on fsync error: a successful rename of an unfsynced temp file
   // can leave the new RDB with stale or torn contents after a power loss.
-  if (::fsync(fd) != 0) {
-    ::close(fd); ::unlink(tmp_path.c_str());
-    err = "RDB fsync error";
-    return false;
-  }
+  if (::fsync(fd) != 0) return write_error();
   ::close(fd);
 
   if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
+    err = "Error moving temp DB file " + tmp_path + " on the final destination " + path.string() +
+          " (in server root dir " + cwd() + "): " + std::strerror(errno);
     ::unlink(tmp_path.c_str());
-    err = "RDB rename failed";
     return false;
   }
   // Crash-durability: fsync the parent directory so the new RDB directory
@@ -884,8 +944,12 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
   return true;
 }
 
+void rdb_remove_temp_file(pid_t pid) {
+  ::unlink(rdb_temp_file_name(std::filesystem::path(), pid).c_str());
+}
+
 std::string rdb_save_to_string(std::string& err) {
-  return rdb_build_string(err);
+  return rdb_build_string(err, /*key_save_delay=*/false);
 }
 
 // ── RDB Load ───────────────────────────────────────────────────────────

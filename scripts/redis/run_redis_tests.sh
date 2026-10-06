@@ -140,6 +140,7 @@ SUITES=(
   "unit/info-command"
   "unit/introspection-2"
   "unit/pause"
+  "unit/shutdown"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

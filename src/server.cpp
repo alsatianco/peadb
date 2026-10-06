@@ -552,6 +552,7 @@ int run_server(const ServerConfig& config) {
                               int& blocked_count_ref, int& wait_count_ref,
                               std::vector<int>& to_close_out) {
     for (int fd : fds) {
+      if (shutdown_requested()) return;  // a SHUTDOWN ran: no command may run after it
       if (!sessions.count(fd)) continue;
       auto& session = sessions[fd];
       auto& input = buffers[fd];
@@ -582,6 +583,7 @@ int run_server(const ServerConfig& config) {
           break;
         }
         consumed += parsed->consumed;
+        if (shutdown_requested()) return;
         if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
       if (consumed > 0) {
@@ -727,6 +729,10 @@ int run_server(const ServerConfig& config) {
   };
 
   while (!shutdown_requested()) {
+    // A SIGTERM or SIGINT asked for a shutdown: run it here, between commands, as Redis does from
+    // serverCron() (it is not safe inside the signal handler).
+    shutdown_signal_cron();
+    if (shutdown_requested()) break;
     // Poll timeout: default 100 ms housekeeping tick, but clamp to the nearest blocked-
     // client deadline so BLPOP-style timeouts fire with millisecond precision instead
     // of up to a tick late (the upstream suite asserts ~150 ms slack on a 1 s timeout).
@@ -790,6 +796,8 @@ int run_server(const ServerConfig& config) {
     if (client_pause_update()) resume_postponed();
 
     for (int i = 0; i < nready; ++i) {
+      // Once SHUTDOWN has succeeded no other command runs: the final save already happened.
+      if (shutdown_requested()) break;
       const int fd = ep_events[i].fd;
 
       // Skip fds already closed (e.g. by blocked-client cleanup above).
@@ -1052,11 +1060,16 @@ int run_server(const ServerConfig& config) {
         continue;
       }
 
+      // The SHUTDOWN client stays open until the listeners are closed below, so it cannot see
+      // its connection close while new connections are still accepted.
+      if (shutdown_requested()) break;
+
       if (should_close) {
         close_client(fd);
         continue;
       }
     }
+    if (shutdown_requested()) break;
 
     // Flush replication streams for all active sessions.
     if (replica_count > 0) {
@@ -1092,15 +1105,19 @@ int run_server(const ServerConfig& config) {
     }
   }
 
-  // Cleanup
-  for (auto& [fd, _] : sessions) ::close(fd);
-  for (auto& [fd, _] : cbus_buffers) ::close(fd);
+  // Cleanup, in the order of Redis's finishShutdown(): a best-effort flush of what replicas have
+  // not been sent yet, then the listeners, then the clients.
+  for (auto& [fd, session] : sessions) {
+    if (session.replica_stream && flush_replication_stream(fd, session)) flush_output(fd);
+  }
   if (listen_fd >= 0) close(listen_fd);
   if (unix_fd >= 0) {
     close(unix_fd);
     ::unlink(config.unixsocket.c_str());
   }
   if (cbus_fd >= 0) close(cbus_fd);
+  for (auto& [fd, _] : sessions) ::close(fd);
+  for (auto& [fd, _] : cbus_buffers) ::close(fd);
   if (reserved_fd >= 0) close(reserved_fd);
   poller.destroy();
   return 0;

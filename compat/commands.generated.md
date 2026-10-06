@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registered: 0
+Total: **234** commands — full: 10, upstream: 215, diff: 1, tested: 8, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -156,12 +156,12 @@ Total: **234** commands — full: 10, upstream: 214, diff: 1, tested: 9, registe
 | `SDIFF` | upstream | test_p3_ecosystem_commands.py |
 | `SDIFFSTORE` | upstream | test_p3_ecosystem_commands.py |
 | `SELECT` | upstream | test_m2_strings_expire.py, test_p1_dbsize_flushdb.py, test_p1_move.py, test_p1_object_swapdb_sync.py |
-| `SET` | full | test_b14_lazyfree.py, test_b4_observability.py, test_b5_commands.py, test_b7_eviction.py, test_b8_repl_safety.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py, test_p5_cluster_ownership.py |
+| `SET` | full | test_b14_lazyfree.py, test_b4_observability.py, test_b5_commands.py, test_b7_eviction.py, test_b8_repl_safety.py, test_command_coverage_extras.py, test_m2_dump_restore.py, test_m2_strings_expire.py, test_m3_object_encoding.py, test_m4_blpop_brpop.py, test_m4_hash.py, test_m4_list.py, test_m4_lua2_atomic.py, test_m4_set.py, test_m4_tx.py, test_m4_zset.py, test_m5_aof.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_offsets.py, test_m6_wait.py, test_m7_migrate.py, test_m9_failover_promotion.py, test_p1_bitmap_xreadgroup.py, test_p1_bzpop.py, test_p1_copy_spop_time.py, test_p1_dbsize_flushdb.py, test_p1_eval_and_script_replication.py, test_p1_expire_error_and_lazy_get.py, test_p1_expire_options.py, test_p1_expire_replication_canonical.py, test_p1_expiretime_debug_digest.py, test_p1_keys_pattern.py, test_p1_lcs.py, test_p1_move.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_object_swapdb_sync.py, test_p1_randomkey.py, test_p1_replicaof_readonly.py, test_p1_set_get_option.py, test_p1_shutdown.py, test_p1_string_range_ops.py, test_p1_sync_stream.py, test_p1_xdel.py, test_p1_xread.py, test_p2_evalsha_sha1.py, test_p2_noreplicas_scripting.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_time_freeze.py, test_p2_shebang_oom.py, test_p3_ecosystem_commands.py, test_p3_hash_extras.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py, test_p4_new_events_hello_object.py, test_p4_subscribe_mode_gate.py, test_p5_cluster_ownership.py, test_shutdown_parity.py |
 | `SETBIT` | upstream | test_p1_bitmap_xreadgroup.py, test_p4_limits_errors.py |
 | `SETEX` | full | test_p1_setex_psetex.py |
 | `SETNX` | upstream | test_p1_setnx_debug.py |
 | `SETRANGE` | upstream | test_p1_string_range_ops.py, test_p4_limits_errors.py |
-| `SHUTDOWN` | tested | test_p1_shutdown.py |
+| `SHUTDOWN` | upstream | test_p1_shutdown.py |
 | `SINTER` | upstream | test_p3_ecosystem_commands.py |
 | `SINTERCARD` | upstream | test_p3_ecosystem_commands.py, test_p4_limits_errors.py |
 | `SINTERSTORE` | upstream | test_p3_ecosystem_commands.py |

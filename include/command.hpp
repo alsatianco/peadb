@@ -170,9 +170,10 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // ServerConfig field: min-replicas-to-write, replica-serve-stale-data, busy-reply-threshold,
 // lazyfree-lazy-server-del, stop-writes-on-bgsave-error, aof-load-truncated,
 // slowlog-log-slower-than, slowlog-max-len, latency-monitor-threshold, proto-max-bulk-len,
-// client-query-buffer-limit, tcp-keepalive, lfu-log-factor and rdbchecksum (values already
-// checked). It also keeps every other setting the config named, for CONFIG GET; `config_file` is
-// the config file PeaDB was started with ("" for none), for CONFIG REWRITE.
+// client-query-buffer-limit, tcp-keepalive, lfu-log-factor, rdbchecksum, rdb-key-save-delay,
+// shutdown-on-sigterm and shutdown-on-sigint (values already checked). It also keeps every other
+// setting the config named, for CONFIG GET; `config_file` is the config file PeaDB was started with
+// ("" for none), for CONFIG REWRITE.
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
                                 const std::string& config_file);
 void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
@@ -209,9 +210,35 @@ void set_lua_script_context(bool in_script);
 bool in_lua_script_context();
 void record_lua_script_rejected_write(const std::string& cmd);
 
-// ── Shutdown request (set by SHUTDOWN command, checked by server loop) ──
+// ── Shutdown ──
+// request_shutdown() makes the event loop stop; the SHUTDOWN command and shutdown_signal_cron()
+// call it once prepare_for_shutdown() has succeeded.
 void request_shutdown();
 bool shutdown_requested();
+// Redis's SHUTDOWN_* flags (server.h).
+inline constexpr int kShutdownSave = 1;
+inline constexpr int kShutdownNosave = 2;
+inline constexpr int kShutdownNow = 4;
+inline constexpr int kShutdownForce = 8;
+// Redis's prepareForShutdown() and finishShutdown() (server.c), shared by the SHUTDOWN command and
+// SIGTERM/SIGINT: stops a BGSAVE or AOF rewrite child, fsyncs the AOF, does the final RDB save
+// (save points without NOSAVE, or SAVE) and logs each step. PeaDB does not wait for lagging
+// replicas (no shutdown-timeout, compat/delta.md item 33). Returns true when the server may exit
+// now; on a failure it logs why, forgets a pending signal and returns false (unless FORCE).
+bool prepare_for_shutdown(int flags);
+// SHUTDOWN ABORT: forgets a signal the event loop has not handled yet; false when there is none.
+bool abort_shutdown();
+// The SIGTERM/SIGINT handler (Redis's sigShutdownHandler()): logs and asks for a shutdown, which
+// shutdown_signal_cron() runs from the event loop with the shutdown-on-sigterm/-sigint flags. A
+// second SIGINT exits at once with code 1 and deletes the final save's temp-<pid>.rdb.
+void shutdown_signal_handler(int sig);
+void shutdown_signal_cron();
+bool shutdown_signal_pending();
+// Set around the startup load: a signal then shuts down without saving (Redis's server.loading).
+void set_loading(bool loading);
+// shutdown-on-sigterm/-sigint values: "save nosave now force" words <-> kShutdown* flags.
+int parse_shutdown_flags(const std::string& value);
+std::string shutdown_flags_to_str(int flags);
 
 // ── Server stats (set from server.cpp, read from command.cpp INFO handler) ──
 extern std::atomic<int> g_connected_clients;

@@ -21,10 +21,6 @@
 #include <execinfo.h>
 #include <unistd.h>
 
-static void signal_handler(int) {
-  peadb::request_shutdown();
-}
-
 // Fatal-signal crash report: dump signal, faulting address, and a backtrace to
 // stderr so a production segfault leaves an actionable artifact (Redis does the
 // same). SA_RESETHAND restores the default handler, so the trailing raise() then
@@ -59,8 +55,17 @@ static void install_crash_handlers() {
 int main(int argc, char** argv) {
   std::signal(SIGPIPE, SIG_IGN);
   std::signal(SIGHUP, SIG_IGN);  // as in Redis (initServer, server.c)
-  std::signal(SIGTERM, signal_handler);
-  std::signal(SIGINT, signal_handler);
+  {
+    // SIGTERM and SIGINT shut down like the SHUTDOWN command, from the event loop (Redis's
+    // setupSignalHandlers()). SA_RESTART, unlike Redis, so a signal does not make a blocking call
+    // in another thread fail with EINTR; the event loop wakes at least every 100 ms anyway.
+    struct sigaction sa{};
+    sa.sa_handler = peadb::shutdown_signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGINT, &sa, nullptr);
+  }
   install_crash_handlers();
 
   // Command line, as in Redis's main() (server.c): -v/--version or -h/--help as the first
@@ -220,6 +225,7 @@ int main(int argc, char** argv) {
 
   // The config loader has made `dir` the working directory, as Redis does.
   const std::filesystem::path snap = config.dbfilename;
+  peadb::set_loading(true);
   // Like Redis's loadDataFromDisk(), load the AOF or the RDB, never both: with the AOF on it holds
   // every write, so loading the RDB under it would apply each write twice (compat/delta.md item
   // 28). The RDB is not read even when the AOF is empty or new, as in Redis.
@@ -272,6 +278,19 @@ int main(int argc, char** argv) {
         peadb::log(peadb::LogLevel::Warn, "failed to load snapshot: " + err);
       }
     }
+  }
+
+  peadb::set_loading(false);
+  // A SIGTERM or SIGINT during the load: exit without saving, as Redis does from
+  // whileBlockedCron(). Redis stops the load at once; PeaDB finishes it first, because it loads
+  // before it serves anything (compat/delta.md item 70).
+  if (peadb::shutdown_signal_pending()) {
+    peadb::set_loading(true);  // prepare_for_shutdown() then never saves
+    if (peadb::prepare_for_shutdown(peadb::kShutdownNosave)) return 0;
+    peadb::set_loading(false);
+    peadb::log(peadb::LogLevel::Warn,
+               "SIGTERM received but errors trying to shut down the server, "
+               "check the logs for more information");
   }
 
   int rc = peadb::run_server(config);

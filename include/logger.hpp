@@ -17,5 +17,7 @@ void set_log_level(LogLevel level);
 // warning -> Warn, nothing -> Nothing. Returns false for any other name.
 bool parse_redis_log_level(const std::string& name, LogLevel& level);
 void log(LogLevel level, const std::string& message);
+// For signal handlers: writes one line with async-signal-safe calls only.
+void log_from_signal_handler(LogLevel level, const char* message);
 
 } // namespace peadb

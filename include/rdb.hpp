@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include <sys/types.h>
+
 namespace peadb {
 
 // Function-library persistence hooks. Libraries live at the server level (command.cpp), not in
@@ -18,8 +20,22 @@ using FunctionDumpFn = std::function<std::vector<std::string>()>;
 using FunctionLoadFn = std::function<bool(const std::string& library_code, std::string& err)>;
 void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 
-// Save all databases to a Redis-compatible RDB file.
+// Save all databases to a Redis-compatible RDB file, through temp-<pid>.rdb next to it (Redis's
+// rdbSave()). On failure `err` is the line Redis logs for it.
 bool rdb_save(const std::filesystem::path& path, std::string& err);
+
+// The temp file rdb_save() writes in process `pid` before the rename: temp-<pid>.rdb in the
+// dump's directory. rdb_remove_temp_file() deletes the one in the working directory (Redis's
+// rdbRemoveTempFile(); `dbfilename` is always a plain file name there).
+std::string rdb_temp_file_name(const std::filesystem::path& path, pid_t pid);
+void rdb_remove_temp_file(pid_t pid);
+
+// rdb-key-save-delay, a hidden Redis setting the upstream tests use to slow saves down:
+// microseconds to wait after each key in an RDB file save or an AOF rewrite (negative: 1
+// microsecond once in every -N keys). debug_delay() is Redis's debugDelay().
+void rdb_set_key_save_delay(int usec);
+int rdb_key_save_delay();
+void debug_delay(int usec);
 
 // Save all databases to an in-memory RDB blob (for PSYNC full-sync).
 // Sets err on failure (e.g. unsupported key types); returns empty string.

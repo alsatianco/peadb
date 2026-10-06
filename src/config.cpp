@@ -516,7 +516,8 @@ const std::unordered_set<std::string>& raw_applied_settings() {
       "lazyfree-lazy-server-del", "stop-writes-on-bgsave-error", "aof-load-truncated",
       "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold",
       "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
-      "enable-protected-configs", "rdbchecksum"};
+      "enable-protected-configs", "rdbchecksum", "rdb-key-save-delay", "shutdown-on-sigterm",
+      "shutdown-on-sigint"};
   return kSet;
 }
 
