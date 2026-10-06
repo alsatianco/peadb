@@ -1,5 +1,6 @@
 #include "command_metadata.generated.hpp"
 
+#include <cstdint>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -135,6 +136,51 @@ int main() {
                   << entry->acl_cats << "\" -- must not carry '" << unwanted << "'\n";
         ++failures;
       }
+    }
+  }
+
+  // Invariant 6: the command flags agree with the categories Redis derives from them
+  // (CMD_WRITE gives @write, setImplicitACLCategories), so the flags column cannot drift from
+  // the acl_cats column.
+  for (const auto& e : table) {
+    const bool write_flag = (e.flags & peadb::kRedisCmdWrite) != 0;
+    const bool write_cat = splitCats(e.acl_cats).count("write") != 0;
+    if (write_flag != write_cat) {
+      std::cerr << "invariant 6 violated: entry '" << e.full_name << "' has the write flag "
+                << (write_flag ? "set" : "unset") << " but acl_cats=\"" << e.acl_cats << "\"\n";
+      ++failures;
+    }
+  }
+
+  // Invariant 7: flag spot-checks for the flags PeaDB acts on (CLIENT PAUSE WRITE holds
+  // WRITE and MAY_REPLICATE commands; read-only scripts may call neither).
+  struct FlagCheck {
+    const char* full_name;
+    std::uint64_t must_have;
+    std::uint64_t must_not_have;
+  };
+  const std::vector<FlagCheck> flag_checks = {
+      {"set", peadb::kRedisCmdWrite | peadb::kRedisCmdDenyoom, peadb::kRedisCmdMayReplicate},
+      {"get", peadb::kRedisCmdReadonly | peadb::kRedisCmdFast, peadb::kRedisCmdWrite},
+      {"publish", peadb::kRedisCmdMayReplicate | peadb::kRedisCmdPubsub, peadb::kRedisCmdWrite},
+      {"pfcount", peadb::kRedisCmdMayReplicate | peadb::kRedisCmdReadonly, peadb::kRedisCmdWrite},
+      {"eval", peadb::kRedisCmdMayReplicate | peadb::kRedisCmdNoscript, peadb::kRedisCmdWrite},
+      {"eval_ro", peadb::kRedisCmdReadonly, peadb::kRedisCmdMayReplicate},
+      {"xgroup|create", peadb::kRedisCmdWrite, 0},
+      {"client|pause", peadb::kRedisCmdAdmin, peadb::kRedisCmdWrite},
+  };
+  for (const auto& check : flag_checks) {
+    const auto* entry = findEntry(table, check.full_name);
+    if (entry == nullptr) {
+      std::cerr << "invariant 7 violated: entry '" << check.full_name << "' is missing\n";
+      ++failures;
+      continue;
+    }
+    if ((entry->flags & check.must_have) != check.must_have ||
+        (entry->flags & check.must_not_have) != 0) {
+      std::cerr << "invariant 7 violated: entry '" << entry->full_name << "' has flags 0x"
+                << std::hex << entry->flags << std::dec << "\n";
+      ++failures;
     }
   }
 

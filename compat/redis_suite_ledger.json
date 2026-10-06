@@ -139,6 +139,15 @@
       "mode": "native",
       "skipfile_lines": 5
     },
+    "unit/pause": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 4,
+        "ok": 15
+      },
+      "mode": "native",
+      "skipfile_lines": 3
+    },
     "unit/printver": {
       "last_counts": {
         "err": 0,

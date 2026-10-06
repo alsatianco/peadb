@@ -140,6 +140,18 @@ std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
 // by the event loop. All DataStore mutations stay on the event loop thread.
 std::mutex g_replica_cmd_queue_mu;
 std::vector<std::vector<std::string>> g_replica_cmd_queue;
+// Commands from the master taken off g_replica_cmd_queue but not applied yet, because
+// CLIENT PAUSE holds them; in arrival order. Event-loop thread only.
+std::deque<std::vector<std::string>> g_replica_cmd_held;
+// Drops every command from the master not applied yet: called when a full resync replaces the
+// dataset (which already holds their effects) and when REPLICAOF changes the master. The caller
+// bumps g_repl_generation first; the streaming thread checks it under the same mutex before it
+// queues, so an old stream cannot add commands afterwards.
+void drop_queued_replica_commands() {
+  std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+  g_replica_cmd_queue.clear();
+  g_replica_cmd_held.clear();
+}
 // Pending RDB load handed off from streaming thread to event loop. The streaming
 // thread sets g_replica_load_path + g_replica_load_pending=true and waits; the event
 // loop runs rdb_load() synchronously and signals completion via g_replica_load_pending=false.
@@ -545,12 +557,79 @@ inline std::string gen_run_id() { return gen_hex_chars(40); }
 // is evictable, propagating each eviction to replicas/AOF/keyspace-notifications.
 void evict_to_fit();
 
+std::string encode_command_resp(const std::vector<std::string>& args);  // defined below
+
+// ── CLIENT PAUSE (Redis's pauseActions()/updatePausedActions(), networking.c) ──
+// What a pause stops. WRITE and ALL also stop key expiry, eviction and replica traffic, so the
+// dataset and the replication offset stay fixed while a failover waits for replicas.
+constexpr std::uint32_t kPauseClientWrite = 1u << 0;
+constexpr std::uint32_t kPauseClientAll = 1u << 1;  // bigger than kPauseClientWrite: stricter
+constexpr std::uint32_t kPauseExpire = 1u << 2;
+constexpr std::uint32_t kPauseEvict = 1u << 3;
+constexpr std::uint32_t kPauseReplica = 1u << 4;
+constexpr std::uint32_t kPauseClientWriteSet = kPauseClientWrite | kPauseExpire | kPauseEvict | kPauseReplica;
+constexpr std::uint32_t kPauseClientAllSet = kPauseClientAll | kPauseExpire | kPauseEvict | kPauseReplica;
+// The pause set by CLIENT PAUSE (Redis's PAUSE_BY_CLIENT_COMMAND purpose). PeaDB has no other
+// pause purpose: no FAILOVER, no SHUTDOWN that waits for replicas, no cluster manual failover.
+std::uint32_t g_client_pause_actions = 0;
+std::int64_t g_client_pause_end_ms = 0;
+std::uint32_t g_paused_actions = 0;    // what is paused now (server.paused_actions)
+bool g_pause_unblock_pending = false;  // the pause became less strict: run held clients again
+bool g_getack_pending = false;         // WAIT asked replicas for an ACK while replica traffic was paused
+
+void update_paused_actions() {
+  const std::uint32_t prev = g_paused_actions;
+  if (g_client_pause_end_ms > now_ms()) {
+    g_paused_actions = g_client_pause_actions;
+  } else {
+    g_client_pause_actions = 0;
+    g_client_pause_end_ms = 0;
+    g_paused_actions = 0;
+  }
+  // Less strict than before: held clients run again and may be held again (Redis unblocks them all).
+  constexpr std::uint32_t kClientMask = kPauseClientWrite | kPauseClientAll;
+  if ((g_paused_actions & kClientMask) < (prev & kClientMask)) g_pause_unblock_pending = true;
+  store().set_expire_paused((g_paused_actions & kPauseExpire) != 0);
+  // Redis's beforeSleep() sends the GETACK a WAIT asked for once replica traffic may flow again.
+  if (g_getack_pending && !(g_paused_actions & kPauseReplica)) {
+    g_getack_pending = false;
+    if (g_replication_role != "slave") backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
+  }
+}
+
+// isPausedActionsWithUpdate(): checks the pause end time before answering.
+std::uint32_t paused_actions_with_update(std::uint32_t mask) {
+  if (!(g_paused_actions & mask)) return 0;
+  update_paused_actions();
+  return g_paused_actions & mask;
+}
+
+// CLIENT PAUSE <timeout> [WRITE|ALL] (pauseClientsByClient + pauseActions): the actions given
+// replace the current ones, except that a pause of everything stays one when a write pause
+// follows it, and the later end time of the two is kept.
+void pause_clients(std::int64_t end_ms, bool pause_all) {
+  std::uint32_t actions = pause_all ? kPauseClientAllSet : kPauseClientWriteSet;
+  if (!pause_all && (g_client_pause_actions & kPauseClientAll)) actions = kPauseClientAllSet;
+  g_client_pause_actions = actions;
+  if (g_client_pause_end_ms < end_ms) g_client_pause_end_ms = end_ms;
+  update_paused_actions();
+}
+
+void unpause_clients() {
+  g_client_pause_end_ms = 0;
+  g_client_pause_actions = 0;
+  update_paused_actions();
+}
+
 // maxmemory enforcement: when used memory exceeds the limit, first try to evict per
 // maxmemory-policy; reject writes with -OOM only if still over budget (true noeviction,
 // or nothing left to evict). The caller gates on the `write` flag, so DEL and other writes
 // that free memory are refused too (no denyoom flag yet: compat/delta.md item 39).
 inline bool oom_should_reject() {
   if (g_config_maxmemory <= 0) return false;
+  // While CLIENT PAUSE stops eviction Redis neither evicts nor refuses with -OOM
+  // (isSafeToPerformEvictions); a held write is checked again when it runs after the pause.
+  if (paused_actions_with_update(kPauseEvict)) return false;
   if (store().used_memory() <= g_config_maxmemory) return false;
   if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction &&
       g_replication_role != "slave" && !g_replaying_aof) {
@@ -2398,7 +2477,7 @@ bool parse_strict_int(const std::string& s, std::int64_t& out) {
   if (s.empty()) return false;
   std::size_t i = (s[0] == '-' ? 1 : 0);
   if (i >= s.size()) return false;
-  if (s[i] == '0' && s.size() - i > 1) return false;
+  if (s[i] == '0' && (s.size() - i > 1 || i == 1)) return false;  // "01" and "-0" are not integers
   for (std::size_t j = i; j < s.size(); ++j) {
     if (!std::isdigit(static_cast<unsigned char>(s[j]))) return false;
   }
@@ -3752,6 +3831,200 @@ std::string config_set_reply(const std::vector<std::string>& args, const Session
   return encode_simple("OK");
 }
 
+// ── Script shebang (Redis's evalExtractShebangFlags(), eval.c) ──
+struct ScriptShebang {
+  bool has_shebang = false;  // no shebang: Redis's EVAL compatibility mode, no declared flags
+  int flags = 0;             // the kFunc* flags it declares
+  std::size_t length = 0;    // length of the shebang line without its '\n'; the Lua code starts there
+  std::string err;           // Redis's error text when the shebang is not valid
+};
+
+ScriptShebang parse_script_shebang(const std::string& body) {
+  ScriptShebang out;
+  if (body.compare(0, 2, "#!") != 0) return out;
+  out.has_shebang = true;
+  const auto nl = body.find('\n');
+  if (nl == std::string::npos) {
+    out.err = "Invalid script shebang";
+    return out;
+  }
+  out.length = nl;
+  std::vector<std::string> parts;
+  if (!split_config_args(body.substr(0, nl), parts) || parts.empty()) {
+    out.err = "Invalid engine in script shebang";
+    return out;
+  }
+  if (parts[0] != "#!lua") {
+    out.err = "Unexpected engine in script shebang: " + parts[0];
+    return out;
+  }
+  for (std::size_t j = 1; j < parts.size(); ++j) {
+    if (parts[j].compare(0, 6, "flags=") != 0) {
+      out.err = "Unknown lua shebang option: " + parts[j];
+      return out;
+    }
+    // Split the rest on ',' like sdssplitlen(): nothing gives no flags, "a," gives "a" and "".
+    const std::string list = parts[j].substr(6);
+    if (list.empty()) continue;
+    std::size_t start = 0;
+    while (true) {
+      const auto comma = list.find(',', start);
+      const std::string flag =
+          list.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
+      if (flag == "no-writes") out.flags |= kFuncNoWrites;
+      else if (flag == "allow-oom") out.flags |= kFuncAllowOom;
+      else if (flag == "allow-stale") out.flags |= kFuncAllowStale;
+      else if (flag == "no-cluster") out.flags |= kFuncNoCluster;
+      else if (flag == "allow-cross-slot-keys") out.flags |= kFuncAllowCrossSlot;
+      else {
+        out.err = "Unexpected flag in script shebang: " + flag;
+        return out;
+      }
+      if (comma == std::string::npos) break;
+      start = comma + 1;
+    }
+  }
+  return out;
+}
+
+// The flags of the library function `name` (kFunc*), or nothing when there is no such function.
+std::optional<int> function_flags(const std::string& name) {
+  const auto idx = g_func_index.find(lower(name));
+  if (idx == g_func_index.end()) return std::nullopt;
+  const auto lib = g_libraries.find(idx->second);
+  if (lib == g_libraries.end()) return std::nullopt;
+  for (const auto& f : lib->second.functions)
+    if (lower(f.name) == lower(name)) return f.flags;
+  return std::nullopt;
+}
+
+// Whether a command writes or may replicate, the way Redis's getCommandFlags() decides it for
+// CLIENT PAUSE WRITE: the command's own flags, or, for EVAL, EVALSHA, FCALL and their _RO forms,
+// the flags the script or function declares (evalGetCommandFlags, fcallGetCommandFlags and
+// scriptFlagsToCmdFlags: declared flags mean "writes" unless they include no-writes).
+bool command_may_replicate(const std::string& cmd, const std::vector<std::string>& args) {
+  const bool eval = cmd == "EVAL" || cmd == "EVAL_RO";
+  const bool evalsha = cmd == "EVALSHA" || cmd == "EVALSHA_RO";
+  if ((eval || evalsha) && args.size() >= 2) {
+    const std::string* body = &args[1];
+    if (evalsha) {
+      const auto it =
+          args[1].size() == 40 ? g_script_cache.find(lower(args[1])) : g_script_cache.end();
+      body = it == g_script_cache.end() ? nullptr : &it->second;
+    }
+    if (body != nullptr) {
+      const auto she = parse_script_shebang(*body);
+      if (she.has_shebang && she.err.empty()) return (she.flags & kFuncNoWrites) == 0;
+    }
+  } else if ((cmd == "FCALL" || cmd == "FCALL_RO") && args.size() >= 2) {
+    if (const auto flags = function_flags(args[1])) return (*flags & kFuncNoWrites) == 0;
+  }
+  return (redis_command_flags(args) & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
+}
+
+// Whether CLIENT PAUSE holds this command (processCommand): everything under ALL; under WRITE
+// a command that writes or may replicate, or an EXEC whose transaction holds one.
+bool pause_applies(const std::string& cmd, const std::vector<std::string>& args,
+                   const SessionState& session) {
+  if (g_paused_actions & kPauseClientAll) return true;
+  if (!(g_paused_actions & kPauseClientWrite)) return false;
+  if (cmd == "EXEC") {
+    if (!session.in_multi) return false;
+    for (const auto& q : session.queued)
+      if (!q.empty() && command_may_replicate(upper(q[0]), q)) return true;
+    return false;
+  }
+  return command_may_replicate(cmd, args);
+}
+
+// Whether this client's command waits until the pause ends. Replicas are never paused. Commands
+// that run inside EXEC (the transaction that sent CLIENT PAUSE finishes first, as with Redis's
+// client_pause_in_transaction), inside a script, or from the AOF are not checked; commands from
+// the master are held in drain_replica_cmd_queue().
+bool pause_holds(const std::string& cmd, const std::vector<std::string>& args,
+                 const SessionState& session) {
+  if (g_paused_actions == 0) return false;
+  if (session.replica_stream || g_replaying_aof || g_executing_exec || in_lua_script_context())
+    return false;
+  return pause_applies(cmd, args, session);
+}
+
+// A guess from the script text whether a script without a shebang writes, used only for the
+// NOREPLICAS check in eval_script(). This is code shaped to the tests, not Redis's behavior:
+// Redis checks min-replicas-to-write on each write command the script calls
+// (scriptVerifyWriteCommandAllow), so a script that writes with any other command runs here
+// (compat/delta.md item 54).
+bool script_has_write_intent(const std::string& src) {
+  const auto nsl = lower(normalize_script(src));
+  static const std::vector<std::string> markers = {
+    "redis.call('set'", "redis.call(\"set\"",
+    "redis.call('del'", "redis.call(\"del\"",
+    "redis.call('incr'", "redis.call(\"incr\"",
+    "redis.call('decr'", "redis.call(\"decr\"",
+    "redis.call('expire'", "redis.call(\"expire\"",
+    "redis.call('pexpire'", "redis.call(\"pexpire\"",
+    "redis.call('sadd'", "redis.call(\"sadd\"",
+    "redis.call('srem'", "redis.call(\"srem\"",
+    "redis.call('spop'", "redis.call(\"spop\"",
+    "redis.call('incrbyfloat'", "redis.call(\"incrbyfloat\""
+  };
+  for (const auto& m : markers) {
+    if (nsl.find(m) != std::string::npos) return true;
+  }
+  return false;
+}
+
+// The body of EVAL and EVALSHA: runs `source` (the script, shebang included) with the numkeys,
+// keys and arguments in args[2..]. `cache` adds the script to the script cache (EVAL does;
+// EVALSHA found it there).
+std::string eval_script(const std::string& source, const std::vector<std::string>& args,
+                        SessionState& session, bool cache) {
+  std::int64_t numkeys = 0;
+  if (!parse_i64(args[2], numkeys)) {
+    return encode_error("value is not an integer or out of range");
+  }
+  if (numkeys < 0) return encode_error("Number of keys can't be negative");
+  if (args.size() < static_cast<std::size_t>(3 + numkeys)) {
+    return encode_error("Number of keys can't be greater than number of args");
+  }
+  std::vector<std::string> keys;
+  std::vector<std::string> argv;
+  for (std::int64_t i = 0; i < numkeys; ++i) keys.push_back(args[3 + i]);
+  for (std::size_t i = static_cast<std::size_t>(3 + numkeys); i < args.size(); ++i) argv.push_back(args[i]);
+
+  const auto she = parse_script_shebang(source);
+  if (!she.err.empty()) return encode_error(she.err);
+  // The shebang line is skipped but its '\n' kept, so Lua's line numbers match the source.
+  const std::string script_body = she.has_shebang ? source.substr(she.length) : source;
+  const bool no_writes = (she.flags & kFuncNoWrites) != 0;
+  const bool allow_oom = (she.flags & kFuncAllowOom) != 0 || no_writes;
+  // EVAL_RO and EVALSHA_RO run in a read-only context; a script that declares it may write is
+  // refused there (scriptPrepareForRun).
+  if (she.has_shebang && !no_writes && g_script_readonly_context) {
+    return encode_error("Can not execute a script with write flag using *_ro command.");
+  }
+  const bool write_intent = she.has_shebang ? !no_writes : script_has_write_intent(script_body);
+  if (oom_should_reject() && she.has_shebang && !allow_oom) {
+    return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+  }
+  if (write_intent && noreplicas_should_reject()) {
+    return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
+  }
+
+  if (cache) g_script_cache[sha1_hex(source)] = source;
+  g_script_client_resp_version = session.resp_version;
+  g_script_current_session = &session;
+  const bool prev_readonly = g_script_readonly_context;
+  const bool prev_allow_oom = g_script_allow_oom;
+  if (no_writes) g_script_readonly_context = true;
+  if (allow_oom) g_script_allow_oom = true;
+  const auto out = eval_miniscript(script_body, keys, argv);
+  g_script_readonly_context = prev_readonly;
+  g_script_allow_oom = prev_allow_oom;
+  g_script_current_session = nullptr;
+  return out;
+}
+
 const std::unordered_map<std::string, CommandSpec>& command_table() {
   static const std::unordered_map<std::string, CommandSpec> table = [] {
     std::unordered_map<std::string, CommandSpec> t;
@@ -4261,6 +4534,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           const std::string sub = upper(args[1]);
           if (sub == "LOAD" && args.size() == 3) {
+            // A script with an invalid shebang is refused at load, like Redis's luaCreateFunction().
+            const auto she = parse_script_shebang(args[2]);
+            if (!she.err.empty()) return encode_error(she.err);
             const auto sha = sha1_hex(args[2]);
             g_script_cache[sha] = args[2];
             return encode_bulk(sha);
@@ -4310,162 +4586,39 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("EVAL", CommandSpec{"EVAL", -3, {"write", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
-          struct ShebangInfo {
-            bool has_shebang = false;
-            bool explicit_flags = false;
-            bool allow_oom = false;
-            bool no_writes = false;
-            std::string body;
-            std::string err;
-          };
-          auto parse_shebang = [](const std::string& src) -> ShebangInfo {
-            ShebangInfo out;
-            out.body = src;
-            if (src.rfind("#!", 0) != 0) return out;
-            out.has_shebang = true;
-            const auto nl = src.find('\n');
-            const std::string hdr = src.substr(2, nl == std::string::npos ? std::string::npos : nl - 2);
-            out.body = nl == std::string::npos ? std::string() : src.substr(nl + 1);
-            std::istringstream iss(hdr);
-            std::string engine;
-            iss >> engine;
-            if (lower(engine) != "lua") {
-              out.err = "Unexpected engine in script shebang";
-              return out;
-            }
-            std::string tok;
-            while (iss >> tok) {
-              if (tok.rfind("flags=", 0) != 0) {
-                out.err = "Unknown lua shebang option";
-                return out;
-              }
-              out.explicit_flags = true;
-              const auto flags = tok.substr(6);
-              if (flags.empty()) continue;
-              std::size_t start = 0;
-              while (start <= flags.size()) {
-                const auto comma = flags.find(',', start);
-                const auto piece = flags.substr(start, comma == std::string::npos ? std::string::npos : comma - start);
-                if (piece == "allow-oom") out.allow_oom = true;
-                else if (piece == "no-writes") out.no_writes = true;
-                else {
-                  out.err = "Unexpected flag in script shebang";
-                  return out;
-                }
-                if (comma == std::string::npos) break;
-                start = comma + 1;
-              }
-            }
-            return out;
-          };
-          auto script_has_write_intent = [](const std::string& src) -> bool {
-            const auto nsl = lower(normalize_script(src));
-            const std::vector<std::string> markers = {
-              "redis.call('set'", "redis.call(\"set\"",
-              "redis.call('del'", "redis.call(\"del\"",
-              "redis.call('incr'", "redis.call(\"incr\"",
-              "redis.call('decr'", "redis.call(\"decr\"",
-              "redis.call('expire'", "redis.call(\"expire\"",
-              "redis.call('pexpire'", "redis.call(\"pexpire\"",
-              "redis.call('sadd'", "redis.call(\"sadd\"",
-              "redis.call('srem'", "redis.call(\"srem\"",
-              "redis.call('spop'", "redis.call(\"spop\"",
-              "redis.call('incrbyfloat'", "redis.call(\"incrbyfloat\""
-            };
-            for (const auto& m : markers) {
-              if (nsl.find(m) != std::string::npos) return true;
-            }
-            return false;
-          };
-          std::int64_t numkeys = 0;
-          if (!parse_i64(args[2], numkeys)) {
-            return encode_error("value is not an integer or out of range");
-          }
-          if (numkeys < 0) return encode_error("Number of keys can't be negative");
-          if (args.size() < static_cast<std::size_t>(3 + numkeys)) {
-            return encode_error("Number of keys can't be greater than number of args");
-          }
-          std::vector<std::string> keys;
-          std::vector<std::string> argv;
-          for (std::int64_t i = 0; i < numkeys; ++i) keys.push_back(args[3 + i]);
-          for (std::size_t i = static_cast<std::size_t>(3 + numkeys); i < args.size(); ++i) argv.push_back(args[i]);
-
-          const auto she = parse_shebang(args[1]);
-          if (!she.err.empty()) return encode_error(she.err);
-          const std::string script_body = she.has_shebang ? she.body : args[1];
-          const bool allow_oom = she.allow_oom || she.no_writes;
-          const bool write_intent = she.has_shebang ? !she.no_writes : script_has_write_intent(script_body);
-          if (oom_should_reject()) {
-            if (she.has_shebang && !she.explicit_flags && !allow_oom) {
-              return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
-            }
-            if (she.explicit_flags && !allow_oom) {
-              return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
-            }
-          }
-          if (write_intent && noreplicas_should_reject()) {
-            return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
-          }
-
-          const auto sha = sha1_hex(args[1]);
-          g_script_cache[sha] = args[1];
-          g_script_client_resp_version = session.resp_version;
-          g_script_current_session = &session;
-          const bool prev_readonly = g_script_readonly_context;
-          const bool prev_allow_oom = g_script_allow_oom;
-          if (she.no_writes) g_script_readonly_context = true;
-          if (allow_oom) g_script_allow_oom = true;
-          const auto out = eval_miniscript(script_body, keys, argv);
-          g_script_readonly_context = prev_readonly;
-          g_script_allow_oom = prev_allow_oom;
-          g_script_current_session = nullptr;
-          return out;
+          return eval_script(args[1], args, session, /*cache=*/true);
         }});
 
+    // EVALSHA runs the cached script exactly as EVAL runs it, so its shebang flags apply.
     t.emplace("EVALSHA", CommandSpec{"EVALSHA", -3, {"write", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           auto it = g_script_cache.find(lower(args[1]));
           if (it == g_script_cache.end()) {
             return std::string("-NOSCRIPT No matching script. Please use EVAL.\r\n");
           }
-          std::int64_t numkeys = 0;
-          if (!parse_i64(args[2], numkeys)) {
-            return encode_error("value is not an integer or out of range");
-          }
-          if (numkeys < 0) return encode_error("Number of keys can't be negative");
-          if (args.size() < static_cast<std::size_t>(3 + numkeys)) {
-            return encode_error("Number of keys can't be greater than number of args");
-          }
-          std::vector<std::string> keys;
-          std::vector<std::string> argv;
-          for (std::int64_t i = 0; i < numkeys; ++i) keys.push_back(args[3 + i]);
-          for (std::size_t i = static_cast<std::size_t>(3 + numkeys); i < args.size(); ++i) argv.push_back(args[i]);
-          g_script_client_resp_version = session.resp_version;
-          g_script_current_session = &session;
-          const auto out = eval_miniscript(it->second, keys, argv);
-          g_script_current_session = nullptr;
-          return out;
+          return eval_script(it->second, args, session, /*cache=*/false);
         }});
 
     t.emplace("EVAL_RO", CommandSpec{"EVAL_RO", -3, {"readonly", "noscript"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool& close) {
-          std::vector<std::string> proxy = args;
-          proxy[0] = "EVAL";
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           g_script_readonly_context = true;
-          const auto& tbl = command_table();
-          const auto it = tbl.find("EVAL");
-          const auto out = (it == tbl.end()) ? encode_error("unknown command") : it->second.handler(proxy, session, close);
+          const auto out = eval_script(args[1], args, session, /*cache=*/true);
           g_script_readonly_context = false;
           return out;
         }});
 
+    // Read-only like EVAL_RO: the script runs in the read-only context (it used to run with
+    // writes allowed).
     t.emplace("EVALSHA_RO", CommandSpec{"EVALSHA_RO", -3, {"readonly", "noscript"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState& session, bool& close) {
-          std::vector<std::string> proxy = args;
-          proxy[0] = "EVALSHA";
-          const auto& tbl = command_table();
-          const auto it = tbl.find("EVALSHA");
-          return (it == tbl.end()) ? encode_error("unknown command") : it->second.handler(proxy, session, close);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          auto it = g_script_cache.find(lower(args[1]));
+          if (it == g_script_cache.end()) {
+            return std::string("-NOSCRIPT No matching script. Please use EVAL.\r\n");
+          }
+          g_script_readonly_context = true;
+          const auto out = eval_script(it->second, args, session, /*cache=*/false);
+          g_script_readonly_context = false;
+          return out;
         }});
 
     t.emplace("INFO", CommandSpec{"INFO", -1, {"readonly"}, 0, 0, 0,
@@ -4640,6 +4793,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (want("COMMANDSTATS")) {
             out += "# Commandstats\r\n";
             for (const auto& [k, st] : g_cmdstats) {
+              if (st.calls == 0 && st.failed_calls == 0 && st.rejected_calls == 0) continue;
               const double upc = st.calls > 0 ? static_cast<double>(st.usec_total) / static_cast<double>(st.calls) : 0.0;
               out += "cmdstat_" + lower(k) +
                      ":calls=" + std::to_string(st.calls) +
@@ -4729,7 +4883,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           // Ask replicas to ACK now instead of waiting for their ~1 Hz heartbeat, so WAIT
           // resolves in ~1 RTT rather than up to a second. The GETACK rides the backlog the
           // same way write commands do; replicas reply REPLCONF ACK out-of-band.
-          backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
+          // While CLIENT PAUSE stops replica traffic the GETACK waits for the pause to end, so
+          // the replication offset does not move (Redis's beforeSleep()).
+          if (g_paused_actions & kPauseReplica) g_getack_pending = true;
+          else backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
           // Defer: event loop resolves when replicas ack or deadline passes
           const auto deadline = (timeout > 0) ? (now_ms() + timeout) : std::int64_t{0};
           session.wait_state = WaitState{target, deadline, replicas};
@@ -4742,6 +4899,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::string port = args[2];
           if (upper(host) == "NO" && upper(port) == "ONE") {
             g_repl_generation.fetch_add(1);  // signal any running reconnect supervisor to stop
+            drop_queued_replica_commands();  // nothing from the old master runs after this
             const bool was_replica = g_replication_role == "slave";
             g_replication_role = "master";
             g_replication_master_host.clear();
@@ -4765,6 +4923,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           g_replication_role = "slave";
           g_replica_stale = true;
           const std::uint64_t gen = g_repl_generation.fetch_add(1) + 1;
+          drop_queued_replica_commands();  // nothing from the old master runs after this
           if (p == 0) {
             return encode_simple("OK");
           }
@@ -8522,7 +8681,35 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             const int n = g_client_unblock_cb ? g_client_unblock_cb(static_cast<std::uint64_t>(cid), error) : 0;
             return encode_integer(n);
           }
-          if (sub == "PAUSE" || sub == "UNPAUSE") {
+          if (sub == "PAUSE") {
+            // CLIENT PAUSE <timeout ms> [WRITE|ALL] (clientCommand, networking.c): the mode is
+            // checked before the timeout; the timeout is relative, 0 sets no end time.
+            if (args.size() < 3) return encode_error("wrong number of arguments for 'client|pause' command");
+            if (args.size() > 4)
+              return encode_error("unknown subcommand or wrong number of arguments for '" + args[1] +
+                                  "'. Try CLIENT HELP.");
+            bool pause_all = true;
+            if (args.size() == 4) {
+              const auto mode = lower(args[3]);
+              if (mode == "write") pause_all = false;
+              else if (mode != "all") return encode_error("CLIENT PAUSE mode must be WRITE or ALL");
+            }
+            std::int64_t timeout = 0;  // getTimeoutFromObjectOrReply(..., UNIT_MILLISECONDS)
+            if (!parse_strict_int(args[2], timeout))
+              return encode_error("timeout is not an integer or out of range");
+            if (timeout < 0) return encode_error("timeout is negative");
+            const std::int64_t now = now_ms();
+            if (timeout > 0) {
+              if (timeout > std::numeric_limits<std::int64_t>::max() - now)
+                return encode_error("timeout is out of range");
+              timeout += now;
+            }
+            pause_clients(timeout, pause_all);
+            return encode_simple("OK");
+          }
+          if (sub == "UNPAUSE") {
+            if (args.size() != 2) return encode_error("wrong number of arguments for 'client|unpause' command");
+            unpause_clients();
             return encode_simple("OK");
           }
           if (sub == "REPLY") {
@@ -10975,6 +11162,11 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       session.multi_dirty = true;
       return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
     }
+    // Redis checks CLIENT PAUSE before it queues, so a write sent inside MULTI waits too.
+    if (pause_holds(cmd, args, session)) {
+      session.postponed = true;
+      return std::string();
+    }
     session.queued.push_back(args);
     return encode_simple("QUEUED");
   }
@@ -11054,14 +11246,8 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   if (cmd == "FCALL_RO") {
     readonly_gate_write = false;
   } else if (cmd == "FCALL" && args.size() >= 2) {
-    readonly_gate_write = true;
-    auto fidx = g_func_index.find(lower(args[1]));
-    if (fidx != g_func_index.end()) {
-      auto flib = g_libraries.find(fidx->second);
-      if (flib != g_libraries.end())
-        for (const auto& f : flib->second.functions)
-          if (lower(f.name) == lower(args[1])) { readonly_gate_write = !(f.flags & kFuncNoWrites); break; }
-    }
+    const auto flags = function_flags(args[1]);
+    readonly_gate_write = !flags || !(*flags & kFuncNoWrites);
   } else if (cmd == "FUNCTION" && args.size() >= 2) {
     const auto sub = upper(args[1]);
     if (sub == "LOAD" || sub == "DELETE" || sub == "FLUSH" || sub == "RESTORE") readonly_gate_write = true;
@@ -11088,6 +11274,13 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     return encode_error("Can't execute '" + lower(cmd) +
                         "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET "
                         "are allowed in this context");
+  }
+
+  // CLIENT PAUSE: hold the command, after the checks that refuse it (as Redis's processCommand
+  // does); the event loop runs it again when the pause ends.
+  if (pause_holds(cmd, args, session)) {
+    session.postponed = true;
+    return std::string();
   }
 
   ++top_stat.calls;
@@ -11482,9 +11675,36 @@ void on_client_disconnect(int fd) {
   }
 }
 
+std::uint64_t redis_command_flags(const std::vector<std::string>& args) {
+  static const auto* const index = [] {
+    auto* m = new std::unordered_map<std::string, std::uint64_t>();
+    for (const auto& e : command_metadata()) (*m)[e.full_name] = e.flags;
+    return m;
+  }();
+  if (args.empty()) return 0;
+  const std::string name = lower(args[0]);
+  // A container command resolves to its subcommand, as Redis's lookupCommand() does.
+  if (args.size() >= 2) {
+    const auto sub = index->find(name + "|" + lower(args[1]));
+    if (sub != index->end()) return sub->second;
+  }
+  const auto it = index->find(name);
+  return it == index->end() ? 0 : it->second;
+}
+
+bool client_pause_update() {
+  if (g_paused_actions != 0 || g_client_pause_end_ms != 0) update_paused_actions();
+  const bool rerun = g_pause_unblock_pending;
+  g_pause_unblock_pending = false;
+  return rerun;
+}
+
+std::int64_t client_pause_end_ms() { return g_paused_actions != 0 ? g_client_pause_end_ms : 0; }
+
 void run_active_expire_cycle() {
   if (g_pause_cron) return;  // DEBUG PAUSE-CRON
   if (g_replication_role == "slave") return;
+  if (paused_actions_with_update(kPauseExpire)) return;  // CLIENT PAUSE stops expiry
   const auto t0 = std::chrono::steady_clock::now();
   auto expired = store().active_expire_cycle();
   // Record the cycle's wall time as an "expire-cycle" latency event (LATENCY monitor).
@@ -11511,6 +11731,7 @@ void run_eviction_cycle() {
   if (g_pause_cron) return;  // DEBUG PAUSE-CRON
   if (g_config_maxmemory <= 0 || g_maxmemory_policy == MaxmemoryPolicy::NoEviction) return;
   if (g_replication_role == "slave" || g_replaying_aof) return;
+  if (paused_actions_with_update(kPauseEvict)) return;  // CLIENT PAUSE stops eviction
   if (store().used_memory() <= g_config_maxmemory) return;
   evict_to_fit();
 }
@@ -11959,6 +12180,10 @@ void drain_replica_cmd_queue() {
       std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
       path = g_replica_load_path;
       g_replica_load_path.clear();
+      // Commands still queued or held came from the stream before this full sync; the new
+      // dataset already holds their effects, so applying them now would apply them twice.
+      g_replica_cmd_queue.clear();
+      g_replica_cmd_held.clear();
     }
     std::string err;
     // A full resync replaces the entire dataset, including server-level function libraries.
@@ -11975,19 +12200,25 @@ void drain_replica_cmd_queue() {
     g_replica_load_pending.store(false);  // signal streaming thread
   }
 
-  std::vector<std::vector<std::string>> cmds;
   {
     std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-    if (g_replica_cmd_queue.empty()) return;
-    cmds.swap(g_replica_cmd_queue);
+    for (auto& c : g_replica_cmd_queue) g_replica_cmd_held.push_back(std::move(c));
+    g_replica_cmd_queue.clear();
   }
+  if (g_replica_cmd_held.empty()) return;
   // Apply on the event loop thread: g_replaying_aof suppresses AOF writes and
   // backlog updates so master commands are not re-replicated or double-logged.
   g_replaying_aof = true;
   static SessionState repl_session;
   bool close_flag = false;
-  for (auto& args : cmds) {
+  // A paused replica holds what its master sends, as Redis pauses its master client: the first
+  // command the pause holds and everything after it wait, in order, until the pause ends.
+  while (!g_replica_cmd_held.empty()) {
+    const auto& args = g_replica_cmd_held.front();
+    if (g_paused_actions != 0 && !args.empty() && pause_applies(upper(args[0]), args, repl_session))
+      break;
     handle_command(args, repl_session, close_flag);
+    g_replica_cmd_held.pop_front();
   }
   g_replaying_aof = false;
 }
@@ -12264,7 +12495,9 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         bool getack_seen = false;
         {
             std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-            while (true) {
+            // A newer REPLICAOF may have come in during the recv: queue nothing for it
+            // (drop_queued_replica_commands() runs under this mutex after the bump).
+            while (g_repl_generation.load() == gen) {
                 const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
                 auto parsed = parse_one_command(view);
                 if (!parsed.has_value()) break;

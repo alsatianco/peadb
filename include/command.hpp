@@ -90,9 +90,22 @@ struct SessionState {
   // Set by the event loop before each command: earlier replies to this client are not sent yet
   // (Redis's clientHasPendingReplies(), which SCRIPT DEBUG checks).
   bool has_pending_replies = false;
+  // ── CLIENT PAUSE ── handle_command sets `postponed` instead of running a command the pause
+  // holds (Redis's blockPostponeClient()); the event loop then keeps the command and everything
+  // after it in the input buffer and runs them again, in `postpone_seq` order, when the pause ends.
+  bool postponed = false;
+  std::uint64_t postpone_seq = 0;
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
+// Redis's command flags (kRedisCmd* in command_metadata.generated.hpp) of the command or
+// subcommand that `args` names, from the pinned Redis command JSON; 0 for a name Redis lacks.
+std::uint64_t redis_command_flags(const std::vector<std::string>& args);
+// CLIENT PAUSE, for the event loop: checks whether the pause has timed out and returns true when
+// the clients it held must run again (Redis's updatePausedActions()/unblockPostponedClients()).
+bool client_pause_update();
+// When the current CLIENT PAUSE ends (0 when nothing is paused), so the event loop wakes up then.
+std::int64_t client_pause_end_ms();
 std::size_t command_count();
 std::vector<std::string> command_names();
 // dbfilename and appendfilename are relative to the working directory, which the config loader

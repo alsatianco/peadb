@@ -325,6 +325,11 @@ int run_server(const ServerConfig& config) {
   int blocked_count = 0;
   int wait_count = 0;
   int replica_count = 0;
+  // Clients whose command CLIENT PAUSE holds (SessionState::postponed). Redis counts them in
+  // blocked_clients and shows them with flag b.
+  int postponed_count = 0;
+  std::uint64_t postpone_seq = 0;
+  std::uint64_t block_seq = 0;  // FIFO serving order of blocked clients (BlockedState::seq)
 
   // Wire up the WAIT callback so it can count synced replicas
   g_count_synced_replicas = [&](std::int64_t target_offset) -> int {
@@ -344,7 +349,7 @@ int run_server(const ServerConfig& config) {
     return count;
   };
 
-  g_blocked_clients_cb = [&]() -> int { return blocked_count; };
+  g_blocked_clients_cb = [&]() -> int { return blocked_count + postponed_count; };
 
   // Wire up the CLIENT LIST callback
   g_client_list_callback = [&]() -> std::string {
@@ -371,7 +376,7 @@ int run_server(const ServerConfig& config) {
       std::string flags;
       if (sess.replica_stream) flags += "S";
       if (sess.is_monitor) flags += "O";
-      if (sess.blocked.type != BlockType::None) flags += "b";
+      if (sess.blocked.type != BlockType::None || sess.postponed) flags += "b";
       if (flags.empty()) flags = "N";
       out += " flags=" + flags;
       out += " cmd=" + (sess.last_cmd.empty() ? std::string("NULL") : sess.last_cmd);
@@ -499,6 +504,7 @@ int run_server(const ServerConfig& config) {
     if (scit != sessions.end()) {
       if (scit->second.blocked.type != BlockType::None && blocked_count > 0) --blocked_count;
       if (scit->second.wait_state.has_value() && wait_count > 0) --wait_count;
+      if (scit->second.postponed && postponed_count > 0) --postponed_count;
     }
     pubsub_unsubscribe_all(fd);
     on_client_disconnect(fd);
@@ -528,6 +534,17 @@ int run_server(const ServerConfig& config) {
   };
 
 
+  auto flush_replication_stream = [&](int fd, SessionState& session) {
+    if (!session.replica_stream) return true;
+    const std::size_t current_total = replication_event_count();
+    if (session.repl_index < current_total) {
+      const auto payload = replication_event_at(session.repl_index);
+      if (!payload.empty() && !enqueue_output(fd, payload)) return false;
+      session.repl_index = current_total;
+    }
+    return true;
+  };
+
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
   // wakeup. Without this, those commands stall until the client sends more data.
   // Returns fds that should be closed (connection error or close-on-command).
@@ -543,6 +560,7 @@ int run_server(const ServerConfig& config) {
       bool sc = false;
       std::size_t consumed = 0;
       const bool output_pending = !write_buffers[fd].empty();
+      const bool was_replica = session.replica_stream;
       while (true) {
         const std::string_view rem(input.data() + consumed, input.size() - consumed);
         auto parsed = parse_one_command(rem, requirepass_is_set() && !session.authenticated,
@@ -555,6 +573,14 @@ int run_server(const ServerConfig& config) {
         batch += self_pubsub_pending;  // self-directed messages come after the reply
         self_pubsub_pending.clear();
         self_dispatch_fd = -1;
+        if (session.postponed) {
+          // CLIENT PAUSE holds it: it stays in the buffer, with everything after it, and runs
+          // when the pause ends; it is counted then.
+          g_total_commands_processed.fetch_sub(1);
+          ++postponed_count;
+          session.postpone_seq = ++postpone_seq;
+          break;
+        }
         consumed += parsed->consumed;
         if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
@@ -564,8 +590,16 @@ int run_server(const ServerConfig& config) {
       }
       if (!batch.empty() && !enqueue_output(fd, batch)) to_close_out.push_back(fd);
       else if (sc) to_close_out.push_back(fd);
-      if (session.blocked.type != BlockType::None) ++blocked_count_ref;
+      if (session.blocked.type != BlockType::None) {
+        ++blocked_count_ref;
+        session.blocked.seq = ++block_seq;  // FIFO serving order, as on the main read path
+      }
       if (session.wait_state.has_value()) ++wait_count_ref;
+      // A PSYNC/SYNC that CLIENT PAUSE ALL held makes this client a replica only now.
+      if (!was_replica && session.replica_stream) {
+        ++replica_count;
+        if (!flush_replication_stream(fd, session)) to_close_out.push_back(fd);
+      }
     }
   };
 
@@ -654,15 +688,26 @@ int run_server(const ServerConfig& config) {
     for (int cfd : drain_close) close_client(cfd);
   };
 
-  auto flush_replication_stream = [&](int fd, SessionState& session) {
-    if (!session.replica_stream) return true;
-    const std::size_t current_total = replication_event_count();
-    if (session.repl_index < current_total) {
-      const auto payload = replication_event_at(session.repl_index);
-      if (!payload.empty() && !enqueue_output(fd, payload)) return false;
-      session.repl_index = current_total;
+  // When CLIENT PAUSE ends (or becomes less strict) the clients it held run their buffered
+  // commands again, in the order they were held (Redis's unblockPostponedClients()); a command
+  // the pause still holds is held again.
+  auto resume_postponed = [&]() {
+    if (postponed_count <= 0) return;
+    std::vector<std::pair<std::uint64_t, int>> ordered;
+    for (auto& [pfd, session] : sessions) {
+      if (session.postponed) ordered.push_back({session.postpone_seq, pfd});
     }
-    return true;
+    std::sort(ordered.begin(), ordered.end());
+    std::vector<int> fds;
+    fds.reserve(ordered.size());
+    for (const auto& [seq, pfd] : ordered) {
+      sessions[pfd].postponed = false;
+      --postponed_count;
+      fds.push_back(pfd);
+    }
+    std::vector<int> to_close;
+    drain_pipelined(fds, blocked_count, wait_count, to_close);
+    for (int cfd : to_close) close_client(cfd);
   };
 
   auto handle_accept_fd_exhaustion = [&](int listener_fd, const std::string& name) {
@@ -694,6 +739,10 @@ int run_server(const ServerConfig& config) {
         if (delta < poll_ms) poll_ms = delta > 1 ? static_cast<int>(delta) : 1;
       }
     }
+    if (const std::int64_t pause_end = client_pause_end_ms(); pause_end > 0) {
+      const auto delta = pause_end - DataStore::now_ms();
+      if (delta < poll_ms) poll_ms = delta > 1 ? static_cast<int>(delta) : 1;
+    }
     const int nready = poller.wait(ep_events, poll_ms);
     if (nready < 0) {
       if (errno == EINTR) continue;
@@ -723,7 +772,7 @@ int run_server(const ServerConfig& config) {
       std::vector<int> idle_fds;
       for (auto& [cfd, session] : sessions) {
         if (session.replica_stream || session.blocked.type != BlockType::None ||
-            session.wait_state.has_value() || session.in_multi) continue;
+            session.postponed || session.wait_state.has_value() || session.in_multi) continue;
         if (session.last_interaction_ms == 0) continue;  // never issued a command yet
         if (loop_now_ms - session.last_interaction_ms < cutoff) continue;
         if (client_has_subscriptions(cfd)) continue;
@@ -736,6 +785,9 @@ int run_server(const ServerConfig& config) {
     if (has_pending_wakeups()) clear_pending_wakeups();
     recheck_blocked();
     recheck_wait();
+    // A CLIENT PAUSE that timed out releases the clients it held before any new input is read,
+    // so they keep their place ahead of newer commands.
+    if (client_pause_update()) resume_postponed();
 
     for (int i = 0; i < nready; ++i) {
       const int fd = ep_events[i].fd;
@@ -933,6 +985,8 @@ int run_server(const ServerConfig& config) {
       std::string batch_reply;
       bool should_close = false;
       auto& session = sessions[fd];
+      // A client CLIENT PAUSE holds only buffers what it sends until the pause ends.
+      if (session.postponed) continue;
       const bool was_blocked = session.blocked.type != BlockType::None;
       const bool was_waiting = session.wait_state.has_value();
       const bool was_replica = session.replica_stream;
@@ -953,6 +1007,14 @@ int run_server(const ServerConfig& config) {
         batch_reply += self_pubsub_pending;  // self-directed messages come after the reply
         self_pubsub_pending.clear();
         self_dispatch_fd = -1;
+        if (session.postponed) {
+          // CLIENT PAUSE holds it: it stays in the buffer, with everything after it, and runs
+          // when the pause ends; it is counted then.
+          g_total_commands_processed.fetch_sub(1);
+          ++postponed_count;
+          session.postpone_seq = ++postpone_seq;
+          break;
+        }
         consumed_total += parsed->consumed;
 
         if (should_close) break;
@@ -964,7 +1026,6 @@ int run_server(const ServerConfig& config) {
       // Track blocked/replica/wait state changes
       if (!was_blocked && session.blocked.type != BlockType::None) {
         ++blocked_count;
-        static std::uint64_t block_seq = 0;
         session.blocked.seq = ++block_seq;  // FIFO serving order
       }
       if (!was_waiting && session.wait_state.has_value()) ++wait_count;
@@ -1007,6 +1068,9 @@ int run_server(const ServerConfig& config) {
       }
       for (int cfd : to_close) close_client(cfd);
     }
+
+    // CLIENT UNPAUSE (or a less strict CLIENT PAUSE) ran above: release the held clients now.
+    if (client_pause_update()) resume_postponed();
 
     // Same-iteration unblock: writes processed above set the pending-wakeup flag; deliver
     // to blocked/WAITing clients now rather than waiting for the next ~100ms poll. This is

@@ -399,6 +399,15 @@ class DataStore {
   // Returns {total_keys, keys_with_expiry, avg_ttl_ms} for current db
   std::tuple<std::size_t, std::size_t, std::int64_t> keyspace_stats() const;
 
+  // CLIENT PAUSE stops key expiry (Redis's PAUSE_ACTION_EXPIRE). While it is stopped, a lookup
+  // that finds an expired key hides the key instead of deleting it: every command sees it as
+  // missing, DBSIZE and INFO still count it (as Redis's dict does), and no DEL or `expired`
+  // statistic is produced. When expiry starts again the hidden keys go back into their database
+  // (unless a write made a new key of the same name meanwhile), so the next access or the
+  // active expiry cycle expires them with their DEL then.
+  void set_expire_paused(bool paused);
+  bool expire_paused() const { return expire_paused_; }
+
   // Observability counters
   std::int64_t stat_expired_keys() const { return stat_expired_keys_.load(); }
   std::int64_t stat_keyspace_hits() const { return stat_keyspace_hits_.load(); }
@@ -477,6 +486,10 @@ class DataStore {
   using DB = std::unordered_map<std::string, Entry>;
 
   bool expire_if_needed(DB& db, const std::string& key);
+  // Removes the expired entry at `it` from `db`: deletes it and counts it in expired_keys, or,
+  // while expiry is paused, hides it (see set_expire_paused()). Returns the next iterator.
+  DB::iterator remove_expired(DB& db, DB::iterator it);
+  std::size_t db_index_of(const DB& db) const { return static_cast<std::size_t>(&db - dbs_.data()); }
   // Background lazyfree: a worker thread destructs detached maps off the event loop.
   void ensure_lazyfree_thread();
   void lazyfree_enqueue(DB&& db);
@@ -487,6 +500,8 @@ class DataStore {
 
   int current_db_;
   std::vector<DB> dbs_;
+  bool expire_paused_ = false;
+  std::vector<DB> hidden_expired_;  // per database: expired keys hidden while expiry is paused
   std::uint64_t mutation_epoch_ = 0;
   mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
   mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
