@@ -142,8 +142,14 @@ int main(int argc, char** argv) {
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
   peadb::configure_max_clients(config.maxclients);
-  peadb::configure_persistence(config.dbfilename, config.appendonly, config.appendfilename,
-                               config.appendfsync);
+  {
+    const std::string aof_error = peadb::configure_persistence(
+        config.dbfilename, config.appendonly, config.appendfilename, config.appendfsync);
+    if (!aof_error.empty()) {
+      peadb::log(peadb::LogLevel::Error, "FATAL: " + aof_error);
+      return 1;
+    }
+  }
   // Must run before the first command_table() build (AOF replay below builds it) so
   // rename-command directives take effect on the live table.
   peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
@@ -214,7 +220,35 @@ int main(int argc, char** argv) {
 
   // The config loader has made `dir` the working directory, as Redis does.
   const std::filesystem::path snap = config.dbfilename;
-  if (std::filesystem::exists(snap)) {
+  // Like Redis's loadDataFromDisk(), load the AOF or the RDB, never both: with the AOF on it holds
+  // every write, so loading the RDB under it would apply each write twice (compat/delta.md item
+  // 28). The RDB is not read even when the AOF is empty or new, as in Redis.
+  if (config.appendonly) {
+    const std::filesystem::path aof = config.appendfilename;
+    std::error_code ec;
+    if (std::filesystem::file_size(aof, ec) == 0 && !ec && std::filesystem::exists(snap, ec)) {
+      const std::string rdb = snap.string();
+      peadb::log(
+          peadb::LogLevel::Warn,
+          "The AOF " + aof.string() +
+              " is empty, and with appendonly yes only the AOF is loaded (as in Redis), "
+              "so " +
+              rdb + " is not loaded and the server starts with no data. To move the data in " +
+              rdb + " to the AOF, start with appendonly no and run CONFIG SET appendonly yes.");
+    }
+    if (std::filesystem::exists(aof)) {
+      std::string err;
+      if (!peadb::load_aof_file(aof.string(), err)) {
+        // A tolerable truncated tail returns success; reaching here means real
+        // corruption. Refuse to start (Redis behaviour) rather than silently
+        // serving partial data.
+        peadb::log(peadb::LogLevel::Error,
+                   "FATAL: AOF load failed: " + err +
+                   " — refusing to start. Restore from backup or repair the AOF.");
+        return 1;
+      }
+    }
+  } else if (std::filesystem::exists(snap)) {
     std::string err;
     // A file with the "REDIS" magic is a native RDB: if it fails to load (e.g. CRC
     // mismatch) that is corruption — refuse to start rather than silently falling back to
@@ -236,22 +270,6 @@ int main(int argc, char** argv) {
       peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");
       if (!peadb::store().load_snapshot_file(snap, err)) {
         peadb::log(peadb::LogLevel::Warn, "failed to load snapshot: " + err);
-      }
-    }
-  }
-
-  if (config.appendonly) {
-    const std::filesystem::path aof = config.appendfilename;
-    if (std::filesystem::exists(aof)) {
-      std::string err;
-      if (!peadb::load_aof_file(aof.string(), err)) {
-        // A tolerable truncated tail returns success; reaching here means real
-        // corruption. Refuse to start (Redis behaviour) rather than silently
-        // serving partial data.
-        peadb::log(peadb::LogLevel::Error,
-                   "FATAL: AOF load failed: " + err +
-                   " — refusing to start. Restore from backup or repair the AOF.");
-        return 1;
       }
     }
   }

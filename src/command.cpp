@@ -11789,8 +11789,9 @@ void background_save_cron() {
   }
 }
 
-void configure_persistence(const std::string& dbfilename, bool appendonly,
-                           const std::string& appendfilename, const std::string& appendfsync) {
+std::string configure_persistence(const std::string& dbfilename, bool appendonly,
+                                  const std::string& appendfilename,
+                                  const std::string& appendfsync) {
   // Both names are relative to the working directory, which the config loader set to `dir`.
   g_snapshot_path = dbfilename;
   // "At startup we consider the DB saved" (Redis's initServer): save points count from now, so
@@ -11801,14 +11802,19 @@ void configure_persistence(const std::string& dbfilename, bool appendonly,
   g_aof_state = appendonly ? AofState::On : AofState::Off;
   g_aof_path = appendfilename;
   g_appendfsync = appendfsync;
-  if (g_appendonly) open_aof_fd();
+  if (!g_appendonly) return {};
+  open_aof_fd();
+  if (g_aof_fd >= 0) return {};
+  // Redis's aofOpenIfNeededOnServerStart() exits when it cannot open the AOF: with the AOF on,
+  // startup loads nothing else, so going on would serve no data and fail every write.
+  return "Can't open the append-only file " + appendfilename + ": " + std::strerror(errno);
 }
 
 bool load_aof_file(const std::string& path, std::string& err) {
   err.clear();
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
-    err = "cannot open AOF";
+    err = "can't open the append log file " + path + " for reading: " + std::strerror(errno);
     return false;
   }
   std::string buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
