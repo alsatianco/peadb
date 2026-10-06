@@ -838,14 +838,15 @@ void notify_keyspace_event(std::uint32_t cls, const std::string& event, const st
     pubsub_publish("__keyevent@" + std::to_string(db) + "__:" + event, key);
 }
 // Centralised emission for write commands (avoids hand-instrumenting ~40 handlers).
-// Covers the most-subscribed events; class is per-command (mirrors the key's type).
+// Covers the most-subscribed events; class is per-command (mirrors the key's type). LSET,
+// LREM, LINSERT, LTRIM, ZREM and ZREMRANGEBY* send their own events from their handlers,
+// which know whether the key became empty ("del"); other commands miss events (delta item 72).
 void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::string>& args,
                                  int first_key, int db, const std::string* reply = nullptr) {
   if (g_notify_flags == 0) return;
   // Redis emits these events only when the command actually changed the key; a no-op
   // (e.g. SREM of a non-member, SADD of existing members) returns 0 and fires nothing.
-  static const std::unordered_set<std::string> count_gated = {
-      "SADD", "SREM", "ZREM", "HDEL", "LREM"};
+  static const std::unordered_set<std::string> count_gated = {"SADD", "SREM", "HDEL"};
   if (reply && count_gated.count(cmd) && reply->rfind(":0\r\n", 0) == 0) return;
   if (cmd == "DEL" || cmd == "UNLINK") {
     for (std::size_t i = 1; i < args.size(); ++i) notify_keyspace_event(NOTIFY_GENERIC, "del", args[i], db);
@@ -862,12 +863,11 @@ void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::
     {"INCR",{NOTIFY_STRING,"incrby"}},{"INCRBY",{NOTIFY_STRING,"incrby"}},{"DECR",{NOTIFY_STRING,"decrby"}},
     {"DECRBY",{NOTIFY_STRING,"decrby"}},{"INCRBYFLOAT",{NOTIFY_STRING,"incrbyfloat"}},{"GETDEL",{NOTIFY_GENERIC,"del"}},
     {"LPUSH",{NOTIFY_LIST,"lpush"}},{"RPUSH",{NOTIFY_LIST,"rpush"}},{"LPOP",{NOTIFY_LIST,"lpop"}},
-    {"RPOP",{NOTIFY_LIST,"rpop"}},{"LSET",{NOTIFY_LIST,"lset"}},{"LREM",{NOTIFY_LIST,"lrem"}},
-    {"LINSERT",{NOTIFY_LIST,"linsert"}},{"LTRIM",{NOTIFY_LIST,"ltrim"}},
+    {"RPOP",{NOTIFY_LIST,"rpop"}},
     {"SADD",{NOTIFY_SET,"sadd"}},{"SREM",{NOTIFY_SET,"srem"}},{"SPOP",{NOTIFY_SET,"spop"}},
     {"HSET",{NOTIFY_HASH,"hset"}},{"HMSET",{NOTIFY_HASH,"hset"}},{"HSETNX",{NOTIFY_HASH,"hset"}},
     {"HDEL",{NOTIFY_HASH,"hdel"}},{"HINCRBY",{NOTIFY_HASH,"hincrby"}},{"HINCRBYFLOAT",{NOTIFY_HASH,"hincrbyfloat"}},
-    {"ZADD",{NOTIFY_ZSET,"zadd"}},{"ZREM",{NOTIFY_ZSET,"zrem"}},{"ZINCRBY",{NOTIFY_ZSET,"zincr"}},
+    {"ZADD",{NOTIFY_ZSET,"zadd"}},{"ZINCRBY",{NOTIFY_ZSET,"zincr"}},
     {"ZPOPMIN",{NOTIFY_ZSET,"zpopmin"}},{"ZPOPMAX",{NOTIFY_ZSET,"zpopmax"}},
     {"XADD",{NOTIFY_STREAM,"xadd"}},{"XTRIM",{NOTIFY_STREAM,"xtrim"}},{"XDEL",{NOTIFY_STREAM,"xdel"}},
     {"EXPIRE",{NOTIFY_GENERIC,"expire"}},{"PEXPIRE",{NOTIFY_GENERIC,"expire"}},
@@ -2989,10 +2989,47 @@ std::string with_stream_key(const std::string& key, Fn&& fn) {
   return fn();
 }
 
+// One bound of Redis's zslParseRange(): a leading "(" makes it exclusive, and the rest must be
+// a whole strtod() number, so "inf", "-inf", " 1" and "" (0) parse, "1abc" and "nan" do not.
+bool parse_score_bound(const std::string& s, double& val, bool& exclusive) {
+  exclusive = !s.empty() && s[0] == '(';
+  const char* p = s.c_str() + (exclusive ? 1 : 0);
+  char* end = nullptr;
+  val = std::strtod(p, &end);
+  return *end == '\0' && !std::isnan(val);
+}
+
+// One bound of Redis's zslParseLexRangeItem(): "-" or "+" alone, or "(" (exclusive) or "["
+// (inclusive) followed by the member.
+struct LexBound {
+  enum Kind { Min, Max, Member } kind = Member;
+  std::string member;
+  bool exclusive = false;
+};
+bool parse_lex_bound(const std::string& s, LexBound& b) {
+  if (s.empty()) return false;
+  switch (s[0]) {
+    case '-':
+    case '+':
+      if (s.size() > 1 && s[1] != '\0') return false;
+      b.kind = s[0] == '-' ? LexBound::Min : LexBound::Max;
+      return true;
+    case '(':
+    case '[':
+      b.kind = LexBound::Member;
+      b.member = s.substr(1);
+      b.exclusive = s[0] == '(';
+      return true;
+    default:
+      return false;
+  }
+}
+
 // Shared ZRANGE/ZRANGESTORE range selector (Redis 6.2 unified ZRANGE semantics):
 // index (default), BYSCORE or BYLEX modes, optional REV, LIMIT for the BY* modes,
 // WITHSCORES only where the caller allows it. Fills `items` in output order and
-// returns an empty string on success or a complete error reply.
+// returns an empty string on success or a complete error reply. Arguments are checked in
+// the order of Redis's zrangeGenericCommand(): the options, then the range, then the key.
 std::string zrange_select(const std::vector<std::string>& args, std::size_t key_idx,
                           std::size_t min_idx, std::size_t opts_idx, bool allow_withscores,
                           std::vector<std::pair<std::string, double>>& items,
@@ -3000,36 +3037,51 @@ std::string zrange_select(const std::vector<std::string>& args, std::size_t key_
   const std::string& key = args[key_idx];
   enum class Mode { Index, ByScore, ByLex };
   Mode mode = Mode::Index;
-  bool rev = false, has_limit = false;
+  bool mode_given = false, rev = false;
   withscores = false;
   std::int64_t lim_off = 0, lim_cnt = -1;
   for (std::size_t i = opts_idx; i < args.size(); ++i) {
     const auto o = upper(args[i]);
-    if (o == "BYSCORE") mode = Mode::ByScore;
-    else if (o == "BYLEX") mode = Mode::ByLex;
-    else if (o == "REV") rev = true;
-    else if (allow_withscores && o == "WITHSCORES") withscores = true;
+    if (allow_withscores && o == "WITHSCORES") withscores = true;
     else if (o == "LIMIT" && i + 2 < args.size()) {
       if (!parse_i64(args[i + 1], lim_off) || !parse_i64(args[i + 2], lim_cnt))
         return encode_error("value is not an integer or out of range");
-      has_limit = true; i += 2;
+      i += 2;
+    } else if (!rev && o == "REV") {
+      rev = true;
+    } else if (!mode_given && (o == "BYSCORE" || o == "BYLEX")) {
+      mode = o == "BYSCORE" ? Mode::ByScore : Mode::ByLex;
+      mode_given = true;
     } else {
       return encode_error("syntax error");
     }
   }
-  if (has_limit && mode == Mode::Index)
+  if (lim_cnt != -1 && mode == Mode::Index)
     return encode_error("syntax error, LIMIT is only supported in combination with either BYSCORE or BYLEX");
   if (withscores && mode == Mode::ByLex)
     return encode_error("syntax error, WITHSCORES not supported in combination with BYLEX");
+  // REV swaps the bound order of the BY* modes: ... max min BYSCORE REV.
+  const std::string& lo_s = rev && mode != Mode::Index ? args[min_idx + 1] : args[min_idx];
+  const std::string& hi_s = rev && mode != Mode::Index ? args[min_idx] : args[min_idx + 1];
+  std::int64_t start = 0, stop = 0;
+  double lo = 0, hi = 0;
+  bool lo_ex = false, hi_ex = false;
+  LexBound lex_lo, lex_hi;
+  if (mode == Mode::Index) {
+    if (!parse_i64(lo_s, start) || !parse_i64(hi_s, stop))
+      return encode_error("value is not an integer or out of range");
+  } else if (mode == Mode::ByScore) {
+    if (!parse_score_bound(lo_s, lo, lo_ex) || !parse_score_bound(hi_s, hi, hi_ex))
+      return encode_error("min or max is not a float");
+  } else if (!parse_lex_bound(lo_s, lex_lo) || !parse_lex_bound(hi_s, lex_hi)) {
+    return encode_error("min or max not valid string range item");
+  }
   if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
   bool wt = false;
   auto all = store().zrange(key, 0, -1, true, wt);  // ascending {member,score}
   if (wt) return wrongtype_error_reply();
 
   if (mode == Mode::Index) {
-    std::int64_t start = 0, stop = 0;
-    if (!parse_i64(args[min_idx], start) || !parse_i64(args[min_idx + 1], stop))
-      return encode_error("value is not an integer or out of range");
     if (rev) std::reverse(all.begin(), all.end());
     const std::int64_t n = static_cast<std::int64_t>(all.size());
     std::int64_t s = start < 0 ? n + start : start, e = stop < 0 ? n + stop : stop;
@@ -3039,21 +3091,6 @@ std::string zrange_select(const std::vector<std::string>& args, std::size_t key_
     return "";
   }
   if (mode == Mode::ByScore) {
-    // REV swaps bound order: ... max min BYSCORE REV.
-    const std::string& lo_s = rev ? args[min_idx + 1] : args[min_idx];
-    const std::string& hi_s = rev ? args[min_idx] : args[min_idx + 1];
-    auto parse_bound = [](const std::string& s, double& val, bool& ex) -> bool {
-      ex = false;
-      if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
-      if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
-      std::string v = s;
-      if (!v.empty() && v[0] == '(') { ex = true; v = v.substr(1); }
-      try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
-    };
-    double lo, hi;
-    bool lo_ex, hi_ex;
-    if (!parse_bound(lo_s, lo, lo_ex) || !parse_bound(hi_s, hi, hi_ex))
-      return encode_error("min or max is not a float");
     for (const auto& [m, sc] : all) {
       const bool above = lo_ex ? (sc > lo) : (sc >= lo);
       const bool below = hi_ex ? (sc < hi) : (sc <= hi);
@@ -3061,39 +3098,25 @@ std::string zrange_select(const std::vector<std::string>& args, std::size_t key_
     }
     if (rev) std::reverse(items.begin(), items.end());
   } else {  // ByLex — all members assumed same score; compare lexicographically.
-    const std::string& lo_s = rev ? args[min_idx + 1] : args[min_idx];
-    const std::string& hi_s = rev ? args[min_idx] : args[min_idx + 1];
-    // Bound forms: "-" (min), "+" (max), "[member" (inclusive), "(member" (exclusive).
     auto lex_ge_lo = [&](const std::string& m) -> bool {
-      if (lo_s == "-") return true;
-      if (lo_s == "+") return false;
-      if (lo_s.empty()) return false;
-      const std::string b = lo_s.substr(1);
-      return lo_s[0] == '(' ? (m > b) : (m >= b);
+      if (lex_lo.kind != LexBound::Member) return lex_lo.kind == LexBound::Min;
+      return lex_lo.exclusive ? (m > lex_lo.member) : (m >= lex_lo.member);
     };
     auto lex_le_hi = [&](const std::string& m) -> bool {
-      if (hi_s == "+") return true;
-      if (hi_s == "-") return false;
-      if (hi_s.empty()) return false;
-      const std::string b = hi_s.substr(1);
-      return hi_s[0] == '(' ? (m < b) : (m <= b);
+      if (lex_hi.kind != LexBound::Member) return lex_hi.kind == LexBound::Max;
+      return lex_hi.exclusive ? (m < lex_hi.member) : (m <= lex_hi.member);
     };
-    if ((!lo_s.empty() && lo_s[0] != '[' && lo_s[0] != '(' && lo_s != "-" && lo_s != "+") ||
-        (!hi_s.empty() && hi_s[0] != '[' && hi_s[0] != '(' && hi_s != "-" && hi_s != "+"))
-      return encode_error("min or max not valid string range item");
     for (const auto& [m, sc] : all) if (lex_ge_lo(m) && lex_le_hi(m)) items.push_back({m, sc});
     if (rev) std::reverse(items.begin(), items.end());
   }
 
   // LIMIT applies to BYSCORE/BYLEX, on the (possibly reversed) output order.
-  if (has_limit) {
-    if (lim_off > 0) {
-      if (static_cast<std::size_t>(lim_off) >= items.size()) items.clear();
-      else items.erase(items.begin(), items.begin() + lim_off);
-    }
-    if (lim_cnt >= 0 && static_cast<std::size_t>(lim_cnt) < items.size())
-      items.resize(static_cast<std::size_t>(lim_cnt));
+  if (lim_off > 0) {
+    if (static_cast<std::size_t>(lim_off) >= items.size()) items.clear();
+    else items.erase(items.begin(), items.begin() + lim_off);
   }
+  if (lim_cnt >= 0 && static_cast<std::size_t>(lim_cnt) < items.size())
+    items.resize(static_cast<std::size_t>(lim_cnt));
   return "";
 }
 
@@ -9136,61 +9159,41 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     // ─── LSET ────────────────────────────────────────────────────────────
+    // LSET, LREM, LINSERT and LTRIM change the list in place, so the key keeps its TTL, and
+    // send their own keyspace events in Redis's order (t_list.c), including "del" when the
+    // list becomes empty.
     t.emplace("LSET", CommandSpec{"LSET", 4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
-          if (store().type_of(args[1]) == "none") return encode_error("no such key");
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          // Redis looks the key up before it parses the index.
+          const auto type = store().type_of(args[1]);
+          if (type == "none") return encode_error("no such key");
+          if (type != "list") return wrongtype_error_reply();
           std::int64_t index;
           if (!parse_i64(args[2], index)) return encode_error("value is not an integer or out of range");
-          bool wt = false;
-          auto items = store().lrange(args[1], 0, -1, wt);
-          if (wt) return wrongtype_error_reply();
-          std::int64_t len = static_cast<std::int64_t>(items.size());
-          if (index < 0) index += len;
-          if (index < 0 || index >= len) return encode_error("index out of range");
-          items[static_cast<std::size_t>(index)] = args[3];
-          // Rebuild list: delete and re-push
-          store().del(args[1]);
-          std::vector<std::string> all(items.begin(), items.end());
-          store().rpush(args[1], all, wt);
+          switch (store().lset(args[1], index, args[3])) {
+            case DataStore::LsetResult::Ok:
+              break;
+            case DataStore::LsetResult::NoKey:
+              return encode_error("no such key");
+            case DataStore::LsetResult::WrongType:
+              return wrongtype_error_reply();
+            case DataStore::LsetResult::OutOfRange:
+              return encode_error("index out of range");
+          }
+          notify_keyspace_event(NOTIFY_LIST, "lset", args[1], session.db_index);
           return encode_simple("OK");
         }});
 
     // ─── LREM ────────────────────────────────────────────────────────────
     t.emplace("LREM", CommandSpec{"LREM", 4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           std::int64_t count;
           if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
-          bool wt = false;
-          auto items = store().lrange(args[1], 0, -1, wt);
+          bool wt = false, key_removed = false;
+          const auto removed = store().lrem(args[1], count, args[3], wt, key_removed);
           if (wt) return wrongtype_error_reply();
-          long long removed = 0;
-          std::deque<std::string> result;
-          if (count > 0) {
-            for (const auto& item : items) {
-              if (item == args[3] && removed < count) ++removed;
-              else result.push_back(item);
-            }
-          } else if (count < 0) {
-            std::int64_t limit = -count;
-            // Remove from tail
-            for (auto it = items.rbegin(); it != items.rend(); ++it) {
-              if (*it == args[3] && removed < limit) ++removed;
-              else result.push_front(*it);
-            }
-          } else {
-            // count == 0: remove all
-            for (const auto& item : items) {
-              if (item == args[3]) ++removed;
-              else result.push_back(item);
-            }
-          }
-          store().del(args[1]);
-          if (!result.empty()) {
-            std::vector<std::string> all(result.begin(), result.end());
-            store().rpush(args[1], all, wt);
-          }
+          if (removed > 0) notify_keyspace_event(NOTIFY_LIST, "lrem", args[1], session.db_index);
+          if (key_removed) notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], session.db_index);
           return encode_integer(removed);
         }});
 
@@ -9273,29 +9276,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── LINSERT ─────────────────────────────────────────────────────────
     t.emplace("LINSERT", CommandSpec{"LINSERT", 5, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
-          if (store().type_of(args[1]) == "none") return encode_integer(0);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          // Redis checks BEFORE/AFTER before it looks the key up.
           const auto dir = upper(args[2]);
           if (dir != "BEFORE" && dir != "AFTER") return encode_error("syntax error");
           bool wt = false;
-          auto items = store().lrange(args[1], 0, -1, wt);
+          const auto len = store().linsert(args[1], dir == "BEFORE", args[3], args[4], wt);
           if (wt) return wrongtype_error_reply();
-          bool found = false;
-          std::vector<std::string> result;
-          for (const auto& item : items) {
-            if (!found && item == args[3]) {
-              found = true;
-              if (dir == "BEFORE") { result.push_back(args[4]); result.push_back(item); }
-              else { result.push_back(item); result.push_back(args[4]); }
-            } else {
-              result.push_back(item);
-            }
-          }
-          if (!found) return encode_integer(-1);
-          store().del(args[1]);
-          store().rpush(args[1], result, wt);
-          return encode_integer(static_cast<long long>(result.size()));
+          if (len > 0) notify_keyspace_event(NOTIFY_LIST, "linsert", args[1], session.db_index);
+          return encode_integer(len);
         }});
 
     // ─── RPOPLPUSH ───────────────────────────────────────────────────────
@@ -9313,16 +9302,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── LTRIM ───────────────────────────────────────────────────────────
     t.emplace("LTRIM", CommandSpec{"LTRIM", 4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_list(args[1])) return wrongtype_error_reply();
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
           std::int64_t start, stop;
           if (!parse_i64(args[2], start) || !parse_i64(args[3], stop))
             return encode_error("value is not an integer or out of range");
-          bool wt = false;
-          auto items = store().lrange(args[1], start, stop, wt);
+          bool wt = false, key_removed = false;
+          const bool existed = store().ltrim(args[1], start, stop, wt, key_removed);
           if (wt) return wrongtype_error_reply();
-          store().del(args[1]);
-          if (!items.empty()) store().rpush(args[1], items, wt);
+          // Redis sends "ltrim" whenever the list exists, even when nothing was trimmed.
+          if (existed) notify_keyspace_event(NOTIFY_LIST, "ltrim", args[1], session.db_index);
+          if (key_removed) notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], session.db_index);
           return encode_simple("OK");
         }});
 
@@ -9419,18 +9408,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── ZCOUNT ──────────────────────────────────────────────────────────
     t.emplace("ZCOUNT", CommandSpec{"ZCOUNT", 4, {"readonly", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
-            exclusive = false;
-            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
-            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
-            std::string v = s;
-            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
-          };
+          // Redis parses the range before it looks the key up.
           double min_val, max_val;
           bool min_ex, max_ex;
-          if (!parse_bound(args[2], min_val, min_ex) || !parse_bound(args[3], max_val, max_ex))
+          if (!parse_score_bound(args[2], min_val, min_ex) ||
+              !parse_score_bound(args[3], max_val, max_ex))
             return encode_error("min or max is not a float");
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
@@ -9525,12 +9507,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     // ─── ZREMRANGEBYSCORE / ZREMRANGEBYRANK / ZREMRANGEBYLEX ─────────────
-    // Each selects victims with the shared unified-range selector, then rebuilds the
-    // zset without them (same delete/re-add mechanics as ZREM).
+    // Each selects victims with the shared unified-range selector (which still copies the
+    // zset, compat/delta.md item 56), then removes them in place, so the key keeps its TTL.
     {
-      auto make_remrange = [](const char* mode) {
+      auto make_remrange = [](const char* mode, const char* event) {
         const std::string mode_s = mode;  // "" = index, "BYSCORE", "BYLEX"
-        return [mode_s](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
+        const std::string event_s = event;
+        return [mode_s, event_s](const std::vector<std::string>& args, SessionState& session,
+                                 bool&) -> std::string {
           std::vector<std::string> proxy{"ZRANGE", args[1], args[2], args[3]};
           if (!mode_s.empty()) proxy.push_back(mode_s);
           std::vector<std::pair<std::string, double>> victims;
@@ -9538,21 +9522,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           auto err = zrange_select(proxy, 1, 2, 4, false, victims, ws);
           if (!err.empty()) return err;
           if (victims.empty()) return encode_integer(0);
-          std::unordered_set<std::string> gone;
-          for (const auto& [m, sc] : victims) gone.insert(m);
-          bool wt = false;
-          auto all = store().zrange(args[1], 0, -1, true, wt);
+          std::vector<std::string> members;
+          members.reserve(victims.size());
+          for (auto& [m, sc] : victims) members.push_back(std::move(m));
+          bool wt = false, key_removed = false;
+          const auto removed = store().zrem(args[1], members, wt, key_removed);
           if (wt) return wrongtype_error_reply();
-          store().del(args[1]);
-          for (const auto& [m, sc] : all) {
-            if (!gone.count(m)) store().zadd_one(args[1], sc, m, false, false, false, false, false);
-          }
-          return encode_integer(static_cast<long long>(gone.size()));
+          // Events in the order of Redis's zremrangeGenericCommand().
+          if (removed > 0) notify_keyspace_event(NOTIFY_ZSET, event_s, args[1], session.db_index);
+          if (key_removed) notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], session.db_index);
+          return encode_integer(removed);
         };
       };
-      t.emplace("ZREMRANGEBYSCORE", CommandSpec{"ZREMRANGEBYSCORE", 4, {"write"}, 1, 1, 1, make_remrange("BYSCORE")});
-      t.emplace("ZREMRANGEBYRANK", CommandSpec{"ZREMRANGEBYRANK", 4, {"write"}, 1, 1, 1, make_remrange("")});
-      t.emplace("ZREMRANGEBYLEX", CommandSpec{"ZREMRANGEBYLEX", 4, {"write"}, 1, 1, 1, make_remrange("BYLEX")});
+      t.emplace("ZREMRANGEBYSCORE", CommandSpec{"ZREMRANGEBYSCORE", 4, {"write"}, 1, 1, 1,
+                                                make_remrange("BYSCORE", "zremrangebyscore")});
+      t.emplace("ZREMRANGEBYRANK", CommandSpec{"ZREMRANGEBYRANK", 4, {"write"}, 1, 1, 1,
+                                               make_remrange("", "zremrangebyrank")});
+      t.emplace("ZREMRANGEBYLEX", CommandSpec{"ZREMRANGEBYLEX", 4, {"write"}, 1, 1, 1,
+                                              make_remrange("BYLEX", "zremrangebylex")});
     }
 
     // ─── ZINTERCARD numkeys key [key ...] [LIMIT n] ──────────────────────
@@ -9605,25 +9592,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     // ─── ZREM ────────────────────────────────────────────────────────────
     t.emplace("ZREM", CommandSpec{"ZREM", -3, {"write", "fast"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          bool wt = false;
-          auto items = store().zrange(args[1], 0, -1, true, wt);
+        [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
+          // In place, so the key keeps its TTL; events in the order of Redis's zremCommand().
+          const std::vector<std::string> members(args.begin() + 2, args.end());
+          bool wt = false, key_removed = false;
+          const auto removed = store().zrem(args[1], members, wt, key_removed);
           if (wt) return wrongtype_error_reply();
-          std::unordered_set<std::string> to_remove(args.begin() + 2, args.end());
-          long long removed = 0;
-          // Delete and re-add remaining
-          std::vector<std::pair<std::string, double>> remaining;
-          for (const auto& [m, s] : items) {
-            if (to_remove.count(m)) ++removed;
-            else remaining.push_back({m, s});
-          }
-          if (removed > 0) {
-            store().del(args[1]);
-            for (const auto& [m, s] : remaining) {
-              store().zadd_one(args[1], s, m, false, false, false, false, false);
-            }
-          }
+          if (removed > 0) notify_keyspace_event(NOTIFY_ZSET, "zrem", args[1], session.db_index);
+          if (key_removed) notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], session.db_index);
           return encode_integer(removed);
         }});
 
@@ -9652,19 +9628,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── ZRANGEBYSCORE ───────────────────────────────────────────────────
     t.emplace("ZRANGEBYSCORE", CommandSpec{"ZRANGEBYSCORE", -4, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
-            exclusive = false;
-            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
-            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
-            std::string v = s;
-            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
-          };
-          double min_val, max_val;
-          bool min_ex, max_ex;
-          if (!parse_bound(args[2], min_val, min_ex) || !parse_bound(args[3], max_val, max_ex))
-            return encode_error("min or max is not a float");
+          // Redis's order: the options, then the range, then the key.
           bool withscores = false;
           std::int64_t offset = 0, limit_count = -1;
           for (std::size_t i = 4; i < args.size(); ++i) {
@@ -9678,6 +9642,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_error("syntax error");  // e.g. REV is invalid for ZRANGEBYSCORE
             }
           }
+          double min_val, max_val;
+          bool min_ex, max_ex;
+          if (!parse_score_bound(args[2], min_val, min_ex) ||
+              !parse_score_bound(args[3], max_val, max_ex))
+            return encode_error("min or max is not a float");
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
@@ -9706,20 +9675,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── ZREVRANGEBYSCORE ────────────────────────────────────────────────
     t.emplace("ZREVRANGEBYSCORE", CommandSpec{"ZREVRANGEBYSCORE", -4, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          auto parse_bound = [](const std::string& s, double& val, bool& exclusive) -> bool {
-            exclusive = false;
-            if (s == "-inf") { val = -std::numeric_limits<double>::infinity(); return true; }
-            if (s == "+inf" || s == "inf") { val = std::numeric_limits<double>::infinity(); return true; }
-            std::string v = s;
-            if (!v.empty() && v[0] == '(') { exclusive = true; v = v.substr(1); }
-            try { val = std::stod(v); return !std::isnan(val); } catch (...) { return false; }  // NaN is not a valid bound
-          };
-          // Note: for ZREVRANGEBYSCORE, args[2] is max, args[3] is min (reversed)
-          double max_val, min_val;
-          bool max_ex, min_ex;
-          if (!parse_bound(args[2], max_val, max_ex) || !parse_bound(args[3], min_val, min_ex))
-            return encode_error("min or max is not a float");
+          // Redis's order: the options, then the range, then the key.
           bool withscores = false;
           std::int64_t offset = 0, limit_count = -1;
           for (std::size_t i = 4; i < args.size(); ++i) {
@@ -9733,6 +9689,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               return encode_error("syntax error");  // e.g. REV is invalid for ZRANGEBYSCORE
             }
           }
+          // Note: for ZREVRANGEBYSCORE, args[2] is max, args[3] is min (reversed)
+          double max_val, min_val;
+          bool max_ex, min_ex;
+          if (!parse_score_bound(args[2], max_val, max_ex) ||
+              !parse_score_bound(args[3], min_val, min_ex))
+            return encode_error("min or max is not a float");
           bool wt = false;
           auto items = store().zrange(args[1], 0, -1, true, wt);
           if (wt) return wrongtype_error_reply();
@@ -9787,39 +9749,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }
           }
           return encode_array(enc);
-        }});
-
-    // ─── ZLEXCOUNT ───────────────────────────────────────────────────────
-    t.emplace("ZLEXCOUNT", CommandSpec{"ZLEXCOUNT", 4, {"readonly", "fast"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-          if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
-          auto parse_lex = [](const std::string& s, std::string& val, bool& exclusive, bool& is_unbounded) -> bool {
-            is_unbounded = false;
-            exclusive = false;
-            if (s == "-") { is_unbounded = true; val = ""; return true; }
-            if (s == "+") { is_unbounded = true; val = "\xff"; return true; }
-            if (s.size() < 2) return false;
-            if (s[0] == '[') { exclusive = false; val = s.substr(1); return true; }
-            if (s[0] == '(') { exclusive = true; val = s.substr(1); return true; }
-            return false;
-          };
-          std::string min_val, max_val;
-          bool min_ex, max_ex, min_unb, max_unb;
-          if (!parse_lex(args[2], min_val, min_ex, min_unb) || !parse_lex(args[3], max_val, max_ex, max_unb))
-            return encode_error("min or max not valid string range item");
-          bool wt = false;
-          auto items = store().zrange(args[1], 0, -1, false, wt);
-          if (wt) return wrongtype_error_reply();
-          // Sort lexicographically (items from zrange are sorted by score then by member)
-          std::vector<std::string> members;
-          for (const auto& [m, _] : items) members.push_back(m);
-          long long count = 0;
-          for (const auto& m : members) {
-            bool above = min_unb ? true : (min_ex ? (m > min_val) : (m >= min_val));
-            bool below = max_unb ? true : (max_ex ? (m < max_val) : (m <= max_val));
-            if (above && below) ++count;
-          }
-          return encode_integer(count);
         }});
 
     // ─── ZRANDMEMBER ─────────────────────────────────────────────────────
