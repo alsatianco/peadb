@@ -211,6 +211,15 @@
       "mode": "native",
       "skipfile_lines": 12
     },
+    "unit/shutdown": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 2,
+        "ok": 9
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "unit/slowlog": {
       "last_counts": {
         "err": 0,

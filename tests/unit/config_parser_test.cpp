@@ -1,6 +1,7 @@
 // Config loader tests: line splitting, settings, value checks and errors as Redis 7.2.5's
 // loadServerConfigFromString() does them (src/config.c), plus the command-line conversion of
 // Redis's main(). The expected error strings are Redis's own.
+#include "command.hpp"
 #include "config.hpp"
 #include "redis_config_table.generated.hpp"
 
@@ -209,6 +210,9 @@ void test_refused_and_ignored() {
       "aclfile \"\"\nreplicaof no one\nenable-debug-command yes\nrdbcompression no\n"
       "list-max-ziplist-entries 5\nsentinel\n");
   expect(cfg.warnings.empty(), "no warning when the value matches PeaDB");
+  // Settings PeaDB applies: no warning either.
+  cfg = expect_ok("shutdown-on-sigterm nosave now\nshutdown-on-sigint force\nrdb-key-save-delay 10\n");
+  expect(cfg.warnings.empty(), "no warning for the shutdown-on-sig* and rdb-key-save-delay settings");
 
   // Any other Redis setting PeaDB does not apply: accepted with one warning per line.
   cfg = expect_ok("hz 10\ndaemonize yes\npidfile /var/run/redis.pid\ntls-cert-file /x.crt\n");
@@ -451,6 +455,15 @@ void test_config_set_values() {
   expect(value("maxmemory-policy", "ALLKEYS-LRU") == "allkeys-lru", "enum is lower case");
   expect(value("shutdown-on-sigterm", "now save") == "save now", "flags print in enum order");
   expect(value("shutdown-on-sigterm", "default save") == "save", "default is only printed alone");
+  // The checked value is what CONFIG SET hands to the live setting, and CONFIG GET prints it back.
+  for (const char* v : {"default", "save", "nosave now", "save now force", "nosave now force"}) {
+    expect(peadb::shutdown_flags_to_str(peadb::parse_shutdown_flags(value("shutdown-on-sigint", v))) ==
+               v,
+           std::string("shutdown flags round trip: ") + v);
+  }
+  expect(peadb::parse_shutdown_flags("nosave force") ==
+             (peadb::kShutdownNosave | peadb::kShutdownForce),
+         "shutdown flags are Redis's SHUTDOWN_* bits");
   expect(value("latency-tracking-info-percentiles", "50.0 99.90") == "50 99.9",
          "percentiles print like %f without trailing zeros");
   expect(value("save", "100  10").rfind("ERR Invalid save parameters", 0) == 0,

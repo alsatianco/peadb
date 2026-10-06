@@ -133,6 +133,15 @@ std::int64_t g_bgsave_start_time = 0;
 std::string g_last_bgsave_status = "ok";
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
+// A shutdown asked for by SIGTERM or SIGINT (Redis's server.shutdown_asap and last_sig_received):
+// set by shutdown_signal_handler(), run by shutdown_signal_cron() between commands. Atomic,
+// because the signal handler writes them.
+std::atomic<int> g_shutdown_asap{0};
+std::atomic<int> g_last_sig_received{0};
+std::atomic<bool> g_loading{false};  // the startup load is running (Redis's server.loading)
+// shutdown-on-sigterm and shutdown-on-sigint: kShutdown* flags, 0 for "default".
+int g_shutdown_on_sigterm = 0;
+int g_shutdown_on_sigint = 0;
 std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
 bool g_aof_rewrite_buf_capped = false; // Set once when the 256 MiB cap is hit per rewrite
 std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
@@ -169,6 +178,7 @@ std::int64_t g_last_save_time = 0;
 std::vector<std::pair<std::int64_t, std::int64_t>> g_save_params;  // (seconds, changes)
 std::string g_save_spec;                       // raw "sec changes ..." for CONFIG GET
 std::int64_t g_dirty_at_last_save = 0;         // mutation_epoch snapshot at last save start
+std::int64_t g_dirty_before_bgsave = 0;        // g_dirty_at_last_save before the running BGSAVE
 bool g_stop_writes_on_bgsave_error = true;
 std::string g_replication_role = "master";
 std::string g_replication_master_host = "";
@@ -670,8 +680,28 @@ bool do_bgsave_fork() {
   g_bgsave_in_progress.store(true);
   g_bgsave_child_pid.store(pid);
   g_bgsave_start_time = now_ms();
+  g_dirty_before_bgsave = g_dirty_at_last_save;
   g_dirty_at_last_save = static_cast<std::int64_t>(store().mutation_epoch());
   return true;
+}
+
+// Redis's killRDBChild() and rdbRemoveTempFile() for a shutdown: stops a running BGSAVE and
+// deletes its temp-<child pid>.rdb. The child is waited for, so it cannot rename an older snapshot
+// over the final save that follows. Stopping it does not count as a failed BGSAVE (Redis kills it
+// with SIGUSR1 for that reason).
+void kill_rdb_child() {
+  const pid_t pid = g_bgsave_child_pid.load();
+  if (!g_bgsave_in_progress.load() || pid <= 0) return;
+  ::kill(pid, SIGKILL);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  rdb_remove_temp_file(pid);
+  g_bgsave_child_pid.store(0);
+  g_bgsave_in_progress.store(false);
+  // Nothing was saved: the changes since the last good save still count for the save points, in
+  // case the shutdown then fails and the server keeps running.
+  g_dirty_at_last_save = g_dirty_before_bgsave;
 }
 
 // ── SLOWLOG / LATENCY recording ──
@@ -2072,13 +2102,26 @@ bool rewrite_aof_file(std::string& err) {
     if (write_failed) { ::close(tmp_fd); ::unlink(tmp_path.c_str()); err = "AOF rewrite write error"; return false; }
   }
   const auto cmds = store().export_aof_commands();
+  // rdb-key-save-delay after each key, as in Redis's rewriteAppendOnlyFileRio(). A key's commands
+  // are next to each other, so a key ends where the key argument changes or a SELECT starts the
+  // next database (XGROUP has its key after the subcommand).
+  const int key_save_delay = rdb_key_save_delay();
+  const std::string* prev_key = nullptr;
   for (const auto& cmd : cmds) {
+    if (key_save_delay != 0) {
+      const std::size_t key_at = cmd[0] == "XGROUP" ? 2 : 1;
+      const std::string* key =
+          cmd[0] == "SELECT" || cmd.size() <= key_at ? nullptr : &cmd[key_at];
+      if (prev_key != nullptr && (key == nullptr || *prev_key != *key)) debug_delay(key_save_delay);
+      prev_key = key;
+    }
     write_all(encode_command_resp(cmd));
     if (write_failed) {
       ::close(tmp_fd); ::unlink(tmp_path.c_str());
       err = "AOF rewrite write error"; return false;
     }
   }
+  if (prev_key != nullptr) debug_delay(key_save_delay);  // after the last key
   if (::fsync(tmp_fd) != 0) {
     ::close(tmp_fd); ::unlink(tmp_path.c_str());
     err = "AOF rewrite fsync error"; return false;
@@ -3529,6 +3572,16 @@ LiveConfig live_string(std::string& var) {
           }};
 }
 
+// shutdown-on-sigterm and shutdown-on-sigint: a set of kShutdown* flags, printed in the order of
+// Redis's shutdown_on_sig_enum, or "default" for none.
+LiveConfig live_shutdown_flags(int& var) {
+  return {[&var] { return shutdown_flags_to_str(var); },
+          [&var](const std::string& v, std::string&) {
+            var = parse_shutdown_flags(v);
+            return true;
+          }};
+}
+
 LiveConfig live_cluster_port(int& var) {
   return {[&var] { return std::to_string(var); },
           [&var](const std::string& v, std::string&) {
@@ -3632,6 +3685,14 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             return true;
           }}},
         {"stop-writes-on-bgsave-error", live_bool(g_stop_writes_on_bgsave_error)},
+        {"rdb-key-save-delay",
+         {[] { return std::to_string(rdb_key_save_delay()); },
+          [](const std::string& v, std::string&) {
+            rdb_set_key_save_delay(std::stoi(v));
+            return true;
+          }}},
+        {"shutdown-on-sigterm", live_shutdown_flags(g_shutdown_on_sigterm)},
+        {"shutdown-on-sigint", live_shutdown_flags(g_shutdown_on_sigint)},
         {"requirepass", live_string(g_requirepass)},
         {"masterauth",
          {[] { return masterauth_copy(); },
@@ -4110,10 +4171,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_simple("OK");
         }});
 
-    // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]: Redis's shutdownCommand() (db.c) and
-    // finishShutdown() (server.c). PeaDB never waits for replicas before it exits (no
-    // shutdown-timeout, compat/delta.md item 33), so a shutdown is never in progress: NOW changes
-    // nothing and ABORT always finds nothing to abort.
+    // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]: Redis's shutdownCommand() (db.c). The work
+    // is prepare_for_shutdown(), shared with SIGTERM and SIGINT. PeaDB never waits for replicas
+    // before it exits (no shutdown-timeout, compat/delta.md item 33): NOW changes nothing, and
+    // ABORT can only cancel a signal that the event loop has not handled yet.
     t.emplace("SHUTDOWN", CommandSpec{"SHUTDOWN", -1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool& close) {
           bool nosave = false, save = false, now = false, force = false, abort = false;
@@ -4128,42 +4189,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if ((abort && (nosave || save || now || force)) || (nosave && save))
             return encode_error("syntax error");
-          if (abort) return encode_error("No shutdown in progress.");
+          if (abort) {
+            if (abort_shutdown()) return encode_simple("OK");
+            return encode_error("No shutdown in progress.");
+          }
           // A script that timed out: only SHUTDOWN NOSAVE may stop the server.
           if (!nosave && g_script_busy.load()) return busy_script_error_reply();
-          log(LogLevel::Info, "User requested shutdown...");
-          auto fail = [] {
-            log(LogLevel::Warn, "Errors trying to shut down the server. Check the logs for more information.");
+          const int flags = (save ? kShutdownSave : 0) | (nosave ? kShutdownNosave : 0) |
+                            (now ? kShutdownNow : 0) | (force ? kShutdownForce : 0);
+          if (!prepare_for_shutdown(flags))
             return encode_error("Errors trying to SHUTDOWN. Check logs.");
-          };
-          // CONFIG SET appendonly yes is still writing the first AOF: exiting now would leave no
-          // AOF with the data.
-          if (g_aof_state == AofState::WaitRewrite) {
-            if (!force) {
-              log(LogLevel::Warn, "Writing initial AOF, can't exit.");
-              return fail();
-            }
-            log(LogLevel::Warn, "Writing initial AOF. Exit anyway.");
-          }
-          // Flush the AOF so the everysec window is not lost on a clean shutdown.
-          if (g_appendonly && g_aof_fd >= 0) {
-            log(LogLevel::Info, "Calling fsync() on the AOF file.");
-            if (::fsync(g_aof_fd) != 0)
-              log(LogLevel::Warn, std::string("Fail to fsync the AOF file: ") + std::strerror(errno) + ".");
-          }
-          if ((!g_save_params.empty() && !nosave) || save) {
-            log(LogLevel::Info, "Saving the final RDB snapshot before exiting.");
-            std::string err;
-            if (!rdb_save(g_snapshot_path, err)) {
-              log(LogLevel::Warn, "Failed saving the DB: " + err);
-              if (!force) {
-                log(LogLevel::Warn, "Error trying to save the DB, can't exit.");
-                return fail();
-              }
-              log(LogLevel::Warn, "Error trying to save the DB. Exit anyway.");
-            }
-          }
-          log(LogLevel::Warn, "PeaDB is now ready to exit, bye bye...");
           request_shutdown();
           close = true;
           return std::string();  // like Redis, no reply: the client sees the connection close
@@ -4770,6 +4805,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "redis_mode:" + std::string(g_cluster_enabled ? "cluster" : "standalone") + "\r\n"
                    "os:Linux\r\n"
                    "arch_bits:64\r\n"
+                   "process_id:" + std::to_string(::getpid()) + "\r\n"
                    "tcp_port:" + std::to_string(g_server_port) + "\r\n"
                    "uptime_in_seconds:" + std::to_string(uptime_s) + "\r\n"
                    "uptime_in_days:" + std::to_string(uptime_s / 86400) + "\r\n"
@@ -4915,6 +4951,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("SAVE", CommandSpec{"SAVE", 1, {"admin", "noscript"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
+          // A BGSAVE that ends after this SAVE would rename its older snapshot over it.
+          if (g_bgsave_in_progress.load())
+            return encode_error("Background save already in progress");
           std::string err;
           if (!rdb_save(g_snapshot_path, err)) return encode_error(err);
           g_last_save_time = now_ms() / 1000;
@@ -11641,6 +11680,13 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   int lfu_log_factor = store().lfu_log_factor();
   num("lfu-log-factor", lfu_log_factor);
   store().set_lfu_log_factor(lfu_log_factor);
+  int key_save_delay = rdb_key_save_delay();
+  num("rdb-key-save-delay", key_save_delay);
+  rdb_set_key_save_delay(key_save_delay);
+  if (const auto it = raw.find("shutdown-on-sigterm"); it != raw.end())
+    g_shutdown_on_sigterm = parse_shutdown_flags(it->second);
+  if (const auto it = raw.find("shutdown-on-sigint"); it != raw.end())
+    g_shutdown_on_sigint = parse_shutdown_flags(it->second);
 }
 
 std::int64_t proto_max_bulk_len() { return g_proto_max_bulk_len; }
@@ -12025,6 +12071,165 @@ void request_shutdown() {
 
 bool shutdown_requested() {
   return g_shutdown_requested.load(std::memory_order_acquire);
+}
+
+int parse_shutdown_flags(const std::string& value) {
+  int flags = 0;
+  std::istringstream words(value);
+  for (std::string w; words >> w;) {
+    w = lower(w);
+    if (w == "save")
+      flags |= kShutdownSave;
+    else if (w == "nosave")
+      flags |= kShutdownNosave;
+    else if (w == "now")
+      flags |= kShutdownNow;
+    else if (w == "force")
+      flags |= kShutdownForce;
+  }
+  return flags;
+}
+
+std::string shutdown_flags_to_str(int flags) {
+  // In the order of Redis's shutdown_on_sig_enum.
+  static constexpr std::pair<int, const char*> kNames[] = {{kShutdownSave, "save"},
+                                                           {kShutdownNosave, "nosave"},
+                                                           {kShutdownNow, "now"},
+                                                           {kShutdownForce, "force"}};
+  std::string out;
+  for (const auto& [flag, name] : kNames) {
+    if ((flags & flag) == 0) continue;
+    if (!out.empty()) out += ' ';
+    out += name;
+  }
+  return out.empty() ? "default" : out;
+}
+
+namespace {
+// cancelShutdown(): a shutdown that failed forgets the signal that asked for it.
+void cancel_shutdown() {
+  g_shutdown_asap.store(0);
+  g_last_sig_received.store(0);
+}
+}  // namespace
+
+bool prepare_for_shutdown(int flags) {
+  // A dataset that is still loading must not be saved over the file it comes from.
+  if (g_loading.load()) flags = (flags & ~kShutdownSave) | kShutdownNosave;
+  const bool save = (flags & kShutdownSave) != 0;
+  const bool nosave = (flags & kShutdownNosave) != 0;
+  const bool force = (flags & kShutdownForce) != 0;
+  log(LogLevel::Info, "User requested shutdown...");
+  auto fail = [] {
+    log(LogLevel::Warn,
+        "Errors trying to shut down the server. Check the logs for more information.");
+    cancel_shutdown();
+    return false;
+  };
+  if (g_bgsave_in_progress.load()) {
+    log(LogLevel::Warn, "There is a child saving an .rdb. Killing it!");
+    kill_rdb_child();
+  }
+  // CONFIG SET appendonly yes is still writing the first AOF: exiting now would leave no AOF with
+  // the data. Redis checks this only while the rewrite child runs; PeaDB also refuses between two
+  // tries of a rewrite that failed, when the AOF does not hold the data either.
+  if (g_aof_state == AofState::WaitRewrite) {
+    if (!force) {
+      log(LogLevel::Warn, "Writing initial AOF, can't exit.");
+      return fail();
+    }
+    log(LogLevel::Warn, "Writing initial AOF. Exit anyway.");
+  }
+  if (g_bgrewrite_in_progress.load()) {
+    log(LogLevel::Warn, "There is a child rewriting the AOF. Killing it!");
+    kill_aof_rewrite_child();
+  }
+  // Flush the AOF so the everysec window is not lost on a clean shutdown.
+  if (g_aof_state != AofState::Off && g_aof_fd >= 0) {
+    log(LogLevel::Info, "Calling fsync() on the AOF file.");
+    if (::fsync(g_aof_fd) != 0)
+      log(LogLevel::Warn, std::string("Fail to fsync the AOF file: ") + std::strerror(errno) + ".");
+  }
+  if ((!g_save_params.empty() && !nosave) || save) {
+    log(LogLevel::Info, "Saving the final RDB snapshot before exiting.");
+    std::string err;
+    if (!rdb_save(g_snapshot_path, err)) {
+      log(LogLevel::Warn, err);
+      if (!force) {
+        log(LogLevel::Warn, "Error trying to save the DB, can't exit.");
+        return fail();
+      }
+      log(LogLevel::Warn, "Error trying to save the DB. Exit anyway.");
+    }
+  }
+  log(LogLevel::Warn, "PeaDB is now ready to exit, bye bye...");
+  return true;
+}
+
+bool abort_shutdown() {
+  if (g_shutdown_asap.exchange(0) == 0) return false;
+  g_last_sig_received.store(0);
+  log(LogLevel::Info, "Shutdown manually aborted.");
+  return true;
+}
+
+void shutdown_signal_handler(int sig) {
+  // Only async-signal-safe work here: the shutdown itself runs in shutdown_signal_cron(). The
+  // interrupted code may be about to read errno, so it is put back.
+  const int saved_errno = errno;
+  const char* msg = sig == SIGINT    ? "Received SIGINT scheduling shutdown..."
+                    : sig == SIGTERM ? "Received SIGTERM scheduling shutdown..."
+                                     : "Received shutdown signal, scheduling shutdown...";
+  // A second SIGINT (often a second Ctrl+C) means: exit now, without saving and without waiting.
+  if (g_shutdown_asap.load() != 0 && sig == SIGINT) {
+    log_from_signal_handler(LogLevel::Warn, "You insist... exiting now.");
+    // rdbRemoveTempFile(getpid()): the final save may be writing temp-<pid>.rdb.
+    char name[40] = "temp-";
+    std::size_t n = 5;
+    char digits[16];
+    std::size_t nd = 0;
+    for (auto pid = static_cast<unsigned long>(::getpid()); nd == 0 || pid != 0; pid /= 10) {
+      digits[nd++] = static_cast<char>('0' + pid % 10);
+    }
+    while (nd > 0) name[n++] = digits[--nd];
+    for (const char* ext = ".rdb"; *ext != '\0'; ++ext) name[n++] = *ext;
+    name[n] = '\0';
+    ::unlink(name);
+    ::_exit(1);  // not a clean shutdown; _exit, because exit() is not async-signal-safe
+  }
+  if (g_loading.load()) msg = "Received shutdown signal during loading, scheduling shutdown.";
+  log_from_signal_handler(LogLevel::Warn, msg);
+  g_shutdown_asap.store(1);
+  g_last_sig_received.store(sig);
+  errno = saved_errno;
+}
+
+bool shutdown_signal_pending() {
+  return g_shutdown_asap.load() != 0;
+}
+
+void set_loading(bool loading) {
+  g_loading.store(loading);
+}
+
+void shutdown_signal_cron() {
+  // Redis runs this in serverCron(), so DEBUG PAUSE-CRON holds it, and so does a script that runs
+  // too long (serverCron() does not run until the script ends).
+  if (g_shutdown_asap.load() == 0 || g_pause_cron || g_script_busy.load()) return;
+  int flags = 0;
+  const int sig = g_last_sig_received.load();
+  if (sig == SIGINT && g_shutdown_on_sigint != 0)
+    flags = g_shutdown_on_sigint;
+  else if (sig == SIGTERM && g_shutdown_on_sigterm != 0)
+    flags = g_shutdown_on_sigterm;
+  // The SHUTDOWN command runs inside safe_handle_command(); this path needs its own guard, so an
+  // exception (for example out of memory) is a failed shutdown and not a crash.
+  try {
+    if (prepare_for_shutdown(flags)) request_shutdown();
+  } catch (const std::exception& e) {
+    log(LogLevel::Warn, std::string("Errors trying to shut down the server: ") + e.what());
+    cancel_shutdown();
+  }
 }
 
 int configured_max_clients() {
@@ -12659,6 +12864,8 @@ void reap_background_children() {
     int status = 0;
     pid_t pid = g_bgsave_child_pid.load();
     if (pid > 0 && ::waitpid(pid, &status, WNOHANG) == pid) {
+      // A child stopped by a signal could not delete its temp file (backgroundSaveDoneHandler()).
+      if (WIFSIGNALED(status)) rdb_remove_temp_file(pid);
       g_last_bgsave_status = (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? "ok" : "err";
       g_last_save_time = now_ms() / 1000;
       g_bgsave_child_pid.store(0);
