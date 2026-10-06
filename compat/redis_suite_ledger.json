@@ -120,11 +120,11 @@
     "unit/multi": {
       "last_counts": {
         "err": 0,
-        "ignored": 4,
-        "ok": 60
+        "ignored": 2,
+        "ok": 62
       },
       "mode": "native",
-      "skipfile_lines": 3
+      "skipfile_lines": 1
     },
     "unit/oom-score-adj": {
       "exclusion_reason": "Linux-specific oom-score-adj not implemented; revisit with the ops/config sweep.",
@@ -205,11 +205,11 @@
     "unit/scripting": {
       "last_counts": {
         "err": 0,
-        "ignored": 35,
-        "ok": 301
+        "ignored": 31,
+        "ok": 305
       },
       "mode": "native",
-      "skipfile_lines": 12
+      "skipfile_lines": 10
     },
     "unit/shutdown": {
       "last_counts": {
