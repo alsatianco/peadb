@@ -151,4 +151,8 @@ if(BUILD_TESTING)
   add_executable(logger_fork_test tests/unit/logger_fork_test.cpp)
   target_link_libraries(logger_fork_test PRIVATE peadb_core)
   add_test(NAME logger_fork_test COMMAND logger_fork_test)
+
+  add_executable(dict_test tests/unit/dict_test.cpp)
+  target_link_libraries(dict_test PRIVATE peadb_core)
+  add_test(NAME dict_test COMMAND dict_test)
 endif()

@@ -774,6 +774,7 @@ int run_server(const ServerConfig& config) {
     aof_cron(loop_now_ms);
     background_save_cron();
     run_eviction_cycle();  // background eviction when over maxmemory (e.g. lowered via CONFIG SET)
+    databases_cron();      // shrink sparse keyspace tables, as Redis's databasesCron() does
     reap_background_children();
     drain_replica_cmd_queue();
 

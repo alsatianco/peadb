@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cerrno>
+#include <cstdlib>
 #include <sstream>
 #include <regex>
 #include <fstream>
@@ -18,9 +19,42 @@
 namespace peadb {
 
 namespace {
-// Reverse-binary-increment SCAN cursor step (defined below; forward-declared for the
-// collection scans that share it with the main-keyspace SCAN).
-std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets);
+// The loop of Redis's scanGenericCommand() over one Dict: Dict::scan() calls from `cursor` until
+// `count` elements have been looked at, count * 10 more buckets have been visited (so a sparse table
+// cannot make one call walk it all), or the scan is over. `visit` gets every element of every
+// visited bucket, before any MATCH filter. Returns the next cursor (0 at the end).
+template <class D, class Fn>
+std::uint64_t scan_dict(const D& d, std::uint64_t cursor, std::int64_t count, Fn&& visit) {
+  constexpr std::int64_t kMax = std::numeric_limits<std::int64_t>::max();
+  // Redis's `long maxiterations = count*10`, without its signed overflow for a huge COUNT.
+  std::int64_t maxiterations = count > kMax / 10 ? kMax : count * 10;
+  std::int64_t sampled = 0;
+  do {
+    cursor = d.scan(cursor, [&](const auto& element) {
+      ++sampled;
+      visit(element);
+    });
+  } while (cursor != 0 && maxiterations-- != 0 && sampled < count);
+  return cursor;
+}
+
+// TYPE's name for a value type.
+const char* type_name(ValueType t) {
+  switch (t) {
+    case ValueType::String: return "string";
+    case ValueType::Hash: return "hash";
+    case ValueType::List: return "list";
+    case ValueType::Set: return "set";
+    case ValueType::ZSet: return "zset";
+    case ValueType::Stream: return "stream";
+  }
+  return "none";
+}
+
+// MATCH for the scans (stringmatchlen() in Redis; PeaDB uses fnmatch(), compat/delta.md item 76).
+bool scan_match(const std::optional<std::string>& pattern, const std::string& s) {
+  return !pattern || fnmatch(pattern->c_str(), s.c_str(), 0) == 0;
+}
 
 // ── Stream IDs are (ms, seq) pairs compared NUMERICALLY (never as strings — "10-0"
 //    sorts before "9-0" lexically). These helpers are the single source of truth. ──
@@ -186,27 +220,25 @@ void DataStore::unfreeze_time() {
   time_frozen_ = false;
 }
 
-DataStore::DB::iterator DataStore::remove_expired(DB& db, DB::iterator it) {
-  const auto next = std::next(it);
+void DataStore::remove_expired(DB& db, DB::iterator it) {
   const std::size_t dbi = db_index_of(db);
   if (replica_expiry_) {
     replica_hidden_[dbi].insert(db.extract(it));
     has_replica_hidden_ = true;
-    return next;
+    return;
   }
   if (expire_paused_) {
     hidden_expired_[dbi].insert(db.extract(it));
-    return next;
+    return;
   }
   record_expired();
   if (!lazy_expire_hook_) {
     db.erase(it);
-    return next;
+    return;
   }
   const std::string key = it->first;
   db.erase(it);
   lazy_expire_hook_(static_cast<int>(dbi), key);
-  return next;
 }
 
 void DataStore::expire_met_keys(DB& db, const std::vector<std::string>& keys) {
@@ -362,13 +394,7 @@ std::string DataStore::type_of(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return "none";
-  if (it->second.type() == ValueType::String) return "string";
-  if (it->second.type() == ValueType::Hash) return "hash";
-  if (it->second.type() == ValueType::List) return "list";
-  if (it->second.type() == ValueType::Set) return "set";
-  if (it->second.type() == ValueType::ZSet) return "zset";
-  if (it->second.type() == ValueType::Stream) return "stream";
-  return "none";
+  return type_name(it->second.type());
 }
 
 bool DataStore::is_wrongtype_for_string(const std::string& key) {
@@ -488,21 +514,25 @@ std::optional<std::string> DataStore::randomkey() {
   static thread_local std::mt19937 rng{std::random_device{}()};
   const auto now = now_ms();
   const std::size_t num_buckets = db.bucket_count();
-  // Pick a random starting bucket and walk forward — O(1/load_factor) amortised. The expired keys
-  // met before the first live one are deleted after the walk, as dbRandomKey() deletes each
-  // expired key it picks (a replica keeps them, and only remembers the first one).
+  // Pick a random starting bucket and walk forward to the first bucket with a live key —
+  // O(1/load_factor) amortised — then, like Redis's dictGetRandomKey(), a random live key of that
+  // bucket's chain (not always its head, which would never return the other keys of the chain). The
+  // expired keys met are deleted after the walk, as dbRandomKey() deletes each expired key it picks
+  // (a replica keeps them, and only remembers the first one).
   const std::size_t start = rng() % num_buckets;
   std::vector<std::string> expired;
   std::optional<std::string> found;
+  std::vector<const std::string*> live;
   for (std::size_t i = 0; i < num_buckets && !found; ++i) {
     const std::size_t bucket = (start + i) % num_buckets;
     for (auto it = db.begin(bucket); it != db.end(bucket); ++it) {
       if (!logically_expired(it->second, now)) {
-        found = it->first;
-        break;
+        live.push_back(&it->first);
+      } else if (!replica_expiry_ || expired.empty()) {
+        expired.push_back(it->first);
       }
-      if (!replica_expiry_ || expired.empty()) expired.push_back(it->first);
     }
+    if (!live.empty()) found = *live[rng() % live.size()];
   }
   // Every key of a replica's database has expired: Redis's dbRandomKey() then returns one of them.
   if (!found && replica_expiry_ && !expired.empty()) return expired.front();
@@ -881,8 +911,13 @@ std::int64_t DataStore::hdel(const std::string& key, const std::vector<std::stri
     return 0;
   }
   std::int64_t removed = 0;
-  for (const auto& f : fields) removed += it->second.hash().erase(f) ? 1 : 0;
-  if (it->second.hash().empty()) db.erase(it);
+  auto& h = it->second.hash();
+  for (const auto& f : fields) {
+    if (h.erase(f) == 0) continue;
+    ++removed;
+    h.shrink_if_sparse();  // like Redis's hashTypeDelete(): a table under 10% full shrinks at once
+  }
+  if (h.empty()) db.erase(it);
   return removed;
 }
 
@@ -929,7 +964,8 @@ std::vector<std::pair<std::string, std::string>> DataStore::hgetall(const std::s
 }
 
 std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataStore::hscan(
-    const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype) {
+    const std::string& key, std::uint64_t cursor, std::int64_t count,
+    const std::optional<std::string>& pattern, bool& wrongtype) {
   wrongtype = false;
   std::vector<std::pair<std::string, std::string>> out;
   auto& db = dbs_[current_db_];
@@ -940,31 +976,16 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataS
     wrongtype = true;
     return {0, out};
   }
-
-  // Bucket-based cursor like the main SCAN (not rehash-safe on prime-sized tables:
-  // elements can be missed when the hash grows during a scan, compat/delta.md item 32).
   const auto& h = it->second.hash();
-  const std::uint64_t nb = h.bucket_count();
-  if (nb == 0 || h.empty()) return {0, out};
-  const bool is_pow2 = (nb & (nb - 1)) == 0;
-  std::uint64_t bucket = cursor % nb;
-  if (!is_pow2) {
-    while (bucket < nb) {
-      for (auto bit = h.begin(bucket); bit != h.end(bucket); ++bit) out.push_back(*bit);
-      ++bucket;
-      if (out.size() >= count) break;
-    }
-    return {(bucket >= nb) ? 0 : bucket, out};
+  if (scans_whole(it->second)) {
+    for (const auto& [f, v] : h)
+      if (scan_match(pattern, f)) out.emplace_back(f, v);
+    return {0, out};
   }
-  std::uint64_t visited = 0;
-  while (visited < nb) {
-    for (auto bit = h.begin(bucket); bit != h.end(bucket); ++bit) out.push_back(*bit);
-    ++visited;
-    bucket = scan_next_cursor(bucket, nb);
-    if (bucket == cursor % nb) { bucket = 0; break; }
-    if (out.size() >= count) break;
-  }
-  return {(visited >= nb) ? 0 : bucket, out};
+  const std::uint64_t next = scan_dict(h, cursor, count, [&](const auto& fv) {
+    if (scan_match(pattern, fv.first)) out.emplace_back(fv.first, fv.second);
+  });
+  return {next, out};
 }
 
 std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype) {
@@ -1232,8 +1253,13 @@ std::int64_t DataStore::srem(const std::string& key, const std::vector<std::stri
     return 0;
   }
   std::int64_t removed = 0;
-  for (const auto& m : members) removed += it->second.set().erase(m) ? 1 : 0;
-  if (it->second.set().empty()) db.erase(it);
+  auto& set = it->second.set();
+  for (const auto& m : members) {
+    if (set.erase(m) == 0) continue;
+    ++removed;
+    set.shrink_if_sparse();  // like Redis's setTypeRemoveAux()
+  }
+  if (set.empty()) db.erase(it);
   return removed;
 }
 
@@ -1293,12 +1319,14 @@ std::optional<std::string> DataStore::spop(const std::string& key, bool& wrongty
   const auto pick = it->second.set().begin();
   const std::string value = *pick;
   it->second.set().erase(pick);
+  it->second.set().shrink_if_sparse();
   if (it->second.set().empty()) db.erase(it);
   return value;
 }
 
 std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
-    const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype) {
+    const std::string& key, std::uint64_t cursor, std::int64_t count,
+    const std::optional<std::string>& pattern, bool& wrongtype) {
   wrongtype = false;
   std::vector<std::string> out;
   auto& db = dbs_[current_db_];
@@ -1309,33 +1337,22 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
     wrongtype = true;
     return {0, out};
   }
-
-  // Bucket-based cursor like the main-keyspace SCAN, so elements present throughout the
-  // scan are returned when the set does not grow between calls (Redis issue #4906). Not
-  // rehash-safe on prime-sized tables: growth can hide elements (compat/delta.md item 32).
   const auto& set = it->second.set();
-  const std::uint64_t nb = set.bucket_count();
-  if (nb == 0 || set.empty()) return {0, out};
-  const bool is_pow2 = (nb & (nb - 1)) == 0;
-  std::uint64_t bucket = cursor % nb;
-  if (!is_pow2) {
-    // libc++/libstdc++ use prime bucket counts: advance monotonically and stop at nb.
-    while (bucket < nb) {
-      for (auto bit = set.begin(bucket); bit != set.end(bucket); ++bit) out.push_back(*bit);
-      ++bucket;
-      if (out.size() >= count) break;
+  if (scans_whole(it->second)) {
+    for (const auto& m : set)
+      if (scan_match(pattern, m)) out.push_back(m);
+    // An intset keeps its members in ascending order, so Redis returns them that way.
+    if (std::string_view(encoding_of(it->second)) == "intset") {
+      std::sort(out.begin(), out.end(), [](const std::string& a, const std::string& b) {
+        return std::strtoll(a.c_str(), nullptr, 10) < std::strtoll(b.c_str(), nullptr, 10);
+      });
     }
-    return {(bucket >= nb) ? 0 : bucket, out};
+    return {0, out};
   }
-  std::uint64_t visited = 0;
-  while (visited < nb) {
-    for (auto bit = set.begin(bucket); bit != set.end(bucket); ++bit) out.push_back(*bit);
-    ++visited;
-    bucket = scan_next_cursor(bucket, nb);
-    if (bucket == cursor % nb) { bucket = 0; break; }
-    if (out.size() >= count) break;
-  }
-  return {(visited >= nb) ? 0 : bucket, out};
+  const std::uint64_t next = scan_dict(set, cursor, count, [&](const std::string& m) {
+    if (scan_match(pattern, m)) out.push_back(m);
+  });
+  return {next, out};
 }
 
 DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, const std::string& member,
@@ -1403,6 +1420,7 @@ std::int64_t DataStore::zrem(const std::string& key, const std::vector<std::stri
     if (mit == entry.zset().end()) continue;
     entry.zord().erase({mit->second, m});
     entry.zset().erase(mit);
+    entry.zset().shrink_if_sparse();  // like Redis's zsetDel() and zremrangeGenericCommand()
     ++removed;
   }
   if (entry.zset().empty()) {
@@ -1444,7 +1462,8 @@ std::vector<std::pair<std::string, double>> DataStore::zrange(
 }
 
 std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore::zscan(
-    const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype) {
+    const std::string& key, std::uint64_t cursor, std::int64_t count,
+    const std::optional<std::string>& pattern, bool& wrongtype) {
   wrongtype = false;
   std::vector<std::pair<std::string, double>> out;
   auto& db = dbs_[current_db_];
@@ -1455,31 +1474,17 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
     wrongtype = true;
     return {0, out};
   }
-
-  // Bucket-based cursor like the main SCAN (not rehash-safe on prime-sized tables:
-  // members can be missed when the zset grows during a scan, compat/delta.md item 32).
   const auto& z = it->second.zset();
-  const std::uint64_t nb = z.bucket_count();
-  if (nb == 0 || z.empty()) return {0, out};
-  const bool is_pow2 = (nb & (nb - 1)) == 0;
-  std::uint64_t bucket = cursor % nb;
-  if (!is_pow2) {
-    while (bucket < nb) {
-      for (auto bit = z.begin(bucket); bit != z.end(bucket); ++bit) out.push_back(*bit);
-      ++bucket;
-      if (out.size() >= count) break;
-    }
-    return {(bucket >= nb) ? 0 : bucket, out};
+  if (scans_whole(it->second)) {
+    // A listpack keeps the members in score order, so Redis returns them that way.
+    for (const auto& [score_member, _] : it->second.zord())
+      if (scan_match(pattern, score_member.second)) out.emplace_back(score_member.second, score_member.first);
+    return {0, out};
   }
-  std::uint64_t visited = 0;
-  while (visited < nb) {
-    for (auto bit = z.begin(bucket); bit != z.end(bucket); ++bit) out.push_back(*bit);
-    ++visited;
-    bucket = scan_next_cursor(bucket, nb);
-    if (bucket == cursor % nb) { bucket = 0; break; }
-    if (out.size() >= count) break;
-  }
-  return {(visited >= nb) ? 0 : bucket, out};
+  const std::uint64_t next = scan_dict(z, cursor, count, [&](const auto& ms) {
+    if (scan_match(pattern, ms.first)) out.emplace_back(ms.first, ms.second);
+  });
+  return {next, out};
 }
 
 std::vector<std::pair<std::string, double>> DataStore::zpop(
@@ -1505,6 +1510,7 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(
     const double score = oit->first.first;
     out.push_back({member, score});
     entry.zset().erase(member);
+    entry.zset().shrink_if_sparse();
     ordered.erase(oit);
   }
   if (entry.zset().empty()) db.erase(it);
@@ -2989,7 +2995,10 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  auto& e = it->second;  // non-const: computing a big encoding sets the sticky flag
+  return std::string(encoding_of(it->second));
+}
+
+const char* DataStore::encoding_of(Entry& e) {  // non-const: seeing a big encoding sets the sticky flag
   const auto& lim = encoding_limits_;
   // Redis string2ll-style integer check for the "int" / intset encodings: digits with
   // optional '-', no leading zeros (except "0" itself), must fit in int64.
@@ -3016,7 +3025,7 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
   };
   auto sticky = [&e](bool small, const char* small_enc, const char* big_enc) {
     if (!small) e.encoding_big = true;
-    return std::optional<std::string>(e.encoding_big ? big_enc : small_enc);
+    return e.encoding_big ? big_enc : small_enc;
   };
   if (e.type() == ValueType::String) {
     if (e.string_force_raw) return "raw";
@@ -3051,10 +3060,12 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
     return small ? "listpack" : "quicklist";
   }
   if (e.type() == ValueType::Set) {
-    bool all_int = true;
-    for (const auto& v : e.set()) if (!is_int(v)) { all_int = false; break; }
-    if (!e.encoding_big && !e.encoding_no_intset && all_int &&
-        within(e.set().size(), lim.set_intset)) return "intset";
+    // The member walk only for a set small enough to be an intset (SSCAN asks on every call).
+    if (!e.encoding_big && !e.encoding_no_intset && within(e.set().size(), lim.set_intset)) {
+      bool all_int = true;
+      for (const auto& v : e.set()) if (!is_int(v)) { all_int = false; break; }
+      if (all_int) return "intset";
+    }
     bool small = within(e.set().size(), lim.set_entries);
     if (small) for (const auto& v : e.set()) if (v.size() > static_cast<std::size_t>(lim.set_value)) { small = false; break; }
     return sticky(small, "listpack", "hashtable");
@@ -3305,101 +3316,39 @@ std::size_t DataStore::dbsize() {
          replica_hidden_[current_db_].size();
 }
 
-namespace {
-// Advance a cursor for SCAN iteration over `num_buckets` buckets.
-// Uses reverse-binary-increment when num_buckets is a power of 2 (gives better
-// resize resilience), otherwise falls back to linear increment.
-// RBI with non-power-of-2 sizes produces out-of-range bucket indices (UB).
-std::uint64_t scan_next_cursor(std::uint64_t cursor, std::uint64_t num_buckets) {
-  if (num_buckets == 0) return 0;
-  const bool is_pow2 = (num_buckets & (num_buckets - 1)) == 0;
-  if (!is_pow2) return (cursor + 1) % num_buckets;
-  const std::uint64_t mask = num_buckets - 1;
-  auto rev64 = [](std::uint64_t v) -> std::uint64_t {
-    v = ((v >> 1) & 0x5555555555555555ULL) | ((v & 0x5555555555555555ULL) << 1);
-    v = ((v >> 2) & 0x3333333333333333ULL) | ((v & 0x3333333333333333ULL) << 2);
-    v = ((v >> 4) & 0x0F0F0F0F0F0F0F0FULL) | ((v & 0x0F0F0F0F0F0F0F0FULL) << 4);
-    v = ((v >> 8) & 0x00FF00FF00FF00FFULL) | ((v & 0x00FF00FF00FF00FFULL) << 8);
-    v = ((v >> 16) & 0x0000FFFF0000FFFFULL) | ((v & 0x0000FFFF0000FFFFULL) << 16);
-    v = (v >> 32) | (v << 32);
-    return v;
-  };
-  cursor |= ~mask;
-  cursor = rev64(cursor);
-  cursor++;
-  return rev64(cursor) & mask;
-}
-} // namespace
-
 std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
-    std::uint64_t cursor, std::size_t count, const std::string& match, const std::string& type) {
+    std::uint64_t cursor, std::int64_t count, const std::optional<std::string>& pattern,
+    const std::optional<std::string>& type) {
   auto& db = dbs_[current_db_];
+  std::vector<std::string> keys;
+  const std::uint64_t next = scan_dict(db, cursor, count, [&](const auto& kv) {
+    if (scan_match(pattern, kv.first)) keys.push_back(kv.first);
+  });
+  // Step 3 of scanGenericCommand(), after the walk (an erase never resizes the table, so the cursor
+  // stays good): with TYPE, lookupKeyReadWithFlags(LOOKUP_NOTOUCH|LOOKUP_NONOTIFY) of each key, which
+  // expires it and counts a hit or a miss; without TYPE, expireIfNeeded().
   std::vector<std::string> out;
-  const auto now = now_ms();
-  const std::uint64_t num_buckets = db.bucket_count();
-
-  if (num_buckets == 0 || db.empty()) return {0, out};
-
-  const bool is_pow2 = (num_buckets & (num_buckets - 1)) == 0;
-
-  // Redis's scanGenericCommand(): of the keys a call visits that match the pattern, the expired
-  // ones are deleted (whatever TYPE asks for), after the walk so no bucket iterator is invalidated.
-  std::vector<std::string> expired;
-  auto emit_bucket = [&](std::uint64_t b) {
-    for (auto it = db.begin(b); it != db.end(b); ++it) {
-      if (match != "*" && fnmatch(match.c_str(), it->first.c_str(), 0) != 0) continue;
-      if (logically_expired(it->second, now)) {
-        expired.push_back(it->first);
+  out.reserve(keys.size());
+  for (auto& key : keys) {
+    if (type) {
+      expire_if_needed(db, key);
+      const auto it = db.find(key);
+      if (it == db.end()) {
+        record_miss();
         continue;
       }
-      if (!type.empty()) {
-        std::string entry_type;
-        switch (it->second.type()) {
-          case ValueType::String: entry_type = "string"; break;
-          case ValueType::Hash: entry_type = "hash"; break;
-          case ValueType::List: entry_type = "list"; break;
-          case ValueType::Set: entry_type = "set"; break;
-          case ValueType::ZSet: entry_type = "zset"; break;
-          case ValueType::Stream: entry_type = "stream"; break;
-        }
-        if (entry_type != type) continue;
-      }
-      out.push_back(it->first);
+      record_hit();
+      if (*type != type_name(it->second.type())) continue;
+    } else if (expire_if_needed(db, key)) {
+      continue;
     }
-  };
-
-  if (!is_pow2) {
-    // For non-power-of-2 bucket counts (libstdc++ prime-sized tables): advance
-    // monotonically from cursor without wrapping. This guarantees termination
-    // because the cursor increases from 0 to num_buckets-1 and we return 0 when
-    // we fall off the end. Wrapping would allow the cursor to revisit buckets it
-    // has already seen, producing cycles that never return 0. It does not survive
-    // a rehash: keys that move to an already-visited bucket are missed (delta item 32).
-    std::uint64_t b = cursor % num_buckets;
-    while (b < num_buckets) {
-      emit_bucket(b);
-      ++b;
-      if (out.size() >= count) break;
-    }
-    expire_met_keys(db, expired);  // erase never rehashes, so the cursor stays valid
-    return {(b >= num_buckets) ? 0 : b, out};
+    out.push_back(std::move(key));
   }
-
-  // Power-of-2 path: reverse-binary-increment for resize resilience.
-  std::uint64_t bucket = cursor % num_buckets;
-  std::size_t buckets_visited = 0;
-
-  while (buckets_visited < num_buckets) {
-    emit_bucket(bucket);
-    ++buckets_visited;
-    bucket = scan_next_cursor(bucket, num_buckets);
-    if (bucket == cursor % num_buckets) { bucket = 0; break; } // full cycle
-    if (out.size() >= count) break;
-  }
-
-  const std::uint64_t next = (buckets_visited >= num_buckets) ? 0 : bucket;
-  expire_met_keys(db, expired);
   return {next, out};
+}
+
+void DataStore::shrink_sparse_tables() {
+  for (auto& db : dbs_) db.shrink_if_sparse();
 }
 
 DataStore& store() {

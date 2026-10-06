@@ -7,8 +7,8 @@ RESET clears client state
 # only the default user is implemented. Phase 5, delta item 7.
 RESET clears authenticated state
 # "Don't rehash if redis has child process" asserts on DEBUG HTSTATS "table size:" output and
-# Redis's incremental-dict rehash suppression during a save child. PeaDB uses std::unordered_map,
-# which has no equivalent knob or table-size introspection.
+# Redis's rehash suppression during a save child. PeaDB's Dict has neither DEBUG HTSTATS nor the
+# resize policy for a fork child (compat/delta.md items 13 and 21).
 Don't rehash if redis has child process
 # proc-title-template / setproctitle is not implemented; the assertions only run on Linux (the
 # test is a no-op elsewhere). Tracked as an ops-parity gap.

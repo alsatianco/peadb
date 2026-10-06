@@ -196,6 +196,7 @@ void configure_lazy_expire();
 void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
 void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)
 void run_eviction_cycle();       // event-loop background eviction when over maxmemory (master only)
+void databases_cron();           // event-loop shrink of sparse keyspace tables (no fork child)
 void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
 std::size_t replication_event_count();
