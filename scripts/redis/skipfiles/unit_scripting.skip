@@ -13,7 +13,7 @@ SHUTDOWN NOSAVE can kill a timedout script anyway
 Replication of script multiple pushes to list with BLPOP
 # SELECT inside a script is not reflected in captured effects replication.
 Lua scripts using SELECT are replicated correctly
-# The LDB (Lua debugger) session protocol is not implemented (SCRIPT DEBUG is accepted as a no-op).
+# The LDB (Lua debugger) session protocol is not implemented (SCRIPT DEBUG YES and SYNC are refused; compat/delta.md item 14).
 Test scripting debug protocol parsing
 Test scripting debug lua stack overflow
 # Replica-mode script gating (MASTERDOWN for EVAL under replica-serve-stale-data no,

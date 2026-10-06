@@ -4258,7 +4258,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("SCRIPT", CommandSpec{"SCRIPT", -2, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
           const std::string sub = upper(args[1]);
           if (sub == "LOAD" && args.size() == 3) {
             const auto sha = sha1_hex(args[2]);
@@ -4281,11 +4281,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_script_cache.clear();
             return encode_simple("OK");
           }
-          if (sub == "DEBUG" && args.size() == 3) {
-            // The LDB (Lua debugger) session protocol is not implemented — accepted
-            // modes just reply OK so scripts run normally (tracked in compat/delta.md).
+          if (sub == "DEBUG") {
+            if (args.size() != 3) return encode_error("wrong number of arguments for 'script|debug' command");
+            // Redis refuses SCRIPT DEBUG while the client has replies not yet sent: inside EXEC,
+            // or after another command of the same pipeline (clientHasPendingReplies, eval.c).
+            if (session.has_pending_replies || g_executing_exec)
+              return encode_error("SCRIPT DEBUG must be called outside a pipeline");
             const auto mode = lower(args[2]);
-            if (mode == "yes" || mode == "sync" || mode == "no") return encode_simple("OK");
+            if (mode == "no") return encode_simple("OK");  // debugging is off: true, nothing to do
+            // PeaDB has no Lua debugger (LDB): YES (a forked session whose writes are thrown away)
+            // and SYNC (a blocking session driven step by step) are refused rather than letting
+            // the next script run unattended with kept effects (compat/delta.md item 14).
+            if (mode == "yes" || mode == "sync")
+              return encode_error("SCRIPT DEBUG YES and SYNC are not supported by PeaDB yet (it has no Lua debugger)");
             return encode_error("Use SCRIPT DEBUG YES/SYNC/NO");
           }
           if (sub == "KILL" && args.size() == 2) {
@@ -5141,21 +5149,25 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               "'. Try CLUSTER HELP.");
         }});
 
+    // ASKING, READONLY and READWRITE are cluster commands: without cluster mode Redis refuses
+    // them (askingCommand/readonlyCommand/readwriteCommand in cluster.c). With cluster mode on,
+    // READONLY and READWRITE change nothing in PeaDB, which has no replica nodes in a cluster.
     t.emplace("ASKING", CommandSpec{"ASKING", 1, {"fast"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
+          if (!g_cluster_enabled) return encode_error("This instance has cluster support disabled");
           session.asking = true;
           return encode_simple("OK");
         }});
 
-    // In standalone mode Redis accepts READONLY/READWRITE and replies OK; the flag
-    // only changes behavior under cluster redirection, which PeaDB doesn't alter here.
     t.emplace("READONLY", CommandSpec{"READONLY", 1, {"readonly", "fast"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
+          if (!g_cluster_enabled) return encode_error("This instance has cluster support disabled");
           return encode_simple("OK");
         }});
 
     t.emplace("READWRITE", CommandSpec{"READWRITE", 1, {"readonly", "fast"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) {
+          if (!g_cluster_enabled) return encode_error("This instance has cluster support disabled");
           return encode_simple("OK");
         }});
 
@@ -6390,11 +6402,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
           std::vector<std::string> restore_args = {"RESTORE", key, std::to_string(pttl), payload};
           if (replace) restore_args.push_back("REPLACE");
-          std::vector<std::string> asking_args = {"ASKING"};
-          const auto asking_wire = encode_command_resp(asking_args);
-          if (!write_all(fd, asking_wire.data(), asking_wire.size()) || !read_resp_reply(fd, payload_reply, is_err) || is_err) {
-            close(fd);
-            return std::string("-IOERR error or timeout writing to target instance\r\n");
+          // Redis sends RESTORE-ASKING only when it runs in cluster mode (migrateCommand); a
+          // target without cluster mode refuses ASKING. PeaDB has no RESTORE-ASKING yet (item 68),
+          // so in cluster mode it sends ASKING before RESTORE.
+          if (g_cluster_enabled) {
+            std::vector<std::string> asking_args = {"ASKING"};
+            const auto asking_wire = encode_command_resp(asking_args);
+            if (!write_all(fd, asking_wire.data(), asking_wire.size()) || !read_resp_reply(fd, payload_reply, is_err) || is_err) {
+              close(fd);
+              return std::string("-IOERR error or timeout writing to target instance\r\n");
+            }
           }
           const auto restore_wire = encode_command_resp(restore_args);
           if (!write_all(fd, restore_wire.data(), restore_wire.size()) || !read_resp_reply(fd, payload_reply, is_err)) {

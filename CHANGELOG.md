@@ -22,6 +22,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ### Fixed
 
+- `ASKING`, `READONLY` and `READWRITE` no longer reply `OK` when cluster mode is off; like Redis 7.2.5 they answer `-ERR This instance has cluster support disabled`. `MIGRATE` therefore sends `ASKING` only when PeaDB runs in cluster mode (Redis sends `RESTORE-ASKING` only then), so `MIGRATE` to a server without cluster mode keeps working (`compat/delta.md` item 26).
+- `SCRIPT DEBUG YES` and `SCRIPT DEBUG SYNC` no longer reply `OK` and then run the next script with kept effects: PeaDB has no Lua debugger, so they are refused. `SCRIPT DEBUG` checks its arguments with Redis's errors, including `SCRIPT DEBUG must be called outside a pipeline`, and `SCRIPT DEBUG NO` still replies `OK`. In native mode the upstream test runner now applies `scripts/redis/suite-native.patch`, which wraps the one upstream `SCRIPT DEBUG SYNC` call that is outside any test, so `unit/scripting` still runs to the end (item 26; the debugger is item 14).
 - A write made while `BGREWRITEAOF` ran could be replayed from the rewritten AOF into the wrong database: the rewritten file ends in the last database that holds keys, and the first write kept for it had no `SELECT` when it went to the same database as the write before the rewrite started.
 
 ## [0.3.0] - 2026-08-19

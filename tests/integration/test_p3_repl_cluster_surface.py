@@ -121,7 +121,8 @@ def main() -> int:
 
         with socket.create_connection(("127.0.0.1", 6522), timeout=2) as s:
             # ── ASKING ───────────────────────────────────────────
-            assert cmd(s, "ASKING") == "OK"
+            # Without cluster mode Redis refuses ASKING (cluster.c askingCommand).
+            assert cmd(s, "ASKING") == ("ERR", "ERR This instance has cluster support disabled")
 
         print("P3 replication/cluster surface tests passed")
         return 0

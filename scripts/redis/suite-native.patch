@@ -1,0 +1,18 @@
+PeaDB's edits to upstream Redis 7.2.5 test bodies for native-mode runs (applied by scripts/redis/run_redis_tests.sh after harness-native.patch).
+
+Keep this file as small as possible. A test PeaDB cannot pass goes in a skipfile (scripts/redis/skipfiles/), which the ratchet counts. Only code outside any `test` block, which a skipfile cannot skip and which would abort the whole suite, belongs here, and each hunk adds a `# PeaDB:` comment that names its compat/delta.md item.
+
+unit/scripting: a server block outside any test calls SCRIPT DEBUG SYNC and then EVAL twice, to check that the server does not crash. PeaDB has no Lua debugger and refuses SCRIPT DEBUG SYNC (item 14), so the call is wrapped in `catch`; both EVAL calls still run.
+
+--- a/tests/unit/scripting.tcl
++++ b/tests/unit/scripting.tcl
+@@ -1410,7 +1410,8 @@
+ 
+ if {$is_eval eq 1} {
+ start_server {tags {"scripting external:skip"}} {
+-    r script debug sync
++    # PeaDB: no Lua debugger, so SCRIPT DEBUG SYNC is refused (compat/delta.md item 14).
++    catch {r script debug sync}
+     r eval {return 'hello'} 0
+     r eval {return 'hello'} 0
+ }

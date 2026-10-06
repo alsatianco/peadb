@@ -5,13 +5,13 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, registered: 0
+Total: **234** commands — full: 10, upstream: 212, diff: 1, tested: 11, registered: 0
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
 | `ACL` | tested | test_p3_repl_cluster_surface.py, test_p5_acl_surface.py |
 | `APPEND` | upstream | test_m2_strings_expire.py |
-| `ASKING` | upstream | test_p3_repl_cluster_surface.py |
+| `ASKING` | tested | test_p3_repl_cluster_surface.py |
 | `AUTH` | upstream | test_command_coverage_extras.py, test_p5_acl_surface.py |
 | `BGREWRITEAOF` | upstream | test_m5_aof.py, test_m5_persistence_commands.py |
 | `BGSAVE` | upstream | test_m5_persistence_commands.py |
@@ -33,7 +33,7 @@ Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, regist
 | `COMMAND` | upstream | test_b5_commands.py, test_m1_commands.py |
 | `CONFIG` | upstream | test_b11_conn_hygiene.py, test_b13_obuf_limit.py, test_b4_observability.py, test_b7_eviction.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p1_multi_state_abort.py, test_p1_object_encoding_policies.py, test_p2_noreplicas_scripting.py, test_p2_shebang_oom.py, test_p4_encoding_shim.py, test_p4_limits_errors.py, test_p4_new_events_hello_object.py, test_p5_cluster_config.py |
 | `COPY` | upstream | test_p1_copy_spop_time.py, test_p1_xinfo_stream_full.py |
-| `DBSIZE` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py, test_p1_expire_lazy_scan.py |
+| `DBSIZE` | full | test_b14_lazyfree.py, test_p1_dbsize_flushdb.py, test_p1_expire_lazy_scan.py, test_p5_cluster_ownership.py |
 | `DEBUG` | upstream | test_p1_expire_error_and_lazy_get.py, test_p1_expire_lazy_scan.py, test_p1_expiretime_debug_digest.py, test_p1_msetnx_debug_loadaof.py, test_p1_setnx_debug.py, test_p2_scripting_debug_protocol.py, test_p2_scripting_time_freeze.py, test_p4_debug_verbs.py |
 | `DECR` | upstream | test_m2_strings_expire.py |
 | `DECRBY` | upstream | test_m2_strings_expire.py |
@@ -92,7 +92,7 @@ Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, regist
 | `INCRBY` | upstream | test_m2_strings_expire.py |
 | `INCRBYFLOAT` | upstream | test_m2_strings_expire.py |
 | `INFO` | upstream | test_b4_observability.py, test_b7_eviction.py, test_b8_repl_safety.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py, test_p5_cluster_config.py, test_p5_info_sections.py, test_p5_version_provenance.py |
-| `KEYS` | full | test_p1_keys_pattern.py |
+| `KEYS` | full | test_p1_keys_pattern.py, test_p5_cluster_ownership.py |
 | `LATENCY` | upstream | test_p3_ecosystem_commands.py |
 | `LCS` | upstream | test_p1_lcs.py |
 | `LINDEX` | upstream | test_p3_ecosystem_commands.py |
@@ -119,7 +119,7 @@ Total: **234** commands — full: 10, upstream: 213, diff: 1, tested: 10, regist
 | `MULTI` | upstream | test_b6_streams.py, test_m4_tx.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p1_multi_replication.py, test_p1_multi_state_abort.py, test_p1_publish.py, test_p1_xreadgroup_propagation.py, test_p4_subscribe_mode_gate.py |
 | `OBJECT` | upstream | test_m3_object_encoding.py, test_m4_hash.py, test_m4_list.py, test_m4_set.py, test_m4_zset.py, test_p1_object_encoding_policies.py, test_p1_object_swapdb_sync.py, test_p4_encoding_shim.py, test_p4_new_events_hello_object.py |
 | `PERSIST` | upstream | test_m2_strings_expire.py |
-| `PEXPIRE` | upstream | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py, test_p4_debug_verbs.py |
+| `PEXPIRE` | upstream | test_command_coverage_extras.py, test_m7_migrate.py, test_p1_expiretime_debug_digest.py, test_p4_debug_verbs.py, test_p5_cluster_ownership.py |
 | `PEXPIREAT` | upstream | test_command_coverage_extras.py |
 | `PEXPIRETIME` | upstream | test_p1_expiretime_debug_digest.py |
 | `PFADD` | tested | test_b5_commands.py |

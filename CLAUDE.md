@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current work
 
-The active plan and the verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read its Part 0 first). A verified review on 2026-10-03 found silent data-loss defects; they are registered as `compat/delta.md` items 24–71 (item 24 is fixed in part; the others are not fixed yet), and the statements below marked "not yet fixed" come from that review and name their item.
+The active plan and the verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read its Part 0 first). A verified review on 2026-10-03 found silent data-loss defects; they are registered as `compat/delta.md` items 24–71 (items 24, 25 and 26 are fixed in part; the others are not fixed yet), and the statements below marked "not yet fixed" come from that review and name their item.
 
 ## Build
 

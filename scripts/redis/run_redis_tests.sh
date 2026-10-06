@@ -234,6 +234,18 @@ apply_native_patch() {
   (cd "$REDIS_DIR" && patch -p1 --forward --silent < "$ROOT_DIR/scripts/redis/harness-native.patch")
 }
 
+# Native mode also needs PeaDB's few edits to upstream test bodies (code outside any test that a
+# skipfile cannot skip; see the header of suite-native.patch). Applied once: a patch that
+# reverses cleanly is already in place.
+apply_suite_patch() {
+  local patch_file="$ROOT_DIR/scripts/redis/suite-native.patch"
+  if (cd "$REDIS_DIR" && patch -p1 -R --dry-run --silent -f < "$patch_file" >/dev/null 2>&1); then
+    return 0
+  fi
+  echo "=== Applying suite-native.patch to $REDIS_DIR ==="
+  (cd "$REDIS_DIR" && patch -p1 --forward --silent < "$patch_file")
+}
+
 cleanup() {
   if [[ -n "$PEADB_PID" ]]; then
     kill "$PEADB_PID" >/dev/null 2>&1 || true
@@ -254,6 +266,7 @@ if [[ "$SUITE_MODE" == "native" ]]; then
     exit 1
   fi
   apply_native_patch
+  apply_suite_patch
   export REDIS_SERVER_BIN="$PEADB_BIN"
 
   FAILED=()

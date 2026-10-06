@@ -102,9 +102,10 @@ def main():
             r = cmd(s, "LPOP", "str", "1")
             assert r[0] == "ERR" and r[1].startswith("WRONGTYPE"), r
 
-            # READONLY / READWRITE are registered and return OK (standalone).
-            assert cmd(s, "READONLY") == "OK"
-            assert cmd(s, "READWRITE") == "OK"
+            # READONLY / READWRITE are registered; without cluster mode Redis refuses them.
+            disabled = ("ERR", "ERR This instance has cluster support disabled")
+            assert cmd(s, "READONLY") == disabled
+            assert cmd(s, "READWRITE") == disabled
             r = cmd(s, "READONLY", "extra")
             assert r[0] == "ERR" and "wrong number of arguments" in r[1], r
         print("P4 LPOP/RPOP COUNT + READONLY/READWRITE tests passed")
