@@ -4,9 +4,10 @@
 //   - Strings (RDB_TYPE_STRING = 0)
 //   - Lists (RDB_TYPE_LIST_QUICKLIST_2 = 18, RDB_TYPE_LIST = 1)
 //   - Sets (RDB_TYPE_SET = 2, RDB_TYPE_SET_INTSET = 11)
-//   - Hashes (RDB_TYPE_HASH = 4, RDB_TYPE_HASH_ZIPMAP = 9, RDB_TYPE_HASH_LISTPACK = 16)
+//   - Hashes (RDB_TYPE_HASH = 4, RDB_TYPE_HASH_LISTPACK = 16)
 //   - Sorted sets (RDB_TYPE_ZSET_2 = 5, RDB_TYPE_ZSET_LISTPACK = 17)
-//   - Streams (RDB_TYPE_STREAM_LISTPACKS_3 = 21, basic)
+//   - Streams (PeaDB's own type 200; Redis's stream types are not read, compat/delta.md item 5)
+// The zipmap and ziplist encodings of Redis before 7.0 (types 9, 10, 12, 13, 14) are refused.
 //
 // References: Redis src/rdb.h, src/rdb.c
 
@@ -113,12 +114,11 @@ constexpr uint8_t RDB_TYPE_LIST_ZIPLIST    = 10;
 constexpr uint8_t RDB_TYPE_SET_INTSET      = 11;
 constexpr uint8_t RDB_TYPE_ZSET_ZIPLIST    = 12;
 constexpr uint8_t RDB_TYPE_HASH_ZIPLIST    = 13;
-constexpr uint8_t RDB_TYPE_LIST_QUICKLIST  = 15;
+constexpr uint8_t RDB_TYPE_LIST_QUICKLIST = 14;  // nodes are ziplists (Redis 3.2 to 6.2)
 constexpr uint8_t RDB_TYPE_HASH_LISTPACK   = 16;
 constexpr uint8_t RDB_TYPE_ZSET_LISTPACK   = 17;
 constexpr uint8_t RDB_TYPE_LIST_QUICKLIST_2= 18;
 constexpr uint8_t RDB_TYPE_SET_LISTPACK    = 20;
-constexpr uint8_t RDB_TYPE_STREAM_LISTPACKS   = 15; // overloaded opcode used for streams
 // PeaDB-specific stream encoding (NOT Redis byte-compatible — Redis can't load an RDB
 // containing this type; cross-engine stream migration still uses the AOF/bridge path).
 // Chosen outside Redis's type range so non-stream RDBs stay fully Redis-compatible.
@@ -492,8 +492,40 @@ class RdbReader {
 // Each entry is: <encoding> <data> <backlen>
 // For simplicity we encode all values as strings.
 
+// Redis's LP_HDR_NUMELE_UNKNOWN: the entry count a listpack stores once it holds 65535 or more
+// entries; the real count is then found by walking the entries.
+constexpr uint16_t kListpackCountUnknown = 65535;
+constexpr std::size_t kListpackHeaderAndEnd = 4 + 2 + 1;  // total bytes, entry count, 0xFF
+
+// Bytes Redis's lpEncodeBacklen() uses for an entry whose encoding header + data is `l` bytes.
+// The limits are Redis's (16383, not 16384, and so on): a different byte count would put the
+// next entry at another offset than Redis reads it from.
+std::size_t listpack_backlen_bytes(std::size_t l) {
+  if (l <= 127) return 1;
+  if (l < 16383) return 2;
+  if (l < 2097151) return 3;
+  if (l < 268435455) return 4;
+  return 5;
+}
+
+// Encoding header bytes of a string entry of `n` bytes (lpEncodeString()).
+std::size_t listpack_string_header_bytes(std::size_t n) {
+  return n < 64 ? 1 : n < 4096 ? 2 : 5;
+}
+
 class ListpackWriter {
  public:
+  // Bytes add_string(s) adds for a string of `n` bytes.
+  static std::size_t string_entry_bytes(std::size_t n) {
+    const std::size_t l = listpack_string_header_bytes(n) + n;
+    return l + listpack_backlen_bytes(l);
+  }
+
+  // Size of the listpack finish() returns (Redis's lpBytes()).
+  std::size_t bytes() const {
+    return kListpackHeaderAndEnd + entries_.size();
+  }
+
   void add_string(const std::string& s) {
     // Real Redis listpack string encodings (listpack.c LP_ENCODING_*_STR): the header MUST
     // be self-describing without colliding with the 7-bit-uint / int encodings, so the reader
@@ -525,9 +557,13 @@ class ListpackWriter {
     add_string(std::to_string(v));
   }
 
+  // The caller keeps the listpack under 4 GB (the total-bytes field is 32 bits): the list writer
+  // puts an element of 1 GB or more in a node of its own that is not a listpack, as Redis does.
   std::string finish() const {
     // total_bytes(4) + num_entries(2) + entries + 0xFF
-    uint32_t total = 4 + 2 + static_cast<uint32_t>(entries_.size()) + 1;
+    const auto total = static_cast<uint32_t>(bytes());
+    const uint16_t count =
+        count_ < kListpackCountUnknown ? static_cast<uint16_t>(count_) : kListpackCountUnknown;
     std::string out;
     out.reserve(total);
     // Little-endian u32 total bytes
@@ -536,8 +572,8 @@ class ListpackWriter {
     out.push_back(static_cast<char>((total >> 16) & 0xff));
     out.push_back(static_cast<char>((total >> 24) & 0xff));
     // Little-endian u16 num entries
-    out.push_back(static_cast<char>(count_ & 0xff));
-    out.push_back(static_cast<char>((count_ >> 8) & 0xff));
+    out.push_back(static_cast<char>(count & 0xff));
+    out.push_back(static_cast<char>((count >> 8) & 0xff));
     out += entries_;
     out.push_back(static_cast<char>(0xFF));
     return out;
@@ -546,18 +582,19 @@ class ListpackWriter {
  private:
   // Redis lpEncodeBacklen: encodes the entry length (encoding header + data) so it can be read
   // backwards. The first byte (forward) carries the high bits with NO continuation flag; every
-  // following byte sets 0x80. The byte COUNT is a pure function of the length.
+  // following byte sets 0x80. The byte COUNT is listpack_backlen_bytes(l).
   void encode_backlen(uint32_t l) {
-    if (l <= 127) {
+    const std::size_t nbytes = listpack_backlen_bytes(l);
+    if (nbytes == 1) {
       entries_.push_back(static_cast<char>(l));
-    } else if (l < 16384) {
+    } else if (nbytes == 2) {
       entries_.push_back(static_cast<char>(l >> 7));
       entries_.push_back(static_cast<char>((l & 127) | 128));
-    } else if (l < 2097152) {
+    } else if (nbytes == 3) {
       entries_.push_back(static_cast<char>(l >> 14));
       entries_.push_back(static_cast<char>(((l >> 7) & 127) | 128));
       entries_.push_back(static_cast<char>((l & 127) | 128));
-    } else if (l < 268435456) {
+    } else if (nbytes == 4) {
       entries_.push_back(static_cast<char>(l >> 21));
       entries_.push_back(static_cast<char>(((l >> 14) & 127) | 128));
       entries_.push_back(static_cast<char>(((l >> 7) & 127) | 128));
@@ -572,7 +609,7 @@ class ListpackWriter {
   }
 
   std::string entries_;
-  uint16_t count_ = 0;
+  std::size_t count_ = 0;
 };
 
 // Simple listpack reader
@@ -580,20 +617,26 @@ class ListpackReader {
  public:
   ListpackReader(const std::string& data) : data_(data), pos_(0) {}
 
+  // Reads every entry, with the checks of Redis's lpValidateIntegrity() in its deep mode: the
+  // total-bytes field is the blob's size, every entry and its backlen lie inside the blob and the
+  // backlen matches the entry, and the entries end at the 0xFF in the last byte. False means a
+  // corrupt listpack. The entry count is not checked, as in Redis with sanitize-dump-payload no
+  // (the default): the entries up to the 0xFF are what is read. So a list saved by PeaDB before
+  // compat/delta.md item 29 was fixed, whose count was cut to 16 bits, loads with all its items.
   bool parse(std::vector<std::string>& out) {
-    if (data_.size() < 7) return false;  // 4 (total) + 2 (count) + 1 (end)
-    uint32_t total_bytes = read_u32_le_at(0);
-    uint16_t num_entries = read_u16_le_at(4);
-    pos_ = 6;
     out.clear();
-    out.reserve(num_entries);
-    for (uint16_t i = 0; i < num_entries; ++i) {
+    if (data_.size() < kListpackHeaderAndEnd) return false;
+    if (read_u32_le_at(0) != data_.size()) return false;
+    if (static_cast<uint8_t>(data_.back()) != 0xFF) return false;
+    const uint16_t num_entries = read_u16_le_at(4);
+    if (num_entries != kListpackCountUnknown) out.reserve(num_entries);
+    pos_ = 6;
+    while (pos_ < data_.size() - 1) {
       std::string val;
       if (!read_entry(val)) return false;
       out.push_back(std::move(val));
     }
-    (void)total_bytes;
-    return true;
+    return pos_ == data_.size() - 1;
   }
 
  private:
@@ -607,15 +650,6 @@ class ListpackReader {
   uint16_t read_u16_le_at(size_t offset) {
     return static_cast<uint16_t>(static_cast<uint8_t>(data_[offset])) |
            (static_cast<uint16_t>(static_cast<uint8_t>(data_[offset + 1])) << 8);
-  }
-
-  // Number of bytes lpEncodeBacklen uses for an entry of the given length.
-  static size_t backlen_bytes(size_t entry_len) {
-    if (entry_len <= 127) return 1;
-    if (entry_len < 16384) return 2;
-    if (entry_len < 2097152) return 3;
-    if (entry_len < 268435456) return 4;
-    return 5;
   }
 
   bool read_entry(std::string& val) {
@@ -692,8 +726,22 @@ class ListpackReader {
       return false;  // unknown encoding
     }
 
-    pos_ += entry_len + backlen_bytes(entry_len);
-    return pos_ <= data_.size();
+    // Like lpValidateNext(): the entry and its backlen end before the 0xFF terminator, and the
+    // backlen, read backwards from its last byte, is the entry's length.
+    const std::size_t nbacklen = listpack_backlen_bytes(entry_len);
+    if (pos_ + entry_len + nbacklen > data_.size() - 1) return false;
+    pos_ += entry_len + nbacklen;
+    std::uint64_t backlen = 0;
+    for (std::size_t i = 0; i < nbacklen; ++i) {
+      const auto b = static_cast<uint8_t>(data_[pos_ - 1 - i]);
+      backlen |= static_cast<std::uint64_t>(b & 127) << (7 * i);
+      if ((b & 128) == 0) {
+        if (i + 1 != nbacklen) return false;  // the first byte of the backlen came early
+        break;
+      }
+      if (i + 1 == nbacklen) return false;  // no first byte (one without the 128 flag)
+    }
+    return backlen == entry_len;
   }
 
   std::string data_;
@@ -705,6 +753,74 @@ class ListpackReader {
 // ── RDB Save ───────────────────────────────────────────────────────────
 
 namespace {
+// Redis's quicklist node containers (quicklist.h).
+constexpr uint64_t kQuicklistNodePlain = 1;   // one element, stored as it is
+constexpr uint64_t kQuicklistNodePacked = 2;  // a listpack of elements
+
+// Writes a list as Redis 7.2.5 holds it: a quicklist whose nodes follow quicklistPushTail()
+// (quicklist.c) for `fill` = list-max-listpack-size. An element of 1 GB or more (packed_threshold)
+// is a PLAIN node of its own; otherwise it joins the last node while that node's listpack, plus
+// the element and 8 bytes of SIZE_ESTIMATE_OVERHEAD, stays within the limit: 4/8/16/32/64 KB for
+// a fill of -1..-5 (lower values count as -5), or for a fill of 0 or more, 8 KB
+// (SIZE_SAFETY_LIMIT) and `fill` elements (0 counts as 1). A node therefore holds at most 32,761
+// elements (empty strings, 2 bytes each, in 64 KB), so the listpack's 16-bit entry count cannot
+// overflow; one listpack for the whole list cut lists of 65,536 or more elements to N mod 65,536
+// (compat/delta.md item 29).
+void write_quicklist(RdbWriter& w, const std::vector<std::string>& items, std::int64_t fill) {
+  constexpr std::size_t kPackedThreshold = std::size_t{1} << 30;
+  constexpr std::size_t kSizeEstimateOverhead = 8;
+  constexpr std::size_t kSizeSafetyLimit = 8192;
+  static constexpr std::size_t kOptimizationLevel[] = {4096, 8192, 16384, 32768, 65536};
+  auto exceeds_limit = [fill](std::size_t new_sz, std::size_t new_count) {
+    if (fill < 0) {
+      const std::uint64_t offset =
+          std::min<std::uint64_t>(static_cast<std::uint64_t>(-(fill + 1)), 4);
+      return new_sz > kOptimizationLevel[offset];
+    }
+    const auto count_limit = static_cast<std::uint64_t>(fill == 0 ? 1 : fill);
+    return new_sz > kSizeSafetyLimit || new_count > count_limit;
+  };
+
+  // First pass: where each node ends. The node count goes before the nodes in the file.
+  struct Node {
+    std::size_t end;  // one past the node's last element
+    bool plain;
+  };
+  std::vector<Node> nodes;
+  std::size_t node_bytes = 0, node_count = 0;
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    const std::size_t sz = items[i].size();
+    if (sz >= kPackedThreshold) {
+      nodes.push_back({i + 1, true});
+      node_count = 0;
+      continue;
+    }
+    if (node_count == 0 || exceeds_limit(node_bytes + sz + kSizeEstimateOverhead, node_count + 1)) {
+      nodes.push_back({i, false});
+      node_bytes = kListpackHeaderAndEnd;
+      node_count = 0;
+    }
+    node_bytes += ListpackWriter::string_entry_bytes(sz);
+    ++node_count;
+    nodes.back().end = i + 1;
+  }
+
+  w.write_length(nodes.size());
+  std::size_t begin = 0;
+  for (const auto& node : nodes) {
+    if (node.plain) {
+      w.write_length(kQuicklistNodePlain);
+      w.write_string(items[begin]);
+    } else {
+      ListpackWriter lp;
+      for (std::size_t i = begin; i < node.end; ++i) lp.add_string(items[i]);
+      w.write_length(kQuicklistNodePacked);
+      w.write_string(lp.finish());
+    }
+    begin = node.end;
+  }
+}
+
 // `key_save_delay`: wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
 // Only the file saves wait: Redis builds a full sync in a child, but PeaDB builds it on the event
 // loop (compat/delta.md item 46), where a wait would stop every client.
@@ -789,17 +905,9 @@ std::string rdb_build_string(std::string& err, bool key_save_delay) {
         bool wrongtype = false;
         auto items = ds.lrange(key, 0, -1, wrongtype);
         if (wrongtype) continue;
-        // Use QUICKLIST_2 encoding
         w.write_u8(RDB_TYPE_LIST_QUICKLIST_2);
         w.write_string(key);
-        // One node containing all items as a single listpack
-        w.write_length(1); // number of quicklist nodes
-        ListpackWriter lp;
-        for (const auto& item : items) lp.add_string(item);
-        auto lp_data = lp.finish();
-        // Container format: 2 = PACKED (listpack) 
-        w.write_length(2); // container type: PACKED
-        w.write_string(lp_data);
+        write_quicklist(w, items, ds.encoding_limits().list_size);
 
       } else if (type_str == "set") {
         bool wrongtype = false;
@@ -1160,28 +1268,46 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       ds.rpush(key, items, wt);
       if (expire_at) ds.expire(key, *expire_at);
 
-    } else if (type == RDB_TYPE_LIST_QUICKLIST || type == RDB_TYPE_LIST_QUICKLIST_2) {
+    } else if (type == RDB_TYPE_LIST_QUICKLIST_2) {
+      // Redis's rdbLoadObject(): the node count, then per node its container and a string. A
+      // PLAIN node is one element as it is, a PACKED node a listpack of elements; any other
+      // container, an empty string or a listpack that fails the checks is a corrupt file.
+      // Empty listpacks are skipped, and a list with no element is not loaded, as in Redis.
       uint64_t node_count;
       bool enc;
       if (!r.read_length(node_count, enc) || enc) { err = "malformed quicklist"; ds.select_db(prev_db); return false; }
       std::vector<std::string> all_items;
       for (uint64_t n = 0; n < node_count; ++n) {
-        if (type == RDB_TYPE_LIST_QUICKLIST_2) {
-          uint64_t container;
-          bool enc2;
-          if (!r.read_length(container, enc2) || enc2) { err = "malformed quicklist2 container"; ds.select_db(prev_db); return false; }
+        uint64_t container;
+        bool enc2;
+        if (!r.read_length(container, enc2) || enc2) {
+          err = "malformed quicklist2 container";
+          ds.select_db(prev_db);
+          return false;
+        }
+        if (container != kQuicklistNodePlain && container != kQuicklistNodePacked) {
+          err = "Quicklist integrity check failed.";
+          ds.select_db(prev_db);
+          return false;
         }
         std::string node_data;
-        if (!r.read_string(node_data)) { err = "malformed quicklist node"; ds.select_db(prev_db); return false; }
-        // Parse as listpack/ziplist
+        if (!r.read_string(node_data) || node_data.empty()) {
+          err = "malformed quicklist node";
+          ds.select_db(prev_db);
+          return false;
+        }
+        if (container == kQuicklistNodePlain) {
+          all_items.push_back(std::move(node_data));
+          continue;
+        }
         ListpackReader lpr(node_data);
         std::vector<std::string> entries;
-        if (lpr.parse(entries)) {
-          for (auto& e : entries) all_items.push_back(std::move(e));
-        } else {
-          // Might be a ziplist; for simplicity add as raw
-          all_items.push_back(node_data);
+        if (!lpr.parse(entries)) {
+          err = "Listpack integrity check failed.";
+          ds.select_db(prev_db);
+          return false;
         }
+        for (auto& e : entries) all_items.push_back(std::move(e));
       }
       if (!all_items.empty()) {
         bool wt = false;
@@ -1189,14 +1315,17 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
       if (expire_at) ds.expire(key, *expire_at);
 
-    } else if (type == RDB_TYPE_LIST_ZIPLIST) {
-      std::string blob;
-      if (!r.read_string(blob)) { err = "malformed list ziplist"; ds.select_db(prev_db); return false; }
-      ListpackReader lpr(blob);
-      std::vector<std::string> items;
-      lpr.parse(items);
-      if (!items.empty()) { bool wt = false; ds.rpush(key, items, wt); }
-      if (expire_at) ds.expire(key, *expire_at);
+    } else if (type == RDB_TYPE_HASH_ZIPMAP || type == RDB_TYPE_LIST_ZIPLIST ||
+               type == RDB_TYPE_ZSET_ZIPLIST || type == RDB_TYPE_HASH_ZIPLIST ||
+               type == RDB_TYPE_LIST_QUICKLIST) {
+      // Encodings that only Redis before 7.0 writes: a zipmap, a ziplist, or a quicklist whose
+      // nodes are ziplists. PeaDB has no zipmap or ziplist reader yet (compat/delta.md item 53),
+      // so the load stops instead of reading them as listpacks, which gave wrong data.
+      err =
+          "unsupported RDB type " + std::to_string(type) +
+          " (an encoding written by Redis before 7.0: load the file in Redis 7 and save it again)";
+      ds.select_db(prev_db);
+      return false;
 
     } else if (type == RDB_TYPE_SET) {
       uint64_t len;
@@ -1256,7 +1385,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       if (!r.read_string(blob)) { err = "malformed set listpack"; ds.select_db(prev_db); return false; }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
-      lpr.parse(entries);
+      if (!lpr.parse(entries)) {
+        err = "Set listpack integrity check failed.";
+        ds.select_db(prev_db);
+        return false;
+      }
       if (!entries.empty()) { bool wt = false; ds.sadd(key, entries, wt); }
       if (expire_at) ds.expire(key, *expire_at);
 
@@ -1274,23 +1407,21 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       ds.hset(key, fields, wt);
       if (expire_at) ds.expire(key, *expire_at);
 
-    } else if (type == RDB_TYPE_HASH_ZIPLIST || type == RDB_TYPE_HASH_LISTPACK) {
+    } else if (type == RDB_TYPE_HASH_LISTPACK) {
       std::string blob;
       if (!r.read_string(blob)) { err = "malformed hash listpack"; ds.select_db(prev_db); return false; }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
-      lpr.parse(entries);
+      if (!lpr.parse(entries) || entries.size() % 2 != 0) {
+        err = "Hash listpack integrity check failed.";
+        ds.select_db(prev_db);
+        return false;
+      }
       std::vector<std::pair<std::string, std::string>> fields;
       for (size_t i = 0; i + 1 < entries.size(); i += 2) {
         fields.push_back({entries[i], entries[i + 1]});
       }
       if (!fields.empty()) { bool wt = false; ds.hset(key, fields, wt); }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_HASH_ZIPMAP) {
-      // Old zipmap format — skip for simplicity
-      std::string blob;
-      if (!r.read_string(blob)) { err = "malformed hash zipmap"; ds.select_db(prev_db); return false; }
       if (expire_at) ds.expire(key, *expire_at);
 
     } else if (type == RDB_TYPE_ZSET || type == RDB_TYPE_ZSET_2) {
@@ -1310,12 +1441,16 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
       if (expire_at) ds.expire(key, *expire_at);
 
-    } else if (type == RDB_TYPE_ZSET_ZIPLIST || type == RDB_TYPE_ZSET_LISTPACK) {
+    } else if (type == RDB_TYPE_ZSET_LISTPACK) {
       std::string blob;
       if (!r.read_string(blob)) { err = "malformed zset listpack"; ds.select_db(prev_db); return false; }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
-      lpr.parse(entries);
+      if (!lpr.parse(entries) || entries.size() % 2 != 0) {
+        err = "Zset listpack integrity check failed.";
+        ds.select_db(prev_db);
+        return false;
+      }
       for (size_t i = 0; i + 1 < entries.size(); i += 2) {
         double score = 0;
         try { score = std::stod(entries[i + 1]); } catch (...) {}
