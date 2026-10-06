@@ -2986,6 +2986,99 @@ bool parse_strict_int(const std::string& s, std::int64_t& out) {
   }
 }
 
+// Redis's parseScanCursorOrReply(): strtoul() in base 10, so a sign is read ("-1" is the largest
+// cursor) and an empty cursor is 0, but a leading space, anything after the number and a value past
+// 2^64 - 1 are refused.
+bool parse_scan_cursor(const std::string& arg, std::uint64_t& cursor) {
+  const char* s = arg.c_str();
+  if (std::isspace(static_cast<unsigned char>(s[0]))) return false;
+  errno = 0;
+  char* end = nullptr;
+  const unsigned long long v = std::strtoull(s, &end, 10);
+  if (*end != '\0' || errno == ERANGE) return false;
+  cursor = v;
+  return true;
+}
+
+struct ScanOptions {
+  std::int64_t count = 10;
+  std::optional<std::string> pattern;  // MATCH; unset (or "*") matches every element
+  std::optional<std::string> type;     // TYPE (SCAN only), in lower case
+};
+
+// Step 1 of Redis's scanGenericCommand(): COUNT (an integer of at least 1), MATCH and, for SCAN
+// only, TYPE, each with its value, in any order and repeatable (the last one wins). Returns the
+// error reply, or "" when the options are good.
+std::string parse_scan_options(const std::vector<std::string>& args, std::size_t i, bool keyspace,
+                               ScanOptions& opts) {
+  for (; i < args.size(); i += 2) {
+    const bool has_value = args.size() - i >= 2;
+    const std::string opt = lower(args[i]);
+    if (opt == "count" && has_value) {
+      std::int64_t count = 0;
+      if (!parse_strict_int(args[i + 1], count)) {
+        return encode_error("value is not an integer or out of range");
+      }
+      if (count < 1) return encode_error("syntax error");
+      opts.count = count;
+    } else if (opt == "match" && has_value) {
+      if (args[i + 1] == "*") {
+        opts.pattern.reset();
+      } else {
+        opts.pattern = args[i + 1];
+      }
+    } else if (opt == "type" && keyspace && has_value) {
+      opts.type = lower(args[i + 1]);
+    } else {
+      return encode_error("syntax error");
+    }
+  }
+  return "";
+}
+
+// HSCAN, SSCAN and ZSCAN, like Redis's hscanCommand(), sscanCommand() and zscanCommand(): the
+// cursor is read first, then the key (a missing key answers an empty page before any option is read,
+// a key of another type WRONGTYPE), then the options, then the scan (scanGenericCommand()).
+std::string collection_scan_command(const std::vector<std::string>& args, ValueType type) {
+  std::uint64_t cursor = 0;
+  if (!parse_scan_cursor(args[2], cursor)) return encode_error("invalid cursor");
+  const std::string& key = args[1];
+  const std::string have = store().type_of(key);
+  if (have == "none") return encode_array({encode_bulk("0"), encode_array({})});
+  const char* want = type == ValueType::Hash ? "hash" : type == ValueType::Set ? "set" : "zset";
+  if (have != want) return wrongtype_error_reply();
+  ScanOptions opts;
+  if (std::string err = parse_scan_options(args, 3, /*keyspace=*/false, opts); !err.empty()) {
+    return err;
+  }
+  bool wrongtype = false;
+  std::uint64_t next = 0;
+  std::vector<std::string> items;
+  if (type == ValueType::Hash) {
+    auto [n, fields] = store().hscan(key, cursor, opts.count, opts.pattern, wrongtype);
+    next = n;
+    items.reserve(fields.size() * 2);
+    for (const auto& [f, v] : fields) {
+      items.push_back(encode_bulk(f));
+      items.push_back(encode_bulk(v));
+    }
+  } else if (type == ValueType::Set) {
+    auto [n, members] = store().sscan(key, cursor, opts.count, opts.pattern, wrongtype);
+    next = n;
+    items.reserve(members.size());
+    for (const auto& m : members) items.push_back(encode_bulk(m));
+  } else {
+    auto [n, members] = store().zscan(key, cursor, opts.count, opts.pattern, wrongtype);
+    next = n;
+    items.reserve(members.size() * 2);
+    for (const auto& [m, score] : members) {
+      items.push_back(encode_bulk(m));
+      items.push_back(encode_bulk(format_score(score)));
+    }
+  }
+  return encode_array({encode_bulk(std::to_string(next)), encode_array(items)});
+}
+
 // Redis string2ld semantics: no leading/trailing whitespace, no embedded NUL, the whole
 // string must parse; "inf"/"-inf" are accepted but NaN is not. Used where Redis demands
 // a *valid float* (INCRBYFLOAT and friends), unlike the more lenient parse_f64.
@@ -6963,25 +7056,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("SCAN", CommandSpec{"SCAN", -2, {"readonly"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           std::uint64_t cursor = 0;
-          try { cursor = static_cast<std::uint64_t>(std::stoull(args[1])); } catch (...) { return encode_error("invalid cursor"); }
-          std::string match_pattern = "*";
-          std::size_t count = 10;
-          std::string type_filter;
-          for (std::size_t i = 2; i < args.size(); i += 2) {
-            if (i + 1 >= args.size()) return encode_error("syntax error");
-            auto opt = upper(args[i]);
-            if (opt == "COUNT") {
-              try { count = static_cast<std::size_t>(std::stoull(args[i + 1])); }
-              catch (...) { return encode_error("value is not an integer or out of range"); }
-            } else if (opt == "MATCH") {
-              match_pattern = args[i + 1];
-            } else if (opt == "TYPE") {
-              type_filter = lower(args[i + 1]);
-            } else {
-              return encode_error("syntax error");
-            }
+          if (!parse_scan_cursor(args[1], cursor)) return encode_error("invalid cursor");
+          ScanOptions opts;
+          if (std::string err = parse_scan_options(args, 2, /*keyspace=*/true, opts); !err.empty()) {
+            return err;
           }
-          auto [next, keys] = store().scan(cursor, count, match_pattern, type_filter);
+          auto [next, keys] = store().scan(cursor, opts.count, opts.pattern, opts.type);
           std::vector<std::string> inner;
           inner.reserve(keys.size());
           for (const auto& k : keys) inner.push_back(encode_bulk(k));
@@ -7630,40 +7710,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("HSCAN", CommandSpec{"HSCAN", -3, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::uint64_t cursor = 0;
-          try {
-            cursor = static_cast<std::uint64_t>(std::stoull(args[2]));
-          } catch (...) {
-            return encode_error("invalid cursor");
-          }
-          std::size_t count = 10;
-          std::string match_pat;
-          bool novalues = false;
-          for (std::size_t i = 3; i < args.size(); ++i) {
-            const auto o = upper(args[i]);
-            if (o == "COUNT" && i + 1 < args.size()) {
-              try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-            } else if (o == "MATCH" && i + 1 < args.size()) {
-              match_pat = args[++i];
-            } else if (o == "NOVALUES") {
-              novalues = true;  // Redis 7.4/backported: return fields only
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          return with_hash_key(args[1], [&]() {
-            bool wrongtype = false;
-            const auto [next, fields] = store().hscan(args[1], cursor, count, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> inner;
-            inner.reserve(fields.size() * (novalues ? 1 : 2));
-            for (const auto& [f, v] : fields) {
-              if (!match_pat.empty() && !pattern_matches(match_pat, f)) continue;
-              inner.push_back(encode_bulk(f));
-              if (!novalues) inner.push_back(encode_bulk(v));
-            }
-            return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
-          });
+          return collection_scan_command(args, ValueType::Hash);
         }});
 
     t.emplace("LPUSH", CommandSpec{"LPUSH", -3, {"write", "denyoom"}, 1, 1, 1,
@@ -8131,32 +8178,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("SSCAN", CommandSpec{"SSCAN", -3, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::uint64_t cursor = 0;
-          try { cursor = static_cast<std::uint64_t>(std::stoull(args[2])); } catch (...) { return encode_error("invalid cursor"); }
-          std::size_t count = 10;
-          std::string match_pat;
-          for (std::size_t i = 3; i < args.size(); ++i) {
-            const auto o = upper(args[i]);
-            if (o == "COUNT" && i + 1 < args.size()) {
-              try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-            } else if (o == "MATCH" && i + 1 < args.size()) {
-              match_pat = args[++i];
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          return with_set_key(args[1], [&]() {
-            bool wrongtype = false;
-            auto [next, members] = store().sscan(args[1], cursor, count, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> inner;
-            inner.reserve(members.size());
-            for (const auto& m : members) {
-              if (!match_pat.empty() && !pattern_matches(match_pat, m)) continue;
-              inner.push_back(encode_bulk(m));
-            }
-            return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
-          });
+          return collection_scan_command(args, ValueType::Set);
         }});
 
     t.emplace("ZADD", CommandSpec{"ZADD", -4, {"write"}, 1, 1, 1,
@@ -8279,32 +8301,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("ZSCAN", CommandSpec{"ZSCAN", -3, {"readonly"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::uint64_t cursor = 0;
-          try { cursor = static_cast<std::uint64_t>(std::stoull(args[2])); } catch (...) { return encode_error("invalid cursor"); }
-          std::size_t count = 10;
-          std::string match_pat;
-          for (std::size_t i = 3; i < args.size(); ++i) {
-            const auto o = upper(args[i]);
-            if (o == "COUNT" && i + 1 < args.size()) {
-              try { count = static_cast<std::size_t>(std::stoull(args[++i])); } catch (...) { return encode_error("value is not an integer or out of range"); }
-            } else if (o == "MATCH" && i + 1 < args.size()) {
-              match_pat = args[++i];
-            } else {
-              return encode_error("syntax error");
-            }
-          }
-          return with_zset_key(args[1], [&]() {
-            bool wrongtype = false;
-            auto [next, vals] = store().zscan(args[1], cursor, count, wrongtype);
-            if (wrongtype) return wrongtype_error_reply();
-            std::vector<std::string> inner;
-            for (const auto& [m, s] : vals) {
-              if (!match_pat.empty() && !pattern_matches(match_pat, m)) continue;
-              inner.push_back(encode_bulk(m));
-              inner.push_back(encode_bulk(format_score(s)));
-            }
-            return encode_array({encode_bulk(std::to_string(next)), encode_array(inner)});
-          });
+          return collection_scan_command(args, ValueType::ZSet);
         }});
 
     t.emplace("ZPOPMIN", CommandSpec{"ZPOPMIN", -2, {"write"}, 1, 1, 1,
@@ -12307,6 +12304,15 @@ void run_active_expire_cycle() {
   const auto cycle_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - t0).count();
   latency_add("expire-cycle", cycle_ms);
+}
+
+// The resize part of Redis's databasesCron(), run from the event loop: shrink each database's
+// keyspace table that is less than 10% full, but not while a fork child runs (a rehash would make
+// the kernel copy the child's memory pages). O(1) per database when nothing is to do.
+void databases_cron() {
+  if (g_pause_cron) return;  // DEBUG PAUSE-CRON
+  if (has_active_child_process()) return;
+  store().shrink_sparse_tables();
 }
 
 // Eviction cron: triggered from the event loop. Mirrors Redis's startEvictionTimeProc —

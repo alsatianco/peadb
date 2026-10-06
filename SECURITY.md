@@ -2,7 +2,7 @@
 
 ## Status
 
-PeaDB is pre-1.0 and has not been through an independent security audit. Do not store data you cannot afford to lose, and do not expose an instance to an untrusted network, until you have reviewed the known gaps below against your own threat model. Open defects that can lose or change data are listed in [`compat/delta.md`](compat/delta.md) items 24–75.
+PeaDB is pre-1.0 and has not been through an independent security audit. Do not store data you cannot afford to lose, and do not expose an instance to an untrusted network, until you have reviewed the known gaps below against your own threat model. Open defects that can lose or change data are listed in [`compat/delta.md`](compat/delta.md) items 24–77.
 
 ## Supported versions
 

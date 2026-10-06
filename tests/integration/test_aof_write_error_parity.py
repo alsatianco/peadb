@@ -270,6 +270,13 @@ def aof_file(workdir):
     return incr[-1]
 
 
+def wait_in_aof(workdir, *args):
+    """Waits until the AOF file holds the command `args`: with appendfsync everysec Redis may hold a write back for up
+    to 2 s while a background fsync runs (flushAppendOnlyFile()), so a kill -9 right after the reply can lose it."""
+    needle = b''.join(b'$%d\r\n%s\r\n' % (len(str(a)), str(a).encode()) for a in args)
+    wait_for(lambda: needle in open(aof_file(workdir), 'rb').read(), f'{args} in the AOF')
+
+
 def build_shim(work):
     src = os.path.join(work, 'failaof.c')
     lib = os.path.join(work, 'failaof.so')
@@ -378,6 +385,7 @@ def check_write_error(name, binary, work, shim):
         wait_for(lambda: info(c, 'aof_rewrite_in_progress') == '0'
                  and info(c, 'aof_last_bgrewrite_status') == 'ok', 'the AOF rewrite')
         assert c('SET', 'f', '6') == '+OK'
+        wait_in_aof(workdir, 'SET', 'f', '6')
         c.close()
     finally:
         kill9(proc)
@@ -419,6 +427,7 @@ def check_short_write(name, binary, work, shim):
         clear_fault(flag)
         wait_for(lambda: info(c, 'aof_last_write_status') == 'ok', 'aof_last_write_status:ok')
         assert c('SET', 'b', '2') == '+OK'
+        wait_in_aof(workdir, 'SET', 'b', '2')
         c.close()
     finally:
         kill9(proc)

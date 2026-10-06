@@ -8,6 +8,7 @@
 #include <map>
 #include <tuple>
 #include <string>
+#include <string_view>
 #include <atomic>
 #include <filesystem>
 #include <unordered_map>
@@ -18,6 +19,8 @@
 #include <thread>
 #include <mutex>
 #include <condition_variable>
+
+#include "dict.hpp"
 
 namespace peadb {
 
@@ -69,11 +72,13 @@ struct Entry {
     std::unordered_map<std::string, std::int64_t> pending_delivery_count; // id -> delivery count
   };
 
-  using HashT = std::unordered_map<std::string, std::string>;
+  // The tables whose elements HSCAN, SSCAN and ZSCAN walk are Dicts (power-of-two buckets), so a
+  // scan keeps Redis's guarantee when the collection grows or shrinks (compat/delta.md item 32).
+  using HashT = DictMap<std::string, std::string, DictStringHash>;
   using ListT = std::deque<std::string>;
-  using SetT  = std::unordered_set<std::string>;
+  using SetT  = DictSet<std::string, DictStringHash>;
   struct ZSetT {
-    std::unordered_map<std::string, double> by_member;            // member → score (O(1) lookup)
+    DictMap<std::string, double, DictStringHash> by_member;       // member → score (O(1) lookup)
     std::map<std::pair<double, std::string>, bool> ordered;       // {score,member} sorted index
   };
   struct StreamT {
@@ -115,7 +120,7 @@ struct Entry {
   SetT&  set()    { if (payload.index() != 3) payload = std::make_unique<SetT>();    return *std::get<std::unique_ptr<SetT>>(payload); }
   ZSetT& zset_payload() { if (payload.index() != 4) payload = std::make_unique<ZSetT>(); return *std::get<std::unique_ptr<ZSetT>>(payload); }
   StreamT& stream() { if (payload.index() != 5) payload = std::make_unique<StreamT>(); return *std::get<std::unique_ptr<StreamT>>(payload); }
-  std::unordered_map<std::string, double>& zset() { return zset_payload().by_member; }
+  DictMap<std::string, double, DictStringHash>& zset() { return zset_payload().by_member; }
   std::map<std::pair<double, std::string>, bool>& zord() { return zset_payload().ordered; }
   auto& stream_entries()  { return stream().entries; }
   std::uint64_t& stream_last_ms()  { return stream().last_ms; }
@@ -130,7 +135,7 @@ struct Entry {
   const SetT&  set()  const { return *std::get<std::unique_ptr<SetT>>(payload); }
   const ZSetT& zset_payload() const { return *std::get<std::unique_ptr<ZSetT>>(payload); }
   const StreamT& stream() const { return *std::get<std::unique_ptr<StreamT>>(payload); }
-  const std::unordered_map<std::string, double>& zset() const { return zset_payload().by_member; }
+  const DictMap<std::string, double, DictStringHash>& zset() const { return zset_payload().by_member; }
   const std::map<std::pair<double, std::string>, bool>& zord() const { return zset_payload().ordered; }
   const auto& stream_entries()  const { return stream().entries; }
   std::uint64_t stream_last_ms()  const { return stream().last_ms; }
@@ -233,8 +238,14 @@ class DataStore {
   std::int64_t hlen(const std::string& key, bool& wrongtype);
   bool hexists(const std::string& key, const std::string& field, bool& wrongtype);
   std::vector<std::pair<std::string, std::string>> hgetall(const std::string& key, bool& wrongtype);
+  // HSCAN, SSCAN and ZSCAN (see scan()): a missing key gives cursor 0 and nothing. A hash, set or
+  // sorted set that PeaDB reports with a small encoding (listpack or intset, see object_encoding())
+  // is returned whole with cursor 0, whatever the cursor and `count`, as Redis returns those (an
+  // intset in ascending order and a sorted set in score order, as Redis keeps them; a small hash or
+  // set in table order, where Redis keeps insertion order, compat/delta.md item 13).
   std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> hscan(
-      const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype);
+      const std::string& key, std::uint64_t cursor, std::int64_t count,
+      const std::optional<std::string>& pattern, bool& wrongtype);
   std::int64_t lpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype);
   std::int64_t rpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype);
   std::optional<std::string> lpop(const std::string& key, bool& wrongtype);
@@ -261,7 +272,8 @@ class DataStore {
   std::int64_t scard(const std::string& key, bool& wrongtype);
   std::optional<std::string> spop(const std::string& key, bool& wrongtype);
   std::pair<std::uint64_t, std::vector<std::string>> sscan(
-      const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype);
+      const std::string& key, std::uint64_t cursor, std::int64_t count,
+      const std::optional<std::string>& pattern, bool& wrongtype);
   std::int64_t copy_key(const std::string& src, const std::string& dst, int db, bool replace);
   struct ZAddResult {
     bool wrongtype = false;
@@ -279,7 +291,8 @@ class DataStore {
   std::vector<std::pair<std::string, double>> zrange(const std::string& key, std::int64_t start, std::int64_t stop,
                                                      bool withscores, bool& wrongtype);
   std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> zscan(
-      const std::string& key, std::uint64_t cursor, std::size_t count, bool& wrongtype);
+      const std::string& key, std::uint64_t cursor, std::int64_t count,
+      const std::optional<std::string>& pattern, bool& wrongtype);
   std::vector<std::pair<std::string, double>> zpop(const std::string& key, std::size_t count, bool max, bool& wrongtype);
   std::optional<std::string> xadd(const std::string& key, const std::string& id,
                                   const std::vector<std::pair<std::string, std::string>>& fields,
@@ -411,7 +424,19 @@ class DataStore {
   // (so its DEL and `expired` event go out at once, as Redis's activeExpireCycle() sends them),
   // and returns the (db_index, key) pairs it deleted. Only a master runs it.
   std::vector<std::pair<int, std::string>> active_expire_cycle(std::size_t budget_per_db = 64);
-  std::pair<std::uint64_t, std::vector<std::string>> scan(std::uint64_t cursor, std::size_t count, const std::string& match = "*", const std::string& type = "");
+  // One SCAN call, like Redis's scanGenericCommand(): Dict::scan() steps from `cursor` until `count`
+  // keys have been looked at (before the MATCH filter), count * 10 more buckets have been visited, or
+  // the scan is over (next cursor 0). Of the keys that match `pattern` (none: every key), an expired
+  // one is deleted (expireIfNeeded()); with `type` (lower case) each one is looked up like a read,
+  // which counts a keyspace hit or miss, and kept only when it has that type. Every key present for
+  // the whole scan is returned at least once, however the database grows or shrinks between calls.
+  std::pair<std::uint64_t, std::vector<std::string>> scan(std::uint64_t cursor, std::int64_t count,
+                                                          const std::optional<std::string>& pattern,
+                                                          const std::optional<std::string>& type);
+  // Redis's tryResizeHashTables() for every database: shrinks a keyspace table that is less than 10%
+  // full. The caller runs it between commands, and not while a fork child runs (a rehash would make
+  // the kernel copy the child's memory pages).
+  void shrink_sparse_tables();
   std::uint64_t mutation_epoch() const;
   void increment_mutation_epoch();
   // Returns {total_keys, keys_with_expiry, avg_ttl_ms} for current db
@@ -542,7 +567,8 @@ class DataStore {
   ~DataStore();
 
  private:
-  using DB = std::unordered_map<std::string, Entry>;
+  // The keyspace of one database: a Dict, so SCAN's cursor keeps Redis's guarantee across resizes.
+  using DB = DictMap<std::string, Entry, DictStringHash>;
 
   // Redis's keyIsExpired(): the key has a TTL that has passed, and lazy expiry is not disabled.
   bool logically_expired(const Entry& e, std::int64_t now) const {
@@ -557,10 +583,9 @@ class DataStore {
   bool expire_if_needed(DB& db, const std::string& key);
   // Removes the expired entry at `it` from `db`: on a replica hides it until the command ends;
   // while expiry is paused hides it until the pause ends (see set_expire_paused()); otherwise
-  // deletes it, counts it in expired_keys and calls the lazy-expire hook. Returns the next
-  // iterator.
-  DB::iterator remove_expired(DB& db, DB::iterator it);
-  // The expired keys a walk met (SCAN, RANDOMKEY) go through expire_if_needed() after it.
+  // deletes it, counts it in expired_keys and calls the lazy-expire hook.
+  void remove_expired(DB& db, DB::iterator it);
+  // The expired keys RANDOMKEY's walk met go through expire_if_needed() after it.
   void expire_met_keys(DB& db, const std::vector<std::string>& keys);
   void restore_replica_hidden();
   void restore_paused_hidden();
@@ -569,6 +594,13 @@ class DataStore {
   void ensure_lazyfree_thread();
   void lazyfree_enqueue(DB&& db);
   static bool entry_is_big(const Entry& e);  // worth offloading (large collection)?
+  // The encoding OBJECT ENCODING reports for `e`; seeing a big encoding sets e.encoding_big.
+  const char* encoding_of(Entry& e);
+  // Whether HSCAN/SSCAN/ZSCAN return `e` whole: Redis does so for a listpack or intset encoding.
+  bool scans_whole(Entry& e) {
+    const std::string_view enc = encoding_of(e);
+    return enc == "listpack" || enc == "intset";
+  }
   // Approximate bytes attributable to one key (map node key + Entry + active payload).
   // Shared by estimate_used_memory() and evict_one() so accounting and eviction agree.
   std::int64_t entry_cost(const std::string& key, const Entry& e) const;
