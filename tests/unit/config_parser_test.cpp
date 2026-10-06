@@ -155,6 +155,8 @@ void test_value_checks() {
   expect_error("client-output-buffer-limit normal 1x 0 0\n", "Error in hard, soft or soft_seconds");
   expect_error("shutdown-on-sigterm save nosave\n", "SAVE and NOSAVE can't be used simultaneously");
   expect_error("dir /no/such/dir/for/peadb\n", std::strerror(ENOENT));
+  // PeaDB has no defragmentation, so it answers like a Redis built without HAVE_DEFRAG.
+  expect_error("activedefrag yes\n", "Active defragmentation cannot be enabled");
   expect_error("maxmemory-clients 200%\n", "percentage argument must be less or equal to 100");
   expect_error("cluster-announce-hostname bad_host\n", "Hostnames may only contain");
   // Values of settings PeaDB does not apply are still checked like Redis.
@@ -376,9 +378,11 @@ void test_generated_table() {
   const std::vector<std::string> handled_validators = {
       "isValidDBfilename", "isValidAOFfilename", "isValidAOFdirname", "isValidAnnouncedHostname",
       "isValidAnnouncedNodename", "isValidShutdownOnSigFlags",
-      // Not checked on purpose: PeaDB sets no process title, and active defrag depends on how
-      // Redis was built (jemalloc); both settings are accepted with a warning.
-      "isValidProcTitleTemplate", "isValidActiveDefrag"};
+      "isValidActiveDefrag",
+      // Not checked on purpose: PeaDB sets no process title, so the setting is accepted with
+      // a warning whatever its value.
+      "isValidProcTitleTemplate"};
+  const auto cwd = std::filesystem::current_path();
   for (const auto& spec : peadb::kRedisConfigSpecs) {
     if (spec.is_valid != nullptr &&
         std::find(handled_validators.begin(), handled_validators.end(), spec.is_valid) ==
@@ -393,8 +397,83 @@ void test_generated_table() {
         fail(std::string("special setting not handled: ") + spec.name);
       }
     }
+    // Every setting but dir (the working directory) has the default CONFIG GET prints.
+    expect((spec.default_value == nullptr) == (std::string(spec.name) == "dir"),
+           std::string("default value of ") + spec.name);
   }
+  std::filesystem::current_path(cwd);  // in case `dir x` found a directory called x
   expect(peadb::kRedisConfigSpecCount == 183, "Redis 7.2.5 has 183 settings in a release build");
+  auto flags = [](const char* name) { return peadb::find_redis_config(name)->flags; };
+  expect((flags("daemonize") & peadb::kCfgImmutable) != 0, "daemonize is immutable");
+  expect((flags("dir") & peadb::kCfgProtected) != 0, "dir is protected");
+  expect((flags("dbfilename") & peadb::kCfgProtected) != 0, "dbfilename is protected");
+  expect((flags("rdb-key-save-delay") & peadb::kCfgHidden) != 0, "rdb-key-save-delay is hidden");
+  expect((flags("requirepass") & peadb::kCfgSensitive) != 0, "requirepass is sensitive");
+  expect(flags("maxmemory") == 0, "maxmemory has no flag CONFIG acts on");
+  expect(std::string(peadb::find_redis_config("save")->default_value) == "3600 1 300 100 60 10000",
+         "save default");
+  expect(std::string(peadb::find_redis_config("proto-max-bulk-len")->default_value) == "536870912",
+         "numeric default is evaluated");
+  expect(std::string(peadb::find_redis_config("loglevel")->default_value) == "notice",
+         "enum default is the enum name");
+}
+
+// The checks and value forms CONFIG SET shares with the loader.
+void test_config_set_values() {
+  using peadb::config_set_args;
+  const auto* save = peadb::find_redis_config("SAVE");
+  expect(save != nullptr && std::string(save->name) == "save", "lookup ignores case");
+  const auto* alias = peadb::find_redis_config("slave-serve-stale-data");
+  expect(alias != nullptr && std::string(alias->name) == "replica-serve-stale-data",
+         "lookup finds an alias");
+  expect(peadb::find_redis_config("list-max-ziplist-entries") == nullptr,
+         "a deprecated name is not a setting");
+  expect(config_set_args(*save, "900 1") == std::vector<std::string>{"900", "1"},
+         "split at spaces");
+  expect(config_set_args(*save, "900  1") == std::vector<std::string>{"900", "", "1"},
+         "every single space splits");
+  expect(config_set_args(*save, "").empty(), "an empty value has no arguments");
+  expect(config_set_args(*peadb::find_redis_config("requirepass"), "a b") ==
+             std::vector<std::string>{"a b"},
+         "a single-argument setting keeps its value whole");
+  auto value = [](const char* name, const std::string& v) {
+    const auto* spec = peadb::find_redis_config(name);
+    std::string out, err;
+    if (!peadb::check_redis_config_value(*spec, config_set_args(*spec, v), out, err)) {
+      return "ERR " + err;
+    }
+    return out;
+  };
+  expect(value("unixsocketperm", "700") == "700", "octal is printed in base 8");
+  expect(value("maxmemory", "1kb") == "1024", "memory is printed in bytes");
+  expect(value("maxmemory-clients", "10%") == "10%", "percent is printed as N%");
+  expect(value("appendonly", "YES") == "yes", "bool is lower case");
+  expect(value("maxmemory-policy", "ALLKEYS-LRU") == "allkeys-lru", "enum is lower case");
+  expect(value("shutdown-on-sigterm", "now save") == "save now", "flags print in enum order");
+  expect(value("shutdown-on-sigterm", "default save") == "save", "default is only printed alone");
+  expect(value("latency-tracking-info-percentiles", "50.0 99.90") == "50 99.9",
+         "percentiles print like %f without trailing zeros");
+  expect(value("save", "100  10").rfind("ERR Invalid save parameters", 0) == 0,
+         "an empty middle argument is not a number");
+  expect(value("activedefrag", "yes").rfind("ERR Active defragmentation", 0) == 0,
+         "activedefrag yes is refused");
+  const auto* fixed = peadb::peadb_fixed_setting("rdbcompression");
+  expect(fixed != nullptr && std::string(fixed->value) == "no" && fixed->refuse == nullptr,
+         "rdbcompression is fixed at no");
+  expect(peadb::peadb_fixed_setting("hz") == nullptr, "hz has no fixed value");
+}
+
+// `dir` changes the working directory while the config is read, as Redis's chdir(2) does.
+void test_dir_changes_working_directory() {
+  const auto cwd = std::filesystem::current_path();
+  const auto dir = std::filesystem::temp_directory_path() /
+                   ("peadb-config-dir-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(dir);
+  expect_ok("dir " + dir.string() + "\n");
+  expect(std::filesystem::equivalent(std::filesystem::current_path(), dir),
+         "dir is now the working directory");
+  std::filesystem::current_path(cwd);
+  std::filesystem::remove_all(dir);
 }
 
 }  // namespace
@@ -414,6 +493,8 @@ int main() {
   test_last_value_wins();
   test_review_save_and_renames();
   test_review_nul_and_post_checks();
+  test_config_set_values();
+  test_dir_changes_working_directory();
   if (g_failures != 0) {
     std::cerr << g_failures << " config_parser_test check(s) failed\n";
     return 1;

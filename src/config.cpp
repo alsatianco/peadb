@@ -2,7 +2,8 @@
 // (src/config.c): the same line splitting, the same settings and aliases (generated from
 // config.c into redis_config_table.generated.hpp), the same value checks and the same errors.
 // A Redis setting that PeaDB cannot honour safely stops startup; any other Redis setting that
-// PeaDB does not apply yet is accepted with a warning (compat/delta.md item 24).
+// PeaDB does not apply yet is accepted with a warning (compat/delta.md item 24). CONFIG SET
+// (command.cpp) runs the same value checks through check_redis_config_value().
 #include "config.hpp"
 
 #include "command_metadata.generated.hpp"
@@ -12,7 +13,6 @@
 #include <glob.h>
 #include <locale.h>
 #include <strings.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -167,19 +167,6 @@ bool path_is_base_name(const std::string& s) {
   return s.find('/') == std::string::npos && s.find('\\') == std::string::npos;
 }
 
-const RedisConfigSpec* find_spec(const std::string& lower_name) {
-  static const auto* index = [] {
-    auto* m = new std::unordered_map<std::string, const RedisConfigSpec*>();
-    for (const auto& spec : kRedisConfigSpecs) {
-      (*m)[spec.name] = &spec;
-      if (spec.alias != nullptr) (*m)[spec.alias] = &spec;
-    }
-    return m;
-  }();
-  const auto it = index->find(lower_name);
-  return it == index->end() ? nullptr : it->second;
-}
-
 std::string join(const std::vector<std::string>& args) {
   std::string out;
   for (const auto& a : args) {
@@ -191,11 +178,20 @@ std::string join(const std::vector<std::string>& args) {
 
 // ── Value checks, as Redis's config set functions do them ──
 
-bool check_bool(const std::string& v, std::string& canonical, std::string& err) {
+bool check_bool(const RedisConfigSpec& spec, const std::string& v, std::string& canonical,
+                std::string& err) {
   if (iequals(v, "yes")) canonical = "yes";
   else if (iequals(v, "no")) canonical = "no";
   else {
     err = "argument must be 'yes' or 'no'";
+    return false;
+  }
+  // isValidActiveDefrag(): PeaDB has no defragmentation, like a Redis built without HAVE_DEFRAG
+  // (the pinned Redis 7.2.5 built with libc malloc gives the same answer).
+  if (canonical == "yes" && spec.is_valid != nullptr &&
+      std::strcmp(spec.is_valid, "isValidActiveDefrag") == 0) {
+    err = "Active defragmentation cannot be enabled: it requires a Redis server compiled with a "
+          "modified Jemalloc like the one shipped by default with the Redis source distribution";
     return false;
   }
   return true;
@@ -232,6 +228,17 @@ bool check_enum(const RedisConfigSpec& spec, const std::vector<std::string>& arg
       err = "shutdown options SAVE and NOSAVE can't be used simultaneously";
       return false;
     }
+  }
+  if (spec.multi_arg) {
+    // A MULTI_ARG enum is a set of bit flags, and configEnumGetName() prints the chosen flags in
+    // the enum's order, each once; its first entry has the value 0 ("default") and is printed
+    // only when nothing else is chosen.
+    std::vector<std::string> ordered;
+    for (auto e = spec.enum_names + 1; *e != nullptr; ++e) {
+      if (std::find(names.begin(), names.end(), *e) != names.end()) ordered.emplace_back(*e);
+    }
+    if (ordered.empty()) ordered.emplace_back(spec.enum_names[0]);
+    names = std::move(ordered);
   }
   canonical = join(names);
   return true;
@@ -346,26 +353,24 @@ bool check_string(const RedisConfigSpec& spec, const std::string& v, std::string
   return true;
 }
 
+// printf("%f") and then Redis's trimDoubleString() (util.c): no trailing zeros or dot.
+std::string trim_double(double d) {
+  char buf[128];
+  std::string s(buf, static_cast<std::size_t>(std::snprintf(buf, sizeof(buf), "%f", d)));
+  if (s.find('.') != std::string::npos) {
+    s.erase(s.find_last_not_of('0') + 1);
+    if (s.back() == '.') s.pop_back();
+  }
+  return s;
+}
+
 // Special settings: each has its own set function in config.c. On success `canonical` holds the
 // checked arguments in the form the matching ServerConfig field expects.
 bool check_special(const std::string& name, const std::vector<std::string>& in,
                    std::string& canonical, std::string& err) {
-  if (name == "dir") {  // setConfigDirOption(): chdir(2) must succeed
+  if (name == "dir") {  // setConfigDirOption(); the chdir(2) itself is done by the caller
     if (in.size() != 1) {
       err = "wrong number of arguments";
-      return false;
-    }
-    struct stat st {};
-    if (::stat(in[0].c_str(), &st) != 0) {
-      err = std::strerror(errno);
-      return false;
-    }
-    if (!S_ISDIR(st.st_mode)) {
-      err = std::strerror(ENOTDIR);
-      return false;
-    }
-    if (::access(in[0].c_str(), X_OK) != 0) {
-      err = std::strerror(errno);
       return false;
     }
     canonical = in[0];
@@ -476,6 +481,7 @@ bool check_special(const std::string& name, const std::vector<std::string>& in,
     return true;
   }
   if (name == "latency-tracking-info-percentiles") {
+    std::vector<std::string> out;
     if (!(in.size() == 1 && in[0].empty())) {
       for (const auto& a : in) {
         double d = 0;
@@ -487,9 +493,10 @@ bool check_special(const std::string& name, const std::vector<std::string>& in,
           err = "latency-tracking-info-percentiles parameters should sit between [0.0,100.0]";
           return false;
         }
+        out.push_back(trim_double(d));
       }
     }
-    canonical = join(in);
+    canonical = join(out);
     return true;
   }
   err = "unhandled special config " + name;  // a new Special setting after a Redis pin bump
@@ -507,33 +514,35 @@ const std::unordered_set<std::string>& raw_applied_settings() {
       "zset-max-listpack-entries", "zset-max-listpack-value",
       "min-replicas-to-write", "replica-serve-stale-data", "busy-reply-threshold",
       "lazyfree-lazy-server-del", "stop-writes-on-bgsave-error", "aof-load-truncated",
-      "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold"};
+      "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold",
+      "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
+      "enable-protected-configs"};
   return kSet;
 }
-
-// A Redis setting that PeaDB does not apply. When the config sets it to `peadb_value` (what
-// PeaDB always does anyway) it is accepted silently; any other value either stops startup with
-// `refuse` (when set) or is accepted with a warning.
-struct NotAppliedSetting {
-  const char* peadb_value;
-  const char* refuse;
-};
 
 const char* const kTlsRefusal =
     "Failed finding TLS support. PeaDB has no TLS (compat/delta.md item 7): terminate TLS in a "
     "proxy in front of PeaDB and remove the tls-port, tls-replication and tls-cluster settings";
 
-const std::unordered_map<std::string, NotAppliedSetting>& not_applied_settings() {
-  static const std::unordered_map<std::string, NotAppliedSetting> kMap = {
+const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
+  static const std::unordered_map<std::string, FixedSetting> kMap = {
       {"daemonize", {"no", nullptr}},
       {"databases", {"16", nullptr}},
       {"logfile", {"", nullptr}},
+      {"pidfile", {"", nullptr}},
       {"syslog-enabled", {"no", nullptr}},
       {"supervised", {"no", nullptr}},
       {"io-threads", {"1", nullptr}},
       {"activedefrag", {"no", nullptr}},
       {"aof-use-rdb-preamble", {"no", nullptr}},
+      {"aof-timestamp-enabled", {"no", nullptr}},
+      {"auto-aof-rewrite-percentage", {"0", nullptr}},  // no automatic AOF rewrite (item 59)
       {"rdbcompression", {"no", nullptr}},
+      {"rdbchecksum", {"yes", nullptr}},
+      {"lfu-decay-time", {"0", nullptr}},  // LFU counters never decay
+      {"maxmemory-clients", {"0", nullptr}},
+      {"replica-read-only", {"yes", nullptr}},
+      {"replica-ignore-maxmemory", {"yes", nullptr}},
       {"tls-port", {"0", kTlsRefusal}},
       {"tls-replication", {"no", kTlsRefusal}},
       {"tls-cluster", {"no", kTlsRefusal}},
@@ -596,9 +605,20 @@ bool parse_config_text(LoadState& st, const std::string& text, std::string& erro
 
 // Applies one standard Redis setting whose value has passed Redis's checks.
 bool apply_setting(LoadState& st, const RedisConfigSpec& spec, const std::vector<std::string>& args,
-                   const std::string& value, int linenum, const std::string& origin) {
+                   const std::string& value, int linenum, const std::string& origin,
+                   std::string& err) {
   ServerConfig& cfg = st.cfg;
   const std::string name = spec.name;
+  if (name == "dir") {
+    // setConfigDirOption() changes the working directory at once, so later relative paths in
+    // the config (include, logfile, unixsocket) and the data files are relative to it.
+    if (::chdir(value.c_str()) != 0) {
+      err = std::strerror(errno);
+      return false;
+    }
+    cfg.raw[name] = value;
+    return true;
+  }
   cfg.raw[name] = value;
   if (raw_applied_settings().count(name) != 0) return true;
   if (name == "port") cfg.port = std::stoi(value);
@@ -607,9 +627,8 @@ bool apply_setting(LoadState& st, const RedisConfigSpec& spec, const std::vector
   else if (name == "tcp-backlog") cfg.tcp_backlog = std::stoi(value);
   else if (name == "timeout") cfg.timeout = value;
   else if (name == "unixsocket") cfg.unixsocket = value;
-  else if (name == "unixsocketperm") cfg.unixsocketperm = std::stoi(value);
+  else if (name == "unixsocketperm") cfg.unixsocketperm = std::stoi(value, nullptr, 8);
   else if (name == "loglevel") cfg.log_level = value;
-  else if (name == "dir") cfg.dir = value;
   else if (name == "dbfilename") cfg.dbfilename = value;
   else if (name == "appendonly") cfg.appendonly = value == "yes";
   else if (name == "appendfilename") cfg.appendfilename = value;
@@ -676,31 +695,8 @@ bool handle_standard(LoadState& st, const RedisConfigSpec& spec, std::vector<std
     args = std::move(split);
   }
   std::string value;
-  switch (spec.type) {
-    case RedisConfigType::Bool:
-      if (!check_bool(args[0], value, err)) return false;
-      break;
-    case RedisConfigType::Enum:
-      if (!check_enum(spec, args, value, err)) return false;
-      break;
-    case RedisConfigType::Numeric: {
-      long long ll = 0;
-      if (!check_numeric(spec, args[0], ll, err)) return false;
-      value = (spec.numeric_flags & kNumPercent) != 0 && ll < 0
-                  ? std::to_string(-ll) + "%"
-                  : (spec.numeric_unsigned ? std::to_string(static_cast<unsigned long long>(ll))
-                                           : std::to_string(ll));
-      break;
-    }
-    case RedisConfigType::String:
-      if (!check_string(spec, args[0], err)) return false;
-      value = args[0];
-      break;
-    case RedisConfigType::Special:
-      if (!check_special(spec.name, args, value, err)) return false;
-      break;
-  }
-  return apply_setting(st, spec, args, value, linenum, origin);
+  if (!check_redis_config_value(spec, args, value, err)) return false;
+  return apply_setting(st, spec, args, value, linenum, origin, err);
 }
 
 // rename-command, checked against Redis's command table the way Redis's loader checks it: the
@@ -759,7 +755,7 @@ bool parse_config_text(LoadState& st, const std::string& text, std::string& erro
       argv[0] = to_lower(argv[0]);
       const std::string& name = argv[0];
       const std::size_t argc = argv.size();
-      if (const RedisConfigSpec* spec = find_spec(name)) {
+      if (const RedisConfigSpec* spec = find_redis_config(name)) {
         handle_standard(st, *spec, argv, linenum, origin, err);
       } else if ((name == "list-max-ziplist-entries" || name == "list-max-ziplist-value" ||
                   name == "lua-replicate-commands") && argc == 2) {
@@ -810,10 +806,10 @@ bool finish_load(LoadState& st, std::string& error) {
   const NotAppliedLine* refused = st.bad_bind_reason.empty() ? nullptr : &st.bad_bind;
   std::string reason = st.bad_bind_reason;
   std::vector<std::pair<std::string, const NotAppliedLine*>> warned;
-  const auto& table = not_applied_settings();
+  const auto& table = fixed_settings();
   for (const auto& [name, line] : st.not_applied) {
     const auto it = table.find(name);
-    if (it != table.end() && line.value == it->second.peadb_value) continue;
+    if (it != table.end() && line.value == it->second.value) continue;
     if (it != table.end() && it->second.refuse != nullptr) {
       if (refused == nullptr || line.seq < refused->seq) {
         refused = &line;
@@ -905,6 +901,78 @@ bool read_config_source(const std::string& path, std::string& text, std::string&
 }
 
 }  // namespace
+
+const RedisConfigSpec* find_redis_config(const std::string& name) {
+  static const auto* index = [] {
+    auto* m = new std::unordered_map<std::string, const RedisConfigSpec*>();
+    for (const auto& spec : kRedisConfigSpecs) {
+      (*m)[spec.name] = &spec;
+      if (spec.alias != nullptr) (*m)[spec.alias] = &spec;
+    }
+    return m;
+  }();
+  const auto it = index->find(to_lower(name));
+  return it == index->end() ? nullptr : it->second;
+}
+
+std::vector<std::string> config_set_args(const RedisConfigSpec& spec, const std::string& value) {
+  if (!spec.multi_arg) return {value};
+  // sdssplitlen(value, len, " ", 1): every single space separates, so "a  b" has an empty
+  // middle argument, and an empty value has no arguments at all.
+  std::vector<std::string> out;
+  if (value.empty()) return out;
+  std::size_t start = 0;
+  while (true) {
+    const auto sp = value.find(' ', start);
+    out.push_back(value.substr(start, sp == std::string::npos ? std::string::npos : sp - start));
+    if (sp == std::string::npos) break;
+    start = sp + 1;
+  }
+  return out;
+}
+
+bool check_redis_config_value(const RedisConfigSpec& spec, const std::vector<std::string>& args,
+                              std::string& value, std::string& err) {
+  if (!spec.multi_arg && args.size() != 1) {
+    err = "wrong number of arguments";
+    return false;
+  }
+  switch (spec.type) {
+    case RedisConfigType::Bool:
+      return check_bool(spec, args[0], value, err);
+    case RedisConfigType::Enum:
+      return check_enum(spec, args, value, err);
+    case RedisConfigType::Numeric: {
+      long long ll = 0;
+      if (!check_numeric(spec, args[0], ll, err)) return false;
+      // numericConfigGet(): a percentage as N%, an octal setting in base 8, else decimal.
+      if ((spec.numeric_flags & kNumPercent) != 0 && ll < 0) {
+        value = std::to_string(-ll) + "%";
+      } else if ((spec.numeric_flags & kNumOctal) != 0) {
+        char buf[32];
+        std::snprintf(buf, sizeof(buf), "%llo", static_cast<unsigned long long>(ll));
+        value = buf;
+      } else {
+        value = spec.numeric_unsigned ? std::to_string(static_cast<unsigned long long>(ll))
+                                      : std::to_string(ll);
+      }
+      return true;
+    }
+    case RedisConfigType::String:
+      if (!check_string(spec, args[0], err)) return false;
+      value = args[0];
+      return true;
+    case RedisConfigType::Special:
+      return check_special(spec.name, args, value, err);
+  }
+  return false;
+}
+
+const FixedSetting* peadb_fixed_setting(const std::string& name) {
+  const auto& table = fixed_settings();
+  const auto it = table.find(name);
+  return it == table.end() ? nullptr : &it->second;
+}
 
 bool split_config_args(const std::string& line, std::vector<std::string>& out) {
   out.clear();

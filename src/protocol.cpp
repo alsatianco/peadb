@@ -16,7 +16,7 @@ namespace {
 // up to the query-buffer limit. This deliberately-stricter 1M cap bounds that; no realistic
 // client or the upstream suite ever declares more.
 constexpr int kMaxMultibulk = 1024 * 1024;            // 1M elements
-constexpr int kMaxBulkLen   = 512 * 1024 * 1024;      // 512 MB (proto-max-bulk-len default)
+// The bulk length cap is proto-max-bulk-len, which the caller passes in (CONFIG SET changes it).
 // Tighter caps for clients that have not authenticated when a password is required
 // (Redis processMultibulkBuffer): >10 elements or >16 KB per bulk is refused up front.
 constexpr int kUnauthMaxMultibulk = 10;
@@ -26,7 +26,8 @@ constexpr int kUnauthMaxBulkLen   = 16 * 1024;
 // rather than buffering unboundedly.
 constexpr std::size_t kProtoInlineMaxSize = 64 * 1024;
 
-bool parse_i32(std::string_view sv, int& out) {
+template <typename Int>
+bool parse_int(std::string_view sv, Int& out) {
   if (sv.empty()) return false;
   bool negative = false;
   std::size_t i = 0;
@@ -35,12 +36,12 @@ bool parse_i32(std::string_view sv, int& out) {
     i = 1;
     if (i == sv.size()) return false;
   }
-  int value = 0;
+  Int value = 0;
   for (; i < sv.size(); ++i) {
     const char c = sv[i];
     if (c < '0' || c > '9') return false;
-    const int digit = c - '0';
-    if (value > (std::numeric_limits<int>::max() - digit) / 10) return false;
+    const Int digit = c - '0';
+    if (value > (std::numeric_limits<Int>::max() - digit) / 10) return false;
     value = value * 10 + digit;
   }
   out = negative ? -value : value;
@@ -53,7 +54,8 @@ inline ParsedCommand proto_error(std::string msg, std::size_t consumed) {
   return ParsedCommand{{"__err_proto__", std::move(msg)}, consumed};
 }
 
-std::optional<ParsedCommand> parse_resp_array(std::string_view buffer, bool unauthenticated) {
+std::optional<ParsedCommand> parse_resp_array(std::string_view buffer, bool unauthenticated,
+                                              std::int64_t max_bulk_len) {
   if (buffer.empty() || buffer[0] != '*') return std::nullopt;
 
   // ── Multibulk count line: *<count>\r\n ──
@@ -65,9 +67,9 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer, bool unau
   }
 
   int count = 0;
-  // parse_i32 fails on a non-number OR on overflow past INT_MAX — both are Redis's
+  // parse_int fails on a non-number OR on overflow past INT_MAX — both are Redis's
   // "invalid multibulk length" case; the stateless-parser bound (kMaxMultibulk) is the same.
-  if (!parse_i32(buffer.substr(1, line_end - 1), count) || count > kMaxMultibulk)
+  if (!parse_int(buffer.substr(1, line_end - 1), count) || count > kMaxMultibulk)
     return ParsedCommand{{"__err_multibulk__"}, line_end + 2};
   // The unauthenticated cap is checked before the <=0 skip, matching Redis's order.
   if (unauthenticated && count > kUnauthMaxMultibulk)
@@ -92,8 +94,9 @@ std::optional<ParsedCommand> parse_resp_array(std::string_view buffer, bool unau
       return std::nullopt;  // need more data
     }
 
-    int len = 0;
-    if (!parse_i32(buffer.substr(pos + 1, bulk_end - pos - 1), len) || len < 0 || len > kMaxBulkLen)
+    std::int64_t len = 0;
+    if (!parse_int(buffer.substr(pos + 1, bulk_end - pos - 1), len) || len < 0 ||
+        len > max_bulk_len)
       return ParsedCommand{{"__err_bulklen__"}, bulk_end + 2};
     if (unauthenticated && len > kUnauthMaxBulkLen)
       return ParsedCommand{{"__err_unauth_bulklen__"}, bulk_end + 2};
@@ -201,10 +204,11 @@ std::optional<ParsedCommand> parse_inline(std::string_view buffer) {
 
 }  // namespace
 
-std::optional<ParsedCommand> parse_one_command(std::string_view buffer, bool unauthenticated) {
+std::optional<ParsedCommand> parse_one_command(std::string_view buffer, bool unauthenticated,
+                                               std::int64_t max_bulk_len) {
   if (buffer.empty()) return std::nullopt;
   // Redis (processInputBuffer): first byte '*' → multibulk, anything else → inline.
-  if (buffer[0] == '*') return parse_resp_array(buffer, unauthenticated);
+  if (buffer[0] == '*') return parse_resp_array(buffer, unauthenticated, max_bulk_len);
   return parse_inline(buffer);
 }
 

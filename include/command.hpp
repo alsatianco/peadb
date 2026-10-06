@@ -80,6 +80,9 @@ struct SessionState {
   bool no_touch = false;
   // ── Introspection (CLIENT LIST / MONITOR / CLIENT KILL) ──
   std::string addr;                       // peer "ip:port", set at accept
+  // A unix-socket or loopback (127.x, ::1) client: Redis's connIsLocal(), which decides what a
+  // "local" value of enable-protected-configs allows. Set at accept.
+  bool is_local = false;
   std::int64_t created_ms = 0;            // connection creation time
   std::int64_t last_interaction_ms = 0;   // last command time (for idle)
   std::string last_cmd;                   // last command name (lowercased)
@@ -89,14 +92,22 @@ struct SessionState {
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
 std::size_t command_count();
 std::vector<std::string> command_names();
-void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
+// dbfilename and appendfilename are relative to the working directory, which the config loader
+// changes to `dir` the way Redis does.
+void configure_persistence(const std::string& dbfilename, bool appendonly,
                            const std::string& appendfilename, const std::string& appendfsync);
 bool load_aof_file(const std::string& path, std::string& err);
 void aof_fsync_if_needed(std::int64_t now_ms);
 void reap_background_children();
 void configure_runtime_port(int port);
 void configure_max_clients(int max_clients);
-int configured_max_clients();
+int configured_max_clients();  // read live by the accept loop, so CONFIG SET maxclients applies
+// Raises the open-files soft limit so `max_clients` clients fit (Redis's adjustOpenFilesLimit())
+// and returns how many clients the limit allows, which may be fewer. Defined in server.cpp.
+int adjust_open_files_limit(int max_clients);
+std::int64_t proto_max_bulk_len();          // proto-max-bulk-len, for the RESP parser
+std::int64_t client_query_buffer_limit();   // client-query-buffer-limit
+int tcp_keepalive_seconds();                 // tcp-keepalive (0 = off), for new connections
 // ── Cluster configuration (wired from main.cpp at startup; startup-only, like Redis's
 // IMMUTABLE_CONFIG for cluster-enabled) ──
 void configure_cluster(bool enabled, const std::string& bind, int port, const std::string& announce_ip,
@@ -140,8 +151,12 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // Apply the config-file settings that CONFIG SET also changes at runtime and that have no
 // ServerConfig field: min-replicas-to-write, replica-serve-stale-data, busy-reply-threshold,
 // lazyfree-lazy-server-del, stop-writes-on-bgsave-error, aof-load-truncated,
-// slowlog-log-slower-than, slowlog-max-len and latency-monitor-threshold (values already checked).
-void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw);
+// slowlog-log-slower-than, slowlog-max-len, latency-monitor-threshold, proto-max-bulk-len,
+// client-query-buffer-limit, tcp-keepalive and lfu-log-factor (values already checked). It also
+// keeps every other setting the config named, for CONFIG GET; `config_file` is the config file
+// PeaDB was started with ("" for none), for CONFIG REWRITE.
+void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
+                                const std::string& config_file);
 void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
 int client_timeout_seconds();                       // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping
@@ -153,7 +168,7 @@ void configure_client_output_buffer_limit(const std::string& spec);  // "normal 
 CoblLimit cobl_for(int cls);                          // limits for a CoblClass
 std::string client_output_buffer_limit_str();         // current config as a CONFIG GET string
 void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
-void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb" (startup only)
+void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb"
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
 void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
 void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)

@@ -2541,7 +2541,7 @@ void DataStore::touch_lru(Entry& e, bool lfu) {
       static thread_local std::mt19937 rng{std::random_device{}()};
       const double r = static_cast<double>(rng()) / static_cast<double>(rng.max());
       const double base = counter > 5 ? counter - 5 : 0;
-      const double p = 1.0 / (base * /*lfu-log-factor*/ 10.0 + 1.0);
+      const double p = 1.0 / (base * static_cast<double>(lfu_log_factor_) + 1.0);
       if (r < p) ++counter;
     }
     e.lru = counter;

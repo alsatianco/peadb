@@ -594,6 +594,11 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
       return enc_error_raw("ERR This Redis command is not allowed from script");
     }
   }
+  // Every CONFIG subcommand except HELP is NOSCRIPT in Redis (src/commands/config-*.json): a
+  // script must not fork an AOF rewrite or change the working directory halfway through.
+  if (cmd_upper == "CONFIG" && (args.size() < 2 || upper(args[1]) != "HELP")) {
+    return enc_error_raw("ERR This Redis command is not allowed from script");
+  }
 
   // Check readonly context
   if (g_lua_readonly) {

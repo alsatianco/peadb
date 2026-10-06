@@ -18,7 +18,7 @@ Besides the event-loop thread there are two helper threads: a detached **replica
 | `src/rdb.cpp` | RDB binary reader/writer |
 | `src/lua_engine.cpp` | Lua 5.1 scripting (`EVAL`/`EVALSHA`/`FCALL`), dispatched back through `handle_command` |
 | `src/protocol.cpp` | RESP parsing (operates on `std::string_view`; only argument values are copied) |
-| `src/config.cpp` | Config file + command-line loading, following Redis 7.2.5's `loadServerConfig()` (settings table generated from Redis's `config.c` into `include/redis_config_table.generated.hpp`) |
+| `src/config.cpp` | Config file + command-line loading, following Redis 7.2.5's `loadServerConfig()` (settings table, with flags and defaults, generated from Redis's `config.c` into `include/redis_config_table.generated.hpp`); its value checks are shared with `CONFIG SET` |
 | `include/poller.hpp` | epoll / kqueue / io_uring abstraction |
 | `src/shard_loop.cpp` | Sharding scaffolding only — not wired (`PEADB_NUM_SHARDS` defaults to 1) |
 

@@ -9,6 +9,7 @@
 #include <map>
 #include "protocol.hpp"
 #include "rdb.hpp"
+#include "redis_config_table.generated.hpp"
 #include "sha256.hpp"
 
 #include <algorithm>
@@ -32,7 +33,11 @@
 #include <array>
 #include <set>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <tuple>
+#include <type_traits>
+#include <unordered_set>
 #include <random>
 #include <limits>
 #include <arpa/inet.h>
@@ -42,6 +47,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <dlfcn.h>
 #include <fnmatch.h>
@@ -86,18 +92,33 @@ struct CommandSpec {
   bool is_write() const { return flag_bits & kFlagWrite; }
 };
 
-// Redis proto-max-bulk-len (512 MB): caps a single string value. Mirrors the parser-side
-// kMaxBulkLen in protocol.cpp; used for SETBIT/GETBIT bit offsets and APPEND/SETRANGE growth.
-constexpr std::int64_t kProtoMaxBulkLen = 512LL * 1024 * 1024;
+// proto-max-bulk-len (Redis default 512 MB): the largest bulk argument a client may send
+// (server.cpp passes it to the parser) and the largest string SETBIT/APPEND/SETRANGE may build.
+std::int64_t g_proto_max_bulk_len = 512LL * 1024 * 1024;
+// client-query-buffer-limit (Redis default 1 GB): server.cpp closes a client whose unparsed
+// input grows past it.
+std::int64_t g_client_query_buffer_limit = 1024LL * 1024 * 1024;
+int g_tcp_keepalive = 300;  // tcp-keepalive: seconds; 0 = no keepalive on new connections
 
 std::unordered_map<std::string, std::string> g_script_cache;
+// Relative to the working directory, which is the configured `dir` (Redis chdir()s into it).
 std::filesystem::path g_snapshot_path = "dump.rdb";
 std::filesystem::path g_aof_path = "appendonly.aof";
-bool g_appendonly = false;
+bool g_appendonly = false;  // the appendonly setting; true whenever g_aof_state is not Off
+// Redis's aof_state. CONFIG SET appendonly yes moves Off -> WaitRewrite: writes then go only to
+// the rewrite buffer until the first rewrite of the dataset is in place, and then the AOF is On.
+enum class AofState { Off, WaitRewrite, On };
+AofState g_aof_state = AofState::Off;
+bool g_aof_rewrite_scheduled = false;  // retry a failed WaitRewrite rewrite from the cron
+std::int64_t g_aofrw_consecutive_failures = 0;  // INFO aof_rewrites_consecutive_failures
 // thread_local: each thread (event loop, REPLICAOF streaming) maintains its own
 // replay flag so setting it in one thread never silently suppresses AOF writes
 // or bypasses READONLY enforcement in the other.
 thread_local bool g_replaying_aof = false;
+// Redis's mustObeyClient(): a command replayed from the AOF or applied from the master stream
+// is not held to the client limits (proto-max-bulk-len), or a replica or a reload whose limit
+// is lower than the one the data was written under would drop it.
+inline bool must_obey_client() { return g_replaying_aof; }
 // Set while re-dispatching a blocked XREAD/XREADGROUP from try_unblock_client so the
 // handler reads once instead of re-registering a block.
 thread_local bool g_block_disabled = false;
@@ -170,6 +191,12 @@ bool g_config_replica_serve_stale_data = true;
 // ── Security ──
 std::string g_requirepass;                    // empty = no auth required (Redis default)
 std::string g_masterauth;                     // sent to master during replica handshake
+// The replica thread reads g_masterauth while CONFIG SET may change it on the event loop.
+std::mutex g_masterauth_mu;
+std::string masterauth_copy() {
+  std::lock_guard<std::mutex> lock(g_masterauth_mu);
+  return g_masterauth;
+}
 bool g_protected_mode = true;                 // refuse non-loopback clients when no auth set
 std::string g_enable_module_command = "no";   // "yes" | "no" | "local" — gates MODULE LOAD
 std::vector<RenameCommandDirective> g_rename_commands;
@@ -205,21 +232,52 @@ struct ReplBacklog {
     std::size_t size_ = 1 << 20;  // default 1 MiB
     std::vector<char> buf;
     std::int64_t total = 0; // total bytes ever appended
+    std::int64_t start_ = 0;  // oldest offset held since the last resize()
 
     ReplBacklog() : buf(size_, 0) {}
 
-    // Resize the backlog. Only valid before any data is appended (startup), since
-    // the modular indexing assumes a fixed size for the lifetime of the buffer.
+    // Sets the size before any data is appended (startup). Throws std::bad_alloc (or
+    // std::length_error) for a size that cannot be allocated, leaving the backlog unchanged.
     void reset(std::size_t newsize) {
         if (newsize == 0) return;
+        std::vector<char> fresh(newsize, 0);
+        buf.swap(fresh);
         size_ = newsize;
-        buf.assign(size_, 0);
         total = 0;
+        start_ = 0;
+    }
+
+    // CONFIG SET repl-backlog-size (resizeReplicationBacklog()): keeps the offsets and as many
+    // of the newest bytes as fit, so a replica can still continue from any offset base() says
+    // is held. Returns false, with the backlog unchanged, when the size cannot be allocated.
+    bool resize(std::size_t newsize) {
+        if (newsize == 0 || newsize == size_) return true;
+        const std::int64_t keep_from =
+            std::max(base(), total - static_cast<std::int64_t>(newsize));
+        std::vector<char> fresh;
+        std::string kept;
+        try {
+            fresh.assign(newsize, 0);
+            get_slice(keep_from, kept);
+        } catch (const std::bad_alloc&) {
+            return false;
+        } catch (const std::length_error&) {
+            return false;
+        }
+        for (std::size_t i = 0; i < kept.size(); ++i) {
+            fresh[static_cast<std::size_t>((keep_from + static_cast<std::int64_t>(i)) %
+                                           static_cast<std::int64_t>(newsize))] = kept[i];
+        }
+        buf.swap(fresh);
+        size_ = newsize;
+        start_ = keep_from;
+        return true;
     }
 
     std::int64_t base() const {
-        return total > static_cast<std::int64_t>(size_)
+        const std::int64_t wrapped = total > static_cast<std::int64_t>(size_)
                ? total - static_cast<std::int64_t>(size_) : 0;
+        return std::max(wrapped, start_);
     }
 
     void append(const std::string& data) {
@@ -556,10 +614,11 @@ std::vector<std::string> redact_slowlog_args(const std::vector<std::string>& arg
     if (sub == "SETUSER" || sub == "GETUSER")
       for (std::size_t i = 2; i < out.size(); ++i) out[i] = "(redacted)";
   } else if (cmd == "CONFIG" && args.size() >= 2 && upper(args[1]) == "SET") {
-    // CONFIG SET <key> <value> [<key> <value> ...] — redact the value of any sensitive key.
+    // CONFIG SET <name> <value> [<name> <value> ...]: redact the value of every SENSITIVE_CONFIG
+    // setting (requirepass, masterauth, masteruser, the TLS key passwords), under any alias.
     for (std::size_t i = 2; i + 1 < out.size(); i += 2) {
-      const std::string k = lower(args[i]);
-      if (k == "requirepass" || k == "masterauth" || k == "masteruser") out[i + 1] = "(redacted)";
+      const RedisConfigSpec* spec = find_redis_config(args[i]);
+      if (spec != nullptr && (spec->flags & kCfgSensitive) != 0) out[i + 1] = "(redacted)";
     }
   } else if (cmd == "MIGRATE") {
     redact_after("AUTH", 1);   // AUTH <password>
@@ -645,6 +704,7 @@ std::uint32_t parse_notify_flags(const std::string& s) {
   }
   return f;
 }
+// keyspaceEventsFlagsToString() (notify.c): the order CONFIG GET prints the classes in.
 std::string notify_flags_to_str(std::uint32_t f) {
   std::string s;
   if ((f & NOTIFY_ALL) == NOTIFY_ALL) s += "A";
@@ -654,11 +714,11 @@ std::string notify_flags_to_str(std::uint32_t f) {
     if (f & NOTIFY_HASH) s += "h";    if (f & NOTIFY_ZSET) s += "z";
     if (f & NOTIFY_EXPIRED) s += "x"; if (f & NOTIFY_EVICTED) s += "e";
     if (f & NOTIFY_STREAM) s += "t";  if (f & NOTIFY_MODULE) s += "d";
+    if (f & NOTIFY_NEW) s += "n";
   }
-  if (f & NOTIFY_KEY_MISS) s += "m";
-  if (f & NOTIFY_NEW) s += "n";
   if (f & NOTIFY_KEYSPACE) s += "K";
   if (f & NOTIFY_KEYEVENT) s += "E";
+  if (f & NOTIFY_KEY_MISS) s += "m";
   return s;
 }
 void notify_keyspace_event(std::uint32_t cls, const std::string& event, const std::string& key, int db) {
@@ -1701,20 +1761,24 @@ void append_aof_command(const std::vector<std::string>& args, const SessionState
 
 void append_aof(const std::vector<std::string>& args) {
   if (!g_appendonly || g_replaying_aof) return;
-  if (g_aof_fd < 0) open_aof_fd();
-  if (g_aof_fd < 0) { g_aof_write_error = true; return; }
   const auto payload = encode_command_resp(args);
-  const ssize_t written = ::write(g_aof_fd, payload.data(), payload.size());
-  if (written < 0 || static_cast<std::size_t>(written) != payload.size()) {
-    g_aof_write_error = true;
-    return;
-  }
-  // In the strongest durability mode, a failed fsync means the just-written command
-  // is NOT durable — surface it (don't silently swallow, matching the strict
-  // fail-on-fsync posture used for RDB/AOF-rewrite).
-  if (g_appendfsync == "always" && ::fsync(g_aof_fd) != 0) {
-    g_aof_write_error = true;
-    log(LogLevel::Error, "AOF fsync (always) failed: " + std::string(std::strerror(errno)));
+  // While the AOF waits for its first rewrite (CONFIG SET appendonly yes) there is no file to
+  // append to yet: the command goes only to the rewrite buffer below.
+  if (g_aof_state == AofState::On) {
+    if (g_aof_fd < 0) open_aof_fd();
+    if (g_aof_fd < 0) { g_aof_write_error = true; return; }
+    const ssize_t written = ::write(g_aof_fd, payload.data(), payload.size());
+    if (written < 0 || static_cast<std::size_t>(written) != payload.size()) {
+      g_aof_write_error = true;
+      return;
+    }
+    // In the strongest durability mode, a failed fsync means the just-written command
+    // is NOT durable — surface it (don't silently swallow, matching the strict
+    // fail-on-fsync posture used for RDB/AOF-rewrite).
+    if (g_appendfsync == "always" && ::fsync(g_aof_fd) != 0) {
+      g_aof_write_error = true;
+      log(LogLevel::Error, "AOF fsync (always) failed: " + std::string(std::strerror(errno)));
+    }
   }
   // Buffer for BGREWRITEAOF diff: commands written while child is rewriting
   // are collected here and appended to the new AOF when the child finishes.
@@ -1753,6 +1817,110 @@ void evict_to_fit() {
     append_aof({"DEL", victim->key});
     notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key, victim->db);
   }
+}
+
+bool rewrite_aof_file(std::string& err);  // defined below
+
+// aofRewriteLimited() (aof.c): after 3 failed rewrites in a row, a retry waits 1 minute, then
+// 2, 4, ... up to 60, so a rewrite that keeps failing (no memory to fork, a full disk) does not
+// fork again on every event-loop pass.
+bool aof_rewrite_limited() {
+  static int next_delay_minutes = 0;
+  static std::int64_t next_rewrite_s = 0;
+  if (g_aofrw_consecutive_failures < 3) {
+    next_delay_minutes = 0;
+    next_rewrite_s = 0;
+    return false;
+  }
+  const std::int64_t now_s = now_ms() / 1000;
+  if (next_rewrite_s != 0) {
+    if (now_s < next_rewrite_s) return true;
+    next_rewrite_s = 0;
+    return false;
+  }
+  next_delay_minutes = next_delay_minutes == 0 ? 1 : std::min(next_delay_minutes * 2, 60);
+  next_rewrite_s = now_s + next_delay_minutes * 60;
+  log(LogLevel::Warn, "Background AOF rewrite has repeatedly failed and triggered the limit, "
+                      "will retry in " + std::to_string(next_delay_minutes) + " minutes");
+  return true;
+}
+
+// Forks the AOF rewrite child (BGREWRITEAOF, and CONFIG SET appendonly yes). The child writes
+// the dataset to <appendfilename>.tmp; reap_background_children() adds the commands buffered
+// meanwhile and renames it over the AOF.
+bool start_aof_rewrite() {
+  const auto fork_t0 = std::chrono::steady_clock::now();
+  const pid_t pid = fork();
+  if (pid < 0) {
+    log(LogLevel::Warn, "Can't rewrite append only file in background: fork: " +
+                            std::string(std::strerror(errno)));
+    return false;
+  }
+  if (pid == 0) {
+    std::string err;
+    _exit(rewrite_aof_file(err) ? 0 : 1);
+  }
+  g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now() - fork_t0).count();
+  ++g_total_forks;
+  g_bgrewrite_in_progress.store(true);
+  g_bgrewrite_child_pid.store(pid);
+  g_aof_rewrite_buf.clear();
+  g_aof_rewrite_buf_capped = false;  // reset per-rewrite overflow flag
+  g_aof_rewrite_scheduled = false;
+  // The rewritten file ends in whatever database its last SELECT named, so the first command
+  // buffered for it must carry its own SELECT.
+  g_last_aof_db = -1;
+  return true;
+}
+
+// Stops a running rewrite and throws its work away (killAppendOnlyChild()).
+void kill_aof_rewrite_child() {
+  const pid_t pid = g_bgrewrite_child_pid.load();
+  if (!g_bgrewrite_in_progress.load() || pid <= 0) return;
+  ::kill(pid, SIGKILL);
+  int status = 0;
+  while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+  }
+  ::unlink((g_aof_path.string() + ".tmp").c_str());
+  g_bgrewrite_child_pid.store(0);
+  g_bgrewrite_in_progress.store(false);
+  g_aof_rewrite_buf.clear();
+}
+
+// CONFIG SET appendonly yes (startAppendOnly()): the AOF starts with a rewrite of the current
+// dataset, and every write from now on is kept for it.
+bool start_append_only(std::string& err) {
+  // A rewrite started while the AOF was off has not kept the writes made since it started.
+  kill_aof_rewrite_child();
+  g_appendonly = true;
+  g_aof_state = AofState::WaitRewrite;
+  g_aof_write_error = false;  // Redis also forgets an earlier AOF write error here
+  if (!start_aof_rewrite()) {
+    g_appendonly = false;
+    g_aof_state = AofState::Off;
+    log(LogLevel::Warn, "PeaDB needs to enable the AOF but can't trigger a background AOF "
+                        "rewrite operation. Check the above logs for more info about the error.");
+    err = "Unable to turn on AOF. Check server logs.";
+    return false;
+  }
+  return true;
+}
+
+// CONFIG SET appendonly no (stopAppendOnly()).
+void stop_append_only() {
+  if (g_aof_fd >= 0) {
+    if (::fsync(g_aof_fd) != 0) {
+      log(LogLevel::Warn, "Fail to fsync the AOF file: " + std::string(std::strerror(errno)));
+    }
+    ::close(g_aof_fd);
+    g_aof_fd = -1;
+  }
+  g_last_aof_db = -1;
+  g_appendonly = false;
+  g_aof_state = AofState::Off;
+  g_aof_rewrite_scheduled = false;
+  kill_aof_rewrite_child();
 }
 
 bool rewrite_aof_file(std::string& err) {
@@ -3182,6 +3350,408 @@ std::string do_geo_search(const std::vector<std::string>& args, RespVersion resp
   return encode_array(out);
 }
 
+// ── CONFIG GET / CONFIG SET ──
+// Both know every Redis 7.2.5 setting (redis_config_table.generated.hpp) and run Redis's own
+// value checks (check_redis_config_value(), shared with the config loader). A setting PeaDB
+// applies has a live entry: its getter reads the running value and its setter applies a checked
+// value. A setting PeaDB does not apply either has a fixed behaviour (peadb_fixed_setting():
+// CONFIG GET reports it and CONFIG SET refuses any other value), or keeps the value it was given
+// and has no effect, with a warning in the log, as in the config file (compat/delta.md item 24).
+
+// The value of every setting with no live entry that differs from Redis's default, by
+// canonical name: the config file's value, then CONFIG SET's.
+std::unordered_map<std::string, std::string> g_config_values;
+std::string g_config_file;  // the config file PeaDB started with; "" when there is none
+
+struct LiveConfig {
+  std::function<std::string()> get;
+  // Applies a value that passed Redis's checks. Empty when PeaDB cannot change the setting
+  // while it runs (or Redis cannot either: an IMMUTABLE_CONFIG setting).
+  std::function<bool(const std::string& value, std::string& err)> set;
+  // For a setting whose apply can fail: the same test, run before CONFIG SET changes anything,
+  // so a value that cannot be applied does not first undo the settings before it.
+  std::function<bool(const std::string& value, std::string& err)> check = nullptr;
+};
+
+template <typename T>
+LiveConfig live_number(T& var) {
+  return {[&var] { return std::to_string(var); },
+          [&var](const std::string& v, std::string&) {
+            // The value is in the setting's range already; a ULongLong above what `var` holds
+            // (only maxmemory) is kept as the largest value it can hold.
+            if constexpr (std::is_signed_v<T>) {
+              constexpr auto kMax = static_cast<unsigned long long>(std::numeric_limits<T>::max());
+              var = v[0] == '-' ? static_cast<T>(std::stoll(v))
+                                : static_cast<T>(std::min(std::stoull(v), kMax));
+            } else {
+              var = static_cast<T>(std::stoull(v));
+            }
+            return true;
+          }};
+}
+
+LiveConfig live_bool(bool& var) {
+  return {[&var] { return std::string(var ? "yes" : "no"); },
+          [&var](const std::string& v, std::string&) {
+            var = v == "yes";
+            return true;
+          }};
+}
+
+LiveConfig live_string(std::string& var) {
+  return {[&var] { return var; },
+          [&var](const std::string& v, std::string&) {
+            var = v;
+            return true;
+          }};
+}
+
+LiveConfig live_cluster_port(int& var) {
+  return {[&var] { return std::to_string(var); },
+          [&var](const std::string& v, std::string&) {
+            var = std::stoi(v);
+            // CLUSTER NODES/SLOTS must show the new address at once (see cluster-announce-ip).
+            reregister_self_if_needed();
+            return true;
+          }};
+}
+
+const std::unordered_map<std::string, LiveConfig>& live_configs() {
+  static const auto* table = [] {
+    auto& lim = store().encoding_limits();
+    return new std::unordered_map<std::string, LiveConfig>{
+        // Redis can move its listeners at runtime; PeaDB cannot yet (item 25).
+        {"port", {[] { return std::to_string(g_server_port); }, nullptr}},
+        {"bind", {[] { return g_server_bind; }, nullptr}},
+        {"tcp-backlog", {[] { return std::to_string(g_config_tcp_backlog); }, nullptr}},
+        {"replicaof",
+         {[] {
+            return g_replication_role == "slave"
+                       ? g_replication_master_host + " " + std::to_string(g_replication_master_port)
+                       : std::string();
+          },
+          nullptr}},
+        {"appendfilename", {[] { return g_aof_path.string(); }, nullptr}},
+        {"cluster-enabled",
+         {[] { return std::string(g_cluster_enabled ? "yes" : "no"); }, nullptr}},
+        {"maxclients",
+         {[] { return std::to_string(configured_max_clients()); },
+          [](const std::string& v, std::string&) {
+            configure_max_clients(static_cast<int>(std::min<long long>(std::stoll(v), INT_MAX)));
+            return true;
+          },
+          [](const std::string& v, std::string& err) {
+            // updateMaxclients(): the open-files limit must allow that many clients (raising
+            // it is harmless even if CONFIG SET then fails on another setting).
+            const long long wanted = std::stoll(v);
+            const int allowed =
+                adjust_open_files_limit(static_cast<int>(std::min<long long>(wanted, INT_MAX)));
+            if (allowed < wanted) {
+              err = "The operating system is not able to handle the specified number of "
+                    "clients, try with " + std::to_string(allowed);
+              return false;
+            }
+            return true;
+          }}},
+        {"timeout", live_number(g_config_timeout)},
+        {"tcp-keepalive", live_number(g_tcp_keepalive)},
+        {"loglevel",
+         {[] { return g_loglevel_name; },
+          [](const std::string& v, std::string&) {
+            configure_log_level(v);
+            return true;
+          }}},
+        {"dir",
+         {[] {
+            std::error_code ec;
+            const auto cwd = std::filesystem::current_path(ec);
+            return ec ? std::string() : cwd.string();
+          },
+          [](const std::string& v, std::string& err) {
+            // setConfigDirOption(): the data files follow, since their names are relative.
+            if (::chdir(v.c_str()) != 0) {
+              err = std::strerror(errno);
+              return false;
+            }
+            return true;
+          },
+          [](const std::string& v, std::string& err) {
+            // What chdir(2) checks: the path is a directory this process may enter.
+            struct stat st {};
+            const int error = ::stat(v.c_str(), &st) != 0       ? errno
+                              : !S_ISDIR(st.st_mode)            ? ENOTDIR
+                              : ::access(v.c_str(), X_OK) != 0 ? errno
+                                                                : 0;
+            if (error != 0) err = std::strerror(error);
+            return error == 0;
+          }}},
+        {"dbfilename",
+         {[] { return g_snapshot_path.string(); },
+          [](const std::string& v, std::string&) {
+            g_snapshot_path = v;
+            return true;
+          }}},
+        {"appendonly",
+         {[] { return std::string(g_appendonly ? "yes" : "no"); },
+          [](const std::string& v, std::string& err) {
+            // updateAppendonly()
+            if (v == "yes" && g_aof_state == AofState::Off) return start_append_only(err);
+            if (v == "no" && g_aof_state != AofState::Off) stop_append_only();
+            return true;
+          }}},
+        {"appendfsync", live_string(g_appendfsync)},
+        {"aof-load-truncated", live_bool(g_aof_load_truncated)},
+        {"save",
+         {[] { return g_save_spec; },
+          [](const std::string& v, std::string&) {
+            configure_save(v);
+            return true;
+          }}},
+        {"stop-writes-on-bgsave-error", live_bool(g_stop_writes_on_bgsave_error)},
+        {"requirepass", live_string(g_requirepass)},
+        {"masterauth",
+         {[] { return masterauth_copy(); },
+          [](const std::string& v, std::string&) {
+            std::lock_guard<std::mutex> lock(g_masterauth_mu);
+            g_masterauth = v;
+            return true;
+          }}},
+        {"protected-mode", live_bool(g_protected_mode)},
+        {"maxmemory", live_number(g_config_maxmemory)},
+        {"maxmemory-policy",
+         {[] { return std::string(maxmemory_policy_to_str(g_maxmemory_policy)); },
+          [](const std::string& v, std::string&) {
+            apply_maxmemory_policy(*parse_maxmemory_policy(v));
+            return true;
+          }}},
+        {"maxmemory-samples", live_number(g_maxmemory_samples)},
+        {"lfu-log-factor",
+         {[] { return std::to_string(store().lfu_log_factor()); },
+          [](const std::string& v, std::string&) {
+            store().set_lfu_log_factor(std::stoi(v));
+            return true;
+          }}},
+        {"lazyfree-lazy-server-del", live_bool(g_lazyfree_lazy_server_del)},
+        {"repl-backlog-size",
+         {[] { return std::to_string(g_repl_backlog.size_); },
+          [](const std::string& v, std::string& err) {
+            // resizeReplicationBacklog() raises a smaller size to 16 KB. PeaDB allocates the
+            // whole buffer at once (Redis grows it as data arrives), so a size that cannot be
+            // allocated is refused instead.
+            const long long size = std::max<long long>(std::stoll(v), 16 * 1024);
+            if (!g_repl_backlog.resize(static_cast<std::size_t>(size))) {
+              err = "Unable to allocate a replication backlog of this size";
+              return false;
+            }
+            return true;
+          }}},
+        {"min-replicas-to-write", live_number(g_config_min_replicas_to_write)},
+        {"replica-serve-stale-data", live_bool(g_config_replica_serve_stale_data)},
+        {"busy-reply-threshold", live_number(g_config_lua_time_limit)},
+        {"proto-max-bulk-len", live_number(g_proto_max_bulk_len)},
+        {"client-query-buffer-limit", live_number(g_client_query_buffer_limit)},
+        {"client-output-buffer-limit",
+         {[] { return client_output_buffer_limit_str(); },
+          [](const std::string& v, std::string&) {
+            configure_client_output_buffer_limit(v);  // only the classes named change
+            return true;
+          }}},
+        {"notify-keyspace-events",
+         {[] { return notify_flags_to_str(g_notify_flags); },
+          [](const std::string& v, std::string&) {
+            g_notify_flags = parse_notify_flags(v);
+            return true;
+          }}},
+        {"slowlog-log-slower-than", live_number(g_slowlog_threshold_us)},
+        {"slowlog-max-len",
+         {[] { return std::to_string(g_slowlog_max_len); },
+          [](const std::string& v, std::string&) {
+            g_slowlog_max_len = static_cast<std::size_t>(std::stoull(v));
+            while (g_slowlog.size() > g_slowlog_max_len) g_slowlog.pop_back();
+            return true;
+          }}},
+        {"latency-monitor-threshold", live_number(g_latency_monitor_threshold_ms)},
+        {"hash-max-listpack-entries", live_number(lim.hash_entries)},
+        {"hash-max-listpack-value", live_number(lim.hash_value)},
+        {"list-max-listpack-size", live_number(lim.list_size)},
+        {"set-max-intset-entries", live_number(lim.set_intset)},
+        {"set-max-listpack-entries", live_number(lim.set_entries)},
+        {"set-max-listpack-value", live_number(lim.set_value)},
+        {"zset-max-listpack-entries", live_number(lim.zset_entries)},
+        {"zset-max-listpack-value", live_number(lim.zset_value)},
+        {"cluster-announce-ip",
+         {[] { return g_cluster_announce_ip; },
+          [](const std::string& v, std::string&) {
+            g_cluster_announce_ip = v;
+            // The node table (g_cluster_nodes[0]) is a lazy snapshot taken by the first
+            // CLUSTER call (ensure_self_registered()); re-derive it so CONFIG GET and CLUSTER
+            // NODES/SLOTS agree whether this runs before or after that snapshot.
+            reregister_self_if_needed();
+            return true;
+          },
+          [](const std::string& v, std::string& err) {
+            // Same hazard the startup guard refuses (main.cpp): a wildcard address is
+            // undialable by any peer. Empty means "fall back to bind" (Redis's
+            // EMPTY_STRING_IS_NULL, config.c:3105), so check the address that would actually
+            // be announced: a node can only start with a wildcard `bind` if it also had an
+            // explicit, non-wildcard cluster-announce-ip, so this override may be the only
+            // thing between the announced host and that wildcard bind.
+            const std::string resolved = v.empty() ? g_server_bind : v;
+            if (is_wildcard_announce_host(resolved)) {
+              err = "cluster-announce-ip must not resolve to a wildcard address ('" + resolved +
+                    "'); no peer could dial it back";
+              return false;
+            }
+            return true;
+          }}},
+        {"cluster-announce-port", live_cluster_port(g_cluster_announce_port)},
+        {"cluster-announce-bus-port", live_cluster_port(g_cluster_announce_bus_port)},
+    };
+  }();
+  return *table;
+}
+
+std::string config_value(const RedisConfigSpec& spec) {
+  const auto& live = live_configs();
+  if (const auto it = live.find(spec.name); it != live.end()) return it->second.get();
+  if (const FixedSetting* fixed = peadb_fixed_setting(spec.name)) return fixed->value;
+  if (const auto it = g_config_values.find(spec.name); it != g_config_values.end()) {
+    return it->second;
+  }
+  return spec.default_value != nullptr ? spec.default_value : "";
+}
+
+// allowProtectedAction(): what enable-protected-configs (and Redis's other "yes / local / no"
+// settings) allow this client.
+bool allow_protected_action(const std::string& setting, const SessionState& session) {
+  return setting == "yes" || (setting == "local" && session.is_local);
+}
+
+// CONFIG GET <pattern> [<pattern> ...] (configGetCommand()): a name without wildcards is looked
+// up directly and shown as the client spelled it, so it also finds a HIDDEN_CONFIG setting; a
+// pattern matches every name and alias except hidden settings, ignoring case.
+std::string config_get_reply(const std::vector<std::string>& args, RespVersion resp) {
+  std::vector<std::string> out;
+  std::unordered_set<std::string> seen;  // lower-case names already in the reply
+  auto add = [&](const std::string& shown, const RedisConfigSpec& spec) {
+    if (!seen.insert(lower(shown)).second) return;
+    out.push_back(encode_bulk(shown));
+    out.push_back(encode_bulk(config_value(spec)));
+  };
+  for (std::size_t i = 2; i < args.size(); ++i) {
+    const std::string& pattern = args[i];
+    if (pattern.find_first_of("[*?") == std::string::npos) {
+      if (const RedisConfigSpec* spec = find_redis_config(pattern)) add(pattern, *spec);
+      continue;
+    }
+    for (const auto& spec : kRedisConfigSpecs) {
+      if ((spec.flags & kCfgHidden) != 0) continue;
+      for (const char* name : {spec.name, spec.alias}) {
+        if (name != nullptr && fnmatch(pattern.c_str(), name, FNM_CASEFOLD) == 0) add(name, spec);
+      }
+    }
+  }
+  return encode_map(out, resp);
+}
+
+// CONFIG SET <name> <value> [<name> <value> ...] (configSetCommand()): all or nothing. Errors
+// come in Redis's order: an unknown, immutable, protected or repeated name first, then a value
+// that fails Redis's checks; PeaDB also refuses at that point a value it cannot apply. Only then
+// does anything change; if applying one setting fails, the ones before it are put back.
+std::string config_set_reply(const std::vector<std::string>& args, const SessionState& session) {
+  if (args.size() % 2 != 0) return encode_error("syntax error");
+  struct Change {
+    const RedisConfigSpec* spec;
+    std::string entry;  // the name or alias it was set by, in lower case (Redis's config->name)
+    std::string value;
+    const LiveConfig* live = nullptr;
+  };
+  std::vector<Change> changes;
+  const std::string protected_allowed =
+      config_value(*find_redis_config("enable-protected-configs"));
+  for (std::size_t i = 2; i < args.size(); i += 2) {
+    const RedisConfigSpec* spec = find_redis_config(args[i]);
+    if (spec == nullptr) {
+      return encode_error("Unknown option or number of arguments for CONFIG SET - '" + args[i] +
+                          "'");
+    }
+    const std::string failed =
+        "CONFIG SET failed (possibly related to argument '" + args[i] + "') - ";
+    if ((spec->flags & kCfgImmutable) != 0) {
+      return encode_error(failed + "can't set immutable config");
+    }
+    if ((spec->flags & kCfgProtected) != 0 && !allow_protected_action(protected_allowed, session)) {
+      return encode_error(failed + "can't set protected config");
+    }
+    const std::string entry = lower(args[i]);
+    for (const auto& c : changes) {
+      if (c.entry == entry) return encode_error(failed + "duplicate parameter");
+    }
+    changes.push_back({spec, entry, args[i + 1]});
+  }
+  const auto& live = live_configs();
+  for (auto& c : changes) {
+    const std::string failed =
+        "CONFIG SET failed (possibly related to argument '" + c.entry + "') - ";
+    std::string checked, err;
+    if (!check_redis_config_value(*c.spec, config_set_args(*c.spec, c.value), checked, err)) {
+      return encode_error(failed + err);
+    }
+    c.value = checked;
+    if (const auto it = live.find(c.spec->name); it != live.end()) {
+      c.live = &it->second;
+      if (!c.live->set && checked != c.live->get()) {
+        return encode_error(failed + "PeaDB cannot change this setting while it runs yet "
+                                     "(compat/delta.md item 25)");
+      }
+      if (c.live->check && !c.live->check(checked, err)) return encode_error(failed + err);
+    } else if (const FixedSetting* fixed = peadb_fixed_setting(c.spec->name)) {
+      if (checked != fixed->value) {
+        return encode_error(failed + (fixed->refuse != nullptr
+                                          ? std::string(fixed->refuse)
+                                          : "PeaDB always uses '" + std::string(fixed->value) +
+                                                "' for this setting and cannot change it "
+                                                "(compat/delta.md item 24)"));
+      }
+    }
+  }
+  std::vector<std::pair<const Change*, std::string>> applied;  // with the value it replaced
+  for (const auto& c : changes) {
+    const std::string old = config_value(*c.spec);
+    if (c.live != nullptr) {
+      // A bool, number, enum or string that keeps its value is left alone, as in Redis (its
+      // set function returns 2, so its apply function does not run); a special setting is
+      // always applied.
+      if (!c.live->set || (c.spec->type != RedisConfigType::Special && c.value == old)) continue;
+      std::string err;
+      if (!c.live->set(c.value, err)) {
+        log(LogLevel::Warn, "Failed applying new configuration. Possibly related to new " +
+                                c.entry + " setting. Restoring previous settings.");
+        for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
+          std::string restore_err;
+          if (it->first->live == nullptr) {
+            g_config_values[it->first->spec->name] = it->second;
+          } else if (!it->first->live->set(it->second, restore_err)) {
+            // restoreBackupConfig() logs the same; the value is left out, as it may be secret.
+            log(LogLevel::Warn, "Failed restoring failed CONFIG SET command. Error setting " +
+                                    it->first->entry + ": " + restore_err);
+          }
+        }
+        return encode_error("CONFIG SET failed (possibly related to argument '" + c.entry +
+                            "') - " + err);
+      }
+    } else if (peadb_fixed_setting(c.spec->name) == nullptr) {
+      g_config_values[c.spec->name] = c.value;
+      if (c.value != old) {
+        log(LogLevel::Warn, "CONFIG SET '" + c.entry + "' is a Redis setting that PeaDB does not "
+                            "support yet, so it has no effect (compat/delta.md item 24)");
+      }
+    }
+    applied.emplace_back(&c, old);
+  }
+  return encode_simple("OK");
+}
+
 const std::unordered_map<std::string, CommandSpec>& command_table() {
   static const std::unordered_map<std::string, CommandSpec> table = [] {
     std::unordered_map<std::string, CommandSpec> t;
@@ -3999,7 +4569,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "rdb_last_bgsave_status:" + g_last_bgsave_status + "\r\n"
                    "aof_enabled:" + std::to_string(g_appendonly ? 1 : 0) + "\r\n"
                    "aof_rewrite_in_progress:" + std::to_string(g_bgrewrite_in_progress.load() ? 1 : 0) + "\r\n"
+                   "aof_rewrite_scheduled:" + std::to_string(g_aof_rewrite_scheduled) + "\r\n"
                    "aof_last_bgrewrite_status:" + g_aof_last_bgrewrite_status + "\r\n"
+                   "aof_rewrites_consecutive_failures:" +
+                       std::to_string(g_aofrw_consecutive_failures) + "\r\n"
                    "aof_write_error:" + std::to_string(g_aof_write_error ? 1 : 0) + "\r\n"
                    "aof_rewrite_buffer_length:" + std::to_string(g_aof_rewrite_buf.size()) + "\r\n\r\n";
           }
@@ -4117,20 +4690,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>&, SessionState&, bool&) {
           if (g_bgrewrite_in_progress.load())
             return encode_error("Background append only file rewriting already in progress");
-          const auto fork_t0 = std::chrono::steady_clock::now();
-          pid_t pid = fork();
-          if (pid < 0) return encode_error("BGREWRITEAOF failed: fork error");
-          if (pid == 0) {
-            std::string err;
-            bool ok = rewrite_aof_file(err);
-            _exit(ok ? 0 : 1);
-          }
-          g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
-              std::chrono::steady_clock::now() - fork_t0).count();
-          ++g_total_forks;
-          g_bgrewrite_in_progress.store(true);
-          g_bgrewrite_child_pid.store(pid);
-          g_aof_rewrite_buf_capped = false; // reset per-rewrite overflow flag
+          g_aofrw_consecutive_failures = 0;  // a rewrite asked for by hand is not held back
+          if (!start_aof_rewrite()) return encode_error("BGREWRITEAOF failed: fork error");
           return encode_simple("Background append only file rewriting started");
         }});
 
@@ -4772,287 +5333,55 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("CONFIG", CommandSpec{"CONFIG", -2, {"admin", "loading"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          if (upper(args[1]) == "HELP") {
-            return encode_array({
-                encode_bulk("CONFIG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
-                encode_bulk("GET <pattern>"), encode_bulk("SET <directive> <value>"),
-                encode_bulk("RESETSTAT"), encode_bulk("REWRITE"), encode_bulk("HELP")});
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          const std::string sub = upper(args[1]);
+          // The arity of each subcommand, as Redis's command table checks it.
+          const auto arity_error = [&] {
+            return encode_error("wrong number of arguments for 'config|" + lower(args[1]) +
+                                "' command");
+          };
+          if (sub == "GET") {
+            if (args.size() < 3) return arity_error();
+            return config_get_reply(args, session.resp_version);
           }
-          if (args.size() >= 3 && upper(args[1]) == "GET") {
-            const auto& pattern = args[2];
-            // Build config parameter table
-            std::vector<std::pair<std::string, std::string>> config_params = {
-              {"save", g_save_spec},
-              {"stop-writes-on-bgsave-error", g_stop_writes_on_bgsave_error ? "yes" : "no"},
-              {"aof-load-truncated", g_aof_load_truncated ? "yes" : "no"},
-              {"repl-backlog-size", std::to_string(g_repl_backlog.size_)},
-              {"appendonly", g_appendonly ? "yes" : "no"},
-              {"maxmemory", std::to_string(g_config_maxmemory)},
-              {"min-replicas-to-write", std::to_string(g_config_min_replicas_to_write)},
-              {"replica-serve-stale-data", g_config_replica_serve_stale_data ? "yes" : "no"},
-              {"lua-time-limit", std::to_string(g_config_lua_time_limit)},
-              {"zset-max-ziplist-entries", std::to_string(store().encoding_limits().zset_entries)},
-              {"zset-max-listpack-entries", std::to_string(store().encoding_limits().zset_entries)},
-              {"zset-max-ziplist-value", std::to_string(store().encoding_limits().zset_value)},
-              {"zset-max-listpack-value", std::to_string(store().encoding_limits().zset_value)},
-              {"hash-max-ziplist-entries", std::to_string(store().encoding_limits().hash_entries)},
-              {"hash-max-listpack-entries", std::to_string(store().encoding_limits().hash_entries)},
-              {"hash-max-ziplist-value", std::to_string(store().encoding_limits().hash_value)},
-              {"hash-max-listpack-value", std::to_string(store().encoding_limits().hash_value)},
-              {"set-max-listpack-entries", std::to_string(store().encoding_limits().set_entries)},
-              {"set-max-listpack-value", std::to_string(store().encoding_limits().set_value)},
-              {"list-max-listpack-size", std::to_string(store().encoding_limits().list_size)},
-              {"dbfilename", g_snapshot_path.filename().string()},
-              {"dir", std::filesystem::current_path().string()},
-              {"bind", g_server_bind},
-              {"port", std::to_string(g_server_port)},
-              {"cluster-enabled", g_cluster_enabled ? "yes" : "no"},
-              {"cluster-announce-ip", g_cluster_announce_ip},
-              {"cluster-announce-port", std::to_string(cluster_announced_port())},
-              {"cluster-announce-bus-port", std::to_string(cluster_announced_bus_port())},
-              {"hz", "10"},
-              {"lfu-log-factor", "10"},
-              {"lfu-decay-time", "1"},
-              {"slave-serve-stale-data", g_config_replica_serve_stale_data ? "yes" : "no"},
-              {"min-slaves-to-write", std::to_string(g_config_min_replicas_to_write)},
-              {"slowlog-log-slower-than", std::to_string(g_slowlog_threshold_us)},
-              {"slowlog-max-len", std::to_string(g_slowlog_max_len)},
-              {"notify-keyspace-events", notify_flags_to_str(g_notify_flags)},
-              {"latency-monitor-threshold", std::to_string(g_latency_monitor_threshold_ms)},
-              {"databases", "16"},
-              {"activedefrag", "no"},
-              {"loglevel", g_loglevel_name},
-              {"maxmemory-policy", maxmemory_policy_to_str(g_maxmemory_policy)},
-              {"maxmemory-samples", std::to_string(g_maxmemory_samples)},
-              {"client-output-buffer-limit", client_output_buffer_limit_str()},
-              {"timeout", std::to_string(g_config_timeout)},
-              {"tcp-keepalive", "300"},
-              {"tcp-backlog", std::to_string(g_config_tcp_backlog)},
-              {"lazyfree-lazy-server-del", g_lazyfree_lazy_server_del ? "yes" : "no"},
-              {"proto-max-bulk-len", std::to_string(kProtoMaxBulkLen)},
-              {"list-max-ziplist-size", std::to_string(store().encoding_limits().list_size)},
-              {"set-max-intset-entries", std::to_string(store().encoding_limits().set_intset)},
-              {"maxclients", std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed))},
-              {"appendfsync", g_appendfsync},
-              {"appendfilename", g_aof_path.filename().string()},
-              {"requirepass", g_requirepass},
-              {"masterauth", g_masterauth},
-              {"protected-mode", g_protected_mode ? "yes" : "no"},
-              {"enable-module-command", g_enable_module_command},
-            };
-            std::vector<std::string> out;
-            for (const auto& [key, value] : config_params) {
-              if (fnmatch(pattern.c_str(), key.c_str(), FNM_CASEFOLD) == 0) {
-                out.push_back(encode_bulk(key));
-                out.push_back(encode_bulk(value));
-              }
-            }
-            return encode_array(out);
+          if (sub == "SET") {
+            if (args.size() < 4) return arity_error();
+            return config_set_reply(args, session);
           }
-          if (args.size() >= 4 && upper(args[1]) == "SET") {
-            const auto k = lower(args[2]);
-            // cluster-enabled is startup-only, matching Redis's IMMUTABLE_CONFIG flag for the
-            // same parameter (config.c:3085); CONFIG SET on it fails with the same error text
-            // Redis uses for any IMMUTABLE_CONFIG parameter (config.c:859,950).
-            if (k == "cluster-enabled") {
-              return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] +
-                                  "') - can't set immutable config");
-            }
-            if (k == "cluster-announce-ip") {
-              // Same hazard the startup guard refuses (main.cpp): a wildcard address is
-              // undialable by any peer. Unlike the two port parameters beside it (already
-              // range-checked below), this field used to accept any string verbatim — an
-              // operator could CONFIG SET their way into the exact address class the server
-              // refuses to boot with. Empty still means "clear the override and fall back to
-              // bind" (mirrors Redis's EMPTY_STRING_IS_NULL treatment of this same parameter,
-              // config.c:3105) — but check the address that would actually be announced
-              // afterward, not just the literal argument: a node can only ever start with a
-              // wildcard `bind` if it also had an explicit, non-wildcard cluster-announce-ip
-              // (the startup guard above refuses every other combination), so that startup check
-              // having passed does NOT mean falling back to `bind` is safe now — this override
-              // may be the only thing standing between the announced host and that wildcard bind.
-              const auto& v = args[3];
-              const std::string resolved = v.empty() ? g_server_bind : v;
-              if (is_wildcard_announce_host(resolved)) {
-                return encode_error("CONFIG SET failed (possibly related to argument '" +
-                                    args[2] + "') - cluster-announce-ip must not resolve to a "
-                                    "wildcard address ('" + resolved + "'); no peer could dial it "
-                                    "back");
-              }
-              g_cluster_announce_ip = v;
-              // The node table (g_cluster_nodes[0]) is a lazy snapshot taken by the first
-              // CLUSTER call (ensure_self_registered()); without this, a CONFIG SET landing
-              // after that snapshot would leave CONFIG GET and CLUSTER NODES/SLOTS disagreeing
-              // about this node's own advertised address, and the NODES line would mix the new
-              // host with the old (now-stale) id. Re-derive it immediately so the two orderings
-              // — CONFIG SET before vs. after the first CLUSTER call — behave identically.
-              reregister_self_if_needed();
-            }
-            if (k == "cluster-announce-port") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
-              g_cluster_announce_port = static_cast<int>(v);
-              reregister_self_if_needed();
-            }
-            if (k == "cluster-announce-bus-port") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0 || v > 65535) return encode_error("value is not an integer or out of range");
-              g_cluster_announce_bus_port = static_cast<int>(v);
-              // The bus port is not part of the node id/host/port triple, but re-derive anyway
-              // for uniformity with the other two announce parameters — it is a cheap no-op
-              // when only the bus port changed.
-              reregister_self_if_needed();
-            }
-            if (k == "maxmemory") {
-              std::int64_t v = 0;
-              if (!parse_memory(args[3], v) || v < 0) {
-                return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] + "') - argument couldn't be parsed into an integer");
-              }
-              g_config_maxmemory = v;
-            }
-            if (k == "maxmemory-policy") {
-              const auto p = parse_maxmemory_policy(args[3]);
-              if (!p) return encode_error("argument(s) must be one of the following: "
-                                          "noeviction, allkeys-lru, allkeys-lfu, allkeys-random, "
-                                          "volatile-lru, volatile-lfu, volatile-random, volatile-ttl");
-              apply_maxmemory_policy(*p);
-            }
-            if (k == "maxmemory-samples") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 1 || v > std::numeric_limits<int>::max()) {
-                // Redis's range is 1..INT_MAX
-                return encode_error("value is not an integer or out of range");
-              }
-              g_maxmemory_samples = static_cast<int>(v);
-            }
-            if (k == "timeout") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              g_config_timeout = static_cast<int>(v);
-            }
-            if (k == "client-output-buffer-limit") {
-              configure_client_output_buffer_limit(args[3]);
-            }
-            if (k == "maxclients") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 1 || v > std::numeric_limits<int>::max()) {
-                return encode_error("value is not an integer or out of range");
-              }
-              g_runtime_max_clients.store(static_cast<int>(v), std::memory_order_relaxed);
-            }
-            if (k == "min-replicas-to-write") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              g_config_min_replicas_to_write = v;
-            }
-            if (k == "replica-serve-stale-data") {
-              const auto v = lower(args[3]);
-              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
-              g_config_replica_serve_stale_data = (v == "yes");
-            }
-            if (k == "lua-time-limit") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              g_config_lua_time_limit = v;
-            }
-            {
-              // Encoding-transition thresholds (listpack/ziplist aliases share storage).
-              auto& lim = store().encoding_limits();
-              std::int64_t* slot = nullptr;
-              bool allow_negative = false;
-              if (k == "zset-max-ziplist-entries" || k == "zset-max-listpack-entries") slot = &lim.zset_entries;
-              else if (k == "zset-max-ziplist-value" || k == "zset-max-listpack-value") slot = &lim.zset_value;
-              else if (k == "hash-max-ziplist-entries" || k == "hash-max-listpack-entries") slot = &lim.hash_entries;
-              else if (k == "hash-max-ziplist-value" || k == "hash-max-listpack-value") slot = &lim.hash_value;
-              else if (k == "set-max-intset-entries") slot = &lim.set_intset;
-              else if (k == "set-max-listpack-entries") slot = &lim.set_entries;
-              else if (k == "set-max-listpack-value") slot = &lim.set_value;
-              else if (k == "list-max-ziplist-size" || k == "list-max-listpack-size") { slot = &lim.list_size; allow_negative = true; }
-              if (slot != nullptr) {
-                std::int64_t v = 0;
-                if (!parse_i64(args[3], v) || (v < 0 && !allow_negative)) {
-                  return encode_error("value is not an integer or out of range");
-                }
-                *slot = v;
-              }
-            }
-            if (k == "appendfsync") {
-              const auto v = lower(args[3]);
-              if (v != "always" && v != "everysec" && v != "no")
-                return encode_error("Invalid argument '" + args[3] + "' for CONFIG SET 'appendfsync'");
-              g_appendfsync = v;
-            }
-            if (k == "lazyfree-lazy-server-del") {
-              g_lazyfree_lazy_server_del = (lower(args[3]) == "yes");
-            }
-            if (k == "requirepass") {
-              // Setting to "" disables auth. Already-connected clients keep their state.
-              g_requirepass = args[3];
-            }
-            if (k == "masterauth") {
-              g_masterauth = args[3];
-            }
-            if (k == "protected-mode") {
-              const auto v = lower(args[3]);
-              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
-              g_protected_mode = (v == "yes");
-            }
-            if (k == "save") {
-              configure_save(args[3]);
-            }
-            if (k == "stop-writes-on-bgsave-error") {
-              const auto v = lower(args[3]);
-              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
-              g_stop_writes_on_bgsave_error = (v == "yes");
-            }
-            if (k == "aof-load-truncated") {
-              const auto v = lower(args[3]);
-              if (v != "yes" && v != "no") return encode_error("argument must be 'yes' or 'no'");
-              g_aof_load_truncated = (v == "yes");
-            }
-            if (k == "notify-keyspace-events") {
-              g_notify_flags = parse_notify_flags(args[3]);
-            }
-            if (k == "slowlog-log-slower-than") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v)) return encode_error("value is not an integer or out of range");
-              g_slowlog_threshold_us = v;
-            }
-            if (k == "slowlog-max-len") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              g_slowlog_max_len = static_cast<std::size_t>(v);
-              while (g_slowlog.size() > g_slowlog_max_len) g_slowlog.pop_back();
-            }
-            if (k == "latency-monitor-threshold") {
-              std::int64_t v = 0;
-              if (!parse_i64(args[3], v) || v < 0) return encode_error("value is not an integer or out of range");
-              g_latency_monitor_threshold_ms = v;
-            }
-            if (k == "loglevel") {
-              const auto v = lower(args[3]);
-              LogLevel level = LogLevel::Info;
-              if (!parse_redis_log_level(v, level)) {
-                return encode_error("CONFIG SET failed (possibly related to argument '" + args[2] +
-                                    "') - argument(s) must be one of the following: debug, "
-                                    "verbose, notice, warning, nothing");
-              }
-              g_loglevel_name = v;
-              set_log_level(level);
-            }
-            return encode_simple("OK");
-          }
-          if (args.size() == 2 && upper(args[1]) == "RESETSTAT") {
+          if (sub == "RESETSTAT") {
+            if (args.size() != 2) return arity_error();
             g_cmdstats.clear();
             g_cmd_latency_hist.clear();  // LATENCY HISTOGRAM resets with commandstats
             g_errorstats.clear();
             g_total_error_replies = 0;
             return encode_simple("OK");
           }
-          // Redis's addReplySubcommandSyntaxError (lowercase, networking.c): an unrecognized
-          // CONFIG subcommand (e.g. `CONFIG GET_XX`) is "unknown subcommand", not an arity error.
-          return encode_error("unknown subcommand or wrong number of arguments for '" + args[1] +
+          if (sub == "REWRITE") {
+            if (args.size() != 2) return arity_error();
+            if (g_config_file.empty()) {
+              return encode_error("The server is running without a config file");
+            }
+            return encode_error(
+                "CONFIG REWRITE is not supported by PeaDB yet (compat/delta.md item 25)");
+          }
+          if (sub == "HELP") {
+            if (args.size() != 2) return arity_error();
+            // addReplyHelp(): one status reply per line.
+            return encode_array({
+                encode_simple("CONFIG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:"),
+                encode_simple("GET <pattern>"),
+                encode_simple("    Return parameters matching the glob-like <pattern> and "
+                              "their values."),
+                encode_simple("SET <directive> <value>"),
+                encode_simple("    Set the configuration <directive> to <value>."),
+                encode_simple("RESETSTAT"),
+                encode_simple("    Reset statistics reported by the INFO command."),
+                encode_simple("REWRITE"),
+                encode_simple("    Rewrite the configuration file."),
+                encode_simple("HELP"),
+                encode_simple("    Print this help.")});
+          }
+          return encode_error("unknown subcommand '" + args[1].substr(0, 128) +
                               "'. Try CONFIG HELP.");
         }});
 
@@ -5435,8 +5764,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("APPEND", CommandSpec{"APPEND", 3, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           return with_string_key(args[1], [&]() {
-            if (static_cast<std::int64_t>(store().strlen(args[1])) +
-                    static_cast<std::int64_t>(args[2].size()) > kProtoMaxBulkLen) {
+            if (!must_obey_client() &&
+                static_cast<std::int64_t>(store().strlen(args[1])) +
+                        static_cast<std::int64_t>(args[2].size()) > g_proto_max_bulk_len) {
               return encode_error("string exceeds maximum allowed size (proto-max-bulk-len)");
             }
             return encode_integer(store().append(args[1], args[2]));
@@ -5451,7 +5781,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("SETBIT", CommandSpec{"SETBIT", 4, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           std::int64_t offset = 0;
-          if (!parse_i64(args[2], offset) || offset < 0 || (offset >> 3) >= kProtoMaxBulkLen) {
+          if (!parse_i64(args[2], offset) || offset < 0 ||
+              (!must_obey_client() && (offset >> 3) >= g_proto_max_bulk_len)) {
             return encode_error("bit offset is not an integer or out of range");
           }
           std::int64_t bit = 0;
@@ -5473,7 +5804,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("GETBIT", CommandSpec{"GETBIT", 3, {"readonly", "fast"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           std::int64_t offset = 0;
-          if (!parse_i64(args[2], offset) || offset < 0 || (offset >> 3) >= kProtoMaxBulkLen) {
+          if (!parse_i64(args[2], offset) || offset < 0 ||
+              (!must_obey_client() && (offset >> 3) >= g_proto_max_bulk_len)) {
             return encode_error("bit offset is not an integer or out of range");
           }
           return with_string_key(args[1], [&]() {
@@ -5494,8 +5826,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (!parse_i64(args[2], offset) || offset < 0) {
             return encode_error("offset is out of range");
           }
-          if (!args[3].empty() &&
-              offset > kProtoMaxBulkLen - static_cast<std::int64_t>(args[3].size())) {
+          if (!args[3].empty() && !must_obey_client() &&
+              offset > g_proto_max_bulk_len - static_cast<std::int64_t>(args[3].size())) {
             // Subtraction form avoids signed overflow when offset is near INT64_MAX.
             return encode_error("string exceeds maximum allowed size (proto-max-bulk-len)");
           }
@@ -10983,7 +11315,12 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
   apply("zset-max-listpack-value", lim.zset_value, false);
 }
 
-void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw) {
+void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
+                                const std::string& config_file) {
+  g_config_file = config_file;
+  // CONFIG GET reports every setting the config named (a live setting reads its global
+  // instead, and a fixed one reports PeaDB's behaviour).
+  for (const auto& [name, value] : raw) g_config_values[name] = value;
   auto num = [&](const char* key, auto& slot) {
     const auto it = raw.find(key);
     std::int64_t v = 0;
@@ -11004,7 +11341,17 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("slowlog-log-slower-than", g_slowlog_threshold_us);
   num("slowlog-max-len", g_slowlog_max_len);
   num("latency-monitor-threshold", g_latency_monitor_threshold_ms);
+  num("proto-max-bulk-len", g_proto_max_bulk_len);
+  num("client-query-buffer-limit", g_client_query_buffer_limit);
+  num("tcp-keepalive", g_tcp_keepalive);
+  int lfu_log_factor = store().lfu_log_factor();
+  num("lfu-log-factor", lfu_log_factor);
+  store().set_lfu_log_factor(lfu_log_factor);
 }
+
+std::int64_t proto_max_bulk_len() { return g_proto_max_bulk_len; }
+std::int64_t client_query_buffer_limit() { return g_client_query_buffer_limit; }
+int tcp_keepalive_seconds() { return g_tcp_keepalive; }
 
 void script_set_repl_flags(int flags) { g_script_repl_flags = flags; }
 
@@ -11075,8 +11422,17 @@ void configure_notify_keyspace_events(const std::string& spec) {
 void configure_repl_backlog_size(const std::string& spec) {
   if (spec.empty()) return;
   std::int64_t v = 0;
-  if (parse_memory(spec, v) && v > 0) g_repl_backlog.reset(static_cast<std::size_t>(v));
-  else log(LogLevel::Warn, "ignoring invalid repl-backlog-size: " + spec);
+  // Redis raises a smaller size to CONFIG_REPL_BACKLOG_MIN_SIZE (16 KB).
+  if (parse_memory(spec, v) && v > 0) {
+    try {
+      g_repl_backlog.reset(static_cast<std::size_t>(std::max<std::int64_t>(v, 16 * 1024)));
+    } catch (const std::exception&) {
+      log(LogLevel::Warn, "cannot allocate a repl-backlog-size of " + spec +
+                              " bytes; keeping the default 1mb");
+    }
+  } else {
+    log(LogLevel::Warn, "ignoring invalid repl-backlog-size: " + spec);
+  }
 }
 
 void configure_save(const std::string& spec) {
@@ -11159,11 +11515,13 @@ void background_save_cron() {
   }
 }
 
-void configure_persistence(const std::string& dir, const std::string& dbfilename, bool appendonly,
+void configure_persistence(const std::string& dbfilename, bool appendonly,
                            const std::string& appendfilename, const std::string& appendfsync) {
-  g_snapshot_path = std::filesystem::path(dir) / dbfilename;
+  // Both names are relative to the working directory, which the config loader set to `dir`.
+  g_snapshot_path = dbfilename;
   g_appendonly = appendonly;
-  g_aof_path = std::filesystem::path(dir) / appendfilename;
+  g_aof_state = appendonly ? AofState::On : AofState::Off;
+  g_aof_path = appendfilename;
   g_appendfsync = appendfsync;
   if (g_appendonly) open_aof_fd();
 }
@@ -11705,8 +12063,8 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     }
 
     // AUTH masterauth (if the master requires a password)
-    if (!g_masterauth.empty()) {
-        if (!repl_send(fd, repl_encode_cmd({"AUTH", g_masterauth})) ||
+    if (const std::string masterauth = masterauth_copy(); !masterauth.empty()) {
+        if (!repl_send(fd, repl_encode_cmd({"AUTH", masterauth})) ||
             !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
             // Redis's syncWithMaster logs exactly this on a rejected AUTH; tooling and tests
             // (unit/auth MASTERAUTH) match on the "Unable to AUTH to MASTER" phrasing.
@@ -11943,7 +12301,7 @@ void reap_background_children() {
       // append the diff buffer to temp.aof, then atomically rename. Any failure
       // unlinks the temp and keeps the old AOF live.
       const std::string tmp_path = g_aof_path.string() + ".tmp";
-      if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_appendonly) {
+      if (WIFEXITED(status) && WEXITSTATUS(status) == 0 && g_aof_state != AofState::Off) {
         if (g_aof_rewrite_buf_capped) {
           // Diff buffer overflowed during rewrite. Abandon: keep old AOF.
           ::unlink(tmp_path.c_str());
@@ -11989,7 +12347,12 @@ void reap_background_children() {
             }
             g_aof_rewrite_buf.clear();
             g_aof_last_bgrewrite_status = dir_durable ? "ok" : "err";
+            g_aofrw_consecutive_failures = 0;
             open_aof_fd();  // reopen on the new inode
+            if (g_aof_state == AofState::WaitRewrite) {
+              g_aof_state = AofState::On;  // CONFIG SET appendonly yes is now in effect
+              log(LogLevel::Info, "Background AOF rewrite finished successfully; the AOF is on");
+            }
           } else {
             ::unlink(tmp_path.c_str());
             const std::size_t dropped = g_aof_rewrite_buf.size();
@@ -12018,7 +12381,18 @@ void reap_background_children() {
         g_aof_rewrite_buf.clear();
         g_aof_last_bgrewrite_status = "err";
       }
+      // The AOF that CONFIG SET appendonly yes turned on still has no file: try again from the
+      // cron (Redis's aof_rewrite_scheduled). The next rewrite forks from the current dataset,
+      // which holds every write the dropped buffer held.
+      if (g_aof_last_bgrewrite_status == "err") ++g_aofrw_consecutive_failures;
+      if (g_aof_state == AofState::WaitRewrite && !g_bgrewrite_in_progress.load()) {
+        g_aof_rewrite_scheduled = true;
+      }
     }
+  }
+  if (g_aof_rewrite_scheduled && g_aof_state == AofState::WaitRewrite &&
+      !g_bgrewrite_in_progress.load() && !aof_rewrite_limited() && !start_aof_rewrite()) {
+    ++g_aofrw_consecutive_failures;
   }
 }
 
