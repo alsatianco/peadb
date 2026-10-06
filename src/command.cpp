@@ -1819,6 +1819,90 @@ void open_aof_fd() {
   g_last_aof_db = -1;
 }
 
+// What one step of the command reader in Redis's loadSingleAppendOnlyFile() found.
+enum class AofStep {
+  Command,     // a whole command, now in `args`
+  Annotation,  // a `#` line, skipped
+  ShortRead,   // the bytes end inside a command (Redis's "unexpected end of file")
+  BadFormat,   // the bytes are not a command (Redis's "bad file format")
+};
+
+// Reads the next command of an AOF held in memory, from `pos` (the start of a line, before the
+// end), the way Redis's loader does with fgets()/fread(): a `*<argc>` line, then for each argument
+// a `$<len>` line and the bytes. What counts as well formed is what redis-check-aof accepts: each
+// number (read like strtol()) is followed by CRLF and nothing else, a length is not negative, and
+// each argument is followed by CRLF. Redis's loader is looser (atoi(), and the two bytes after an
+// argument skipped unchecked), which only matters for a damaged file: torn bytes in the middle of
+// the file, as older PeaDB versions left them, could then be read as a different command.
+AofStep read_aof_step(std::string_view buf, std::size_t& pos, std::vector<std::string>& args) {
+  std::string_view line;
+  bool complete = false;  // the line ends in '\n' (fgets() returned a whole line)
+  const auto next_line = [&] {
+    const std::size_t nl = buf.find('\n', pos);
+    complete = nl != std::string_view::npos;
+    const std::size_t end = complete ? nl + 1 : buf.size();
+    line = buf.substr(pos, end - pos);
+    pos = end;
+  };
+  // strtol() of what follows the line's first byte; `end` is where it stops (1 with no digits).
+  std::size_t end = 1;
+  const auto number = [&] {
+    std::size_t i = 1;
+    while (i < line.size() && (line[i] == ' ' || (line[i] >= '\t' && line[i] <= '\r'))) ++i;
+    const bool negative = i < line.size() && line[i] == '-';
+    if (i < line.size() && (line[i] == '-' || line[i] == '+')) ++i;
+    const std::size_t digits = i;
+    long long value = 0;
+    for (; i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
+      if (value < (1LL << 50)) value = value * 10 + (line[i] - '0');
+    }
+    end = i > digits ? i : 1;
+    return negative ? -value : value;
+  };
+  const auto number_ends_line = [&] {
+    return end + 2 == line.size() && line[end] == '\r';
+  };
+
+  next_line();
+  if (line[0] == '#') return complete ? AofStep::Annotation : AofStep::ShortRead;
+  if (line[0] != '*') return AofStep::BadFormat;
+  if (line.size() == 1) return AofStep::ShortRead;  // Redis: buf[1] == '\0'
+  const long long argc = number();
+  if (argc < 1) return AofStep::BadFormat;
+  if (!complete) return AofStep::ShortRead;
+  if (!number_ends_line()) return AofStep::BadFormat;
+  args.clear();
+  args.reserve(static_cast<std::size_t>(std::min<long long>(argc, 1024)));
+  for (long long j = 0; j < argc; ++j) {
+    if (pos >= buf.size()) return AofStep::ShortRead;
+    next_line();
+    if (line[0] != '$') return AofStep::BadFormat;
+    if (!complete) return AofStep::ShortRead;
+    const long long len = number();
+    if (len < 0 || !number_ends_line()) return AofStep::BadFormat;
+    if (static_cast<unsigned long long>(len) + 2 > buf.size() - pos) return AofStep::ShortRead;
+    const std::size_t n = static_cast<std::size_t>(len);
+    if (buf[pos + n] != '\r' || buf[pos + n + 1] != '\n') return AofStep::BadFormat;
+    args.emplace_back(buf.substr(pos, n));
+    pos += n + 2;
+  }
+  return AofStep::Command;
+}
+
+// Cuts the file at `path` to `size` bytes and syncs it. The AOF fd is opened with O_APPEND, so the
+// next append lands at the new end.
+bool truncate_file(const std::string& path, std::size_t size, std::string& err) {
+  const int fd = ::open(path.c_str(), O_WRONLY | O_CLOEXEC);
+  if (fd < 0) {
+    err = std::strerror(errno);
+    return false;
+  }
+  const bool ok = ::ftruncate(fd, static_cast<off_t>(size)) == 0 && ::fsync(fd) == 0;
+  if (!ok) err = std::strerror(errno);
+  ::close(fd);
+  return ok;
+}
+
 void append_aof(const std::vector<std::string>& args);  // defined below
 
 // Canonicalizing AOF append for a dispatched client write: same deterministic rewrite
@@ -11817,41 +11901,72 @@ bool load_aof_file(const std::string& path, std::string& err) {
     err = "can't open the append log file " + path + " for reading: " + std::strerror(errno);
     return false;
   }
-  std::string buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::string buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+  const std::string_view view(buffer);
+  // Redis's loadSingleAppendOnlyFile(): `valid_up_to` is the end of the last whole command, where
+  // a short read at the end cuts the file, so the next append does not land after torn bytes
+  // (compat/delta.md item 30).
   std::size_t pos = 0;
+  std::size_t valid_up_to = 0;
+  std::size_t valid_before_multi = 0;
   SessionState session {};
   session.authenticated = true;  // internal replay must not be gated by requirepass
   g_replaying_aof = true;
-  while (pos < buffer.size()) {
-    auto parsed = parse_one_command(std::string_view(buffer).substr(pos));
-    if (!parsed.has_value()) {
-      // Incomplete frame remains. If it plausibly looks like a partial command at
-      // EOF, treat it as a truncated tail (Redis: aof-load-truncated, default yes)
-      // and warn with the byte offset; otherwise refuse to start on corruption
-      // rather than silently discarding the remainder.
-      const std::size_t dropped = buffer.size() - pos;
-      const unsigned char first = static_cast<unsigned char>(buffer[pos]);
-      const bool looks_partial = (first == '*' || std::isprint(first));
-      if (looks_partial && g_aof_load_truncated) {
-        log(LogLevel::Warn, "AOF: ignoring truncated tail — " + std::to_string(dropped) +
-            " bytes dropped at offset " + std::to_string(pos));
-        break;
-      }
+  struct ReplayingAof {
+    ~ReplayingAof() {
       g_replaying_aof = false;
-      err = "AOF corrupted at offset " + std::to_string(pos);
+    }
+  } replaying;
+  std::vector<std::string> args;
+  bool short_read = false;
+  while (pos < view.size()) {
+    const std::size_t start = pos;
+    const AofStep step = read_aof_step(view, pos, args);
+    if (step == AofStep::Annotation) continue;
+    if (step == AofStep::ShortRead) {
+      short_read = true;
+      break;
+    }
+    if (step == AofStep::BadFormat) {
+      err = "Bad file format reading the append only file " + path + " at offset " +
+            std::to_string(start) +
+            ": make a backup of your AOF file, then use ./redis-check-aof --fix <filename>";
       return false;
     }
+    if (upper(args[0]) == "MULTI") valid_before_multi = valid_up_to;
     bool close = false;
-    const auto reply = handle_command(parsed->args, session, close);
+    const auto reply = handle_command(args, session, close);
     if (is_error_reply(reply)) {
-      g_replaying_aof = false;
-      err = "AOF replay command failed at offset " + std::to_string(pos);
+      err = "AOF replay command failed at offset " + std::to_string(start);
       return false;
     }
-    pos += parsed->consumed;
+    valid_up_to = pos;
   }
-  g_replaying_aof = false;
-  return true;
+  // A MULTI without its EXEC at the end is cut off like a short read, as in Redis, and so is the
+  // whole MULTI when the short read is inside it: Redis cuts after the last whole command there,
+  // which leaves an open MULTI in the file that would hold every later append in its queue.
+  if (session.in_multi) {
+    log(LogLevel::Warn, "Revert incomplete MULTI/EXEC transaction in AOF file " + path);
+    valid_up_to = valid_before_multi;
+    short_read = true;
+  }
+  if (!short_read) return true;
+  if (g_aof_load_truncated) {
+    log(LogLevel::Warn, "!!! Warning: short read while loading the AOF file " + path + "!!!");
+    log(LogLevel::Warn,
+        "!!! Truncating the AOF " + path + " at offset " + std::to_string(valid_up_to) + " !!!");
+    std::string truncate_err;
+    if (truncate_file(path, valid_up_to, truncate_err)) {
+      log(LogLevel::Warn, "AOF " + path + " loaded anyway because aof-load-truncated is enabled");
+      return true;
+    }
+    log(LogLevel::Warn, "Error truncating the AOF file " + path + ": " + truncate_err);
+  }
+  err = "Unexpected end of file reading the append only file " + path +
+        ". You can: 1) Make a backup of your AOF file, then use ./redis-check-aof --fix "
+        "<filename>. 2) Alternatively you can set the 'aof-load-truncated' configuration option "
+        "to yes and restart the server.";
+  return false;
 }
 
 void configure_runtime_port(int port) {

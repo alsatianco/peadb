@@ -202,9 +202,26 @@ def check_dump_only(name, binary, work):
         stop(proc)
 
 
+def expect_start_fails(name, binary, port, workdir, *extra):
+    """Starts the server and expects it to exit with an error; returns the new log text."""
+    os.makedirs(workdir, exist_ok=True)
+    log_path = os.path.join(workdir, 'server.log')
+    before = os.path.getsize(log_path) if os.path.exists(log_path) else 0
+    with open(log_path, 'ab') as log:
+        proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--dir', workdir,
+                                 '--loglevel', 'notice', '--save', '', *extra],
+                                stdout=log, stderr=subprocess.STDOUT)
+    try:
+        rc = proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        stop(proc)
+        raise AssertionError(f'{name}: started although it should not ({extra})')
+    assert rc != 0, (name, rc)
+    return read_log(workdir)[before:]
+
+
 def check_aof_cannot_open(name, binary, work):
     """An AOF that cannot be opened stops startup instead of starting with no data."""
-    port = PORTS[name]
     workdir = os.path.join(work, name, 'cannot-open')
     os.makedirs(workdir, exist_ok=True)
     # Redis keeps its AOF in the directory `appendonlydir`, PeaDB in the file `appendonly.aof`;
@@ -213,26 +230,205 @@ def check_aof_cannot_open(name, binary, work):
         open(os.path.join(workdir, 'appendonlydir'), 'w').close()
     else:
         os.makedirs(os.path.join(workdir, 'appendonly.aof'))
-    log_path = os.path.join(workdir, 'server.log')
-    with open(log_path, 'ab') as log:
-        proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--dir', workdir,
-                                 '--loglevel', 'notice', '--save', '', '--appendonly', 'yes'],
-                                stdout=log, stderr=subprocess.STDOUT)
-    try:
-        rc = proc.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        stop(proc)
-        raise AssertionError(f'{name}: started although its AOF cannot be opened')
-    assert rc != 0, (name, rc)
+    log = expect_start_fails(name, binary, PORTS[name], workdir, '--appendonly', 'yes')
     if name == 'peadb':
-        log = read_log(workdir)
         assert "Can't open the append-only file appendonly.aof" in log, log[-2000:]
+
+
+def aof_file(name, workdir):
+    """The file the server appends to: PeaDB's single file, or Redis's last INCR file."""
+    if name == 'peadb':
+        return os.path.join(workdir, 'appendonly.aof')
+    d = os.path.join(workdir, 'appendonlydir')
+    with open(os.path.join(d, 'appendonly.aof.manifest')) as f:
+        incr = [ln.split()[1] for ln in f if ln.split() and ln.split()[-1] == 'i']
+    return os.path.join(d, incr[-1])
+
+
+def set_keys(port, prefix, count):
+    c = Conn(port)
+    for i in range(count):
+        assert c('SET', f'{prefix}{i}', f'v{i}') == '+OK'
+    c.close()
+
+
+def check_torn_tail(name, binary, work):
+    """A torn last command is cut off the file, so the next restart works too (delta item 30)."""
+    port = PORTS[name]
+    workdir = os.path.join(work, name, 'torn')
+    aof_args = ('--appendonly', 'yes', '--appendfsync', 'always')
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        set_keys(port, 'k', 100)
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+    path = aof_file(name, workdir)
+    data = open(path, 'rb').read()
+    last = data.rfind(b'*3\r\n$3\r\nSET\r\n$3\r\nk99\r\n')
+    assert last > 0, name
+    with open(path, 'wb') as f:
+        f.write(data[:-5])  # a crash in the middle of the last write
+
+    # Restart 1 drops the torn command and cuts the file at the last whole one.
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('DBSIZE') == 99, name
+        assert c('GET', 'k98') == 'v98' and c('GET', 'k99') is None, name
+        c.close()
+        assert os.path.getsize(path) == last, (name, os.path.getsize(path), last)
+        log = read_log(workdir)
+        assert f'Truncating the AOF {os.path.basename(path)} at offset {last}' in log, (name, log[-2000:])
+        assert 'loaded anyway because aof-load-truncated is enabled' in log, (name, log[-2000:])
+        set_keys(port, 'n', 50)
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+
+    # Restart 2 loads every write made after restart 1.
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('DBSIZE') == 149, name
+        assert c('GET', 'n49') == 'v49', name
+        c.close()
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+
+    # With aof-load-truncated no, a torn tail stops startup and the file is left as it is.
+    data = open(path, 'rb').read()
+    with open(path, 'wb') as f:
+        f.write(data[:-5])
+    log = expect_start_fails(name, binary, port, workdir, *aof_args, '--aof-load-truncated', 'no')
+    assert 'Unexpected end of file reading the append only file' in log, (name, log[-2000:])
+    assert os.path.getsize(path) == len(data) - 5, name
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('DBSIZE') == 148, name
+        c.close()
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+
+    # A MULTI with no EXEC at the end is cut off, so it cannot hold the next writes in its queue.
+    size = os.path.getsize(path)
+    with open(path, 'ab') as f:
+        f.write(b'*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$1\r\nm\r\n$1\r\n1\r\n')
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('GET', 'm') is None, name
+        assert c('DBSIZE') == 148, name
+        assert c('SET', 'after', '1') == '+OK'
+        c.close()
+        assert 'Revert incomplete MULTI/EXEC transaction' in read_log(workdir), name
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+    assert os.path.getsize(path) > size, name  # cut back to `size`, then `after` appended
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('GET', 'after') == '1', name
+        assert c('DBSIZE') == 149, name
+        c.close()
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+
+    # A `#` annotation line is skipped.
+    data = open(path, 'rb').read()
+    with open(path, 'wb') as f:
+        f.write(data + b'#TS:1700000000\r\n*3\r\n$3\r\nSET\r\n$1\r\na\r\n$1\r\n2\r\n')
+    proc = start(binary, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('GET', 'a') == '2', name
+        assert c('DBSIZE') == 150, name
+        c.close()
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+
+    # Bytes that are not a command stop startup, wherever they are, and are not cut off.
+    data = open(path, 'rb').read()
+    with open(path, 'wb') as f:
+        f.write(data + b'\x00\x01garbage\r\n')
+    log = expect_start_fails(name, binary, port, workdir, *aof_args)
+    assert 'Bad file format reading the append only file' in log, (name, log[-2000:])
+    assert open(path, 'rb').read() == data + b'\x00\x01garbage\r\n', name
+
+
+def check_torn_inside_multi(work):
+    """PeaDB only: a short read inside a MULTI cuts the whole MULTI off.
+
+    Redis 7.2.5 cuts after the last whole command there, which leaves an open MULTI at the end of
+    the file; every command appended after the restart is then queued in it on the next load and
+    dropped with it. PeaDB cuts back to before the MULTI instead.
+    """
+    port = PORTS['peadb']
+    workdir = os.path.join(work, 'peadb', 'torn-multi')
+    aof_args = ('--appendonly', 'yes', '--appendfsync', 'always')
+    proc = start(PEADB, port, workdir, *aof_args)
+    try:
+        set_keys(port, 'k', 3)
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+    path = aof_file('peadb', workdir)
+    size = os.path.getsize(path)
+    with open(path, 'ab') as f:
+        f.write(b'*1\r\n$5\r\nMULTI\r\n*3\r\n$3\r\nSET\r\n$1\r\nm\r\n$1\r\n1\r\n*3\r\n$3\r\nSET\r\n$1\r\nn')
+    proc = start(PEADB, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('DBSIZE') == 3 and c('GET', 'm') is None
+        c.close()
+        assert os.path.getsize(path) == size
+        set_keys(port, 'after', 2)
+        shutdown(proc, port, 'NOSAVE')
+    finally:
+        stop(proc)
+    proc = start(PEADB, port, workdir, *aof_args)
+    try:
+        c = Conn(port)
+        assert c('DBSIZE') == 5 and c('GET', 'after1') == 'v1'
+        c.close()
+    finally:
+        stop(proc)
+
+
+def check_damaged_by_old_peadb(work):
+    """PeaDB only: torn bytes in the middle of the file stop startup at the torn command.
+
+    Older PeaDB versions kept a torn last command and appended after it. The reader checks the
+    lines the way redis-check-aof does, so the torn command is a format error where it starts,
+    instead of being read together with the next command's bytes as a different command.
+    """
+    port = PORTS['peadb']
+    workdir = os.path.join(work, 'peadb', 'damaged')
+    os.makedirs(workdir, exist_ok=True)
+    good = b'*3\r\n$3\r\nSET\r\n$2\r\nk8\r\n$2\r\nv8\r\n'
+    torn = b'*3\r\n$3\r\nSET\r\n$2\r\nk9\r\n$2\r'
+    later = b'*2\r\n$6\r\nSELECT\r\n$1\r\n0\r\n*3\r\n$3\r\nSET\r\n$2\r\nn0\r\n$2\r\nv0\r\n'
+    with open(os.path.join(workdir, 'appendonly.aof'), 'wb') as f:
+        f.write(good + torn + later)
+    log = expect_start_fails('peadb', PEADB, port, workdir, '--appendonly', 'yes')
+    assert f'Bad file format reading the append only file appendonly.aof at offset {len(good)}' in log, \
+        log[-2000:]
 
 
 def check_engine(name, binary, work):
     check_aof_and_dump(name, binary, work)
     check_dump_only(name, binary, work)
     check_aof_cannot_open(name, binary, work)
+    check_torn_tail(name, binary, work)
+    if name == 'peadb':
+        check_torn_inside_multi(work)
+        check_damaged_by_old_peadb(work)
     print(f'{name}: ok')
 
 

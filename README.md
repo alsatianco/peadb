@@ -142,7 +142,7 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `busy-reply-threshold` (`lua-time-limit`) | `5000` | Milliseconds a script may run before other clients get `-BUSY` |
 | `lazyfree-lazy-server-del` | `no` | Propagate server-side deletes as `UNLINK` |
 | `stop-writes-on-bgsave-error` | `yes` | Refuse writes with `-MISCONF` after a failed background save |
-| `aof-load-truncated` | `yes` | Accept an AOF whose last command is cut short (delta item 30) |
+| `aof-load-truncated` | `yes` | Accept an AOF whose last command is cut short, and cut that command off the file, as Redis does (delta item 30) |
 | `slowlog-log-slower-than`, `slowlog-max-len` | `10000`, `128` | `SLOWLOG` threshold (µs) and length |
 | `latency-monitor-threshold` | `0` (off) | `LATENCY` monitor threshold (ms) |
 | `hash-max-listpack-entries`, `hash-max-listpack-value`, `list-max-listpack-size`, `set-max-intset-entries`, `set-max-listpack-entries`, `set-max-listpack-value`, `zset-max-listpack-entries`, `zset-max-listpack-value` | Redis defaults | Encoding thresholds reported by `OBJECT ENCODING` |
