@@ -1272,60 +1272,20 @@ void functions_flush_all() {
   g_func_index.clear();
 }
 
-// FNV-1a 64-bit — a self-contained checksum for the FUNCTION DUMP/RESTORE payload. The blob is
-// PeaDB-internal (it round-trips only within PeaDB; Redis's serialization differs), so we don't
-// need crc64 byte-parity — only self-consistent tamper detection for "payload ... are wrong".
-std::uint64_t functions_fnv1a64(const std::string& s) {
-  std::uint64_t h = 1469598103934665603ULL;
-  for (unsigned char c : s) { h ^= c; h *= 1099511628211ULL; }
-  return h;
-}
-
-// Serialize every library's source into a versioned, checksummed blob:
-//   0xF5, 0x01 (version), u32 count, [u32 code_len + code]..., u64 fnv1a(all preceding bytes).
+// FUNCTION DUMP: Redis's payload (one FUNCTION2 opcode and source string per library, the RDB
+// version and the CRC64), so a payload moves between PeaDB and Redis in both directions.
 std::string functions_dump() {
-  std::string out;
-  out.push_back(static_cast<char>(0xF5));
-  out.push_back(0x01);
-  auto put32 = [&](std::uint32_t v) { for (int i = 0; i < 4; ++i) out.push_back(static_cast<char>((v >> (8 * i)) & 0xFF)); };
-  put32(static_cast<std::uint32_t>(g_libraries.size()));
-  for (const auto& [lc, lib] : g_libraries) {
-    put32(static_cast<std::uint32_t>(lib.code.size()));
-    out += lib.code;
-  }
-  const std::uint64_t crc = functions_fnv1a64(out);
-  for (int i = 0; i < 8; ++i) out.push_back(static_cast<char>((crc >> (8 * i)) & 0xFF));
-  return out;
+  std::vector<std::string> codes;
+  codes.reserve(g_libraries.size());
+  for (const auto& [lc, lib] : g_libraries) codes.push_back(lib.code);
+  return rdb_dump_functions(codes);
 }
 
 // Apply a FUNCTION DUMP blob under FLUSH|APPEND|REPLACE. Atomic: on any failure the pre-call
 // state is fully restored (Redis semantics — a bad/colliding payload never partially applies).
 bool functions_restore(const std::string& payload, const std::string& policy, std::string& err) {
-  const std::string bad = "payload version or checksum are wrong";
-  if (payload.size() < 2 + 4 + 8 ||
-      static_cast<unsigned char>(payload[0]) != 0xF5 || payload[1] != 0x01) { err = bad; return false; }
-  const std::string body = payload.substr(0, payload.size() - 8);
-  std::uint64_t stored = 0;
-  for (int i = 0; i < 8; ++i)
-    stored |= static_cast<std::uint64_t>(static_cast<unsigned char>(payload[payload.size() - 8 + i])) << (8 * i);
-  if (functions_fnv1a64(body) != stored) { err = bad; return false; }
-
-  std::size_t pos = 2;
-  auto get32 = [&](std::uint32_t& v) -> bool {
-    if (pos + 4 > body.size()) return false;
-    v = 0;
-    for (int i = 0; i < 4; ++i) v |= static_cast<std::uint32_t>(static_cast<unsigned char>(body[pos++])) << (8 * i);
-    return true;
-  };
-  std::uint32_t count = 0;
-  if (!get32(count)) { err = bad; return false; }
   std::vector<std::string> codes;
-  for (std::uint32_t i = 0; i < count; ++i) {
-    std::uint32_t len = 0;
-    if (!get32(len) || pos + len > body.size()) { err = bad; return false; }
-    codes.push_back(body.substr(pos, len));
-    pos += len;
-  }
+  if (!rdb_parse_function_payload(payload, codes, err)) return false;
 
   // APPEND rejects a library whose name already exists (Redis message here omits the quotes
   // that FUNCTION LOAD uses). Pre-checked before any mutation so the state is untouched.
@@ -3597,6 +3557,7 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
         {"appendfilename", {[] { return g_aof_path.string(); }, nullptr}},
         {"cluster-enabled",
          {[] { return std::string(g_cluster_enabled ? "yes" : "no"); }, nullptr}},
+        {"rdbchecksum", {[] { return std::string(rdb_checksum() ? "yes" : "no"); }, nullptr}},
         {"maxclients",
          {[] { return std::to_string(configured_max_clients()); },
           [](const std::string& v, std::string&) {
@@ -5716,7 +5677,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               functions_flush_all();
             }
             g_rdb_load_functions_replace = merge;
-            const bool ok = rdb_load(g_snapshot_path, err, /*verify_crc=*/true);
+            const bool ok = rdb_load(g_snapshot_path, err);
             g_rdb_load_functions_replace = true;  // restore safe default for replica/startup loads
             if (!ok) return encode_error("Error trying to load the RDB dump: " + err);
             return encode_simple("OK");
@@ -6830,7 +6791,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           if (sub == "RESTORE" && (args.size() == 3 || args.size() == 4)) {
             std::string policy = "APPEND";
-            if (args.size() == 4) { policy = upper(args[3]); if (policy != "FLUSH" && policy != "APPEND" && policy != "REPLACE") return encode_error("Wrong restore policy given. Accept values are: FLUSH, APPEND or REPLACE."); }
+            if (args.size() == 4) { policy = upper(args[3]); if (policy != "FLUSH" && policy != "APPEND" && policy != "REPLACE") return encode_error("Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE."); }
             if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             std::string err;
             if (!functions_restore(args[2], policy, err)) return encode_error(err);
@@ -11668,6 +11629,9 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   yes("lazyfree-lazy-server-del", g_lazyfree_lazy_server_del);
   yes("stop-writes-on-bgsave-error", g_stop_writes_on_bgsave_error);
   yes("aof-load-truncated", g_aof_load_truncated);
+  bool rdbchecksum = rdb_checksum();
+  yes("rdbchecksum", rdbchecksum);
+  rdb_set_checksum(rdbchecksum);
   num("slowlog-log-slower-than", g_slowlog_threshold_us);
   num("slowlog-max-len", g_slowlog_max_len);
   num("latency-monitor-threshold", g_latency_monitor_threshold_ms);
@@ -12348,14 +12312,13 @@ void drain_replica_cmd_queue() {
     }
     std::string err;
     // A full resync replaces the entire dataset, including server-level function libraries.
-    // rdb_load() flushes the keyspace but not functions, so clear them here first — otherwise
-    // libraries that exist only on this node (before it became a replica) would survive and
-    // diverge from the master (Redis's emptyData clears functions on full sync).
-    functions_flush_all();
-    // Skip CRC verification: the RDB came from the master (possibly real Redis, whose
-    // CRC-64 variant differs from PeaDB's); the TCP stream + length framing + parser already
-    // guard integrity. CRC verification is for on-disk startup loads of PeaDB's own dumps.
-    const bool ok = rdb_load(path, err, /*verify_crc=*/false);
+    // rdb_load() flushes the keyspace but not functions, so it clears them once the file passes
+    // its checks — otherwise libraries that exist only on this node (before it became a replica)
+    // would survive and diverge from the master (Redis's emptyData clears functions on full
+    // sync). The checksum is checked as for any load (a real Redis master writes the same CRC64
+    // as PeaDB, or 0 with rdbchecksum no); on a mismatch keys and libraries are kept and the
+    // sync is tried again.
+    const bool ok = rdb_load(path, err, functions_flush_all);
     if (!ok) log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
     g_replica_load_ok.store(ok);
     g_replica_load_pending.store(false);  // signal streaming thread

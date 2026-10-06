@@ -516,7 +516,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
       "lazyfree-lazy-server-del", "stop-writes-on-bgsave-error", "aof-load-truncated",
       "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold",
       "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
-      "enable-protected-configs"};
+      "enable-protected-configs", "rdbchecksum"};
   return kSet;
 }
 
@@ -538,7 +538,6 @@ const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
       {"aof-timestamp-enabled", {"no", nullptr}},
       {"auto-aof-rewrite-percentage", {"0", nullptr}},  // no automatic AOF rewrite (item 59)
       {"rdbcompression", {"no", nullptr}},
-      {"rdbchecksum", {"yes", nullptr}},
       {"lfu-decay-time", {"0", nullptr}},  // LFU counters never decay
       {"maxmemory-clients", {"0", nullptr}},
       {"replica-read-only", {"yes", nullptr}},

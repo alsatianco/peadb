@@ -170,9 +170,9 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // ServerConfig field: min-replicas-to-write, replica-serve-stale-data, busy-reply-threshold,
 // lazyfree-lazy-server-del, stop-writes-on-bgsave-error, aof-load-truncated,
 // slowlog-log-slower-than, slowlog-max-len, latency-monitor-threshold, proto-max-bulk-len,
-// client-query-buffer-limit, tcp-keepalive and lfu-log-factor (values already checked). It also
-// keeps every other setting the config named, for CONFIG GET; `config_file` is the config file
-// PeaDB was started with ("" for none), for CONFIG REWRITE.
+// client-query-buffer-limit, tcp-keepalive, lfu-log-factor and rdbchecksum (values already
+// checked). It also keeps every other setting the config named, for CONFIG GET; `config_file` is
+// the config file PeaDB was started with ("" for none), for CONFIG REWRITE.
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
                                 const std::string& config_file);
 void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
