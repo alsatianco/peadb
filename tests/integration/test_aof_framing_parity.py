@@ -5,11 +5,11 @@ The same checks run on peadb-server and on the pinned redis-server (Redis side f
 
 - framing: a MULTI/EXEC, a script and a function that write more than once reach the AOF and a replica (a fake one that sends PSYNC) wrapped in MULTI/EXEC, with each SELECT inside; a single write, and a transaction with one write, are not wrapped; a script that drops a target with redis.set_repl() still sends that target an empty MULTI/EXEC, as Redis does.
 - torn units: the AOF of two money transfers (one MULTI/EXEC, one script) cut inside a transfer loads without half of it.
-- eviction: a key evicted in database 3 while the AOF is in database 0 is deleted in database 3 on replay, and the key of the same name in database 0 stays.
+- eviction: a key evicted in database 3 while the AOF is in database 0 is deleted in database 3 on replay, and the key of the same name in database 0 stays; no key is evicted inside a transaction, so one that goes over maxmemory runs whole and the DEL comes after its EXEC (compat/delta.md item 39).
 - rewrite scheduling: BGREWRITEAOF and CONFIG SET appendonly yes inside MULTI/EXEC, or while a BGSAVE runs, start the rewrite after it, with Redis's replies and log lines, and nothing is applied twice.
 - the AOF and the master stream are never refused: an AOF with transactions loads under maxmemory or min-replicas-to-write, and a replica with either setting applies every write its master sends.
 - a woken XREADGROUP is one unit; BRPOPLPUSH and BLMOVE served at once move one element on replay (PeaDB sent BRPOPLPUSH twice); PUBLISH goes to the replicas only; SCAN's expiry DELs are not wrapped.
-- PeaDB only: a key evicted in the middle of a transaction keeps its place in the streams, and a replica drops a MULTI cut off by a broken link when the next full sync comes.
+- PeaDB only: a replica drops a MULTI cut off by a broken link when the next full sync comes.
 
 Without a pinned Redis 7.2.x, only the PeaDB side runs.
 """
@@ -352,45 +352,44 @@ def check_woken_and_moves(name, binary, work):
         stop(proc)
 
 
-def check_eviction_in_unit(work):
-    """PeaDB only: a key evicted between two writes of a transaction keeps its place in the streams.
-
-    Redis evicts only before a command runs; PeaDB also evicts in the OOM check of each command
-    that EXEC runs (compat/delta.md item 39), and the DEL then goes inside the transaction.
-    """
-    port = PORTS['peadb']
-    workdir = os.path.join(work, 'peadb', 'evict-unit')
+def check_eviction_after_unit(name, binary, work):
+    """No key is evicted inside a transaction (Redis evicts only before a command runs): a transaction that goes over maxmemory runs whole, and the DEL of the key evicted for it comes after its EXEC, before the next command."""
+    port = PORTS[name]
+    workdir = os.path.join(work, name, 'evict-unit')
     aof = ('--appendonly', 'yes', '--appendfsync', 'always')
-    proc = start(PEADB, port, workdir, *aof, '--maxmemory-policy', 'volatile-lru',
-                 '--enable-debug-command', 'yes')
+    proc = start(binary, port, workdir, *aof, '--maxmemory-policy', 'volatile-lru')
     try:
         replica = FakeReplica(port)
         c = Conn(port)
+        other = Conn(port)
         assert c('SELECT', 3) == '+OK'
-        assert c('SET', 'victim', 'x' * 200000, 'EX', 1000) == '+OK'
+        # Bigger than what the transaction adds: SETRANGE may leave a buffer of twice its 300 KB
+        # (libstdc++ doubles a string as it grows, and Redis's sds does too).
+        assert c('SET', 'victim', 'x' * 1000000, 'EX', 1000) == '+OK'
         assert c('SELECT', 0) == '+OK'
-        time.sleep(0.15)  # used_memory is recomputed at most every 100 ms
-        assert c('CONFIG', 'SET', 'maxmemory', int(info(c, 'used_memory')) + 50000) == '+OK'
         assert c('MULTI') == '+OK'
-        c('SET', 'big', 'y' * 100000)
-        c('DEBUG', 'SLEEP', '0.15')
-        c('SET', 'small', '1')
-        assert c('EXEC') == ['+OK', '+OK', '+OK']
-        assert c('CONFIG', 'SET', 'maxmemory', 0) == '+OK'
-        assert c('SET', 'end', 1) == '+OK'
+        assert c('SETRANGE', 'big', 300000, 'y') == '+QUEUED'
+        assert c('SET', 'small', '1') == '+QUEUED'
+        assert other('CONFIG', 'SET', 'maxmemory', int(info(other, 'used_memory')) + 50000) == '+OK'
+        assert c('EXEC') == [300001, '+OK'], name
+        assert c('SET', 'end', 1) == '+OK', name  # the eviction runs before it
+        assert other('CONFIG', 'SET', 'maxmemory', 0) == '+OK'
         c.close()
-        unit = [['MULTI'], ['SELECT', '0'], ['SET', 'big', 'y' * 100000], ['SELECT', '3'],
-                ['DEL', 'victim'], ['SELECT', '0'], ['SET', 'small', '1'], ['EXEC'], ['SET', 'end', '1']]
-        assert replica.commands_until(['SET', 'end', '1'])[-len(unit):] == unit
+        other.close()
+        unit = [['MULTI'], ['SELECT', '0'], ['SETRANGE', 'big', '300000', 'y'], ['SET', 'small', '1'], ['EXEC'],
+                ['SELECT', '3'], ['DEL', 'victim'], ['SELECT', '0'], ['SET', 'end', '1']]
+        got = replica.commands_until(['SET', 'end', '1'])
+        assert got[-len(unit):] == unit, (name, got[-len(unit):])
         replica.close()
-        assert [args for args, _, _ in aof_commands(aof_file('peadb', workdir))][-len(unit):] == unit
+        got = [args for args, _, _ in aof_commands(aof_file(name, workdir))]
+        assert got[-len(unit):] == unit, (name, got[-len(unit):])
     finally:
         crash(proc)
-    proc = start(PEADB, port, workdir, *aof)
+    proc = start(binary, port, workdir, *aof)
     try:
         c = Conn(port)
-        assert (c('STRLEN', 'big'), c('GET', 'small')) == (100000, '1')
-        assert c('SELECT', 3) == '+OK' and c('DBSIZE') == 0
+        assert (c('STRLEN', 'big'), c('GET', 'small')) == (300001, '1'), name
+        assert c('SELECT', 3) == '+OK' and c('DBSIZE') == 0, name
         c.close()
     finally:
         stop(proc)
@@ -663,10 +662,10 @@ def check_engine(name, binary, work):
     check_woken_and_moves(name, binary, work)
     check_torn_units(name, binary, work)
     check_eviction_select(name, binary, work)
+    check_eviction_after_unit(name, binary, work)
     check_rewrite_scheduling(name, binary, work)
     check_obeyed_streams(name, binary, work)
     if name == 'peadb':
-        check_eviction_in_unit(work)
         check_replica_drops_open_multi(work)
     print(f'{name}: ok')
 

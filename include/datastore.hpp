@@ -99,6 +99,10 @@ struct Entry {
   std::optional<std::int64_t> expire_at_ms;
   std::uint32_t lru = 0;             // eviction metadata (LRU clock / LFU counter), Phase B
   bool string_force_raw = false;
+  // Created and not touched yet: the first touch_lru() starts the LFU counter at Redis's
+  // LFU_INIT_VAL (5) instead of counting the write that made the key, as Redis's createObject()
+  // does, so a new key is not the first one LFU eviction picks.
+  bool lru_fresh = true;
   // Sticky encoding conversion: once a collection is observed past its listpack/intset
   // thresholds it reports the big encoding forever, like Redis's one-way conversions
   // (set on OBJECT ENCODING computation — an approximation until real backends exist).
@@ -147,12 +151,18 @@ struct Entry {
   Entry(Entry&&) = default;
   Entry& operator=(Entry&&) = default;
   Entry(const Entry& o)
-      : expire_at_ms(o.expire_at_ms), lru(o.lru), string_force_raw(o.string_force_raw),
-        encoding_big(o.encoding_big), encoding_no_intset(o.encoding_no_intset),
-        payload(clone_payload(o.payload)) {}
+      : expire_at_ms(o.expire_at_ms),
+        lru(o.lru),
+        string_force_raw(o.string_force_raw),
+        lru_fresh(o.lru_fresh),
+        encoding_big(o.encoding_big),
+        encoding_no_intset(o.encoding_no_intset),
+        payload(clone_payload(o.payload)) {
+  }
   Entry& operator=(const Entry& o) {
     if (this != &o) {
       expire_at_ms = o.expire_at_ms; lru = o.lru; string_force_raw = o.string_force_raw;
+      lru_fresh = o.lru_fresh;
       encoding_big = o.encoding_big; encoding_no_intset = o.encoding_no_intset;
       payload = clone_payload(o.payload);
     }
@@ -512,20 +522,21 @@ class DataStore {
   void set_lfu_log_factor(int v) { lfu_log_factor_ = v; }
   int lfu_log_factor() const { return lfu_log_factor_; }
   void touch_key_for_eviction(const std::string& key);  // current db; no-op if absent
-  struct EvictVictim { int db; std::string key; std::int64_t freed_bytes; };
+  struct EvictVictim {
+    int db;
+    std::string key;
+  };
   // Sample `samples` candidate keys across all DBs (allkeys-*) or only volatile keys
-  // (volatile-*), pick the victim per policy, erase it, record the eviction, and decrement
-  // the cached used_memory so a tight eviction loop sees memory fall in real time (instead
-  // of over-evicting against the ~100ms-stale cache). nullopt = nothing evictable.
+  // (volatile-*), pick the victim per policy, erase it (its memory is freed at once) and record
+  // the eviction. nullopt = nothing evictable.
   std::optional<EvictVictim> evict_one(MaxmemoryPolicy policy, int samples);
 
-  // Memory accounting — walks all databases to compute an estimate
-  std::int64_t estimate_used_memory() const;
-  // Cached view of estimate_used_memory(), recomputed when the cache is ~100ms old.
-  // The cache time is taken before the walk, so once one walk takes 100ms or more
-  // (about 2M keys) every call walks again, and the estimate leaves out container
-  // and allocator overhead, so it is too low for collections (compat/delta.md item 38).
-  std::int64_t used_memory() const;
+  // Keys handed to the lazyfree thread (UNLINK of a big value, FLUSHALL/FLUSHDB ASYNC) and not
+  // freed yet: INFO's lazyfree_pending_objects, and what eviction waits for when it has nothing
+  // left to evict (Redis's bioPendingJobsOfType(BIO_LAZY_FREE)).
+  std::size_t lazyfree_pending_objects() const {
+    return lazyfree_pending_.load(std::memory_order_relaxed);
+  }
   bool save_snapshot_file(const std::filesystem::path& path, std::string& err);
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);
   std::vector<std::vector<std::string>> export_aof_commands() const;
@@ -568,7 +579,8 @@ class DataStore {
 
  private:
   // The keyspace of one database: a Dict, so SCAN's cursor keeps Redis's guarantee across resizes.
-  using DB = DictMap<std::string, Entry, DictStringHash>;
+  using DB = DictMap<std::string, Entry, DictStringHash, std::equal_to<std::string>,
+                     KeyspaceExpandAllowed>;
 
   // Redis's keyIsExpired(): the key has a TTL that has passed, and lazy expiry is not disabled.
   bool logically_expired(const Entry& e, std::int64_t now) const {
@@ -601,10 +613,6 @@ class DataStore {
     const std::string_view enc = encoding_of(e);
     return enc == "listpack" || enc == "intset";
   }
-  // Approximate bytes attributable to one key (map node key + Entry + active payload).
-  // Shared by estimate_used_memory() and evict_one() so accounting and eviction agree.
-  std::int64_t entry_cost(const std::string& key, const Entry& e) const;
-
   int current_db_;
   std::vector<DB> dbs_;
   bool expire_paused_ = false;
@@ -615,8 +623,6 @@ class DataStore {
   std::vector<DB> replica_hidden_;  // per database: expired keys a replica's command hid
   bool has_replica_hidden_ = false;
   std::uint64_t mutation_epoch_ = 0;
-  mutable std::int64_t used_mem_cache_ = -1;   // -1 = not yet computed
-  mutable std::int64_t used_mem_cache_ms_ = 0; // wall-clock of last recompute
   EncodingLimits encoding_limits_;
   bool eviction_lfu_ = false;   // touch_key_for_eviction uses LFU semantics when true
   int lfu_log_factor_ = 10;
@@ -625,6 +631,7 @@ class DataStore {
   std::mutex lazyfree_mu_;
   std::condition_variable lazyfree_cv_;
   std::deque<DB> lazyfree_queue_;
+  std::atomic<std::size_t> lazyfree_pending_{0};  // keys queued or being freed by the thread
   bool lazyfree_stop_ = false;
   bool lazyfree_started_ = false;
   std::atomic<std::int64_t> stat_expired_keys_{0};

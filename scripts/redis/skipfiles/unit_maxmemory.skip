@@ -1,0 +1,6 @@
+# Client eviction: PeaDB keeps maxmemory-clients at 0 and never evicts a client (compat/delta.md item 24).
+eviction due to output buffers of many MGET clients, client eviction: true
+eviction due to input buffer of a dead client, client eviction: true
+eviction due to output buffers of pubsub, client eviction: true
+# CLIENT TRACKING (client-side caching) is not implemented (compat/delta.md item 68).
+client tracking don't cause eviction feedback loop

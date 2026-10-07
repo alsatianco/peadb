@@ -113,6 +113,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "unit/maxmemory": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 14,
+        "ok": 28
+      },
+      "mode": "native",
+      "skipfile_lines": 4
+    },
     "unit/moduleapi": {
       "exclusion_reason": "Module certification out of scope; see compat/delta.md item 4.",
       "mode": "excluded"

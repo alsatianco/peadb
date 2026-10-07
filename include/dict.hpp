@@ -145,7 +145,27 @@ struct DictStringHash {
   }
 };
 
-template <class Key, class Mapped, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
+// Whether a table may double (Redis's dictType.expandAllowed). The default always allows it.
+struct DictExpandAlways {
+  static bool allowed(std::size_t /*more_bytes*/, double /*used_ratio*/) {
+    return true;
+  }
+};
+
+// Redis's dictExpandAllowed() for the keyspace tables (dbDictType): set by the server, it refuses
+// a doubling whose new bucket array would push the used memory over maxmemory while the table is
+// at most 1.618 elements per bucket (HASHTABLE_MAX_LOAD_FACTOR), so a rehash does not evict keys.
+// Null (unit tests, tools): always allowed.
+inline bool (*g_keyspace_expand_allowed)(std::size_t more_bytes, double used_ratio) = nullptr;
+struct KeyspaceExpandAllowed {
+  static bool allowed(std::size_t more_bytes, double used_ratio) {
+    return g_keyspace_expand_allowed == nullptr ||
+           g_keyspace_expand_allowed(more_bytes, used_ratio);
+  }
+};
+
+template <class Key, class Mapped, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>,
+          class ExpandPolicy = DictExpandAlways>
 class Dict {
   using Tr = dict_detail::Traits<Key, Mapped>;
   static constexpr bool kIsMap = !std::is_void_v<Mapped>;
@@ -550,12 +570,16 @@ class Dict {
   }
 
   // Links a new element (its key is not in the table), first growing the table like Redis's
-  // _dictExpandIfNeeded(): to 4 buckets on the first insert, and to twice the size once there are as
-  // many elements as buckets. A failed allocation leaves the table unchanged (and frees the node).
+  // _dictExpandIfNeeded(): to 4 buckets on the first insert, and to twice the size once there are
+  // as many elements as buckets, if ExpandPolicy allows it (dictTypeExpandAllowed(): the bytes of
+  // the new bucket array and the elements per bucket). A failed allocation leaves the table
+  // unchanged (and frees the node).
   Node* link_new(std::unique_ptr<Node> owned) {
     if (nbuckets_ == 0) {
       rehash_to(kInitialBuckets);
-    } else if (size_ >= nbuckets_) {
+    } else if (size_ >= nbuckets_ &&
+               ExpandPolicy::allowed(nbuckets_ * 2 * sizeof(Node*),
+                                     static_cast<double>(size_) / static_cast<double>(nbuckets_))) {
       rehash_to(nbuckets_ * 2);
     }
     Node* n = owned.release();
@@ -643,8 +667,9 @@ class Dict {
   [[no_unique_address]] KeyEqual eq_;
 };
 
-template <class Key, class Mapped, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
-using DictMap = Dict<Key, Mapped, Hash, KeyEqual>;
+template <class Key, class Mapped, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>,
+          class ExpandPolicy = DictExpandAlways>
+using DictMap = Dict<Key, Mapped, Hash, KeyEqual, ExpandPolicy>;
 template <class Key, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>>
 using DictSet = Dict<Key, void, Hash, KeyEqual>;
 

@@ -4,6 +4,7 @@
 #include "datastore.hpp"
 #include "logger.hpp"
 #include "poller.hpp"
+#include "zmalloc.hpp"
 #include "protocol.hpp"
 #include "server_context.hpp"
 
@@ -25,6 +26,7 @@
 #include <string_view>
 #include <limits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace peadb {
@@ -124,6 +126,18 @@ struct WriteBuf {
     }
   }
 };
+
+// Empties a client buffer that has been used up. Redis gives such memory back (a reply block is
+// freed once it is written, clientsCronResizeQueryBuffer() trims the query buffer), and used_memory
+// counts what a buffer keeps (maxmemory), so a buffer bigger than 64 KB is freed instead of kept
+// for the next command; a smaller one is kept, so pipelined traffic does not allocate per read.
+void release_drained(std::string& buf) {
+  if (buf.capacity() > 64 * 1024) {
+    std::string().swap(buf);
+  } else {
+    buf.clear();
+  }
+}
 
 } // namespace
 
@@ -325,6 +339,8 @@ int run_server(const ServerConfig& config) {
   int blocked_count = 0;
   int wait_count = 0;
   int replica_count = 0;
+  // The replicas' connections, so what walks only replicas does not walk every client.
+  std::unordered_set<int> replica_fds;
   // Clients whose command CLIENT PAUSE holds (SessionState::postponed). Redis counts them in
   // blocked_clients and shows them with flag b.
   int postponed_count = 0;
@@ -347,6 +363,31 @@ int run_server(const ServerConfig& config) {
       if (sess.replica_stream) ++count;
     }
     return count;
+  };
+
+  // Bytes in the replicas' output buffers (the full-sync payload and the commands not sent yet),
+  // which maxmemory does not count (Redis's freeMemoryGetNotCountedMemory()). O(replicas): it is
+  // asked before each command while memory is over maxmemory.
+  g_replica_output_buffers_cb = [&]() -> std::size_t {
+    std::size_t bytes = 0;
+    for (int fd : replica_fds) {
+      const auto it = write_buffers.find(fd);
+      if (it != write_buffers.end()) bytes += zmalloc_string_bytes(it->second.data);
+    }
+    return bytes;
+  };
+
+  g_client_buffers_cb = [&]() -> std::pair<std::size_t, std::size_t> {
+    std::pair<std::size_t, std::size_t> bytes{0, 0};
+    for (auto& [fd, sess] : sessions) {
+      std::size_t held = 0;
+      if (const auto it = buffers.find(fd); it != buffers.end())
+        held += zmalloc_string_bytes(it->second);
+      if (const auto it = write_buffers.find(fd); it != write_buffers.end())
+        held += zmalloc_string_bytes(it->second.data);
+      (sess.replica_stream ? bytes.second : bytes.first) += held;
+    }
+    return bytes;
   };
 
   g_blocked_clients_cb = [&]() -> int { return blocked_count + postponed_count; };
@@ -438,7 +479,7 @@ int run_server(const ServerConfig& config) {
     }
     if (overflow) { obuf_overflow_fds.push_back(fd); return false; }
     if (wbuf.empty()) {
-      wbuf.data.clear();
+      release_drained(wbuf.data);
       wbuf.offset = 0;
     } else {
       wbuf.compact();
@@ -466,7 +507,7 @@ int run_server(const ServerConfig& config) {
       wbuf.advance(static_cast<std::size_t>(n));
     }
     if (wbuf.empty()) {
-      wbuf.data.clear();
+      release_drained(wbuf.data);
       wbuf.offset = 0;
     } else if (wbuf.offset > 65536) {
       wbuf.compact();
@@ -513,6 +554,7 @@ int run_server(const ServerConfig& config) {
     buffers.erase(fd);
     write_buffers.erase(fd);
     sessions.erase(fd);
+    replica_fds.erase(fd);
     g_connected_clients.fetch_sub(1);
   };
 
@@ -529,20 +571,51 @@ int run_server(const ServerConfig& config) {
   // CLIENT KILL: close clients matching a filter, except skip_fd (the caller, which
   // closes itself via should_close). Safe to erase here — the event loop skips fds no
   // longer in `sessions` at the top of each ready-fd iteration.
-  g_client_kill_cb = [&](const std::string& by, const std::string& val, int skip_fd) -> int {
+  g_client_kill_cb = [&](const ClientKillFilter& filter, bool& kill_self) -> int {
+    // getClientSockname(): the local end of the client's socket.
+    auto local_addr = [&](int fd) -> std::string {
+      sockaddr_storage ss{};
+      socklen_t len = sizeof(ss);
+      if (::getsockname(fd, reinterpret_cast<sockaddr*>(&ss), &len) != 0) return {};
+      if (ss.ss_family == AF_UNIX) return config.unixsocket + ":0";
+      if (ss.ss_family == AF_INET6) {  // Redis's formatAddr(): [ip]:port
+        const auto* in6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+        char ipbuf[INET6_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET6, &in6->sin6_addr, ipbuf, sizeof(ipbuf));
+        return "[" + std::string(ipbuf) + "]:" + std::to_string(ntohs(in6->sin6_port));
+      }
+      if (ss.ss_family != AF_INET) return {};
+      const auto* in4 = reinterpret_cast<const sockaddr_in*>(&ss);
+      char ipbuf[INET_ADDRSTRLEN] = {0};
+      inet_ntop(AF_INET, &in4->sin_addr, ipbuf, sizeof(ipbuf));
+      return std::string(ipbuf) + ":" + std::to_string(ntohs(in4->sin_port));
+    };
+    // getClientType(): PeaDB's link to its own master is not a client session, so no session is
+    // of the master type; a MONITOR client is a normal one.
+    auto type_of = [&](int fd, const SessionState& sess) {
+      if (sess.replica_stream) return ClientType::Slave;
+      if (client_has_subscriptions(fd)) return ClientType::Pubsub;
+      return ClientType::Normal;
+    };
     std::vector<int> to_kill;
+    int matched = 0;
+    kill_self = false;
     for (auto& [fd, sess] : sessions) {
-      if (fd == skip_fd) continue;
-      bool match = false;
-      if (by == "ID") match = (std::to_string(sess.client_id) == val);
-      else if (by == "ADDR") match = (sess.addr == val);
-      else if (by == "ANY") match = true;
-      if (match) to_kill.push_back(fd);
+      if (!filter.addr.empty() && sess.addr != filter.addr) continue;
+      if (!filter.laddr.empty() && local_addr(fd) != filter.laddr) continue;
+      if (filter.type && type_of(fd, sess) != *filter.type) continue;
+      if (filter.id != 0 && sess.client_id != filter.id) continue;
+      if (fd == filter.self_fd) {
+        if (filter.skipme) continue;
+        kill_self = true;
+      } else {
+        to_kill.push_back(fd);
+      }
+      ++matched;
     }
     for (int fd : to_kill) close_client(fd);
-    return static_cast<int>(to_kill.size());
+    return matched;
   };
-
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream) return true;
@@ -597,7 +670,8 @@ int run_server(const ServerConfig& config) {
         if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
       }
       if (consumed > 0) {
-        if (consumed == input.size()) input.clear();
+        if (consumed == input.size())
+          release_drained(input);
         else input.erase(0, consumed);
       }
       if (!batch.empty() && !enqueue_output(fd, batch)) to_close_out.push_back(fd);
@@ -610,6 +684,7 @@ int run_server(const ServerConfig& config) {
       // A PSYNC/SYNC that CLIENT PAUSE ALL held makes this client a replica only now.
       if (!was_replica && session.replica_stream) {
         ++replica_count;
+        replica_fds.insert(fd);
         if (!flush_replication_stream(fd, session)) to_close_out.push_back(fd);
       }
     }
@@ -759,6 +834,9 @@ int run_server(const ServerConfig& config) {
       const auto delta = pause_end - DataStore::now_ms();
       if (delta < poll_ms) poll_ms = delta > 1 ? static_cast<int>(delta) : 1;
     }
+    // Redis's eviction timer runs again at once (a 0 ms time event), so do not sleep while it is
+    // on.
+    if (eviction_proc_running()) poll_ms = 0;
     const int nready = poller.wait(ep_events, poll_ms);
     if (nready < 0) {
       if (errno == EINTR) continue;
@@ -1048,11 +1126,14 @@ int run_server(const ServerConfig& config) {
         session.blocked.seq = ++block_seq;  // FIFO serving order
       }
       if (!was_waiting && session.wait_state.has_value()) ++wait_count;
-      if (!was_replica && session.replica_stream) ++replica_count;
+      if (!was_replica && session.replica_stream) {
+        ++replica_count;
+        replica_fds.insert(fd);
+      }
 
       if (consumed_total > 0) {
         if (consumed_total == input.size()) {
-          input.clear();
+          release_drained(input);
         } else {
           input.erase(0, consumed_total);
         }

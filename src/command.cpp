@@ -1,4 +1,5 @@
 #include "command.hpp"
+#include "zmalloc.hpp"
 #include "command_metadata.generated.hpp"
 #include "peadb_version.hpp"
 #include "server_context.hpp"
@@ -275,21 +276,25 @@ inline std::string acl_describe_default_user() {
 // disconnected replica resume via +CONTINUE instead of forcing a full resync.
 struct ReplBacklog {
     std::size_t size_ = 1 << 20;  // default 1 MiB
-    std::vector<char> buf;
+    // Allocated at its full size but not zero-filled, so the pages of the part never written are
+    // not touched (not resident), and used_memory leaves that part out (unused_bytes()).
+    std::unique_ptr<char[]> buf;
     std::int64_t total = 0; // total bytes ever appended
     std::int64_t start_ = 0;  // oldest offset held since the last resize()
+    std::size_t filled_ = 0;  // bytes of buf that hold data (size_ once the ring has wrapped)
 
-    ReplBacklog() : buf(size_, 0) {}
+    ReplBacklog() : buf(new char[size_]) {}
 
     // Sets the size before any data is appended (startup). Throws std::bad_alloc (or
     // std::length_error) for a size that cannot be allocated, leaving the backlog unchanged.
     void reset(std::size_t newsize) {
         if (newsize == 0) return;
-        std::vector<char> fresh(newsize, 0);
+        std::unique_ptr<char[]> fresh(new char[newsize]);
         buf.swap(fresh);
         size_ = newsize;
         total = 0;
         start_ = 0;
+        filled_ = 0;
     }
 
     // CONFIG SET repl-backlog-size (resizeReplicationBacklog()): keeps the offsets and as many
@@ -299,10 +304,10 @@ struct ReplBacklog {
         if (newsize == 0 || newsize == size_) return true;
         const std::int64_t keep_from =
             std::max(base(), total - static_cast<std::int64_t>(newsize));
-        std::vector<char> fresh;
+        std::unique_ptr<char[]> fresh;
         std::string kept;
         try {
-            fresh.assign(newsize, 0);
+            fresh.reset(new char[newsize]);
             get_slice(keep_from, kept);
         } catch (const std::bad_alloc&) {
             return false;
@@ -316,6 +321,9 @@ struct ReplBacklog {
         buf.swap(fresh);
         size_ = newsize;
         start_ = keep_from;
+        // The kept bytes may sit anywhere in the new ring; count the ring as filled unless they
+        // start at its beginning (then later bytes fill it in order).
+        filled_ = keep_from % static_cast<std::int64_t>(newsize) == 0 ? kept.size() : newsize;
         return true;
     }
 
@@ -325,11 +333,26 @@ struct ReplBacklog {
         return std::max(wrapped, start_);
     }
 
+    // Copies at most two runs (the end of the ring, then its start); of a write bigger than the
+    // ring only the last size_ bytes stay, as a byte-by-byte copy would leave them.
     void append(const std::string& data) {
-        for (char c : data) {
-            buf[static_cast<std::size_t>(total++ % size_)] = c;
+        const char* p = data.data();
+        std::size_t n = data.size();
+        if (n > size_) {
+            p += n - size_;
+            total += static_cast<std::int64_t>(n - size_);
+            n = size_;
         }
+        const std::size_t pos = static_cast<std::size_t>(total % static_cast<std::int64_t>(size_));
+        const std::size_t first = std::min(n, size_ - pos);
+        std::memcpy(buf.get() + pos, p, first);
+        std::memcpy(buf.get(), p + first, n - first);
+        total += static_cast<std::int64_t>(n);
+        filled_ = std::min(size_, filled_ + data.size());
     }
+
+    // The bytes of the ring no write has reached yet.
+    std::size_t unused_bytes() const { return size_ - filled_; }
 
     // Fill out with bytes [from_byte, total). Returns false if from_byte < base().
     bool get_slice(std::int64_t from_byte, std::string& out) const {
@@ -339,16 +362,29 @@ struct ReplBacklog {
         if (len == 0) return true;
         const std::size_t start = static_cast<std::size_t>(from_byte % size_);
         if (start + len <= size_) {
-            std::memcpy(out.data(), buf.data() + start, len);
+            std::memcpy(out.data(), buf.get() + start, len);
         } else {
             const std::size_t first = size_ - start;
-            std::memcpy(out.data(), buf.data() + start, first);
-            std::memcpy(out.data() + first, buf.data(), len - first);
+            std::memcpy(out.data(), buf.get() + start, first);
+            std::memcpy(out.data() + first, buf.get(), len - first);
         }
         return true;
     }
 };
 ReplBacklog g_repl_backlog;
+// Redis creates its backlog when the first replica connects; PeaDB fills its own from the start.
+bool g_backlog_has_replica = false;
+
+// INFO's used_memory and what maxmemory starts from: the bytes the process holds on the heap
+// (zmalloc_used_memory()) less the part of the replication backlog that Redis would not hold: the
+// part no write has reached yet (reserved, not resident; Redis grows its backlog as data comes),
+// and, until a replica has attached, the whole ring (Redis has no backlog before that).
+std::size_t used_memory() {
+  const std::size_t total = zmalloc_used_memory();
+  const std::size_t left_out =
+      g_backlog_has_replica ? g_repl_backlog.unused_bytes() : g_repl_backlog.size_;
+  return total > left_out ? total - left_out : 0;
+}
 // Append a RESP-encoded command to the replication backlog and advance the master offset
 inline void backlog_append(const std::string& data) {
     g_repl_backlog.append(data);
@@ -598,10 +634,13 @@ inline std::string gen_hex_chars(std::size_t n) {
 // replica can't be wrongly served a +CONTINUE partial resync against a different stream.
 inline std::string gen_run_id() { return gen_hex_chars(40); }
 
-// Defined later (needs the AOF/backlog/notify propagation helpers). When over the
-// maxmemory budget and a policy is set, evict keys until back under budget or nothing
-// is evictable, propagating each eviction to replicas/AOF/keyspace-notifications.
-void evict_to_fit();
+// Defined later (needs the AOF/backlog/notify propagation helpers): Redis's performEvictions()
+// (evict.c). Ok when memory is within maxmemory (or eviction is not safe now), Running when it
+// stopped at its time limit and the eviction timer goes on from the event loop, Fail when memory
+// is over the limit and there is nothing (or, under noeviction, nothing allowed) to evict.
+enum class EvictResult { Ok, Running, Fail };
+EvictResult perform_evictions();
+void clear_buffer(std::string& buf);  // defined with the maxmemory code
 
 std::string encode_command_resp(const std::vector<std::string>& args);  // defined below
 
@@ -667,22 +706,10 @@ void unpause_clients() {
   update_paused_actions();
 }
 
-// maxmemory enforcement: when used memory exceeds the limit, first try to evict per
-// maxmemory-policy; reject writes with -OOM only if still over budget (true noeviction,
-// or nothing left to evict). The caller gates on the `write` flag, so DEL and other writes
-// that free memory are refused too (no denyoom flag yet: compat/delta.md item 39).
-// Never for the AOF or the master stream, and never on a replica (Redis's mustObeyClient(), and
-// isSafeToPerformEvictions() with replica-ignore-maxmemory yes, PeaDB's fixed value).
-inline bool oom_should_reject() {
-  if (g_config_maxmemory <= 0) return false;
-  if (g_replaying_aof || g_replication_role == "slave") return false;
-  // While CLIENT PAUSE stops eviction Redis neither evicts nor refuses with -OOM
-  // (isSafeToPerformEvictions); a held write is checked again when it runs after the pause.
-  if (paused_actions_with_update(kPauseEvict)) return false;
-  if (store().used_memory() <= g_config_maxmemory) return false;
-  if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction) evict_to_fit();
-  return store().used_memory() > g_config_maxmemory;
-}
+// processCommand()'s maxmemory result for the client's command now running, saved for its
+// scripts (Redis's server.pre_command_oom_state): a script's denyoom write is refused only when
+// memory was already over the limit when the command started (scriptVerifyOOM()).
+bool g_pre_command_oom_state = false;
 // min-replicas-to-write: reject writes only when FEWER than the required number of
 // replicas are actually connected (the previous code rejected whenever the knob was
 // set at all, blocking writes even with healthy replicas — a footgun).
@@ -1140,8 +1167,10 @@ std::atomic<std::int64_t> g_server_start_time{0};
 std::atomic<int> g_runtime_max_clients{10000};
 std::function<int(std::int64_t)> g_count_synced_replicas;
 std::function<int()> g_count_connected_replicas;
+std::function<std::size_t()> g_replica_output_buffers_cb;
+std::function<std::pair<std::size_t, std::size_t>()> g_client_buffers_cb;
 std::function<int()> g_blocked_clients_cb;
-std::function<int(const std::string&, const std::string&, int)> g_client_kill_cb;
+std::function<int(const ClientKillFilter&, bool&)> g_client_kill_cb;
 std::function<void()> g_close_sockets_in_child_cb;
 std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
@@ -1499,9 +1528,12 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
   if (ro_command && !no_writes)
     return encode_error("Can not execute a script with write flag using *_ro command.");
   const bool readonly = ro_command || no_writes;
-  // A function that could write is denied under OOM unless it carries allow-oom; a no-writes
-  // function always runs (it can't grow memory), matching Redis.
-  if (!no_writes && !(entry->flags & kFuncAllowOom) && oom_should_reject())
+  // scriptPrepareForRun(): a function that may write and has no allow-oom flag does not run when
+  // memory was over maxmemory as the command started. The dispatch has already refused such an
+  // FCALL (its flags make it denyoom, scriptFlagsToCmdFlags()), so this is reached only when that
+  // check did not run.
+  if (!no_writes && !(entry->flags & kFuncAllowOom) && g_pre_command_oom_state &&
+      g_config_maxmemory > 0 && !g_replaying_aof)
     return std::string("-OOM allow-oom flag is not set on the script, can not run it when used memory > 'maxmemory'\r\n");
 
   // Cooperative BUSY simulation for trivially-infinite functions, mirroring eval_miniscript: a
@@ -2229,7 +2261,7 @@ void flush_append_only_file(std::string_view payload) {
       log(LogLevel::Info, "AOF write error looks solved, PeaDB can write again.");
       g_aof_write_error = false;
     }
-    g_aof_buf.clear();
+    clear_buffer(g_aof_buf);
     g_aof_unsynced = true;
     if (g_appendfsync == "always") aof_fsync_always();
     return;
@@ -2318,30 +2350,196 @@ void append_aof_payload(std::string_view payload) {
   }
 }
 
-// Eviction loop (maxmemory-policy). Evicts sampled keys until used memory is back under
-// the limit or nothing is evictable. Each evicted key is propagated like Redis's
-// propagateDeletion(): a DEL to the AOF and the replicas, each after a SELECT of the key's
-// database when the stream is in another one (a script's redis.set_repl() does not apply), plus
-// an "evicted" keyspace notification. Redis evicts only before a command runs, so each DEL is
-// written at once; PeaDB also evicts in the OOM check of each command that EXEC or a script runs
-// (item 39), and once that unit has queued a write the DEL joins it, so the streams keep the
-// order in which the keys changed.
-void evict_to_fit() {
-  // Bound the loop so a pathological config can never spin forever; in practice it exits
-  // as soon as used_memory drops under the limit (evict_one keeps the cache live).
-  int guard = 0;
-  while (store().used_memory() > g_config_maxmemory) {
-    if (++guard > 10'000'000) break;
-    auto victim = store().evict_one(g_maxmemory_policy, g_maxmemory_samples);
-    if (!victim) break;  // nothing evictable (e.g. volatile-* with no TTL keys)
-    constexpr int kBoth = kPropagateAof | kPropagateRepl;
-    if (g_also_propagate.empty()) {
-      propagate_now(victim->db, {"DEL", victim->key}, kBoth);
-    } else {
-      also_propagate(victim->db, {"DEL", victim->key}, kBoth);
-    }
-    notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key, victim->db);
+// ── maxmemory (Redis's evict.c) ──
+
+// Empties a buffer, and gives a large one back to the allocator as Redis's flushAppendOnlyFile()
+// does with aof_buf: std::string::clear() keeps the buffer, and used_memory counts it.
+void clear_buffer(std::string& buf) {
+  if (buf.capacity() < 4000) {
+    buf.clear();
+  } else {
+    std::string().swap(buf);
   }
+}
+
+// freeMemoryGetNotCountedMemory(): memory that maxmemory does not count, so that evicting keys
+// (whose DELs go into these buffers) cannot feed itself: the replicas' output buffers and, with
+// the AOF on, the AOF buffer; also the AOF rewrite buffer (Redis 7 has none; Redis 6 did not count
+// its own). The replication backlog counts as far as it holds data, as Redis's does, once a
+// replica has attached (used_memory()).
+std::size_t free_memory_not_counted() {
+  std::size_t overhead = g_replica_output_buffers_cb ? g_replica_output_buffers_cb() : 0;
+  if (g_aof_state != AofState::Off) overhead += zmalloc_string_bytes(g_aof_buf);
+  overhead += zmalloc_string_bytes(g_aof_rewrite_buf);
+  return overhead;
+}
+
+// getMaxmemoryState(): true while maxmemory is off or the used memory, less what is not counted,
+// is within it; otherwise false, with the bytes to free.
+bool maxmemory_state_ok(std::size_t* tofree) {
+  if (g_config_maxmemory <= 0) return true;
+  const std::size_t reported = used_memory();
+  const auto maxmemory = static_cast<std::size_t>(g_config_maxmemory);
+  if (reported <= maxmemory) return true;
+  const std::size_t overhead = free_memory_not_counted();
+  const std::size_t used = reported > overhead ? reported - overhead : 0;
+  if (used <= maxmemory) return true;
+  if (tofree != nullptr) *tofree = used - maxmemory;
+  return false;
+}
+
+// overMaxmemoryAfterAlloc(): whether allocating `more_bytes` would put the used memory (less what
+// is not counted) over maxmemory.
+bool over_maxmemory_after_alloc(std::size_t more_bytes) {
+  if (g_config_maxmemory <= 0) return false;
+  const auto maxmemory = static_cast<std::size_t>(g_config_maxmemory);
+  std::size_t used = used_memory();
+  if (used + more_bytes <= maxmemory) return false;
+  const std::size_t overhead = free_memory_not_counted();
+  used = used > overhead ? used - overhead : 0;
+  return used + more_bytes > maxmemory;
+}
+
+// dictExpandAllowed() (server.c), installed for the keyspace tables (g_keyspace_expand_allowed):
+// up to 1.618 elements per bucket, a table does not double when its new bucket array would go
+// over maxmemory, so a rehash near the limit does not evict keys to make room for itself.
+bool dict_expand_allowed(std::size_t more_bytes, double used_ratio) {
+  constexpr double kHashtableMaxLoadFactor = 1.618;
+  if (used_ratio <= kHashtableMaxLoadFactor) return !over_maxmemory_after_alloc(more_bytes);
+  return true;
+}
+
+int g_maxmemory_eviction_tenacity = 10;  // maxmemory-eviction-tenacity
+bool g_eviction_proc_running = false;    // isEvictionProcRunning: the eviction timer is on
+// stat_last_eviction_exceeded_time (0 = memory is within the limit) and
+// stat_total_eviction_exceeded_time, in steady-clock microseconds.
+std::int64_t g_eviction_exceeded_since_us = 0;
+std::int64_t g_eviction_exceeded_total_us = 0;
+
+std::int64_t steady_now_us() {
+  return std::chrono::duration_cast<std::chrono::microseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
+// evictionTimeLimitUs(): how long one call may evict, from maxmemory-eviction-tenacity (10, the
+// default, gives 500 us; 100 gives no limit).
+std::uint64_t eviction_time_limit_us() {
+  if (g_maxmemory_eviction_tenacity <= 10) return 50ULL * g_maxmemory_eviction_tenacity;
+  if (g_maxmemory_eviction_tenacity < 100)
+    return static_cast<std::uint64_t>(500.0 * std::pow(1.15, g_maxmemory_eviction_tenacity - 10.0));
+  return std::numeric_limits<std::uint64_t>::max();
+}
+
+// isSafeToPerformEvictions(): no eviction while the AOF loads or the master's stream applies, on a
+// replica (replica-ignore-maxmemory yes, a fixed setting), while CLIENT PAUSE stops eviction, or
+// while a script is busy.
+bool is_safe_to_perform_evictions() {
+  if (g_replaying_aof || g_replication_role == "slave") return false;
+  if (g_script_busy.load(std::memory_order_relaxed)) return false;
+  return !paused_actions_with_update(kPauseEvict);
+}
+
+// startEvictionTimeProc(): run_eviction_cycle() goes on evicting from the event loop, which does
+// not sleep while it runs (eviction_proc_running()).
+void start_eviction_time_proc() {
+  g_eviction_proc_running = true;
+}
+
+// performEvictions(): evict keys by maxmemory-policy until the memory to free at the start has
+// been freed (measured around each delete, so the DEL written to the AOF and the replicas is not
+// counted against it), at most eviction_time_limit_us() per call (then the eviction timer goes
+// on). Each evicted key is propagated like Redis's propagateDeletion(): a DEL to the AOF and the
+// replicas, after a SELECT of its database when the stream is in another one, plus an "evicted"
+// keyspace event.
+EvictResult perform_evictions() {
+  if (!is_safe_to_perform_evictions()) return EvictResult::Ok;
+  EvictResult result = EvictResult::Fail;
+  std::size_t tofree = 0;
+  if (maxmemory_state_ok(&tofree)) {
+    result = EvictResult::Ok;
+  } else if (g_maxmemory_policy != MaxmemoryPolicy::NoEviction) {
+    const std::uint64_t limit_us = eviction_time_limit_us();
+    const std::int64_t start_us = steady_now_us();
+    std::int64_t freed = 0;
+    int keys_freed = 0;
+    bool nothing_to_evict = false;
+    // The DELs of this pass go out together when it ends, each on its own (no MULTI/EXEC), as
+    // Redis writes them with its next AOF flush: one AOF write (and one fsync under appendfsync
+    // always) per pass, not per key. Inside a unit that is already open they join it, in order.
+    const ExecutionUnit unit(nullptr, /*may_wrap=*/false);
+    while (freed < static_cast<std::int64_t>(tofree)) {
+      const auto before = static_cast<std::int64_t>(zmalloc_used_memory());
+      auto victim = store().evict_one(g_maxmemory_policy, g_maxmemory_samples);
+      if (!victim) {
+        nothing_to_evict = true;
+        break;
+      }
+      freed += before - static_cast<std::int64_t>(zmalloc_used_memory());
+      also_propagate(victim->db, {"DEL", victim->key}, kPropagateAof | kPropagateRepl);
+      notify_keyspace_event(NOTIFY_EVICTED, "evicted", victim->key, victim->db);
+      // After some time, stop early, even if the memory is not back under the limit yet.
+      if (++keys_freed % 16 == 0 &&
+          static_cast<std::uint64_t>(steady_now_us() - start_us) > limit_us) {
+        start_eviction_time_proc();
+        break;
+      }
+    }
+    if (!nothing_to_evict) {
+      result = g_eviction_proc_running ? EvictResult::Running : EvictResult::Ok;
+    } else {
+      // Nothing left to evict, but the lazyfree thread may still be freeing memory: wait a little.
+      while (store().lazyfree_pending_objects() > 0 &&
+             static_cast<std::uint64_t>(steady_now_us() - start_us) < limit_us) {
+        if (maxmemory_state_ok(nullptr)) {
+          result = EvictResult::Ok;
+          break;
+        }
+        ::usleep(static_cast<useconds_t>(std::min<std::uint64_t>(limit_us, 1000)));
+      }
+    }
+  }
+  if (result == EvictResult::Ok) {
+    if (g_eviction_exceeded_since_us != 0) {
+      g_eviction_exceeded_total_us += steady_now_us() - g_eviction_exceeded_since_us;
+      g_eviction_exceeded_since_us = 0;
+    }
+  } else if (g_eviction_exceeded_since_us == 0) {
+    g_eviction_exceeded_since_us = steady_now_us();
+  }
+  return result;
+}
+
+std::uint64_t command_flags(const std::string& cmd, const std::vector<std::string>& args);  // below
+
+// The maxmemory step of processCommand() for a client's own command (not one EXEC or a script
+// runs, never the AOF or the master stream): evict as the policy says, and refuse with -OOM, while
+// memory is still over the limit, a denyoom command (by command_flags(); an EXEC by the commands
+// it queued) or, inside MULTI, any command but EXEC, DISCARD, QUIT and RESET (queueing may use
+// unlimited memory). The result is kept for the command's scripts (g_pre_command_oom_state).
+bool maxmemory_refuses(const std::string& cmd, const std::vector<std::string>& args,
+                       const SessionState& session) {
+  if (g_config_maxmemory <= 0) return false;
+  const bool out_of_memory = perform_evictions() == EvictResult::Fail;
+  g_pre_command_oom_state = out_of_memory;
+  if (!out_of_memory) return false;
+  if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "QUIT" && cmd != "RESET")
+    return true;
+  if (command_flags(cmd, args) & kRedisCmdDenyoom) return true;
+  if (cmd == "EXEC" && session.in_multi) {
+    for (const auto& q : session.queued)
+      if (!q.empty() && (command_flags(upper(q[0]), q) & kRedisCmdDenyoom)) return true;
+  }
+  return false;
+}
+
+// scriptVerifyOOM(): inside a script, a denyoom command is refused only when memory was over the
+// limit as the script's command started and the script has not written yet (a script is never
+// stopped half done), unless it runs with allow-oom.
+bool script_refuses_for_oom(const std::vector<std::string>& args) {
+  if (g_script_allow_oom || g_config_maxmemory <= 0 || g_replaying_aof) return false;
+  if (g_script_write_dirty || !g_pre_command_oom_state) return false;
+  return (redis_command_flags(args) & kRedisCmdDenyoom) != 0;
 }
 
 bool rewrite_aof_file(std::string& err);  // defined below
@@ -2393,7 +2591,7 @@ bool start_aof_rewrite() {
   ++g_total_forks;
   g_bgrewrite_in_progress.store(true);
   g_bgrewrite_child_pid.store(pid);
-  g_aof_rewrite_buf.clear();
+  clear_buffer(g_aof_rewrite_buf);
   g_aof_rewrite_buf_capped = false;  // reset per-rewrite overflow flag
   g_aof_rewrite_scheduled = false;
   // The rewritten file ends in whatever database its last SELECT named, so the first command
@@ -2413,7 +2611,7 @@ void kill_aof_rewrite_child() {
   ::unlink((g_aof_path.string() + ".tmp").c_str());
   g_bgrewrite_child_pid.store(0);
   g_bgrewrite_in_progress.store(false);
-  g_aof_rewrite_buf.clear();
+  clear_buffer(g_aof_rewrite_buf);
 }
 
 // CONFIG SET appendonly yes (startAppendOnly()): the AOF starts with a rewrite of the current
@@ -2477,7 +2675,7 @@ void stop_append_only() {
     g_aof_fd = -1;
   }
   g_last_aof_db = -1;
-  g_aof_buf.clear();
+  clear_buffer(g_aof_buf);
   g_aof_unsynced = false;
   g_appendonly = false;
   g_aof_state = AofState::Off;
@@ -4227,7 +4425,29 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             return true;
           }}},
         {"protected-mode", live_bool(g_protected_mode)},
-        {"maxmemory", live_number(g_config_maxmemory)},
+        {"maxmemory",
+         {[] { return std::to_string(g_config_maxmemory); },
+          [](const std::string& v, std::string& err) {
+            if (!live_number(g_config_maxmemory).set(v, err)) return false;
+            // updateMaxmemory()
+            if (g_config_maxmemory > 0) {
+              const std::size_t reported = used_memory();
+              const std::size_t not_counted = free_memory_not_counted();
+              const std::size_t used = reported > not_counted ? reported - not_counted : 0;
+              if (static_cast<std::size_t>(g_config_maxmemory) < used) {
+                log(LogLevel::Warn, "WARNING: the new maxmemory value set via CONFIG SET (" +
+                                        std::to_string(g_config_maxmemory) +
+                                        ") is smaller than the current memory usage (" +
+                                        std::to_string(used) +
+                                        "). This will result in key eviction and/or the inability "
+                                        "to accept new write commands depending on the "
+                                        "maxmemory-policy.");
+              }
+              start_eviction_time_proc();
+            }
+            return true;
+          }}},
+        {"maxmemory-eviction-tenacity", live_number(g_maxmemory_eviction_tenacity)},
         {"maxmemory-policy",
          {[] { return std::string(maxmemory_policy_to_str(g_maxmemory_policy)); },
           [](const std::string& v, std::string&) {
@@ -4529,11 +4749,15 @@ std::optional<int> function_flags(const std::string& name) {
   return std::nullopt;
 }
 
-// Whether a command writes or may replicate, the way Redis's getCommandFlags() decides it for
-// CLIENT PAUSE WRITE: the command's own flags, or, for EVAL, EVALSHA, FCALL and their _RO forms,
-// the flags the script or function declares (evalGetCommandFlags, fcallGetCommandFlags and
-// scriptFlagsToCmdFlags: declared flags mean "writes" unless they include no-writes).
-bool command_may_replicate(const std::string& cmd, const std::vector<std::string>& args) {
+// Redis's getCommandFlags(): the command's flags from Redis's table, except that EVAL, EVALSHA,
+// FCALL and their _RO forms take the flags the script or function declares (evalGetCommandFlags(),
+// fcallGetCommandFlags()), mapped by scriptFlagsToCmdFlags(): declared flags mean "writes" unless
+// they include no-writes, and "denyoom" unless they include allow-oom or no-writes. A script
+// without a shebang keeps EVAL's own flags (it may replicate; its writes are checked one by one
+// when they run).
+std::uint64_t command_flags(const std::string& cmd, const std::vector<std::string>& args) {
+  std::uint64_t flags = redis_command_flags(args);
+  std::optional<int> declared;
   const bool eval = cmd == "EVAL" || cmd == "EVAL_RO";
   const bool evalsha = cmd == "EVALSHA" || cmd == "EVALSHA_RO";
   if ((eval || evalsha) && args.size() >= 2) {
@@ -4545,36 +4769,27 @@ bool command_may_replicate(const std::string& cmd, const std::vector<std::string
     }
     if (body != nullptr) {
       const auto she = parse_script_shebang(*body);
-      if (she.has_shebang && she.err.empty()) return (she.flags & kFuncNoWrites) == 0;
+      if (she.has_shebang && she.err.empty()) declared = she.flags;
     }
   } else if ((cmd == "FCALL" || cmd == "FCALL_RO") && args.size() >= 2) {
-    if (const auto flags = function_flags(args[1])) return (*flags & kFuncNoWrites) == 0;
+    declared = function_flags(args[1]);
   }
-  return (redis_command_flags(args) & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
+  if (!declared) return flags;
+  flags &= ~(kRedisCmdStale | kRedisCmdDenyoom | kRedisCmdWrite | kRedisCmdMayReplicate);
+  if (!(*declared & (kFuncAllowOom | kFuncNoWrites))) flags |= kRedisCmdDenyoom;
+  if (!(*declared & kFuncNoWrites)) flags |= kRedisCmdWrite;
+  if (*declared & kFuncAllowStale) flags |= kRedisCmdStale;
+  return flags;
 }
 
-// Whether a command writes, the way Redis's processCommand() reads CMD_WRITE from
-// getCommandFlags() for the -MISCONF check: the command's own flag, or, for a script or function
-// that declares flags, "writes" unless they include no-writes (scriptFlagsToCmdFlags()). EVAL
-// without a shebang is not a write here; its writes are checked one by one when they run.
+// Whether a command writes or may replicate (CLIENT PAUSE WRITE holds it).
+bool command_may_replicate(const std::string& cmd, const std::vector<std::string>& args) {
+  return (command_flags(cmd, args) & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
+}
+
+// Whether a command writes, as processCommand() reads CMD_WRITE for the -MISCONF check.
 bool command_writes(const std::string& cmd, const std::vector<std::string>& args) {
-  const bool eval = cmd == "EVAL" || cmd == "EVAL_RO";
-  const bool evalsha = cmd == "EVALSHA" || cmd == "EVALSHA_RO";
-  if ((eval || evalsha) && args.size() >= 2) {
-    const std::string* body = &args[1];
-    if (evalsha) {
-      const auto it =
-          args[1].size() == 40 ? g_script_cache.find(lower(args[1])) : g_script_cache.end();
-      body = it == g_script_cache.end() ? nullptr : &it->second;
-    }
-    if (body != nullptr) {
-      const auto she = parse_script_shebang(*body);
-      if (she.has_shebang && she.err.empty()) return (she.flags & kFuncNoWrites) == 0;
-    }
-  } else if ((cmd == "FCALL" || cmd == "FCALL_RO") && args.size() >= 2) {
-    if (const auto flags = function_flags(args[1])) return (*flags & kFuncNoWrites) == 0;
-  }
-  return (redis_command_flags(args) & kRedisCmdWrite) != 0;
+  return (command_flags(cmd, args) & kRedisCmdWrite) != 0;
 }
 
 // Whether CLIENT PAUSE holds this command (processCommand): everything under ALL; under WRITE
@@ -4659,8 +4874,13 @@ std::string eval_script(const std::string& source, const std::vector<std::string
     return encode_error("Can not execute a script with write flag using *_ro command.");
   }
   const bool write_intent = she.has_shebang ? !no_writes : script_has_write_intent(script_body);
-  if (oom_should_reject() && she.has_shebang && !allow_oom) {
-    return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+  // scriptPrepareForRun(), as for FCALL: the dispatch refuses a flagged script that may write and
+  // has no allow-oom flag before it gets here.
+  if (she.has_shebang && !allow_oom && g_pre_command_oom_state && g_config_maxmemory > 0 &&
+      !g_replaying_aof) {
+    return std::string(
+        "-OOM allow-oom flag is not set on the script, can not run it when used memory > "
+        "'maxmemory'\r\n");
   }
   if (write_intent && noreplicas_should_reject()) {
     return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
@@ -4759,6 +4979,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
           session.replica_stream = true;
+          g_backlog_has_replica = true;
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           g_last_repl_db = -1; // Force re-emit SELECT on next write
           // Plain SYNC sends an empty RDB and relies on the command stream. PeaDB's own
@@ -4808,6 +5029,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           parse_i64(args[2], offset);
 
           session.replica_stream = true;
+          g_backlog_has_replica = true;
           g_last_repl_db = -1;
 
           // Attempt partial resync if the requested replid matches our current id (or our
@@ -4816,10 +5038,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const bool id_ok = (replid == g_master_replid) ||
                              (replid == g_master_replid2 && g_second_replid_offset >= 0 &&
                               offset <= g_second_replid_offset);
-          if (id_ok && offset >= 0 &&
-              offset >= g_repl_backlog.base() && offset <= g_repl_backlog.total) {
+          // Redis numbers the stream's bytes from 1: a replica that holds the stream up to offset
+          // R asks for R + 1, the first byte it lacks (masterTryPartialResynchronization(): from
+          // repl_backlog->offset to repl_backlog->offset + histlen). The backlog counts from 0.
+          if (id_ok && offset >= 1 && offset - 1 >= g_repl_backlog.base() &&
+              offset - 1 <= g_repl_backlog.total) {
             std::string pending;
-            g_repl_backlog.get_slice(offset, pending);
+            g_repl_backlog.get_slice(offset - 1, pending);
             session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
             g_sync_partial_ok.fetch_add(1, std::memory_order_relaxed);
             return "+CONTINUE\r\n" + pending;
@@ -4927,13 +5152,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (it->second.is_write()) has_write = true;
             else has_read = true;
           }
-          // oom_should_reject() and noreplicas_should_reject() never refuse the AOF or the master
-          // stream (Redis's mustObeyClient()), so a transaction they replay is never dropped.
+          // noreplicas_should_reject() never refuses the AOF or the master stream (Redis's
+          // mustObeyClient()), so a transaction they replay is never dropped. The dispatch has
+          // already run the maxmemory check for EXEC (processCommand()).
           if (has_write && noreplicas_should_reject()) {
             return std::string("-EXECABORT Transaction discarded because of previous errors: NOREPLICAS Not enough good replicas to write.\r\n");
-          }
-          if (has_write && oom_should_reject()) {
-            return std::string("-EXECABORT Transaction discarded because of previous errors: OOM command not allowed when used memory > 'maxmemory'.\r\n");
           }
           if (has_read && !g_replaying_aof && g_replication_role == "slave" &&
               !g_config_replica_serve_stale_data && g_replica_stale) {
@@ -5271,7 +5494,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           auto uptime_s = (now_ms() - g_server_start_time.load()) / 1000;
           if (uptime_s < 1) uptime_s = 1;
 
-          const std::size_t used_mem = static_cast<std::size_t>(store().used_memory());
+          const std::size_t used_mem = used_memory();
+          // (normal clients, replicas): the bytes their query and output buffers hold.
+          const std::pair<std::size_t, std::size_t> client_mem =
+              g_client_buffers_cb ? g_client_buffers_cb()
+                                  : std::pair<std::size_t, std::size_t>{0, 0};
+          const std::int64_t current_eviction_exceeded_us =
+              g_eviction_exceeded_since_us != 0 ? steady_now_us() - g_eviction_exceeded_since_us
+                                                : 0;
           if (static_cast<std::int64_t>(used_mem) > g_used_memory_peak) g_used_memory_peak = static_cast<std::int64_t>(used_mem);
           const std::int64_t rss_bytes = process_rss_bytes();
           const double frag_ratio = (used_mem > 0 && rss_bytes > 0)
@@ -5349,11 +5579,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "used_memory_peak_human:" + format_mem(static_cast<std::size_t>(g_used_memory_peak)) + "\r\n"
                    "used_memory_rss:" + std::to_string(rss_bytes > 0 ? rss_bytes : static_cast<std::int64_t>(used_mem)) + "\r\n"
                    "mem_fragmentation_ratio:" + fmt2(frag_ratio) + "\r\n"
+                   "mem_not_counted_for_evict:" + std::to_string(free_memory_not_counted()) + "\r\n"
+                   "mem_clients_slaves:" + std::to_string(client_mem.second) + "\r\n"
+                   "mem_clients_normal:" + std::to_string(client_mem.first) + "\r\n"
+                   "mem_aof_buffer:" + std::to_string(zmalloc_string_bytes(g_aof_buf)) + "\r\n"
                    "mem_allocator:libc\r\n"
                    "maxmemory:" + std::to_string(g_config_maxmemory) + "\r\n"
                    "maxmemory_human:" + format_mem(static_cast<size_t>(g_config_maxmemory)) + "\r\n"
                    "maxmemory_policy:" + std::string(maxmemory_policy_to_str(g_maxmemory_policy)) + "\r\n"
-                   "number_of_cached_scripts:" + std::to_string(g_script_cache.size()) + "\r\n\r\n";
+                   "number_of_cached_scripts:" + std::to_string(g_script_cache.size()) + "\r\n"
+                   "lazyfree_pending_objects:" + std::to_string(store().lazyfree_pending_objects()) + "\r\n\r\n";
           }
           if (want("PERSISTENCE")) {
             // Redis's rdb_changes_since_last_save is the DELTA since the last save baseline
@@ -5396,6 +5631,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "keyspace_misses:" + std::to_string(store().stat_keyspace_misses()) + "\r\n"
                    "expired_keys:" + std::to_string(store().stat_expired_keys()) + "\r\n"
                    "evicted_keys:" + std::to_string(store().stat_evicted_keys()) + "\r\n"
+                   // PeaDB never evicts clients (maxmemory-clients is fixed at 0).
+                   "evicted_clients:0\r\n"
+                   "total_eviction_exceeded_time:" + std::to_string((g_eviction_exceeded_total_us + current_eviction_exceeded_us) / 1000) + "\r\n"
+                   "current_eviction_exceeded_time:" + std::to_string(current_eviction_exceeded_us / 1000) + "\r\n"
                    "sync_full:" + std::to_string(g_sync_full.load()) + "\r\n"
                    "sync_partial_ok:" + std::to_string(g_sync_partial_ok.load()) + "\r\n"
                    "sync_partial_err:" + std::to_string(g_sync_partial_err.load()) + "\r\n\r\n";
@@ -5603,7 +5842,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             // adopt a fresh replid for the new lineage (Redis PSYNC2 promotion semantics).
             if (was_replica) {
               g_master_replid2 = g_master_replid;
-              g_second_replid_offset = g_master_repl_offset;
+              g_second_replid_offset = g_master_repl_offset + 1;  // shiftReplicationId()
               g_master_replid = gen_run_id();
             }
             return encode_simple("OK");
@@ -7333,7 +7572,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               else return encode_error("Unknown option given: " + args[i]);
             }
             if (i >= args.size()) return encode_error("Function code is missing");
-            if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             std::string name, err;
             if (!load_function_library(args[i], replace, name, err)) return encode_error(err);
             propagate_write({"FUNCTION", "LOAD", "REPLACE", args[i]}, session, nullptr);
@@ -7419,7 +7657,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "RESTORE" && (args.size() == 3 || args.size() == 4)) {
             std::string policy = "APPEND";
             if (args.size() == 4) { policy = upper(args[3]); if (policy != "FLUSH" && policy != "APPEND" && policy != "REPLACE") return encode_error("Wrong restore policy given, value should be either FLUSH, APPEND or REPLACE."); }
-            if (oom_should_reject()) return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
             std::string err;
             if (!functions_restore(args[2], policy, err)) return encode_error(err);
             propagate_write({"FUNCTION", "RESTORE", args[2], policy}, session, nullptr);
@@ -7462,9 +7699,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (sub == "REFCOUNT" && args.size() == 3) {
             const auto t = store().type_of(args[2]);
             if (t == "none") return encode_null(session.resp_version);
-            // Redis returns INT_MAX for shared integer objects (values 0..9999);
-            // the upstream incr suite asserts refcount > 1 for them.
-            if (t == "string") {
+            // Redis returns INT_MAX for shared integer objects (values 0..9999); the upstream incr
+            // suite asserts refcount > 1 for them. With maxmemory set and an LRU or LFU policy
+            // Redis does not share them (MAXMEMORY_FLAG_NO_SHARED_INTEGERS: each key keeps its own
+            // access time); Redis decides when the value is written, PeaDB when it is asked.
+            const bool no_shared_integers = g_config_maxmemory > 0 &&
+                                            g_maxmemory_policy != MaxmemoryPolicy::NoEviction &&
+                                            g_maxmemory_policy != MaxmemoryPolicy::AllkeysRandom &&
+                                            g_maxmemory_policy != MaxmemoryPolicy::VolatileRandom &&
+                                            g_maxmemory_policy != MaxmemoryPolicy::VolatileTtl;
+            if (t == "string" && !no_shared_integers) {
               auto v = store().get(args[2]);
               std::int64_t n = 0;
               if (v.has_value() && parse_i64(*v, n) && n >= 0 && n < 10000) {
@@ -9254,27 +9498,63 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             return encode_verbatim(out, session.resp_version);
           }
           if (sub == "KILL") {
-            // Old form: CLIENT KILL <ip:port>.  New form: CLIENT KILL [ID id] [ADDR a] [SKIPME y/n] ...
-            if (args.size() == 3) {
-              const bool self = (session.addr == args[2]);
-              int killed = g_client_kill_cb ? g_client_kill_cb("ADDR", args[2], session.fd) : 0;
-              if (self) { should_close = true; ++killed; }
-              return killed > 0 ? encode_simple("OK") : encode_error("No such client");
+            // clientKillCommand(): CLIENT KILL <ip:port>, or CLIENT KILL <filter> <value> ...
+            // with ID, TYPE, ADDR, LADDR, USER and SKIPME, all of which must match.
+            if (args.size() < 3)
+              return encode_error("wrong number of arguments for 'client|kill' command");
+            ClientKillFilter filter;
+            filter.self_fd = session.fd;
+            const bool old_form = args.size() == 3;
+            if (old_form) {
+              filter.addr = args[2];
+              filter.skipme = false;  // with the old form a client can kill itself
+            } else {
+              for (std::size_t i = 2; i < args.size(); i += 2) {
+                const bool moreargs = args.size() > i + 1;
+                const auto opt = lower(args[i]);
+                if (opt == "id" && moreargs) {
+                  std::int64_t id = 0;
+                  if (!parse_i64(args[i + 1], id) || id < 1)
+                    return encode_error("client-id should be greater than 0");
+                  filter.id = static_cast<std::uint64_t>(id);
+                } else if (opt == "type" && moreargs) {
+                  const auto type = lower(args[i + 1]);
+                  if (type == "normal")
+                    filter.type = ClientType::Normal;
+                  else if (type == "slave" || type == "replica")
+                    filter.type = ClientType::Slave;
+                  else if (type == "pubsub")
+                    filter.type = ClientType::Pubsub;
+                  else if (type == "master")
+                    filter.type = ClientType::Master;
+                  else
+                    return encode_error("Unknown client type '" + args[i + 1] + "'");
+                } else if (opt == "addr" && moreargs) {
+                  filter.addr = args[i + 1];
+                } else if (opt == "laddr" && moreargs) {
+                  filter.laddr = args[i + 1];
+                } else if (opt == "user" && moreargs) {
+                  // Every client is the default user (multi-user ACL is item 7), so USER default
+                  // matches all of them.
+                  if (args[i + 1] != "default")
+                    return encode_error("No such user '" + args[i + 1] + "'");
+                } else if (opt == "skipme" && moreargs) {
+                  const auto v = lower(args[i + 1]);
+                  if (v == "yes")
+                    filter.skipme = true;
+                  else if (v == "no")
+                    filter.skipme = false;
+                  else
+                    return encode_error("syntax error");
+                } else {
+                  return encode_error("syntax error");
+                }
+              }
             }
-            std::string by, val; bool skipme = true;
-            for (std::size_t i = 2; i + 1 < args.size(); i += 2) {
-              const auto o = upper(args[i]);
-              if (o == "ID") { by = "ID"; val = args[i + 1]; }
-              else if (o == "ADDR") { by = "ADDR"; val = args[i + 1]; }
-              else if (o == "SKIPME") { skipme = (lower(args[i + 1]) != "no"); }
-              else if (o == "TYPE" || o == "LADDR" || o == "USER" || o == "MAXAGE") { /* accepted; unsupported filter */ }
-              else return encode_error("syntax error");
-            }
-            if (by.empty()) return encode_error("syntax error");
-            const bool self = (by == "ID" && std::to_string(session.client_id) == val) ||
-                              (by == "ADDR" && session.addr == val);
-            int killed = g_client_kill_cb ? g_client_kill_cb(by, val, session.fd) : 0;
-            if (self && !skipme) { should_close = true; ++killed; }
+            bool kill_self = false;
+            const int killed = g_client_kill_cb ? g_client_kill_cb(filter, kill_self) : 0;
+            if (kill_self) should_close = true;  // after the reply, like CLIENT_CLOSE_AFTER_REPLY
+            if (old_form) return killed > 0 ? encode_simple("OK") : encode_error("No such client");
             return encode_integer(killed);
           }
           if (sub == "NO-EVICT" && args.size() == 3) {
@@ -11669,7 +11949,6 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "QUIT" &&
       cmd != "RESET") {
-    if (cmd == "WATCH") return encode_error("WATCH inside MULTI is not allowed");
     if (cmd == "SAVE" || cmd == "SHUTDOWN") {
       session.multi_dirty = true;
       return std::string("-ERR Command not allowed inside a transaction\r\n");
@@ -11683,12 +11962,16 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       session.multi_dirty = true;
       return encode_error("wrong number of arguments for '" + lower(cmd) + "' command");
     }
-    bool q_is_write = qit->second.is_write();
-    if (q_is_write && oom_should_reject() && !g_script_allow_oom &&
-        cmd != "EVAL" && cmd != "EVALSHA" && cmd != "FLUSHALL" && cmd != "FLUSHDB") {
+    // processCommand() runs the maxmemory step before it queues: while memory is over the limit,
+    // nothing is queued. Not for a transaction from the master stream or the AOF.
+    if (!g_replaying_aof && maxmemory_refuses(cmd, args, session)) {
       session.multi_dirty = true;
+      record_cmd_rejected(cmd);
+      record_error_stat("OOM");
       return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
     }
+    // WATCH is not queued: watchCommand() answers this, after processCommand()'s checks.
+    if (cmd == "WATCH") return encode_error("WATCH inside MULTI is not allowed");
     // processCommand() checks a command before it queues it, as at the top level below; not a
     // transaction from the master stream or the AOF.
     if (std::string misconf = g_replaying_aof ? std::string() : misconf_reply();
@@ -11743,12 +12026,25 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   const bool is_script_dispatch =
       cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
       cmd == "FCALL" || cmd == "FCALL_RO";
-  if (spec_is_write && oom_should_reject() && !g_script_allow_oom &&
-      cmd != "CONFIG" && !is_script_dispatch &&
-      cmd != "FLUSHALL" && cmd != "FLUSHDB") {
+  const bool in_script = in_lua_script_context();
+  // The maxmemory step of processCommand(), before the -MISCONF check: only for the client's own
+  // command; the commands EXEC runs are not checked again, and a script's are checked by
+  // script_refuses_for_oom() below.
+  if (!g_replaying_aof && !in_script && !g_executing_exec &&
+      maxmemory_refuses(cmd, args, session)) {
     ++top_stat.rejected_calls;
+    if (cmd == "EXEC" && session.in_multi) {
+      // rejectCommand() on EXEC: execCommandAbort() discards the transaction.
+      record_error_stat("EXECABORT");
+      session.in_multi = false;
+      session.multi_dirty = false;
+      session.queued.clear();
+      session.watched_epoch.reset();
+      session.watched_digests.clear();
+      return "-EXECABORT Transaction discarded because of: OOM command not allowed when used "
+             "memory > 'maxmemory'.\r\n";
+    }
     record_error_stat("OOM");
-    if (in_lua_script_context()) g_script_inner_error_seen = true;
     return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
   }
   // After the OOM check, as in Redis's processCommand(): while persistence is failing it refuses
@@ -11756,7 +12052,6 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // commands EXEC runs are not checked again; a script's writes are (scriptCall()), until its
   // first write (scriptVerifyWriteCommandAllow()): PeaDB writes the AOF per command, so the first
   // write of a script can be the one that fails.
-  const bool in_script = in_lua_script_context();
   if (!g_replaying_aof && !(g_executing_exec && !in_script) &&
       !(in_script && g_script_write_dirty)) {
     std::string misconf = misconf_reply();
@@ -11783,6 +12078,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
         return misconf;
       }
     }
+  }
+  // scriptCall(): after the checks of scriptVerifyWriteCommandAllow() (-MISCONF above),
+  // scriptVerifyOOM(), then a write marks the script as having written.
+  if (in_script && script_refuses_for_oom(args)) {
+    ++top_stat.rejected_calls;
+    record_error_stat("OOM");
+    g_script_inner_error_seen = true;
+    return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
   }
   if (in_script && !g_script_write_dirty && command_writes(cmd, args)) g_script_write_dirty = true;
   if (spec_is_write && noreplicas_should_reject() &&
@@ -12036,10 +12339,19 @@ bool protected_mode_enabled() { return g_protected_mode; }
 bool requirepass_is_set() { return !g_requirepass.empty(); }
 
 void configure_maxmemory(const std::string& spec) {
+  g_keyspace_expand_allowed = dict_expand_allowed;
   if (spec.empty()) { g_config_maxmemory = 0; return; }
   std::int64_t v = 0;
   if (parse_memory(spec, v) && v >= 0) g_config_maxmemory = v;
   else log(LogLevel::Warn, "ignoring invalid maxmemory value: " + spec);
+  // Redis's main() warns about a suspicious setting.
+  if (g_config_maxmemory > 0 && g_config_maxmemory < 1024 * 1024) {
+    log(LogLevel::Warn,
+        "WARNING: You specified a maxmemory value that is less than 1MB (current "
+        "value is " +
+            std::to_string(g_config_maxmemory) +
+            " bytes). Are you sure this is what you really want?");
+  }
 }
 
 void configure_maxmemory_policy(const std::string& spec) {
@@ -12132,6 +12444,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("proto-max-bulk-len", g_proto_max_bulk_len);
   num("client-query-buffer-limit", g_client_query_buffer_limit);
   num("tcp-keepalive", g_tcp_keepalive);
+  num("maxmemory-eviction-tenacity", g_maxmemory_eviction_tenacity);
   int lfu_log_factor = store().lfu_log_factor();
   num("lfu-log-factor", lfu_log_factor);
   store().set_lfu_log_factor(lfu_log_factor);
@@ -12315,18 +12628,20 @@ void databases_cron() {
   store().shrink_sparse_tables();
 }
 
-// Eviction cron: triggered from the event loop. Mirrors Redis's startEvictionTimeProc —
-// once maxmemory is exceeded (e.g. lowered below usage via CONFIG SET) under an eviction
-// policy, evict keys in the background so the 'evicted' keyspace event and DEL propagation
-// fire without waiting for the next write command. Cheap O(1) when under budget
-// (used_memory() is a bounded-staleness cache), and a no-op on replicas / during AOF replay.
+// Run on every event-loop pass: keeps the peak of used_memory (Redis's serverCron() does it every
+// 100 ms) and, while the eviction timer is on (an eviction that stopped at its time limit, or a
+// CONFIG SET maxmemory), evicts again, like Redis's evictionTimeProc(): until memory is within the
+// limit or nothing is left to evict.
 void run_eviction_cycle() {
-  if (g_pause_cron) return;  // DEBUG PAUSE-CRON
-  if (g_config_maxmemory <= 0 || g_maxmemory_policy == MaxmemoryPolicy::NoEviction) return;
-  if (g_replication_role == "slave" || g_replaying_aof) return;
-  if (paused_actions_with_update(kPauseEvict)) return;  // CLIENT PAUSE stops eviction
-  if (store().used_memory() <= g_config_maxmemory) return;
-  evict_to_fit();
+  if (const auto used = static_cast<std::int64_t>(used_memory()); used > g_used_memory_peak)
+    g_used_memory_peak = used;
+  if (!g_eviction_proc_running) return;
+  if (perform_evictions() == EvictResult::Running) return;
+  g_eviction_proc_running = false;
+}
+
+bool eviction_proc_running() {
+  return g_eviction_proc_running;
 }
 
 // Save-point cron, run from the event loop (the BGSAVE part of Redis's serverCron()): starts a
@@ -13427,7 +13742,7 @@ void reap_background_children() {
               "old AOF retained intact (dropping " +
               std::to_string(g_aof_rewrite_buf.size()) +
               " bytes of partial diff). Reduce write rate and rerun BGREWRITEAOF.");
-          g_aof_rewrite_buf.clear();
+          clear_buffer(g_aof_rewrite_buf);
           g_aof_last_bgrewrite_status = "err";
           // g_aof_fd unchanged — still pointing at the live old AOF.
         } else {
@@ -13463,14 +13778,14 @@ void reap_background_children() {
                   "new AOF is live but the rename may revert across a crash. "
                   "Reporting aof_last_bgrewrite_status:err — retry the rewrite.");
             }
-            g_aof_rewrite_buf.clear();
+            clear_buffer(g_aof_rewrite_buf);
             g_aof_last_bgrewrite_status = dir_durable ? "ok" : "err";
             g_aofrw_consecutive_failures = 0;
             open_aof_fd();  // reopen on the new inode
             // The new file, written and synced, holds every write: what a failed write left in
             // g_aof_buf is in the dataset the child saved or in the rewrite buffer, so writing
             // it again would apply it twice. A good rewrite ends an earlier write or fsync error.
-            g_aof_buf.clear();
+            clear_buffer(g_aof_buf);
             g_aof_unsynced = false;
             g_aof_fsync_error = false;
             if (g_aof_write_error) {
@@ -13490,7 +13805,7 @@ void reap_background_children() {
             // in-memory state — which also already reflects these commands — so
             // re-appending the old buffer would double-apply non-idempotent
             // operations (INCR, list pushes, set removals, stream appends).
-            g_aof_rewrite_buf.clear();
+            clear_buffer(g_aof_rewrite_buf);
             g_aof_last_bgrewrite_status = "err";
             log(LogLevel::Error, "BGREWRITEAOF: failed to commit (" +
                 std::string(diff_ok ? "rename" : "diff append") +
@@ -13506,7 +13821,7 @@ void reap_background_children() {
           log(LogLevel::Warn, "BGREWRITEAOF: child failed; discarding " +
               std::to_string(g_aof_rewrite_buf.size()) + " bytes of buffered diff");
         }
-        g_aof_rewrite_buf.clear();
+        clear_buffer(g_aof_rewrite_buf);
         g_aof_last_bgrewrite_status = "err";
       }
       // The AOF that CONFIG SET appendonly yes turned on still has no file: try again from the

@@ -63,6 +63,7 @@ add_library(peadb_core
     src/shard_loop.cpp
     src/lua_engine.cpp
     src/rdb.cpp
+    src/zmalloc.cpp
     src/lua_cjson_stub.c
     src/lua_cmsgpack_stub.c
     src/lua_bit_stub.c
@@ -155,4 +156,8 @@ if(BUILD_TESTING)
   add_executable(dict_test tests/unit/dict_test.cpp)
   target_link_libraries(dict_test PRIVATE peadb_core)
   add_test(NAME dict_test COMMAND dict_test)
+
+  add_executable(zmalloc_test tests/unit/zmalloc_test.cpp)
+  target_link_libraries(zmalloc_test PRIVATE peadb_core)
+  add_test(NAME zmalloc_test COMMAND zmalloc_test)
 endif()

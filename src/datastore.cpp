@@ -2688,68 +2688,16 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
 std::uint64_t DataStore::mutation_epoch() const { return mutation_epoch_; }
 void DataStore::increment_mutation_epoch() { ++mutation_epoch_; }
 
-std::int64_t DataStore::entry_cost(const std::string& k, const Entry& e) const {
-  // Per-key fixed overhead: the map node's key string + the (now small) Entry.
-  std::int64_t total = static_cast<std::int64_t>(sizeof(k) + k.size() + sizeof(e));
-  // Only the active payload is allocated now (tagged union), so account per type —
-  // and add the heap container's own sizeof, which no longer rides inside Entry.
-  switch (e.type()) {
-    case ValueType::String:
-      total += static_cast<std::int64_t>(e.str().size());
-      break;
-    case ValueType::Hash:
-      total += static_cast<std::int64_t>(sizeof(Entry::HashT));
-      for (const auto& [f, v] : e.hash()) total += static_cast<std::int64_t>(f.size() + v.size());
-      break;
-    case ValueType::List:
-      total += static_cast<std::int64_t>(sizeof(Entry::ListT));
-      for (const auto& v : e.list()) total += static_cast<std::int64_t>(v.size());
-      break;
-    case ValueType::Set:
-      total += static_cast<std::int64_t>(sizeof(Entry::SetT));
-      for (const auto& m : e.set()) total += static_cast<std::int64_t>(m.size());
-      break;
-    case ValueType::ZSet:
-      total += static_cast<std::int64_t>(sizeof(Entry::ZSetT));
-      for (const auto& [m, _] : e.zset()) total += static_cast<std::int64_t>(m.size() + sizeof(double));
-      break;
-    case ValueType::Stream:
-      // Count entries + consumer-group PEL so stream-heavy datasets are not invisible
-      // to used_memory / maxmemory.
-      total += static_cast<std::int64_t>(sizeof(Entry::StreamT));
-      for (const auto& [id, fields] : e.stream_entries()) {
-        total += static_cast<std::int64_t>(id.size());
-        for (const auto& [f, v] : fields) total += static_cast<std::int64_t>(f.size() + v.size());
-      }
-      for (const auto& [gname, grp] : e.stream_groups()) {
-        total += static_cast<std::int64_t>(gname.size() + grp.last_delivered_id.size());
-        for (const auto& [id, c] : grp.pending_to_consumer) total += static_cast<std::int64_t>(id.size() + c.size());
-      }
-      break;
-  }
-  return total;
-}
-
-std::int64_t DataStore::estimate_used_memory() const {
-  std::int64_t total = sizeof(*this);
-  for (const auto& db : dbs_)
-    for (const auto& [k, e] : db) total += entry_cost(k, e);
-  return total;
-}
-
-std::int64_t DataStore::used_memory() const {
-  const std::int64_t now = now_ms();
-  constexpr std::int64_t kRecomputeIntervalMs = 100;
-  if (used_mem_cache_ < 0 || now - used_mem_cache_ms_ >= kRecomputeIntervalMs) {
-    used_mem_cache_ = estimate_used_memory();
-    used_mem_cache_ms_ = now;
-  }
-  return used_mem_cache_;
-}
-
 // ── Eviction (maxmemory-policy) ──
 
 void DataStore::touch_lru(Entry& e, bool lfu) {
+  if (e.lru_fresh) {
+    e.lru_fresh = false;
+    if (lfu) {
+      e.lru = 5;  // LFU_INIT_VAL
+      return;
+    }
+  }
   if (lfu) {
     // Approximate LFU: the low 8 bits of `lru` are a logarithmic access counter (Redis
     // LFU_INIT_VAL=5). Increment probabilistically so the counter saturates slowly — the
@@ -2800,7 +2748,7 @@ std::optional<std::int64_t> DataStore::object_freq(const std::string& key) {
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  return static_cast<std::int64_t>(it->second.lru & 0xFF);
+  return static_cast<std::int64_t>(it->second.lru_fresh ? 5 : (it->second.lru & 0xFF));
 }
 
 bool DataStore::set_object_idle(const std::string& key, std::int64_t idle_seconds) {
@@ -2810,6 +2758,7 @@ bool DataStore::set_object_idle(const std::string& key, std::int64_t idle_second
   // idletime reads back as (now_low32 - lru)/1000, so store lru = now - idle*1000.
   const auto now = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
   it->second.lru = now - static_cast<std::uint32_t>(idle_seconds * 1000);
+  it->second.lru_fresh = false;
   return true;
 }
 
@@ -2818,6 +2767,7 @@ bool DataStore::set_object_freq(const std::string& key, std::int64_t freq) {
   auto it = db.find(key);
   if (it == db.end()) return false;
   it->second.lru = static_cast<std::uint32_t>(freq & 0xFF);
+  it->second.lru_fresh = false;
   return true;
 }
 
@@ -2865,7 +2815,8 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
         const bool has_ttl = e.expire_at_ms.has_value();
         if (logically_expired(e, now)) continue;
         if (volatile_only && !has_ttl) continue;
-        Cand c{static_cast<int>((db_start + di) % ndb), it->first, e.lru,
+        // A key no command has touched yet counts as LFU_INIT_VAL under LFU.
+        Cand c{static_cast<int>((db_start + di) % ndb), it->first, lfu && e.lru_fresh ? 5u : e.lru,
                has_ttl ? *e.expire_at_ms : std::numeric_limits<std::int64_t>::max()};
         if (better(c)) best = c;
         ++collected;
@@ -2877,16 +2828,9 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
   auto& vdb = dbs_[static_cast<std::size_t>(best->db)];
   auto vit = vdb.find(best->key);
   if (vit == vdb.end()) return std::nullopt;
-  const std::int64_t freed = entry_cost(best->key, vit->second);
   vdb.erase(vit);
   record_evicted();
-  // Keep the cached used_memory live so the caller's eviction loop sees memory fall
-  // immediately rather than over-evicting against the ~100ms-stale cache.
-  if (used_mem_cache_ >= 0) {
-    used_mem_cache_ -= freed;
-    if (used_mem_cache_ < 0) used_mem_cache_ = 0;
-  }
-  return EvictVictim{best->db, best->key, freed};
+  return EvictVictim{best->db, best->key};
 }
 
 std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() const {
@@ -3248,7 +3192,10 @@ void DataStore::ensure_lazyfree_thread() {
       // Destruct the detached maps (and every Entry/payload they own) here, off the
       // event-loop thread. These maps are exclusively owned by `batch` — moved out of the
       // live keyspace before handoff — so there is no race with command processing.
+      std::size_t keys = 0;
+      for (const auto& db : batch) keys += db.size();
       batch.clear();
+      lazyfree_pending_.fetch_sub(keys, std::memory_order_relaxed);
     }
   });
 }
@@ -3256,6 +3203,7 @@ void DataStore::ensure_lazyfree_thread() {
 void DataStore::lazyfree_enqueue(DB&& db) {
   if (db.empty()) return;
   ensure_lazyfree_thread();
+  lazyfree_pending_.fetch_add(db.size(), std::memory_order_relaxed);
   {
     std::lock_guard<std::mutex> lk(lazyfree_mu_);
     lazyfree_queue_.push_back(std::move(db));
