@@ -98,7 +98,7 @@ echo "=== Building fuzz harnesses ==="
 $CXX $COMMON_FLAGS tests/fuzz/resp_parser_stress.cpp src/protocol.cpp \
   -o /tmp/resp_parser_stress
 CORE_SOURCES="src/command.cpp src/datastore.cpp src/config.cpp src/logger.cpp \
-  src/protocol.cpp src/server.cpp src/lua_engine.cpp src/rdb.cpp src/sha256.cpp"
+  src/protocol.cpp src/server.cpp src/lua_engine.cpp src/rdb.cpp src/sha256.cpp src/zmalloc.cpp"
 LUA_STUB_SOURCES="src/lua_cjson_stub.c src/lua_cmsgpack_stub.c src/lua_bit_stub.c src/lua_struct_stub.c"
 
 # Compile C stubs as C (not C++) so extern "C" linkage matches.

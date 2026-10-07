@@ -195,7 +195,8 @@ void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
 void configure_lazy_expire();
 void background_save_cron();     // event-loop save-point check (triggers BGSAVE)
 void run_active_expire_cycle();  // event-loop active expiry (master propagates DEL; replica no-op)
-void run_eviction_cycle();       // event-loop background eviction when over maxmemory (master only)
+void run_eviction_cycle();       // every event-loop pass: used_memory peak, and the eviction timer
+bool eviction_proc_running();    // the eviction timer is on: the event loop must not sleep
 void databases_cron();           // event-loop shrink of sparse keyspace tables (no fork child)
 void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
@@ -254,11 +255,28 @@ extern std::atomic<std::int64_t> g_server_start_time;
 extern std::function<int(std::int64_t)> g_count_synced_replicas;
 // Callback: returns the number of currently-connected replica sessions (replica_stream=true).
 extern std::function<int()> g_count_connected_replicas;
+// Bytes held by the replicas' output buffers (server.cpp): not counted against maxmemory.
+extern std::function<std::size_t()> g_replica_output_buffers_cb;
+// Bytes held by the query and output buffers of (normal clients, replicas): INFO's
+// mem_clients_normal and mem_clients_slaves.
+extern std::function<std::pair<std::size_t, std::size_t>()> g_client_buffers_cb;
 // Callback: returns the number of currently-blocked clients (BLPOP/BRPOP/etc.).
 extern std::function<int()> g_blocked_clients_cb;
-// Callback: close clients matching (by="ID"|"ADDR"|"ANY", val), excluding skip_fd.
-// Returns the number closed. Wired by server.cpp (owns fd lifecycle).
-extern std::function<int(const std::string& by, const std::string& val, int skip_fd)> g_client_kill_cb;
+// CLIENT KILL's filters (Redis's clientKillCommand()): a client matches when it passes every
+// filter that is set.
+enum class ClientType { Normal, Slave, Pubsub, Master };
+struct ClientKillFilter {
+  std::string addr;                // ADDR ip:port (the peer), or the old form's argument
+  std::string laddr;               // LADDR ip:port (the local end of the client's socket)
+  std::uint64_t id = 0;            // ID; 0 = any
+  std::optional<ClientType> type;  // TYPE
+  bool skipme = true;              // SKIPME yes: the calling client is never killed
+  int self_fd = -1;                // the calling client
+};
+// Callback: closes the clients that match, except the caller, which is only reported in
+// kill_self (it is closed after its reply). Returns the number matched, the caller included.
+// Wired by server.cpp (owns fd lifecycle).
+extern std::function<int(const ClientKillFilter& filter, bool& kill_self)> g_client_kill_cb;
 // CLIENT UNBLOCK <id> [TIMEOUT|ERROR]: unblock a blocked client by id. error=true
 // delivers -UNBLOCKED; error=false delivers the command's timeout reply. Returns 1 if
 // a matching, currently-blocked client was found, else 0.
