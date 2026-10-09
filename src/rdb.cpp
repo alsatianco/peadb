@@ -831,7 +831,8 @@ void write_quicklist(RdbWriter& w, const std::vector<std::string>& items, std::i
 // `key_save_delay`: wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
 // Only the file saves wait: Redis builds a full sync in a child, but PeaDB builds it on the event
 // loop (compat/delta.md item 46), where a wait would stop every client.
-std::string rdb_build_string(std::string& err, bool key_save_delay) {
+std::string rdb_build_string(std::string& err, bool key_save_delay,
+                             const RdbReplicationInfo* repl = nullptr) {
   err.clear();
   auto& ds = store();
   // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
@@ -856,6 +857,13 @@ std::string rdb_build_string(std::string& err, bool key_save_delay) {
   write_aux("redis-bits", "64");
   write_aux("ctime", std::to_string(std::time(nullptr)));
   write_aux("used-mem", "0");
+  // A full sync's RDB carries the replication state it was taken at, as Redis's
+  // rdbSaveInfoAuxFields() writes it: the replica selects repl-stream-db for its master's stream.
+  if (repl != nullptr) {
+    write_aux("repl-stream-db", std::to_string(repl->stream_db));
+    write_aux("repl-id", repl->replid);
+    write_aux("repl-offset", std::to_string(repl->offset));
+  }
 
   // Function libraries (server-level, not per-db) — one FUNCTION2 opcode + string per library,
   // written after AUX and before the keyspace, matching Redis's RDB layout.
@@ -1067,15 +1075,16 @@ void rdb_remove_temp_file(pid_t pid) {
   ::unlink(rdb_temp_file_name(std::filesystem::path(), pid).c_str());
 }
 
-std::string rdb_save_to_string(std::string& err) {
-  return rdb_build_string(err, /*key_save_delay=*/false);
+std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl) {
+  return rdb_build_string(err, /*key_save_delay=*/false, repl);
 }
 
 // ── RDB Load ───────────────────────────────────────────────────────────
 
 bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace) {
+              const std::function<void()>& before_replace, int* repl_stream_db) {
   err.clear();
+  if (repl_stream_db != nullptr) *repl_stream_db = -1;
 
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
@@ -1184,6 +1193,13 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         err = "malformed AUX field";
         ds.select_db(prev_db);
         return false;
+      }
+      // rdbLoadRio(): the database the master's stream has selected, for a replica's full sync.
+      if (repl_stream_db != nullptr && aux_key == "repl-stream-db") {
+        char* end = nullptr;
+        const long db = std::strtol(aux_val.c_str(), &end, 10);
+        if (end != aux_val.c_str() && *end == '\0' && db >= 0 && db < 16)
+          *repl_stream_db = static_cast<int>(db);
       }
       continue;
     }

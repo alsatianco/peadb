@@ -126,7 +126,7 @@ Total: **235** commands — full: 10, upstream: 215, diff: 1, tested: 8, registe
 | `PFADD` | upstream | test_b5_commands.py |
 | `PFCOUNT` | upstream | test_b5_commands.py |
 | `PFMERGE` | tested | test_b5_commands.py |
-| `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p4_subscribe_mode_gate.py, test_p5_acl_surface.py, test_p5_cluster_config.py, test_p5_cluster_ownership.py |
+| `PING` | full | test_b10_protocol.py, test_b11_conn_hygiene.py, test_b12_block_latency.py, test_b13_obuf_limit.py, test_b14_lazyfree.py, test_b1_security.py, test_b2_durability.py, test_b4_observability.py, test_b5_commands.py, test_b6_streams.py, test_b7_eviction.py, test_b8_repl_safety.py, test_b9_rdb_crc.py, test_m0_smoke.py, test_m1_commands.py, test_p1_multi_busy_execabort.py, test_p3_repl_cluster_surface.py, test_p4_subscribe_mode_gate.py, test_p5_acl_surface.py, test_p5_cluster_config.py, test_p5_cluster_ownership.py |
 | `PSETEX` | full | test_p1_expire_lazy_scan.py, test_p1_setex_psetex.py |
 | `PSUBSCRIBE` | upstream | test_b4_observability.py, test_b7_eviction.py, test_p3_pubsub_surface.py, test_p4_subscribe_mode_gate.py |
 | `PSYNC` | upstream | — |

@@ -21,6 +21,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -327,6 +328,20 @@ int run_server(const ServerConfig& config) {
   if (listen_fd >= 0) poller.add_read(listen_fd);
   if (unix_fd >= 0) poller.add_read(unix_fd);
   if (cbus_fd >= 0) poller.add_read(cbus_fd);
+  // The replica's link thread wakes the loop through this pipe when its master has sent commands,
+  // so they are applied (and acknowledged) at once rather than at the next 100 ms tick.
+  int replica_wakeup_fds[2] = {-1, -1};
+  if (::pipe(replica_wakeup_fds) == 0) {
+    for (int wfd : replica_wakeup_fds) {
+      set_nonblocking(wfd);
+      set_cloexec(wfd);
+    }
+    poller.add_read(replica_wakeup_fds[0]);
+    set_replica_wakeup_fd(replica_wakeup_fds[1], replica_wakeup_fds[0]);
+  } else {
+    log(LogLevel::Warn,
+        "cannot create the replica wake-up pipe: " + std::string(std::strerror(errno)));
+  }
   // Third line of the startup log contract; the upstream harness counts these lines
   // to detect (re)starts.
   log(LogLevel::Info, "Ready to accept connections tcp");
@@ -345,10 +360,13 @@ int run_server(const ServerConfig& config) {
   // blocked_clients and shows them with flag b.
   int postponed_count = 0;
   std::uint64_t postpone_seq = 0;
-  // Clients blocked on a SHUTDOWN that waits for replicas (SessionState::blocked_on_shutdown), and
-  // those a cancelled shutdown has just answered, whose pipelined commands run next.
+  // Clients blocked on a SHUTDOWN that waits for replicas (SessionState::blocked_on_shutdown).
   int shutdown_blocked_count = 0;
-  std::vector<int> shutdown_released_fds;
+  // Clients a command answered on another client's behalf (a cancelled shutdown, CLIENT UNBLOCK,
+  // REPLICAOF making this server a replica): their pipelined commands run after that command, from
+  // run_released(), never inside it. Those whose answer could not be sent are closed then.
+  std::vector<int> released_fds;
+  std::vector<int> release_close;
   std::uint64_t block_seq = 0;  // FIFO serving order of blocked clients (BlockedState::seq)
 
   // Wire up the WAIT callback so it can count synced replicas
@@ -394,8 +412,10 @@ int run_server(const ServerConfig& config) {
     return bytes;
   };
 
+  // Redis's server.blocked_clients counts every blocked type: BLPOP and friends, WAIT, clients
+  // CLIENT PAUSE holds and clients blocked on SHUTDOWN.
   g_blocked_clients_cb = [&]() -> int {
-    return blocked_count + postponed_count + shutdown_blocked_count;
+    return blocked_count + wait_count + postponed_count + shutdown_blocked_count;
   };
 
   g_for_each_replica_cb = [&](const std::function<void(const SessionState&)>& fn) {
@@ -430,7 +450,8 @@ int run_server(const ServerConfig& config) {
       std::string flags;
       if (sess.replica_stream) flags += "S";
       if (sess.is_monitor) flags += "O";
-      if (sess.blocked.type != BlockType::None || sess.postponed || sess.blocked_on_shutdown)
+      if (sess.blocked.type != BlockType::None || sess.wait_state.has_value() || sess.postponed ||
+          sess.blocked_on_shutdown)
         flags += "b";
       if (flags.empty()) flags = "N";
       out += " flags=" + flags;
@@ -634,13 +655,52 @@ int run_server(const ServerConfig& config) {
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream) return true;
+    // Over its output-buffer limit already: it is closed at the end of the pass.
+    if (!obuf_overflow_fds.empty() &&
+        std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(), fd) !=
+            obuf_overflow_fds.end())
+      return false;
     const std::size_t current_total = replication_event_count();
     if (session.repl_index < current_total) {
-      const auto payload = replication_event_at(session.repl_index);
+      std::string payload;
+      if (!replication_stream_from(session.repl_index, payload)) {
+        // backlog_append() hands bytes out before the backlog drops them, so this does not
+        // happen; if it did, the replica could only go on with a hole in its stream.
+        log(LogLevel::Warn, "closing replica fd=" + std::to_string(fd) +
+                                ": its stream is no longer in the replication backlog");
+        return false;
+      }
       if (!payload.empty() && !enqueue_output(fd, payload)) return false;
       session.repl_index = current_total;
     }
     return true;
+  };
+
+  // backlog_append() is about to overwrite bytes some replica has not taken: each replica gets
+  // what it has not taken yet, then `data` (the bytes being appended), in its output buffer now.
+  // A replica that fails is closed at the end of the pass (closing it here could pull a session
+  // out from under the command that is running).
+  std::vector<std::pair<int, std::uint64_t>> replica_failed_fds;  // fd, client id
+  g_feed_replicas_cb = [&](const std::string* data) {
+    const std::size_t total_after =
+        replication_event_count() + (data != nullptr ? data->size() : 0);
+    for (int rfd : replica_fds) {
+      const auto it = sessions.find(rfd);
+      if (it == sessions.end()) continue;
+      SessionState& session = it->second;
+      const std::pair<int, std::uint64_t> id{rfd, session.client_id};
+      if (std::find(replica_failed_fds.begin(), replica_failed_fds.end(), id) !=
+          replica_failed_fds.end())
+        continue;
+      if (!flush_replication_stream(rfd, session) ||
+          (data != nullptr && !enqueue_output(rfd, *data))) {
+        if (std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(), rfd) ==
+            obuf_overflow_fds.end())
+          replica_failed_fds.push_back(id);
+        continue;
+      }
+      session.repl_index = total_after;
+    }
   };
 
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
@@ -710,7 +770,21 @@ int run_server(const ServerConfig& config) {
 
   g_client_unblock_cb = [&](std::uint64_t client_id, bool error) -> int {
     for (auto& [fd, sess] : sessions) {
-      if (sess.client_id != client_id || sess.blocked.type == BlockType::None) continue;
+      if (sess.client_id != client_id) continue;
+      if (sess.wait_state.has_value()) {
+        // replyToBlockedClientTimedOut(): a WAIT answers with the replicas that have acknowledged
+        // its offset so far (ERROR: -UNBLOCKED), then runs what the client sent after it.
+        const std::int64_t target = sess.wait_state->target_offset;
+        const std::string reply =
+            error ? "-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n"
+                  : ":" + std::to_string(g_count_synced_replicas ? g_count_synced_replicas(target)
+                                                                 : 0) + "\r\n";
+        sess.wait_state.reset();
+        --wait_count;
+        (enqueue_output(fd, reply) ? released_fds : release_close).push_back(fd);
+        return 1;
+      }
+      if (sess.blocked.type == BlockType::None) continue;
       // TIMEOUT: deliver the command's normal timeout reply (nil array, or nil bulk for
       // the BLMOVE/BRPOPLPUSH move forms). ERROR: deliver -UNBLOCKED. Then clear the
       // block and drain any pipelined follow-up, exactly like a natural wakeup.
@@ -729,19 +803,35 @@ int run_server(const ServerConfig& config) {
       }
       sess.blocked = BlockedState{};  // clear the block
       --blocked_count;
-      if (!enqueue_output(fd, reply)) { close_client(fd); return 1; }
-      std::vector<int> one{fd}, dclose;
-      drain_pipelined(one, blocked_count, wait_count, dclose);
-      for (int c : dclose) close_client(c);
+      // Its pipelined commands run after CLIENT UNBLOCK, as their own commands (run inside it,
+      // their writes would join CLIENT UNBLOCK's execution unit).
+      (enqueue_output(fd, reply) ? released_fds : release_close).push_back(fd);
       return 1;
     }
     return 0;
   };
 
+  // Redis's disconnectAllBlockedClients(), when REPLICAOF makes this server a replica: every client
+  // blocked on keys or in WAIT gets `error` (a client CLIENT PAUSE holds runs its command later).
+  g_unblock_blocked_clients_cb = [&](const std::string& error) {
+    if (blocked_count <= 0 && wait_count <= 0) return;
+    for (auto& [fd, sess] : sessions) {
+      if (sess.blocked.type != BlockType::None) {
+        sess.blocked = BlockedState{};
+        --blocked_count;
+      } else if (sess.wait_state.has_value()) {
+        sess.wait_state.reset();
+        --wait_count;
+      } else {
+        continue;
+      }
+      (enqueue_output(fd, error) ? released_fds : release_close).push_back(fd);
+    }
+  };
+
   // replyToClientsBlockedOnShutdown(): a shutdown that waited for replicas failed or was
   // aborted. It can run inside another client's command (SHUTDOWN ABORT), so the answered
-  // clients' pipelined commands run later, from run_shutdown_released().
-  std::vector<int> shutdown_release_close;
+  // clients' pipelined commands run later, from run_released().
   g_reply_blocked_on_shutdown_cb =
       [&](const std::function<std::string(const SessionState&)>& reply) {
         if (shutdown_blocked_count <= 0) return;
@@ -750,16 +840,16 @@ int run_server(const ServerConfig& config) {
           sess.blocked_on_shutdown = false;
           --shutdown_blocked_count;
           if (enqueue_output(fd, reply(sess)))
-            shutdown_released_fds.push_back(fd);
+            released_fds.push_back(fd);
           else
-            shutdown_release_close.push_back(fd);
+            release_close.push_back(fd);
         }
       };
-  auto run_shutdown_released = [&]() {
-    if (shutdown_released_fds.empty() && shutdown_release_close.empty()) return;
+  auto run_released = [&]() {
+    if (released_fds.empty() && release_close.empty()) return;
     std::vector<int> fds, to_close;
-    fds.swap(shutdown_released_fds);
-    to_close.swap(shutdown_release_close);
+    fds.swap(released_fds);
+    to_close.swap(release_close);
     for (int cfd : to_close) close_client(cfd);
     drain_pipelined(fds, blocked_count, wait_count, to_close);
     for (int cfd : to_close) close_client(cfd);
@@ -864,7 +954,7 @@ int run_server(const ServerConfig& config) {
     // handler).
     shutdown_cron();
     if (shutdown_requested()) break;
-    run_shutdown_released();
+    run_released();
     // Poll timeout: default 100 ms housekeeping tick, but clamp to the nearest blocked-
     // client deadline so BLPOP-style timeouts fire with millisecond precision instead
     // of up to a tick late (the upstream suite asserts ~150 ms slack on a 1 s timeout).
@@ -884,11 +974,16 @@ int run_server(const ServerConfig& config) {
     // Redis's eviction timer runs again at once (a 0 ms time event), so do not sleep while it is
     // on.
     if (eviction_proc_running()) poll_ms = 0;
+    // A WAIT that ran after this pass's replica flush still needs its GETACK sent.
+    if (replica_getack_pending()) poll_ms = 0;
     const int nready = poller.wait(ep_events, poll_ms);
     if (nready < 0) {
       if (errno == EINTR) continue;
       log(LogLevel::Error, "poller wait failed: " + std::string(std::strerror(errno)));
       break;
+    }
+    for (int i = 0; i < nready; ++i) {
+      if (ep_events[i].fd == replica_wakeup_fds[0]) take_replica_wakeup();
     }
 
     const auto loop_now_ms = DataStore::now_ms();
@@ -897,6 +992,7 @@ int run_server(const ServerConfig& config) {
       last_active_expire_ms = loop_now_ms;
     }
     aof_cron(loop_now_ms);
+    replication_cron(loop_now_ms);
     background_save_cron();
     run_eviction_cycle();  // background eviction when over maxmemory (e.g. lowered via CONFIG SET)
     databases_cron();      // shrink sparse keyspace tables, as Redis's databasesCron() does
@@ -1221,7 +1317,16 @@ int run_server(const ServerConfig& config) {
     }
     if (shutdown_requested()) break;
 
-    // Flush replication streams for all active sessions.
+    // Replicas that could not take the bytes backlog_append() handed out (a write error).
+    if (!replica_failed_fds.empty()) {
+      for (const auto& [cfd, id] : replica_failed_fds) {
+        const auto it = sessions.find(cfd);
+        if (it != sessions.end() && it->second.client_id == id) close_client(cfd);
+      }
+      replica_failed_fds.clear();
+    }
+    // Flush replication streams for all active sessions, with the GETACK a WAIT asked for.
+    send_pending_getack();
     if (replica_count > 0) {
       std::vector<int> to_close;
       for (auto& [rfd, session] : sessions) {
@@ -1230,11 +1335,12 @@ int run_server(const ServerConfig& config) {
         }
       }
       for (int cfd : to_close) close_client(cfd);
+      replicas_took_backlog();
     }
 
     // SHUTDOWN ABORT ran above: the clients blocked on SHUTDOWN have their answer, and run what
     // they sent after it.
-    run_shutdown_released();
+    run_released();
     // CLIENT UNPAUSE, a less strict CLIENT PAUSE or the end of a shutdown's pause ran above:
     // release the held clients now.
     if (client_pause_update()) resume_postponed();
@@ -1275,6 +1381,10 @@ int run_server(const ServerConfig& config) {
   for (auto& [fd, _] : sessions) ::close(fd);
   for (auto& [fd, _] : cbus_buffers) ::close(fd);
   if (reserved_fd >= 0) close(reserved_fd);
+  g_feed_replicas_cb = nullptr;  // it refers to this function's sessions
+  g_unblock_blocked_clients_cb = nullptr;
+  // The wake-up pipe stays open until the process exits: a replica link thread may still write.
+  set_replica_wakeup_fd(-1, -1);
   poller.destroy();
   return 0;
 }

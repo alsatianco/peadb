@@ -74,10 +74,10 @@ def main() -> int:
             # REPLCONF capa
             assert cmd(s, "REPLCONF", "capa", "eof") == "OK"
 
-            # REPLCONF GETACK → returns array with REPLCONF ACK <offset>
-            r = cmd(s, "REPLCONF", "GETACK", "*")
-            assert isinstance(r, list) and len(r) == 3
-            assert r[0] == "REPLCONF" and r[1] == "ACK"
+            # REPLCONF GETACK has no reply (Redis's replconfCommand(): only a replica answers,
+            # and it answers its master with REPLCONF ACK); the next command's reply comes next.
+            s.sendall(b"*3\r\n$8\r\nREPLCONF\r\n$6\r\nGETACK\r\n$1\r\n*\r\n")
+            assert cmd(s, "PING") == "PONG"
 
         with socket.create_connection(("127.0.0.1", 6522), timeout=2) as s:
             # ── PSYNC ────────────────────────────────────────────
