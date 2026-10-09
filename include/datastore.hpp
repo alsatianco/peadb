@@ -193,8 +193,6 @@ class DataStore {
   bool set(const std::string& key, const std::string& value, bool nx, bool xx,
            std::optional<std::int64_t> expire_at_ms, bool keep_ttl);
   std::optional<std::string> getdel(const std::string& key);
-  std::optional<std::string> getex(const std::string& key, std::optional<std::int64_t> expire_at_ms,
-                                   bool persist);
 
   bool del(const std::string& key);
   std::size_t exists(const std::vector<std::string>& keys);
