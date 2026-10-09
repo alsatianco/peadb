@@ -304,6 +304,9 @@ std::optional<std::string> DataStore::get(const std::string& key) {
     return std::nullopt;
   }
   record_hit();
+  // A key of another type reads as no string (MGET, SORT's BY and GET patterns), as in Redis; the
+  // non-const str() would turn it into an empty string and lose its data.
+  if (it->second.type() != ValueType::String) return std::nullopt;
   return it->second.str();
 }
 
@@ -357,20 +360,6 @@ std::optional<std::string> DataStore::getdel(const std::string& key) {
   const auto out = it->second.str();
   db.erase(it);
   return out;
-}
-
-std::optional<std::string> DataStore::getex(const std::string& key, std::optional<std::int64_t> expire_at_ms,
-                                            bool persist_ttl) {
-  auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
-  auto it = db.find(key);
-  if (it == db.end()) return std::nullopt;
-  if (persist_ttl) {
-    it->second.expire_at_ms.reset();
-  } else if (expire_at_ms.has_value()) {
-    it->second.expire_at_ms = expire_at_ms;
-  }
-  return it->second.str();
 }
 
 bool DataStore::del(const std::string& key) {

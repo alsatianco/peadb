@@ -39,6 +39,7 @@
 #include <tuple>
 #include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <random>
 #include <limits>
 #include <arpa/inet.h>
@@ -410,6 +411,12 @@ std::vector<PendingPropagation> g_also_propagate;
 // their commands inside the command that started them, and everything they propagate is written
 // when the outermost one ends (propagate_pending_commands()).
 int g_execution_nesting = 0;
+// Redis's call() propagates a write, counts it in server.dirty and its handler sends its events
+// only when it changed something. A write handler that changed nothing (a SET stopped by NX or XX,
+// a SETNX or MSETNX answered 0, a GETEX that set or removed no TTL, a GETDEL, SETRANGE, PERSIST or
+// SORT that changed nothing) sets this, and handle_command() then does none of the three. Other
+// handlers still count every write that succeeds (item 18).
+bool g_write_changed_nothing = false;
 bool g_executing_exec = false;
 int g_last_repl_db = 0;
 bool g_replica_stale = false;
@@ -1860,14 +1867,27 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
       }
     }
   } else if (cmd == "SET" && args.size() >= 4) {
+    // Redis's setGenericCommand() for a SET that ran (one NX or XX stopped is not propagated): EX,
+    // PX and EXAT go out as SET key value PXAT <ms>, PXAT as it came, and without an expire the
+    // GET options are left out.
     std::string exp_opt;
+    bool get = false;
     for (std::size_t i = 3; i < args.size(); ++i) {
       const auto o = upper(args[i]);
-      if (o == "EX" || o == "PX" || o == "EXAT" || o == "PXAT") { exp_opt = args[i]; break; }
+      if (o == "EX" || o == "PX" || o == "EXAT" || o == "PXAT") {
+        exp_opt = o;
+        ++i;  // its value
+      } else if (o == "GET") {
+        get = true;
+      }
     }
-    if (!exp_opt.empty()) {
+    if (!exp_opt.empty() && exp_opt != "PXAT") {
       const auto abs = abs_ttl(args[1]);
-      if (abs >= 0) out = {"SET", args[1], args[2], exp_opt == "pxat" ? "pxat" : "PXAT", std::to_string(abs)};
+      if (abs >= 0) out = {"SET", args[1], args[2], "PXAT", std::to_string(abs)};
+    } else if (exp_opt.empty() && get) {
+      out.erase(std::remove_if(out.begin() + 3, out.end(),
+                               [](const std::string& a) { return upper(a) == "GET"; }),
+                out.end());
     }
   } else if ((cmd == "SETEX" || cmd == "PSETEX") && args.size() == 4) {
     const auto abs = abs_ttl(args[1]);
@@ -3385,12 +3405,59 @@ LcsResult compute_lcs(const std::string& a, const std::string& b) {
   return {out, blocks};
 }
 
+// The options of SET (`is_set`) and GETEX as Redis's parseExtendedStringArgumentsOrReply() reads
+// them: NX, XX, GET and KEEPTTL only for SET, PERSIST only for GETEX, NX never with XX, and one
+// kind of expire (the same kind twice is allowed, the last value counts), never with KEEPTTL or
+// PERSIST. Returns false for Redis's syntax error. The expire value is checked later, by
+// parse_expiry().
+struct ExtendedStringArgs {
+  bool nx = false;
+  bool xx = false;
+  bool get = false;
+  bool keepttl = false;
+  bool persist = false;
+  std::string expire_mode;  // "EX", "PX", "EXAT" or "PXAT"; empty without an expire
+  const std::string* expire = nullptr;
+};
+
+bool parse_extended_string_args(const std::vector<std::string>& args, bool is_set,
+                                ExtendedStringArgs& out) {
+  for (std::size_t j = is_set ? 3 : 2; j < args.size(); ++j) {
+    const std::string opt = upper(args[j]);
+    if (opt == "NX" && is_set && !out.xx) {
+      out.nx = true;
+    } else if (opt == "XX" && is_set && !out.nx) {
+      out.xx = true;
+    } else if (opt == "GET" && is_set) {
+      out.get = true;
+    } else if (opt == "KEEPTTL" && is_set && !out.persist && out.expire_mode.empty()) {
+      out.keepttl = true;
+    } else if (opt == "PERSIST" && !is_set && out.expire_mode.empty() && !out.keepttl) {
+      out.persist = true;
+    } else if ((opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") && !out.keepttl &&
+               !out.persist && (out.expire_mode.empty() || out.expire_mode == opt) &&
+               j + 1 < args.size()) {
+      out.expire_mode = opt;
+      out.expire = &args[++j];
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Redis's getExpireMillisecondsOrReply(): the absolute expire time in ms of an EX, PX, EXAT or PXAT
+// value, which must be a positive integer, or the error text in `err`.
 std::optional<std::int64_t> parse_expiry(std::string mode, const std::string& value, std::string& err,
                                          const std::string& cmd_name) {
   auto invalid_msg = [&]() { return "invalid expire time in '" + lower(cmd_name) + "' command"; };
   std::int64_t n = 0;
-  if (!parse_i64(value, n)) {
+  if (!parse_strict_int(value, n)) {  // Redis's string2ll(): no sign "+", no spaces, no "05"
     err = "value is not an integer or out of range";
+    return std::nullopt;
+  }
+  if (n <= 0) {
+    err = invalid_msg();
     return std::nullopt;
   }
   auto mul_1000 = [&](std::int64_t x, std::int64_t& out) -> bool {
@@ -3411,10 +3478,6 @@ std::optional<std::int64_t> parse_expiry(std::string mode, const std::string& va
   };
   mode = upper(mode);
   if (mode == "EX") {
-    if (n <= 0) {
-      err = invalid_msg();
-      return std::nullopt;
-    }
     std::int64_t d = 0;
     if (!mul_1000(n, d)) {
       err = invalid_msg();
@@ -3428,10 +3491,6 @@ std::optional<std::int64_t> parse_expiry(std::string mode, const std::string& va
     return out;
   }
   if (mode == "PX") {
-    if (n <= 0) {
-      err = invalid_msg();
-      return std::nullopt;
-    }
     std::int64_t out = 0;
     if (!add_checked(now_ms(), n, out)) {
       err = invalid_msg();
@@ -4084,11 +4143,15 @@ std::string do_sort(const std::vector<std::string>& args, RespVersion resp, bool
   }
 
   if (have_store) {
-    store().del(store_key);
+    const bool deleted = store().del(store_key);
     // GET-missing entries are stored as empty strings (Redis behavior for SORT ... STORE).
     if (!results.empty()) { bool wt = false; (void)store().rpush(store_key, results, wt); }
+    // An empty result that deleted nothing changed nothing, as in Redis's sortCommandGeneric().
+    if (results.empty() && !deleted) g_write_changed_nothing = true;
     return encode_integer(static_cast<long long>(results.size()));
   }
+  // SORT without STORE only reads: Redis neither propagates it nor counts it as a change.
+  g_write_changed_nothing = true;
   std::vector<std::string> out; out.reserve(results.size());
   if (get_patterns.empty()) {
     for (const auto& v : results) out.push_back(encode_bulk(v));
@@ -6809,37 +6872,30 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("SET", CommandSpec{"SET", -3, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          bool nx = false, xx = false, keepttl = false, get_old = false;
+          // Redis's setCommand() and setGenericCommand(): the options, the expire value, GET's
+          // type check, then NX or XX. A SET they stop changes nothing: it is not propagated
+          // (canonicalize_propagated_command() has the form of one that ran) and sends no event.
+          ExtendedStringArgs opts;
+          if (!parse_extended_string_args(args, true, opts)) return encode_error("syntax error");
           std::optional<std::int64_t> expire_at;
-
-          for (std::size_t i = 3; i < args.size(); ++i) {
-            const std::string opt = upper(args[i]);
-            if (opt == "NX") { nx = true; continue; }
-            if (opt == "XX") { xx = true; continue; }
-            if (opt == "KEEPTTL") { keepttl = true; continue; }
-            if (opt == "GET") { get_old = true; continue; }
-            if (opt == "EX" || opt == "PX" || opt == "EXAT" || opt == "PXAT") {
-              if (i + 1 >= args.size()) return encode_error("syntax error");
-              std::string err;
-              auto exp = parse_expiry(opt, args[++i], err, "set");
-              if (!exp.has_value()) return encode_error(err);
-              expire_at = *exp;
-              continue;
-            }
-            return encode_error("syntax error");
+          if (opts.expire != nullptr) {
+            std::string err;
+            expire_at = parse_expiry(opts.expire_mode, *opts.expire, err, "set");
+            if (!expire_at.has_value()) return encode_error(err);
           }
-          if (nx && xx) return encode_error("syntax error");
-
-          // Plain SET overwrites a key of ANY type (Redis semantics) — only the GET
-          // option demands the existing value be a string.
-          const bool existing_non_string = store().is_wrongtype_for_string(args[1]);
-          if (get_old && existing_non_string) return wrongtype_error_reply();
+          // Plain SET overwrites a key of any type; only GET needs the old value to be a string.
           std::optional<std::string> old;
-          if (get_old) old = store().get(args[1]);
-          const bool ok = store().set(args[1], args[2], nx, xx, expire_at, keepttl);
-          if (get_old) return old.has_value() ? encode_bulk(*old) : encode_null(RespVersion::Resp2);
-          if (!ok) return encode_null(RespVersion::Resp2);
-          return encode_simple("OK");
+          if (opts.get) {
+            if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
+            old = store().get(args[1]);
+          }
+          const bool done =
+              store().set(args[1], args[2], opts.nx, opts.xx, expire_at, opts.keepttl);
+          if (!done) g_write_changed_nothing = true;
+          if (opts.get) {
+            return old.has_value() ? encode_bulk(*old) : encode_null(RespVersion::Resp2);
+          }
+          return done ? encode_simple("OK") : encode_null(RespVersion::Resp2);
         }});
 
     t.emplace("SETEX", CommandSpec{"SETEX", 4, {"write"}, 1, 1, 1,
@@ -6868,6 +6924,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           // SETNX on an existing key of any type returns 0 without a type error.
           const bool ok = store().set(args[1], args[2], true, false, std::nullopt, false);
+          if (!ok) g_write_changed_nothing = true;
           return encode_integer(ok ? 1 : 0);
         }});
 
@@ -6893,8 +6950,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("MSETNX", CommandSpec{"MSETNX", -3, {"write"}, 1, -1, 2,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           if (((args.size() - 1) % 2) != 0) return encode_error("wrong number of arguments for 'msetnx' command");
+          // A key of any type stops it, as Redis's lookupKeyWrite() finds it.
           for (std::size_t i = 1; i < args.size(); i += 2) {
-            if (store().get(args[i]).has_value()) return encode_integer(0);
+            if (store().type_of(args[i]) != "none") {
+              g_write_changed_nothing = true;
+              return encode_integer(0);
+            }
           }
           for (std::size_t i = 1; i < args.size(); i += 2) {
             (void)store().set(args[i], args[i + 1], false, false, std::nullopt, false);
@@ -6906,6 +6967,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState&, bool&) {
           return with_string_key(args[1], [&]() {
             auto v = store().getdel(args[1]);
+            if (!v.has_value()) g_write_changed_nothing = true;  // nothing deleted
             return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
           });
         }});
@@ -6921,25 +6983,28 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("GETEX", CommandSpec{"GETEX", -2, {"write"}, 1, 1, 1,
         [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::optional<std::int64_t> exp;
-          bool persist = false;
-          if (args.size() > 2) {
-            if (args.size() != 4 && !(args.size() == 3 && upper(args[2]) == "PERSIST")) return encode_error("syntax error");
-            if (args.size() == 3) {
-              persist = true;
-            } else {
-              std::string err;
-              auto p = parse_expiry(args[2], args[3], err, "getex");
-              if (!p.has_value()) return encode_error(err);
-              exp = *p;
-            }
+          // Redis's getexCommand(): the options, the key (nil, or WRONGTYPE), then the expire
+          // value. Only a TTL set or removed, or a key an expire time in the past deletes, is a
+          // change; canonicalize_propagated_command() sends it as PEXPIREAT, PERSIST or DEL.
+          ExtendedStringArgs opts;
+          if (!parse_extended_string_args(args, false, opts)) return encode_error("syntax error");
+          bool wrongtype = false;
+          const auto value = store().get_string(args[1], wrongtype);
+          if (wrongtype) return wrongtype_error_reply();
+          if (!value.has_value()) {
+            g_write_changed_nothing = true;
+            return encode_null(RespVersion::Resp2);
           }
-          return with_string_key(args[1], [&]() {
-            const bool expired_now = exp.has_value() && already_expired(*exp);
-            auto v = store().getex(args[1], expired_now ? std::nullopt : exp, persist);
-            if (v.has_value() && expired_now) store().del(args[1]);
-            return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
-          });
+          if (opts.expire != nullptr) {
+            std::string err;
+            const auto expire_at = parse_expiry(opts.expire_mode, *opts.expire, err, "getex");
+            if (!expire_at.has_value()) return encode_error(err);
+            if (already_expired(*expire_at)) store().del(args[1]);
+            else store().expire(args[1], *expire_at);
+          } else if (!opts.persist || !store().persist(args[1])) {
+            g_write_changed_nothing = true;  // no option, or PERSIST of a key without a TTL
+          }
+          return encode_bulk(*value);
         }});
 
     t.emplace("APPEND", CommandSpec{"APPEND", 3, {"write"}, 1, 1, 1,
@@ -7020,6 +7085,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (err == "WRONGTYPE") return wrongtype_error_reply();
               return encode_error(err.empty() ? "ERR" : err);
             }
+            if (args[3].empty()) g_write_changed_nothing = true;  // Redis answers the length only
             return encode_integer(static_cast<long long>(out));
           });
         }});
@@ -7317,7 +7383,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("PERSIST", CommandSpec{"PERSIST", 2, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) { return encode_integer(store().persist(args[1]) ? 1 : 0); }});
+        [](const std::vector<std::string>& args, SessionState&, bool&) {
+          const bool removed = store().persist(args[1]);
+          if (!removed) g_write_changed_nothing = true;
+          return encode_integer(removed ? 1 : 0);
+        }});
 
     t.emplace("SELECT", CommandSpec{"SELECT", 2, {"loading"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
@@ -12289,7 +12359,10 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // written when the outermost one ends, before its reply goes out.
   const ExecutionUnit unit(&args);
   const auto t_start = std::chrono::steady_clock::now();
+  g_write_changed_nothing = false;
   const std::string reply = spec.handler(args, session, should_close);
+  // Read at once: the commands EXEC or a script runs clear it for their own handlers.
+  const bool changed_nothing = std::exchange(g_write_changed_nothing, false);
   const std::int64_t exec_usec = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::steady_clock::now() - t_start).count();
   // Single instrumentation chokepoint: per-command time → cmdstat usec, SLOWLOG, LATENCY.
@@ -12326,8 +12399,10 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   // Skip write side-effects when the command DEFERRED (a blocking command that just
   // registered a block produced no mutation yet). Without this guard a blocked
-  // BLPOP/XREADGROUP would be wrongly written to the AOF / dirtied / notified.
-  if (spec_is_write && !is_error_reply(reply) && session.blocked.type == BlockType::None) {
+  // BLPOP/XREADGROUP would be wrongly written to the AOF / dirtied / notified. A write that
+  // changed nothing is skipped too (g_write_changed_nothing).
+  if (spec_is_write && !changed_nothing && !is_error_reply(reply) &&
+      session.blocked.type == BlockType::None) {
     store().increment_mutation_epoch();
     // Queued for the AOF and the replicas until the execution unit ends (`unit` above), which
     // advances g_master_repl_offset in backlog_append(). PUBLISH and SPUBLISH go to the replicas
