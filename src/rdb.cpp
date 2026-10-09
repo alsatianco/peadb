@@ -25,6 +25,8 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <string_view>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 #include <bit>
@@ -416,6 +418,11 @@ class RdbReader {
           bool enc2;
           if (!read_length(clen, enc2) || enc2) return false;
           if (!read_length(ulen, enc2) || enc2) return false;
+          // LZF's longest back-reference makes 264 bytes out of 3, so a declared length over 88
+          // times the compressed one cannot be right; refuse it before allocating, which also
+          // stops a few bytes from claiming gigabytes (Redis refuses such data too, after a lazy
+          // allocation PeaDB's zero-filled one cannot copy).
+          if (ulen / 88 > clen) return false;
           std::string compressed;
           if (!read_bytes(compressed, static_cast<size_t>(clen))) return false;
           // Simple LZF decompression
@@ -1657,124 +1664,101 @@ bool rdb_parse_function_payload(const std::string& payload, std::vector<std::str
   return true;
 }
 
-bool rdb_restore_key(const std::string& key, const std::string& payload,
-                     int64_t ttl_ms, bool replace, bool absttl,
-                     std::string& err) {
+bool rdb_decode_dump_payload(const std::string& payload, DumpValue& out, std::string& err) {
   err.clear();
-  auto& ds = store();
-
-  // Key-existence check comes FIRST (Redis restoreCommand): RESTORE onto an existing key
-  // without REPLACE is BUSYKEY regardless of whether the payload is even well-formed.
-  if (!replace && ds.type_of(key) != "none") {
-    err = "Target key name already exists.";
-    return false;
-  }
-
+  out = DumpValue{};
   // DUMP format: <type+data> <rdb-ver:u16 LE> <crc64:u64 LE>
   if (!verify_dump_payload(payload)) {
     err = "DUMP payload version or checksum are wrong";
     return false;
   }
-
-  // Strip the 2-byte version + 8-byte CRC
-  size_t data_len = payload.size() - 10;
-  RdbReader r(payload.data(), data_len);
-
-  // Delete existing key if replacing
-  if (replace) ds.del(key);
-
-  std::optional<int64_t> expire_at;
-  if (ttl_ms != 0) {
-    if (absttl) {
-      expire_at = ttl_ms;
-    } else {
-      expire_at = DataStore::now_ms() + ttl_ms;
+  // Every other failure is Redis's one reply for a payload rdbLoadObject() cannot read; like it,
+  // an empty collection, a set member, hash field or zset member twice, and a NaN score fail too.
+  err = "Bad data format";
+  RdbReader r(payload.data(), payload.size() - 10);
+  if (!r.read_u8(out.type)) return false;
+  // Redis's rdbLoadObject() refuses a collection with no element (RDB_LOAD_ERR_EMPTY_KEY).
+  auto read_count = [&r](uint64_t& len) {
+    bool enc = false;
+    return r.read_length(len, enc) && !enc && len > 0;
+  };
+  // Views into the decoded strings, which do not move once read.
+  auto unique = [](auto first, auto last, auto name_of) {
+    std::unordered_set<std::string_view> seen;
+    for (; first != last; ++first) {
+      if (!seen.insert(name_of(*first)).second) return false;
     }
-  }
-  // An already-expired absolute TTL means the key must NOT be stored (Redis restoreCommand):
-  // any existing key was already removed above by REPLACE; return OK without recreating it. Not
-  // while the AOF loads or on a replica (Redis's checkAlreadyExpired()): there the key keeps its
-  // past expire time, so a later write in the stream applies to it (compat/delta.md item 37).
-  if (expire_at && *expire_at <= DataStore::now_ms() && !ds.lazy_expire_disabled() &&
-      !ds.replica_expiry())
     return true;
-
-  uint8_t type;
-  if (!r.read_u8(type)) {
-    err = "Bad data format";
-    return false;
-  }
-
-  if (type == RDB_TYPE_STRING) {
-    std::string val;
-    if (!r.read_string(val)) { err = "Bad data format"; return false; }
-    ds.set(key, val, false, false, expire_at, false);
-
-  } else if (type == RDB_TYPE_LIST) {
-    uint64_t len;
-    bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
-    std::vector<std::string> items;
+  };
+  uint64_t len = 0;
+  if (out.type == RDB_TYPE_STRING) {
+    if (!r.read_string(out.str)) return false;
+  } else if (out.type == RDB_TYPE_LIST || out.type == RDB_TYPE_SET) {
+    if (!read_count(len)) return false;
     for (uint64_t i = 0; i < len; ++i) {
-      std::string val;
-      if (!r.read_string(val)) { err = "Bad data format"; return false; }
-      items.push_back(std::move(val));
+      std::string item;
+      if (!r.read_string(item)) return false;
+      out.items.push_back(std::move(item));
     }
-    bool wt = false;
-    ds.rpush(key, items, wt);
-    if (expire_at) ds.expire(key, *expire_at);
-
-  } else if (type == RDB_TYPE_SET) {
-    uint64_t len;
-    bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
-    std::vector<std::string> members;
-    for (uint64_t i = 0; i < len; ++i) {
-      std::string m;
-      if (!r.read_string(m)) { err = "Bad data format"; return false; }
-      members.push_back(std::move(m));
-    }
-    bool wt = false;
-    ds.sadd(key, members, wt);
-    if (expire_at) ds.expire(key, *expire_at);
-
-  } else if (type == RDB_TYPE_HASH) {
-    uint64_t len;
-    bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
-    std::vector<std::pair<std::string, std::string>> fields;
+    if (out.type == RDB_TYPE_SET &&
+        !unique(out.items.begin(), out.items.end(),
+                [](const std::string& m) -> std::string_view { return m; }))
+      return false;  // "Duplicate set members detected"
+  } else if (out.type == RDB_TYPE_HASH) {
+    if (!read_count(len)) return false;
     for (uint64_t i = 0; i < len; ++i) {
       std::string f, v;
-      if (!r.read_string(f) || !r.read_string(v)) { err = "Bad data format"; return false; }
-      fields.push_back({std::move(f), std::move(v)});
+      if (!r.read_string(f) || !r.read_string(v)) return false;
+      out.fields.emplace_back(std::move(f), std::move(v));
     }
-    bool wt = false;
-    ds.hset(key, fields, wt);
-    if (expire_at) ds.expire(key, *expire_at);
-
-  } else if (type == RDB_TYPE_ZSET_2 || type == RDB_TYPE_ZSET) {
-    uint64_t len;
-    bool enc;
-    if (!r.read_length(len, enc) || enc) { err = "Bad data format"; return false; }
+    // Redis 7.2.5 with sanitize-dump-payload no takes a field twice in a hash small enough for a
+    // listpack as a broken listpack, and refuses it otherwise; PeaDB cannot hold a field twice, so
+    // it always refuses (compat/delta.md item 42).
+    if (!unique(out.fields.begin(), out.fields.end(),
+                [](const auto& fv) -> std::string_view { return fv.first; }))
+      return false;
+  } else if (out.type == RDB_TYPE_ZSET_2 || out.type == RDB_TYPE_ZSET) {
+    if (!read_count(len)) return false;
     for (uint64_t i = 0; i < len; ++i) {
       std::string member;
-      if (!r.read_string(member)) { err = "Bad data format"; return false; }
-      double score;
-      if (type == RDB_TYPE_ZSET_2) {
-        if (!r.read_double_binary(score)) { err = "Bad data format"; return false; }
-      } else {
-        if (!r.read_double_old(score)) { err = "Bad data format"; return false; }
-      }
-      ds.zadd_one(key, score, member, false, false, false, false, false);
+      double score = 0;
+      if (!r.read_string(member)) return false;
+      if (out.type == RDB_TYPE_ZSET_2 ? !r.read_double_binary(score) : !r.read_double_old(score))
+        return false;
+      if (std::isnan(score)) return false;  // "Zset with NAN score detected"
+      out.scored.emplace_back(std::move(member), score);
     }
-    if (expire_at) ds.expire(key, *expire_at);
-
+    if (!unique(out.scored.begin(), out.scored.end(),
+                [](const auto& ms) -> std::string_view { return ms.first; }))
+      return false;  // "Duplicate zset fields detected"
   } else {
-    err = "Bad data format";
+    // The compact encodings Redis's DUMP writes (listpack, intset, quicklist) and streams are not
+    // read yet (compat/delta.md item 51).
     return false;
   }
-
+  err.clear();
   return true;
+}
+
+void rdb_store_dump_value(const std::string& key, DumpValue&& value,
+                          std::optional<int64_t> expire_at_ms) {
+  auto& ds = store();
+  bool wrongtype = false;
+  if (value.type == RDB_TYPE_STRING) {
+    ds.set(key, value.str, false, false, expire_at_ms, false);
+    return;
+  }
+  if (value.type == RDB_TYPE_LIST) {
+    ds.rpush(key, value.items, wrongtype);
+  } else if (value.type == RDB_TYPE_SET) {
+    ds.sadd(key, value.items, wrongtype);
+  } else if (value.type == RDB_TYPE_HASH) {
+    ds.hset(key, value.fields, wrongtype);
+  } else {
+    for (const auto& [member, score] : value.scored)
+      ds.zadd_one(key, score, member, false, false, false, false, false);
+  }
+  if (expire_at_ms) ds.expire(key, *expire_at_ms);
 }
 
 } // namespace peadb
