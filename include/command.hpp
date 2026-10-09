@@ -57,6 +57,12 @@ struct SessionState {
   std::size_t repl_index = 0;
   bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
+  // A replica's last REPLCONF ACK (set when it starts streaming, as Redis's repl_ack_time), and
+  // what it said with REPLCONF listening-port and ip-address: the shutdown's "Lagging replica"
+  // log line names it by them (Redis's replicationGetSlaveName()).
+  std::int64_t repl_ack_time_ms = 0;
+  int repl_listening_port = 0;
+  std::string repl_ip_address;
   BlockedState blocked;
   std::optional<WaitState> wait_state;
   // CLIENT command support
@@ -95,16 +101,22 @@ struct SessionState {
   // after it in the input buffer and runs them again, in `postpone_seq` order, when the pause ends.
   bool postponed = false;
   std::uint64_t postpone_seq = 0;
+  // ── SHUTDOWN waiting for replicas (Redis's BLOCKED_SHUTDOWN) ── set by the SHUTDOWN handler
+  // when the shutdown waits for lagging replicas; the event loop then runs nothing more from this
+  // client until the server exits (no reply) or the shutdown fails or is aborted (the client gets
+  // "Errors trying to SHUTDOWN. Check logs.", g_reply_blocked_on_shutdown_cb).
+  bool blocked_on_shutdown = false;
 };
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
 // Redis's command flags (kRedisCmd* in command_metadata.generated.hpp) of the command or
 // subcommand that `args` names, from the pinned Redis command JSON; 0 for a name Redis lacks.
 std::uint64_t redis_command_flags(const std::vector<std::string>& args);
-// CLIENT PAUSE, for the event loop: checks whether the pause has timed out and returns true when
-// the clients it held must run again (Redis's updatePausedActions()/unblockPostponedClients()).
+// CLIENT PAUSE and the pause of a shutdown that waits for replicas, for the event loop: checks
+// whether a pause has timed out and returns true when the clients it held must run again
+// (Redis's updatePausedActions()/unblockPostponedClients()).
 bool client_pause_update();
-// When the current CLIENT PAUSE ends (0 when nothing is paused), so the event loop wakes up then.
+// When the first current pause ends (0 when nothing is paused), so the event loop wakes up then.
 std::int64_t client_pause_end_ms();
 std::size_t command_count();
 std::vector<std::string> command_names();
@@ -217,8 +229,8 @@ bool in_lua_script_context();
 void record_lua_script_rejected_write(const std::string& cmd);
 
 // ── Shutdown ──
-// request_shutdown() makes the event loop stop; the SHUTDOWN command and shutdown_signal_cron()
-// call it once prepare_for_shutdown() has succeeded.
+// request_shutdown() makes the event loop stop; the SHUTDOWN command and shutdown_cron() call it
+// once prepare_for_shutdown() or the end of the wait for replicas has succeeded.
 void request_shutdown();
 bool shutdown_requested();
 // Redis's SHUTDOWN_* flags (server.h).
@@ -226,20 +238,37 @@ inline constexpr int kShutdownSave = 1;
 inline constexpr int kShutdownNosave = 2;
 inline constexpr int kShutdownNow = 4;
 inline constexpr int kShutdownForce = 8;
-// Redis's prepareForShutdown() and finishShutdown() (server.c), shared by the SHUTDOWN command and
-// SIGTERM/SIGINT: stops a BGSAVE or AOF rewrite child, fsyncs the AOF, does the final RDB save
-// (save points without NOSAVE, or SAVE) and logs each step. PeaDB does not wait for lagging
-// replicas (no shutdown-timeout, compat/delta.md item 33). Returns true when the server may exit
-// now; on a failure it logs why, forgets a pending signal and returns false (unless FORCE).
+// Redis's prepareForShutdown() (server.c), shared by the SHUTDOWN command and SIGTERM/SIGINT.
+// Without NOW, with shutdown-timeout not 0 and a replica whose ACK is behind the replication
+// offset, it starts the wait for replicas (shutdown_initiated(): writes are paused, the replicas
+// are asked for an ACK, shutdown_cron() finishes it) and returns false. Otherwise it runs
+// finishShutdown(): logs the lagging replicas, stops a BGSAVE or AOF rewrite child, fsyncs the
+// AOF, does the final RDB save (save points without NOSAVE, or SAVE) and logs each step. Returns
+// true when the server may exit now; on a failure it logs why, cancels the shutdown (a pending
+// signal is forgotten, the blocked SHUTDOWN clients get the error) and returns false (unless
+// FORCE). While a shutdown waits it returns false at once.
 bool prepare_for_shutdown(int flags);
-// SHUTDOWN ABORT: forgets a signal the event loop has not handled yet; false when there is none.
+// Redis's isShutdownInitiated(): a shutdown waits for lagging replicas.
+bool shutdown_initiated();
+// SHUTDOWN ABORT (Redis's abortShutdown()): cancels a shutdown that waits for replicas, or forgets
+// a signal the event loop has not handled yet; false when there is neither.
 bool abort_shutdown();
 // The SIGTERM/SIGINT handler (Redis's sigShutdownHandler()): logs and asks for a shutdown, which
-// shutdown_signal_cron() runs from the event loop with the shutdown-on-sigterm/-sigint flags. A
-// second SIGINT exits at once with code 1 and deletes the final save's temp-<pid>.rdb.
+// shutdown_cron() runs from the event loop with the shutdown-on-sigterm/-sigint flags. A second
+// SIGINT exits at once with code 1 and deletes the final save's temp-<pid>.rdb.
 void shutdown_signal_handler(int sig);
-void shutdown_signal_cron();
+// The shutdown part of Redis's serverCron(), run on every event-loop pass: starts the shutdown a
+// signal asked for, and finishes a shutdown that waits once every replica has acknowledged the
+// whole replication stream or shutdown-timeout has passed.
+void shutdown_cron();
 bool shutdown_signal_pending();
+// Calls fn for each replica's session (server.cpp walks its replica connections).
+extern std::function<void(const std::function<void(const SessionState&)>&)> g_for_each_replica_cb;
+// Redis's replyToClientsBlockedOnShutdown(): server.cpp unblocks every client blocked on SHUTDOWN,
+// sends it what reply(client) returns ("Errors trying to SHUTDOWN. Check logs.") and then runs
+// its next commands.
+extern std::function<void(const std::function<std::string(const SessionState&)>& reply)>
+    g_reply_blocked_on_shutdown_cb;
 // Set around the startup load: a signal then shuts down without saving (Redis's server.loading).
 void set_loading(bool loading);
 // shutdown-on-sigterm/-sigint values: "save nosave now force" words <-> kShutdown* flags.

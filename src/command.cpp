@@ -151,14 +151,20 @@ bool g_rdb_bgsave_scheduled = false;
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
 // A shutdown asked for by SIGTERM or SIGINT (Redis's server.shutdown_asap and last_sig_received):
-// set by shutdown_signal_handler(), run by shutdown_signal_cron() between commands. Atomic,
-// because the signal handler writes them.
+// set by shutdown_signal_handler(), run by shutdown_cron() between commands. Atomic, because the
+// signal handler writes them.
 std::atomic<int> g_shutdown_asap{0};
 std::atomic<int> g_last_sig_received{0};
 std::atomic<bool> g_loading{false};  // the startup load is running (Redis's server.loading)
 // shutdown-on-sigterm and shutdown-on-sigint: kShutdown* flags, 0 for "default".
 int g_shutdown_on_sigterm = 0;
 int g_shutdown_on_sigint = 0;
+// shutdown-timeout: how many seconds a shutdown waits for lagging replicas (0: it does not wait).
+int g_shutdown_timeout = 10;
+// A shutdown that waits for replicas (Redis's server.shutdown_mstime and shutdown_flags): when the
+// wait ends at the latest (0: no shutdown waits), and the flags it finishes with.
+std::int64_t g_shutdown_mstime = 0;
+int g_shutdown_flags = 0;
 std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
 bool g_aof_rewrite_buf_capped = false; // Set once when the 256 MiB cap is hit per rewrite
 std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
@@ -654,22 +660,30 @@ constexpr std::uint32_t kPauseEvict = 1u << 3;
 constexpr std::uint32_t kPauseReplica = 1u << 4;
 constexpr std::uint32_t kPauseClientWriteSet = kPauseClientWrite | kPauseExpire | kPauseEvict | kPauseReplica;
 constexpr std::uint32_t kPauseClientAllSet = kPauseClientAll | kPauseExpire | kPauseEvict | kPauseReplica;
-// The pause set by CLIENT PAUSE (Redis's PAUSE_BY_CLIENT_COMMAND purpose). PeaDB has no other
-// pause purpose: no FAILOVER, no SHUTDOWN that waits for replicas, no cluster manual failover.
-std::uint32_t g_client_pause_actions = 0;
-std::int64_t g_client_pause_end_ms = 0;
+// Why something is paused (Redis's pause_purpose): each purpose keeps its own actions and end
+// time, and what is paused is all of them together, so CLIENT UNPAUSE does not end the pause of a
+// shutdown that waits for replicas. PeaDB has no FAILOVER (compat/delta.md item 68), so no
+// PAUSE_DURING_FAILOVER.
+enum PausePurpose { kPauseByClientCommand = 0, kPauseDuringShutdown = 1, kNumPausePurposes = 2 };
+struct PauseEvent {
+  std::uint32_t actions = 0;
+  std::int64_t end_ms = 0;
+};
+PauseEvent g_pause_per_purpose[kNumPausePurposes];
 std::uint32_t g_paused_actions = 0;    // what is paused now (server.paused_actions)
 bool g_pause_unblock_pending = false;  // the pause became less strict: run held clients again
 bool g_getack_pending = false;         // WAIT asked replicas for an ACK while replica traffic was paused
 
 void update_paused_actions() {
   const std::uint32_t prev = g_paused_actions;
-  if (g_client_pause_end_ms > now_ms()) {
-    g_paused_actions = g_client_pause_actions;
-  } else {
-    g_client_pause_actions = 0;
-    g_client_pause_end_ms = 0;
-    g_paused_actions = 0;
+  g_paused_actions = 0;
+  const std::int64_t now = now_ms();
+  for (auto& p : g_pause_per_purpose) {
+    if (p.end_ms > now) {
+      g_paused_actions |= p.actions;
+    } else {
+      p = PauseEvent{};
+    }
   }
   // Less strict than before: held clients run again and may be held again (Redis unblocks them all).
   constexpr std::uint32_t kClientMask = kPauseClientWrite | kPauseClientAll;
@@ -689,21 +703,31 @@ std::uint32_t paused_actions_with_update(std::uint32_t mask) {
   return g_paused_actions & mask;
 }
 
-// CLIENT PAUSE <timeout> [WRITE|ALL] (pauseClientsByClient + pauseActions): the actions given
-// replace the current ones, except that a pause of everything stays one when a write pause
-// follows it, and the later end time of the two is kept.
-void pause_clients(std::int64_t end_ms, bool pause_all) {
-  std::uint32_t actions = pause_all ? kPauseClientAllSet : kPauseClientWriteSet;
-  if (!pause_all && (g_client_pause_actions & kPauseClientAll)) actions = kPauseClientAllSet;
-  g_client_pause_actions = actions;
-  if (g_client_pause_end_ms < end_ms) g_client_pause_end_ms = end_ms;
+// pauseActions(): the actions given replace the purpose's current ones, and the later end time
+// of the two is kept.
+void pause_actions(PausePurpose purpose, std::int64_t end_ms, std::uint32_t actions) {
+  auto& p = g_pause_per_purpose[purpose];
+  p.actions = actions;
+  if (p.end_ms < end_ms) p.end_ms = end_ms;
   update_paused_actions();
 }
 
-void unpause_clients() {
-  g_client_pause_end_ms = 0;
-  g_client_pause_actions = 0;
+void unpause_actions(PausePurpose purpose) {
+  g_pause_per_purpose[purpose] = PauseEvent{};
   update_paused_actions();
+}
+
+// CLIENT PAUSE <timeout> [WRITE|ALL] (pauseClientsByClient()): a pause of everything stays one
+// when a write pause follows it.
+void pause_clients(std::int64_t end_ms, bool pause_all) {
+  std::uint32_t actions = pause_all ? kPauseClientAllSet : kPauseClientWriteSet;
+  if (!pause_all && (g_pause_per_purpose[kPauseByClientCommand].actions & kPauseClientAll))
+    actions = kPauseClientAllSet;
+  pause_actions(kPauseByClientCommand, end_ms, actions);
+}
+
+void unpause_clients() {
+  unpause_actions(kPauseByClientCommand);
 }
 
 // processCommand()'s maxmemory result for the client's command now running, saved for its
@@ -1173,6 +1197,9 @@ std::function<int()> g_blocked_clients_cb;
 std::function<int(const ClientKillFilter&, bool&)> g_client_kill_cb;
 std::function<void()> g_close_sockets_in_child_cb;
 std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
+std::function<void(const std::function<void(const SessionState&)>&)> g_for_each_replica_cb;
+std::function<void(const std::function<std::string(const SessionState&)>&)>
+    g_reply_blocked_on_shutdown_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
 std::function<std::string()> g_client_list_callback;
 std::function<bool(int fd, const std::string& data)> g_pubsub_send;
@@ -4416,6 +4443,7 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
           }}},
         {"shutdown-on-sigterm", live_shutdown_flags(g_shutdown_on_sigterm)},
         {"shutdown-on-sigint", live_shutdown_flags(g_shutdown_on_sigint)},
+        {"shutdown-timeout", live_number(g_shutdown_timeout)},
         {"requirepass", live_string(g_requirepass)},
         {"masterauth",
          {[] { return masterauth_copy(); },
@@ -4944,11 +4972,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     // SHUTDOWN [NOSAVE|SAVE] [NOW] [FORCE] [ABORT]: Redis's shutdownCommand() (db.c). The work
-    // is prepare_for_shutdown(), shared with SIGTERM and SIGINT. PeaDB never waits for replicas
-    // before it exits (no shutdown-timeout, compat/delta.md item 33): NOW changes nothing, and
-    // ABORT can only cancel a signal that the event loop has not handled yet.
+    // is prepare_for_shutdown(), shared with SIGTERM and SIGINT. While the shutdown waits for
+    // lagging replicas the client is blocked (Redis's blockClientShutdown()): it gets no reply
+    // when the server exits, and "Errors trying to SHUTDOWN. Check logs." when the shutdown fails
+    // or SHUTDOWN ABORT cancels it.
     t.emplace("SHUTDOWN", CommandSpec{"SHUTDOWN", -1, {"admin"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool& close) {
+        [](const std::vector<std::string>& args, SessionState& session, bool& close) {
           bool nosave = false, save = false, now = false, force = false, abort = false;
           for (std::size_t i = 1; i < args.size(); ++i) {
             const auto o = lower(args[i]);
@@ -4965,20 +4994,34 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             if (abort_shutdown()) return encode_simple("OK");
             return encode_error("No shutdown in progress.");
           }
+          // A client that cannot block (Redis's CLIENT_DENY_BLOCKING): in PeaDB a script, which
+          // Redis does not let call SHUTDOWN at all (NOSCRIPT, compat/delta.md item 14).
+          const bool deny_blocking = in_lua_script_context();
+          if (!now && deny_blocking)
+            return encode_error(
+                "SHUTDOWN without NOW or ABORT isn't allowed for DENY BLOCKING client");
           // A script that timed out: only SHUTDOWN NOSAVE may stop the server.
           if (!nosave && g_script_busy.load()) return busy_script_error_reply();
           const int flags = (save ? kShutdownSave : 0) | (nosave ? kShutdownNosave : 0) |
                             (now ? kShutdownNow : 0) | (force ? kShutdownForce : 0);
-          if (!prepare_for_shutdown(flags))
-            return encode_error("Errors trying to SHUTDOWN. Check logs.");
-          request_shutdown();
-          close = true;
-          return std::string();  // like Redis, no reply: the client sees the connection close
+          if (prepare_for_shutdown(flags)) {
+            request_shutdown();
+            close = true;
+            return std::string();  // like Redis, no reply: the client sees the connection close
+          }
+          // The shutdown waits for replicas (this one, or one that was already waiting): the
+          // client waits for its end.
+          if (shutdown_initiated() && !deny_blocking) {
+            session.blocked_on_shutdown = true;
+            return std::string();
+          }
+          return encode_error("Errors trying to SHUTDOWN. Check logs.");
         }});
 
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
           session.replica_stream = true;
+          session.repl_ack_time_ms = now_ms();
           g_backlog_has_replica = true;
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           g_last_repl_db = -1; // Force re-emit SELECT on next write
@@ -4999,15 +5042,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           for (std::size_t i = 1; i + 1 < args.size(); i += 2) {
             const auto opt = upper(args[i]);
             if (opt == "LISTENING-PORT") {
-              // Store the replica's listening port (informational)
+              // The replica's own port, which names it in the shutdown's "Lagging replica" line.
+              std::int64_t port = 0;
+              if (!parse_i64(args[i + 1], port))
+                return encode_error("value is not an integer or out of range");
+              session.repl_listening_port = static_cast<int>(port);
+            } else if (opt == "IP-ADDRESS") {
+              if (args[i + 1].size() >= 256)  // NET_HOST_STR_LEN
+                return encode_error(
+                    "REPLCONF ip-address provided by replica instance is too long: " +
+                    std::to_string(args[i + 1].size()) + " bytes");
+              session.repl_ip_address = args[i + 1];
             } else if (opt == "CAPA") {
               // Note capability
             } else if (opt == "ACK") {
-              // Parse replication offset from replica
+              // replconfCommand(): only a replica's ACK counts, the offset never goes back, and
+              // there is no reply.
               std::int64_t offset = 0;
-              parse_i64(args[i + 1], offset);
-              session.repl_ack_offset = offset;
-              return std::string(); // No reply for ACK
+              if (!session.replica_stream || !parse_i64(args[i + 1], offset)) return std::string();
+              if (offset > session.repl_ack_offset) session.repl_ack_offset = offset;
+              session.repl_ack_time_ms = now_ms();
+              return std::string();
             }
           }
           if (args.size() >= 2 && upper(args[1]) == "GETACK") {
@@ -5029,6 +5084,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           parse_i64(args[2], offset);
 
           session.replica_stream = true;
+          session.repl_ack_time_ms = now_ms();  // replicaPutOnline(): no false lag
           g_backlog_has_replica = true;
           g_last_repl_db = -1;
 
@@ -5562,11 +5618,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "uptime_in_days:" + std::to_string(uptime_s / 86400) + "\r\n"
                    "executable:peadb-server\r\n"
                    "config_file:\r\n"
-                   "cluster_enabled:" + std::string(g_cluster_enabled ? "1" : "0") + "\r\n\r\n";
+                   "cluster_enabled:" + std::string(g_cluster_enabled ? "1" : "0") + "\r\n";
+            // Only while a shutdown waits for lagging replicas, as in Redis.
+            if (shutdown_initiated())
+              out += "shutdown_in_milliseconds:" +
+                     std::to_string(g_shutdown_mstime - now_ms()) + "\r\n";
+            out += "\r\n";
           }
           if (want("CLIENTS")) {
+            // Replicas are not counted, as in Redis.
+            const int replicas = g_count_connected_replicas ? g_count_connected_replicas() : 0;
+            const int clients = g_connected_clients.load() - replicas;
             out += "# Clients\r\n"
-                   "connected_clients:" + std::to_string(g_connected_clients.load()) + "\r\n"
+                   "connected_clients:" + std::to_string(clients) + "\r\n"
                    "blocked_clients:" + std::to_string(blocked_now) + "\r\n"
                    "tracking_clients:0\r\n"
                    "maxclients:" + std::to_string(g_runtime_max_clients.load(std::memory_order_relaxed)) + "\r\n\r\n";
@@ -12445,6 +12509,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("client-query-buffer-limit", g_client_query_buffer_limit);
   num("tcp-keepalive", g_tcp_keepalive);
   num("maxmemory-eviction-tenacity", g_maxmemory_eviction_tenacity);
+  num("shutdown-timeout", g_shutdown_timeout);
   int lfu_log_factor = store().lfu_log_factor();
   num("lfu-log-factor", lfu_log_factor);
   store().set_lfu_log_factor(lfu_log_factor);
@@ -12593,13 +12658,19 @@ std::uint64_t redis_command_flags(const std::vector<std::string>& args) {
 }
 
 bool client_pause_update() {
-  if (g_paused_actions != 0 || g_client_pause_end_ms != 0) update_paused_actions();
+  if (g_paused_actions != 0) update_paused_actions();
   const bool rerun = g_pause_unblock_pending;
   g_pause_unblock_pending = false;
   return rerun;
 }
 
-std::int64_t client_pause_end_ms() { return g_paused_actions != 0 ? g_client_pause_end_ms : 0; }
+std::int64_t client_pause_end_ms() {
+  std::int64_t end = 0;
+  for (const auto& p : g_pause_per_purpose) {
+    if (p.actions != 0 && (end == 0 || p.end_ms < end)) end = p.end_ms;
+  }
+  return end;
+}
 
 void run_active_expire_cycle() {
   if (g_pause_cron) return;  // DEBUG PAUSE-CRON
@@ -12896,20 +12967,77 @@ std::string shutdown_flags_to_str(int flags) {
 }
 
 namespace {
-// cancelShutdown(): a shutdown that failed forgets the signal that asked for it.
+// isReadyToShutdown(): every replica has acknowledged the whole replication stream.
+bool is_ready_to_shutdown() {
+  bool ready = true;
+  if (g_for_each_replica_cb) {
+    g_for_each_replica_cb([&](const SessionState& replica) {
+      if (replica.repl_ack_offset != g_master_repl_offset) ready = false;
+    });
+  }
+  return ready;
+}
+
+// replicationGetSlaveName(): the address the replica gave (REPLCONF ip-address) or its peer
+// address, with the port it listens on (REPLCONF listening-port).
+std::string replica_name(const SessionState& replica) {
+  std::string ip = replica.repl_ip_address;
+  if (ip.empty()) {
+    const auto colon = replica.addr.rfind(':');
+    ip = colon == std::string::npos ? replica.addr : replica.addr.substr(0, colon);
+  }
+  if (replica.repl_listening_port == 0) return ip + ":<unknown-replica-port>";
+  if (ip.find(':') != std::string::npos)  // formatAddr(): an IPv6 address goes in brackets
+    return "[" + ip + "]:" + std::to_string(replica.repl_listening_port);
+  return ip + ":" + std::to_string(replica.repl_listening_port);
+}
+
+// cancelShutdown(): a shutdown that failed or was aborted forgets the signal that asked for it,
+// answers the clients blocked on SHUTDOWN and ends its write pause.
 void cancel_shutdown() {
   g_shutdown_asap.store(0);
+  g_shutdown_flags = 0;
+  g_shutdown_mstime = 0;
   g_last_sig_received.store(0);
+  if (g_reply_blocked_on_shutdown_cb) {
+    g_reply_blocked_on_shutdown_cb([](const SessionState& client) {
+      // addReplyError(): counted in the error stats, and not sent under CLIENT REPLY OFF.
+      record_error_stat("ERR");
+      return client.reply_off ? std::string()
+                              : encode_error("Errors trying to SHUTDOWN. Check logs.");
+    });
+  }
+  unpause_actions(kPauseDuringShutdown);
 }
-}  // namespace
 
-bool prepare_for_shutdown(int flags) {
-  // A dataset that is still loading must not be saved over the file it comes from.
-  if (g_loading.load()) flags = (flags & ~kShutdownSave) | kShutdownNosave;
+// finishShutdown(): the last step, after the wait for replicas (if any). Returns true when the
+// server may exit now.
+bool finish_shutdown() {
+  const int flags = g_shutdown_flags;
   const bool save = (flags & kShutdownSave) != 0;
   const bool nosave = (flags & kShutdownNosave) != 0;
   const bool force = (flags & kShutdownForce) != 0;
-  log(LogLevel::Info, "User requested shutdown...");
+  // A line for each replica that has not acknowledged the whole replication stream. PeaDB sends
+  // a full sync as one reply, so a replica is always "online" here.
+  int replicas = 0;
+  int lagging = 0;
+  if (g_for_each_replica_cb) {
+    const std::int64_t now_s = now_ms() / 1000;
+    g_for_each_replica_cb([&](const SessionState& replica) {
+      ++replicas;
+      if (replica.repl_ack_offset == g_master_repl_offset) return;
+      ++lagging;
+      log(LogLevel::Info,
+          "Lagging replica " + replica_name(replica) + " reported offset " +
+              std::to_string(g_master_repl_offset - replica.repl_ack_offset) +
+              " behind master, lag=" + std::to_string(now_s - replica.repl_ack_time_ms / 1000) +
+              ", state=online.");
+    });
+  }
+  if (replicas > 0) {
+    log(LogLevel::Info, std::to_string(replicas - lagging) + " of " + std::to_string(replicas) +
+                            " replicas are in sync when shutting down.");
+  }
   auto fail = [] {
     log(LogLevel::Warn,
         "Errors trying to shut down the server. Check the logs for more information.");
@@ -12969,16 +13097,48 @@ bool prepare_for_shutdown(int flags) {
   log(LogLevel::Warn, "PeaDB is now ready to exit, bye bye...");
   return true;
 }
+}  // namespace
+
+bool shutdown_initiated() {
+  return g_shutdown_mstime != 0;
+}
+
+bool prepare_for_shutdown(int flags) {
+  if (shutdown_initiated()) return false;
+  // A dataset that is still loading must not be saved over the file it comes from.
+  if (g_loading.load()) flags = (flags & ~kShutdownSave) | kShutdownNosave;
+  g_shutdown_flags = flags;
+  log(LogLevel::Info, "User requested shutdown...");
+  // Lagging replicas get shutdown-timeout seconds to catch up, so no acknowledged write is lost:
+  // they are asked for an ACK, and writes (and key expiry and eviction) wait so the replication
+  // offset stays where it is. shutdown_cron() finishes the shutdown.
+  if (!(flags & kShutdownNow) && g_shutdown_timeout != 0 && !is_ready_to_shutdown()) {
+    g_shutdown_mstime = now_ms() + static_cast<std::int64_t>(g_shutdown_timeout) * 1000;
+    if (!(g_paused_actions & kPauseReplica) && g_replication_role != "slave")
+      backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
+    pause_actions(kPauseDuringShutdown, std::numeric_limits<std::int64_t>::max(),
+                  kPauseClientWriteSet);
+    log(LogLevel::Info, "Waiting for replicas before shutting down.");
+    return false;
+  }
+  return finish_shutdown();
+}
 
 bool abort_shutdown() {
-  if (g_shutdown_asap.exchange(0) == 0) return false;
-  g_last_sig_received.store(0);
+  if (shutdown_initiated()) {
+    cancel_shutdown();
+  } else if (g_shutdown_asap.exchange(0) != 0) {
+    // A signal asked for a shutdown that the event loop has not started yet.
+    g_last_sig_received.store(0);
+  } else {
+    return false;
+  }
   log(LogLevel::Info, "Shutdown manually aborted.");
   return true;
 }
 
 void shutdown_signal_handler(int sig) {
-  // Only async-signal-safe work here: the shutdown itself runs in shutdown_signal_cron(). The
+  // Only async-signal-safe work here: the shutdown itself runs in shutdown_cron(). The
   // interrupted code may be about to read errno, so it is put back.
   const int saved_errno = errno;
   const char* msg = sig == SIGINT    ? "Received SIGINT scheduling shutdown..."
@@ -13016,20 +13176,29 @@ void set_loading(bool loading) {
   g_loading.store(loading);
 }
 
-void shutdown_signal_cron() {
+void shutdown_cron() {
   // Redis runs this in serverCron(), so DEBUG PAUSE-CRON holds it, and so does a script that runs
   // too long (serverCron() does not run until the script ends).
-  if (g_shutdown_asap.load() == 0 || g_pause_cron || g_script_busy.load()) return;
-  int flags = 0;
-  const int sig = g_last_sig_received.load();
-  if (sig == SIGINT && g_shutdown_on_sigint != 0)
-    flags = g_shutdown_on_sigint;
-  else if (sig == SIGTERM && g_shutdown_on_sigterm != 0)
-    flags = g_shutdown_on_sigterm;
+  if (g_pause_cron || g_script_busy.load()) return;
   // The SHUTDOWN command runs inside safe_handle_command(); this path needs its own guard, so an
   // exception (for example out of memory) is a failed shutdown and not a crash.
   try {
-    if (prepare_for_shutdown(flags)) request_shutdown();
+    if (g_shutdown_asap.load() != 0 && !shutdown_initiated()) {
+      // A SIGTERM or SIGINT asked for a shutdown.
+      int flags = 0;
+      const int sig = g_last_sig_received.load();
+      if (sig == SIGINT && g_shutdown_on_sigint != 0)
+        flags = g_shutdown_on_sigint;
+      else if (sig == SIGTERM && g_shutdown_on_sigterm != 0)
+        flags = g_shutdown_on_sigterm;
+      if (prepare_for_shutdown(flags)) request_shutdown();
+    } else if (shutdown_initiated()) {
+      // A shutdown waits for replicas: finish it once they are in sync or the time is up. When
+      // it fails, finish_shutdown() has logged why and cancelled it.
+      if (now_ms() >= g_shutdown_mstime || is_ready_to_shutdown()) {
+        if (finish_shutdown()) request_shutdown();
+      }
+    }
   } catch (const std::exception& e) {
     log(LogLevel::Warn, std::string("Errors trying to shut down the server: ") + e.what());
     cancel_shutdown();

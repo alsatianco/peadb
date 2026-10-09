@@ -82,7 +82,7 @@ docker run -d --name peadb -p 6379:6379 -v peadb-data:/data alsatianco/peadb-ser
 
 Arguments after the image name replace the image's default `CMD` (`--port 6379 --bind 0.0.0.0 --dir /data`) completely, so the line above repeats those defaults. Without `--bind 0.0.0.0`, PeaDB listens on `127.0.0.1` inside the container and the published port cannot reach it.
 
-The image turns on neither save points nor AOF, so without `--appendonly yes` (or `--save`) nothing is saved to the `/data` volume unless you run `SAVE` or `BGSAVE` yourself. `docker stop` sends SIGTERM, which shuts PeaDB down like `SHUTDOWN` (with save points it saves first, as Redis does); give it time to finish (`docker stop -t`) when the dataset is large. Read the open persistence defects in [`compat/delta.md`](compat/delta.md) items 32 and 33 first.
+The image turns on neither save points nor AOF, so without `--appendonly yes` (or `--save`) nothing is saved to the `/data` volume unless you run `SAVE` or `BGSAVE` yourself. `docker stop` sends SIGTERM, which shuts PeaDB down like `SHUTDOWN` (with save points it saves first, as Redis does, and a master first waits up to `shutdown-timeout` seconds, default 10, for replicas that are behind); Docker's default grace time is also 10 seconds, so give it more (`docker stop -t`) when the dataset is large or replicas may lag. Read the open persistence and replication defects in [`compat/delta.md`](compat/delta.md) (items 40–47 and 53) first.
 
 **protected-mode is on by default**: a client reaching the container through the published port is not seen as a loopback connection, so without a password PeaDB refuses it with `-DENIED`. Pass `--requirepass` as above, or, only if your network already isolates the container (for example a private Docker network with no published port), use `--protected-mode no` instead.
 
@@ -135,6 +135,7 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `unixsocket` | — | Also listen on an AF_UNIX socket path |
 | `unixsocketperm` | `0` | Octal file mode for the unix socket (e.g. `700`); `0` leaves the mode it was created with |
 | `save` | none | Save points, e.g. `save 900 1` (each line adds one; `save ""` clears them; `save 60 0` saves every 60 s); triggers `BGSAVE` + saves on `SHUTDOWN`, SIGTERM and SIGINT (change that with `shutdown-on-sigterm`/`shutdown-on-sigint`). With no `save` line Redis uses `3600 1 300 100 60 10000`, PeaDB uses none (delta item 2) |
+| `shutdown-timeout` | `10` | Seconds a master's `SHUTDOWN`, SIGTERM or SIGINT waits for replicas that have not acknowledged every write; writes wait meanwhile, reads are served (`0`: no wait; `SHUTDOWN NOW` does not wait either) |
 | `client-output-buffer-limit` | Redis defaults | Per-class (`normal`/`replica`/`pubsub`) output-buffer limits; overflowing clients are disconnected |
 | `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax) |
 | `repl-backlog-size` | `1mb` | Replication backlog size for partial resync |

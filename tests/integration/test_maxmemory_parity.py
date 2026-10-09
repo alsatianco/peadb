@@ -463,7 +463,9 @@ def check_backlog_ring(name, binary, work):
         assert pf.readline().startswith(b'+CONTINUE'), name
         got = pf.read(tail)
         assert got == received[-tail:], (name, 'partial resync bytes differ from the stream')
-        for s_ in (part, whole):
+        # Close the file objects too, or the sockets stay open and the shutdown waits
+        # shutdown-timeout seconds for these two replicas, which never ACK.
+        for s_ in (pf, part, f, whole):
             s_.close()
         c.close()
     finally:

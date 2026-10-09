@@ -405,7 +405,10 @@ def check_signals(name, binary, work):
     # needs the load to be still running when the signal arrives; on a machine fast enough to
     # finish first it reports that and checks nothing.
     workdir = os.path.join(work, f'{name}-loading')
-    proc = start(binary, port, workdir, '--save', '', '--enable-debug-command', 'yes')
+    # The pinned redis-server writes the dump when there is one: PeaDB loads Redis's RDB files
+    # (compat/delta.md item 27), and its own RDB writer needs about 20 s for these 2,000,000 keys
+    # (item 58), which would put this test at the runner's 30 s limit.
+    proc = start(REDIS or binary, port, workdir, '--save', '', '--enable-debug-command', 'yes')
     try:
         c = Conn(port, timeout=120)
         assert c('DEBUG', 'POPULATE', '2000000') == '+OK', name
