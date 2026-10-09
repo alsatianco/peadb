@@ -1056,6 +1056,12 @@ void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::
   };
   auto it = m.find(cmd);
   if (it == m.end()) return;
+  if (cmd == "RESTORE" && args.size() >= 2 && !store().key_exists_raw(args[1])) {
+    // The TTL had passed and REPLACE deleted the key that was there (a RESTORE that changed
+    // nothing sends nothing): Redis's restoreCommand() sends `del`.
+    notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], db);
+    return;
+  }
   if (it->second.second == "expire" && args.size() >= 2 && !store().key_exists_raw(args[1])) {
     // An expire time in the past deleted the key (already_expired()), as Redis's
     // expireGenericCommand() does, with a `del` event; a missing key replies 0 and sends nothing.
@@ -1899,18 +1905,20 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     else if (abs >= 0) out = {"PEXPIREAT", args[1], std::to_string(abs)};
     else emit = false;
   } else if (cmd == "RESTORE" && args.size() >= 4) {
+    // Redis's restoreCommand(). A RESTORE that stored nothing and deleted nothing is not propagated
+    // (g_write_changed_nothing).
     if (!key_exists(args[1])) {
-      // The key wasn't stored (already-expired absolute TTL); if REPLACE removed an existing
-      // key, Redis propagates the deletion as DEL/UNLINK instead of the RESTORE.
+      // The TTL had passed and REPLACE deleted the key that was there: DEL (UNLINK) instead.
       out = {g_lazyfree_lazy_server_del ? "UNLINK" : "DEL", args[1]};
     } else {
+      // A relative TTL goes out as the absolute expire time, with ABSTTL added last; the payload
+      // and the other options stay as they came. Without a TTL, or with ABSTTL, as it came.
+      const bool has_absttl = std::any_of(
+          args.begin() + 4, args.end(), [](const std::string& a) { return upper(a) == "ABSTTL"; });
       const auto abs = abs_ttl(args[1]);
-      if (abs >= 0) {
-        std::string absttl = "ABSTTL";
-        for (std::size_t i = 4; i < args.size(); ++i) {
-          if (upper(args[i]) == "ABSTTL") { absttl = args[i]; break; }
-        }
-        out = {"RESTORE", args[1], std::to_string(abs), "{" + args[3] + "}", absttl};
+      if (!has_absttl && abs >= 0) {
+        out[2] = std::to_string(abs);
+        out.push_back("ABSTTL");
       }
     }
   } else if (cmd == "SCRIPT") {
@@ -7499,51 +7507,74 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         }});
 
     t.emplace("RESTORE", CommandSpec{"RESTORE", -4, {"write"}, 1, 1, 1,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          std::int64_t ttl_ms = 0;
-          if (!parse_i64(args[2], ttl_ms) || ttl_ms < 0) {
-            return encode_error("value is not an integer or out of range");
-          }
-
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          // Redis's restoreCommand(): the options, then the key, the TTL and the payload, each with
+          // Redis's error; the payload is read in full before REPLACE deletes anything.
           bool replace = false;
           bool absttl = false;
           std::int64_t idletime = -1, freq = -1;
           for (std::size_t i = 4; i < args.size(); ++i) {
             const std::string opt = upper(args[i]);
+            const bool has_value = i + 1 < args.size();
             if (opt == "REPLACE") {
               replace = true;
-              continue;
-            }
-            if (opt == "ABSTTL") {
+            } else if (opt == "ABSTTL") {
               absttl = true;
-              continue;
-            }
-            if (opt == "IDLETIME") {
-              if (i + 1 >= args.size() || !parse_i64(args[i + 1], idletime) || idletime < 0)
-                return encode_error("Invalid IDLETIME value, must be >= 0");
-              ++i;
-              continue;
-            }
-            if (opt == "FREQ") {
-              if (i + 1 >= args.size() || !parse_i64(args[i + 1], freq) || freq < 0 || freq > 255)
+            } else if (opt == "IDLETIME" && has_value && freq == -1) {
+              if (!parse_strict_int(args[++i], idletime))
+                return encode_error("value is not an integer or out of range");
+              if (idletime < 0) return encode_error("Invalid IDLETIME value, must be >= 0");
+            } else if (opt == "FREQ" && has_value && idletime == -1) {
+              if (!parse_strict_int(args[++i], freq))
+                return encode_error("value is not an integer or out of range");
+              if (freq < 0 || freq > 255)
                 return encode_error("Invalid FREQ value, must be >= 0 and <= 255");
-              ++i;
-              continue;
+            } else {
+              return encode_error("syntax error");
             }
-            return encode_error("syntax error");
           }
-
+          const std::string& key = args[1];
+          if (!replace && store().type_of(key) != "none")
+            return std::string("-BUSYKEY Target key name already exists.\r\n");
+          std::int64_t ttl = 0;
+          if (!parse_strict_int(args[2], ttl))
+            return encode_error("value is not an integer or out of range");
+          if (ttl < 0) return encode_error("Invalid TTL value, must be >= 0");
+          DumpValue value;
           std::string err;
-          if (!rdb_restore_key(args[1], args[3], ttl_ms, replace, absttl, err)) {
-            if (err.find("Target key") != std::string::npos) {
-              return std::string("-BUSYKEY ") + err + "\r\n";
-            }
-            return encode_error(err);
+          if (!rdb_decode_dump_payload(args[3], value, err)) return encode_error(err);
+
+          // Redis's dbDelete() erases the key even when its TTL has passed and it is not deleted
+          // yet (no lazy-expiry DEL, no `expired` event).
+          const bool was_live = store().live_type(key).has_value();
+          const bool deleted = replace && store().del_raw(key);
+          // A relative TTL counts from now; past the largest time it wraps into the past, as the
+          // sum does in Redis.
+          if (ttl != 0 && !absttl)
+            ttl = static_cast<std::int64_t>(static_cast<std::uint64_t>(ttl) +
+                                            static_cast<std::uint64_t>(DataStore::now_ms()));
+          if (ttl != 0 && already_expired(ttl)) {
+            // Nothing is stored. If REPLACE deleted a key, Redis sends DEL (UNLINK) in place of the
+            // RESTORE, with a `del` event (canonicalize_propagated_command(),
+            // emit_keyspace_notifications()); otherwise nothing changed.
+            if (!deleted) g_write_changed_nothing = true;
+            return encode_simple("OK");
           }
-          // Seed LRU/LFU metadata if requested (no-op when the key was already-expired and
-          // therefore not stored).
-          if (idletime >= 0) store().set_object_idle(args[1], idletime);
-          if (freq >= 0) store().set_object_freq(args[1], freq);
+          rdb_store_dump_value(key, std::move(value),
+                               ttl != 0 ? std::optional<std::int64_t>(ttl) : std::nullopt);
+          // A new object starts with a fresh LRU clock or LFU counter (Redis's createObject());
+          // objectSetLRUOrLFU() then applies FREQ under an LFU policy and IDLETIME under any other.
+          // The dispatch does not touch a RESTORE key afterwards.
+          store().touch_key_for_eviction(key);
+          if (g_maxmemory_policy == MaxmemoryPolicy::AllkeysLfu ||
+              g_maxmemory_policy == MaxmemoryPolicy::VolatileLfu) {
+            if (freq >= 0) store().set_object_freq(key, freq);
+          } else if (idletime >= 0) {
+            store().set_object_idle(key, idletime);
+          }
+          // Redis deletes the old key and adds the new one (dbDelete(), dbAdd()), so it sends `new`
+          // for a replaced key too; the dispatch sends it for a key that was not live before.
+          if (deleted && was_live) notify_keyspace_event(NOTIFY_NEW, "new", key, session.db_index);
           return encode_simple("OK");
         }});
 

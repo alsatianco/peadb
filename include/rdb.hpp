@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sys/types.h>
@@ -60,10 +62,23 @@ std::string rdb_dump_functions(const std::vector<std::string>& library_codes);
 bool rdb_parse_function_payload(const std::string& payload, std::vector<std::string>& library_codes,
                                 std::string& err);
 
-// Restore a key from Redis DUMP payload. Returns true on success.
-bool rdb_restore_key(const std::string& key, const std::string& payload,
-                     std::int64_t ttl_ms, bool replace, bool absttl,
-                     std::string& err);
+// A value read from a DUMP payload by RESTORE, held apart from the keyspace until it is stored.
+struct DumpValue {
+  std::uint8_t type = 0;                                    // the RDB type byte
+  std::string str;                                          // string
+  std::vector<std::string> items;                           // list items, set members
+  std::vector<std::pair<std::string, std::string>> fields;  // hash
+  std::vector<std::pair<std::string, double>> scored;       // zset members and scores
+};
+
+// RESTORE, Redis's verifyDumpPayload() and rdbLoadObject(): check the payload's footer and read
+// its value without touching the keyspace. On failure sets err to Redis's reply text.
+bool rdb_decode_dump_payload(const std::string& payload, DumpValue& out, std::string& err);
+
+// Store a value rdb_decode_dump_payload() read under `key`, which must not exist, with its expire
+// time if it has one.
+void rdb_store_dump_value(const std::string& key, DumpValue&& value,
+                          std::optional<std::int64_t> expire_at_ms);
 
 // DEBUG SET-SKIP-CHECKSUM-VALIDATION: when set, RESTORE skips the DUMP-payload CRC64
 // check (the upstream Redis test suite uses this to feed synthetic payloads).

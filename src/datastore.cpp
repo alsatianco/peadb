@@ -368,6 +368,10 @@ bool DataStore::del(const std::string& key) {
   return db.erase(key) > 0;
 }
 
+bool DataStore::del_raw(const std::string& key) {
+  return dbs_[current_db_].erase(key) > 0;
+}
+
 std::size_t DataStore::exists(const std::vector<std::string>& keys) {
   std::size_t n = 0;
   auto& db = dbs_[current_db_];
@@ -2679,6 +2683,22 @@ void DataStore::increment_mutation_epoch() { ++mutation_epoch_; }
 
 // ── Eviction (maxmemory-policy) ──
 
+namespace {
+// Redis's LRU clock (LRU_CLOCK(), LRU_BITS, LRU_CLOCK_RESOLUTION): seconds in 24 bits, so it wraps
+// about every 194 days.
+constexpr std::uint32_t kLruClockMax = (1u << 24) - 1;
+
+std::uint32_t lru_clock() {
+  return static_cast<std::uint32_t>((DataStore::now_ms() / 1000) & kLruClockMax);
+}
+
+// Redis's estimateObjectIdleTime(), in seconds: an access clock above the current one has wrapped.
+std::int64_t lru_idle_seconds(std::uint32_t lru) {
+  const std::uint32_t now = lru_clock();
+  return now >= lru ? now - lru : static_cast<std::int64_t>(now) + (kLruClockMax - lru);
+}
+}  // namespace
+
 void DataStore::touch_lru(Entry& e, bool lfu) {
   if (e.lru_fresh) {
     e.lru_fresh = false;
@@ -2702,9 +2722,7 @@ void DataStore::touch_lru(Entry& e, bool lfu) {
     }
     e.lru = counter;
   } else {
-    // LRU: store a coarse millisecond access clock (truncated to 32 bits — wraps ~49
-    // days, which only risks treating a 49-day-idle key as recent; acceptable for a cache).
-    e.lru = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
+    e.lru = lru_clock();
   }
 }
 
@@ -2719,9 +2737,7 @@ std::optional<std::int64_t> DataStore::object_idletime_seconds(const std::string
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  const auto now = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
-  const std::uint32_t last = it->second.lru;
-  return static_cast<std::int64_t>(now >= last ? now - last : 0) / 1000;
+  return lru_idle_seconds(it->second.lru);
 }
 
 std::optional<std::uint32_t> DataStore::object_lru_clock(const std::string& key) {
@@ -2729,7 +2745,7 @@ std::optional<std::uint32_t> DataStore::object_lru_clock(const std::string& key)
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
-  return it->second.lru;  // raw LRU clock (or LFU counter) — for DEBUG OBJECT's lru field
+  return it->second.lru;  // LRU clock (or LFU counter), as DEBUG OBJECT's lru field shows it
 }
 
 std::optional<std::int64_t> DataStore::object_freq(const std::string& key) {
@@ -2744,9 +2760,11 @@ bool DataStore::set_object_idle(const std::string& key, std::int64_t idle_second
   auto& db = dbs_[current_db_];
   auto it = db.find(key);
   if (it == db.end()) return false;
-  // idletime reads back as (now_low32 - lru)/1000, so store lru = now - idle*1000.
-  const auto now = static_cast<std::uint32_t>(now_ms() & 0xFFFFFFFF);
-  it->second.lru = now - static_cast<std::uint32_t>(idle_seconds * 1000);
+  // Redis's objectSetLRUOrLFU(): the access clock `idle_seconds` ago, wrapped once into the clock's
+  // range and then cut to its 24 bits (so an idle time past the range wraps, as in Redis).
+  std::int64_t lru_abs = static_cast<std::int64_t>(lru_clock()) - idle_seconds;
+  if (lru_abs < 0) lru_abs += kLruClockMax;
+  it->second.lru = static_cast<std::uint32_t>(lru_abs) & kLruClockMax;
   it->second.lru_fresh = false;
   return true;
 }
@@ -2784,7 +2802,7 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
     if (!best) return true;
     if (ttl)  return c.expire < best->expire;          // soonest to expire
     if (lfu)  return (c.lru & 0xFF) < (best->lru & 0xFF); // lowest frequency
-    if (lru)  return c.lru < best->lru;                // oldest access clock
+    if (lru)  return lru_idle_seconds(c.lru) > lru_idle_seconds(best->lru);  // longest idle
     return (rng() & 1) != 0;                            // random: keep flipping
   };
 

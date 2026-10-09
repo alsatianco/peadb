@@ -195,6 +195,9 @@ class DataStore {
   std::optional<std::string> getdel(const std::string& key);
 
   bool del(const std::string& key);
+  // Erase `key` whether or not its TTL has passed, with no lazy-expiry DEL or event (Redis's
+  // dbDelete(), as RESTORE ... REPLACE uses it).
+  bool del_raw(const std::string& key);
   std::size_t exists(const std::vector<std::string>& keys);
   std::string type_of(const std::string& key);
   bool is_wrongtype_for_string(const std::string& key);
