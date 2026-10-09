@@ -518,7 +518,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
       "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
       "maxmemory-eviction-tenacity",
       "enable-protected-configs", "rdbchecksum", "rdb-key-save-delay", "shutdown-on-sigterm",
-      "shutdown-on-sigint"};
+      "shutdown-on-sigint", "shutdown-timeout"};
   return kSet;
 }
 

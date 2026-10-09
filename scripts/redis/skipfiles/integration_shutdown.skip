@@ -1,0 +1,4 @@
+# A replica does not keep the replication offset it has applied: its INFO master_repl_offset stays at the offset its full sync started from, so the tests' wait_for_ofs_sync never sees it in sync (compat/delta.md item 44); these tests also read INFO mem_total_replication_buffers, which PeaDB does not report (item 22).
+Shutting down master waits for replica to catch up (sigterm)
+Shutting down master waits for replica to catch up (shutdown)
+Shutting down master waits for replica timeout

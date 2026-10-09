@@ -345,6 +345,10 @@ int run_server(const ServerConfig& config) {
   // blocked_clients and shows them with flag b.
   int postponed_count = 0;
   std::uint64_t postpone_seq = 0;
+  // Clients blocked on a SHUTDOWN that waits for replicas (SessionState::blocked_on_shutdown), and
+  // those a cancelled shutdown has just answered, whose pipelined commands run next.
+  int shutdown_blocked_count = 0;
+  std::vector<int> shutdown_released_fds;
   std::uint64_t block_seq = 0;  // FIFO serving order of blocked clients (BlockedState::seq)
 
   // Wire up the WAIT callback so it can count synced replicas
@@ -390,7 +394,16 @@ int run_server(const ServerConfig& config) {
     return bytes;
   };
 
-  g_blocked_clients_cb = [&]() -> int { return blocked_count + postponed_count; };
+  g_blocked_clients_cb = [&]() -> int {
+    return blocked_count + postponed_count + shutdown_blocked_count;
+  };
+
+  g_for_each_replica_cb = [&](const std::function<void(const SessionState&)>& fn) {
+    for (int fd : replica_fds) {
+      const auto it = sessions.find(fd);
+      if (it != sessions.end()) fn(it->second);
+    }
+  };
 
   // Wire up the CLIENT LIST callback
   g_client_list_callback = [&]() -> std::string {
@@ -417,7 +430,8 @@ int run_server(const ServerConfig& config) {
       std::string flags;
       if (sess.replica_stream) flags += "S";
       if (sess.is_monitor) flags += "O";
-      if (sess.blocked.type != BlockType::None || sess.postponed) flags += "b";
+      if (sess.blocked.type != BlockType::None || sess.postponed || sess.blocked_on_shutdown)
+        flags += "b";
       if (flags.empty()) flags = "N";
       out += " flags=" + flags;
       out += " cmd=" + (sess.last_cmd.empty() ? std::string("NULL") : sess.last_cmd);
@@ -546,6 +560,7 @@ int run_server(const ServerConfig& config) {
       if (scit->second.blocked.type != BlockType::None && blocked_count > 0) --blocked_count;
       if (scit->second.wait_state.has_value() && wait_count > 0) --wait_count;
       if (scit->second.postponed && postponed_count > 0) --postponed_count;
+      if (scit->second.blocked_on_shutdown && shutdown_blocked_count > 0) --shutdown_blocked_count;
     }
     pubsub_unsubscribe_all(fd);
     on_client_disconnect(fd);
@@ -667,7 +682,9 @@ int run_server(const ServerConfig& config) {
         }
         consumed += parsed->consumed;
         if (shutdown_requested()) return;
-        if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
+        if (sc || session.blocked.type != BlockType::None || session.wait_state.has_value() ||
+            session.blocked_on_shutdown)
+          break;
       }
       if (consumed > 0) {
         if (consumed == input.size())
@@ -681,6 +698,7 @@ int run_server(const ServerConfig& config) {
         session.blocked.seq = ++block_seq;  // FIFO serving order, as on the main read path
       }
       if (session.wait_state.has_value()) ++wait_count_ref;
+      if (session.blocked_on_shutdown) ++shutdown_blocked_count;
       // A PSYNC/SYNC that CLIENT PAUSE ALL held makes this client a replica only now.
       if (!was_replica && session.replica_stream) {
         ++replica_count;
@@ -718,6 +736,33 @@ int run_server(const ServerConfig& config) {
       return 1;
     }
     return 0;
+  };
+
+  // replyToClientsBlockedOnShutdown(): a shutdown that waited for replicas failed or was
+  // aborted. It can run inside another client's command (SHUTDOWN ABORT), so the answered
+  // clients' pipelined commands run later, from run_shutdown_released().
+  std::vector<int> shutdown_release_close;
+  g_reply_blocked_on_shutdown_cb =
+      [&](const std::function<std::string(const SessionState&)>& reply) {
+        if (shutdown_blocked_count <= 0) return;
+        for (auto& [fd, sess] : sessions) {
+          if (!sess.blocked_on_shutdown) continue;
+          sess.blocked_on_shutdown = false;
+          --shutdown_blocked_count;
+          if (enqueue_output(fd, reply(sess)))
+            shutdown_released_fds.push_back(fd);
+          else
+            shutdown_release_close.push_back(fd);
+        }
+      };
+  auto run_shutdown_released = [&]() {
+    if (shutdown_released_fds.empty() && shutdown_release_close.empty()) return;
+    std::vector<int> fds, to_close;
+    fds.swap(shutdown_released_fds);
+    to_close.swap(shutdown_release_close);
+    for (int cfd : to_close) close_client(cfd);
+    drain_pipelined(fds, blocked_count, wait_count, to_close);
+    for (int cfd : to_close) close_client(cfd);
   };
 
   // Recheck blocked clients (BLPOP/BRPOP/BLMOVE/BZPOPMIN/XREAD…): deliver to any whose
@@ -814,10 +859,12 @@ int run_server(const ServerConfig& config) {
   };
 
   while (!shutdown_requested()) {
-    // A SIGTERM or SIGINT asked for a shutdown: run it here, between commands, as Redis does from
-    // serverCron() (it is not safe inside the signal handler).
-    shutdown_signal_cron();
+    // A SIGTERM or SIGINT asked for a shutdown, or a shutdown waits for replicas: run it here,
+    // between commands, as Redis does from serverCron() (it is not safe inside the signal
+    // handler).
+    shutdown_cron();
     if (shutdown_requested()) break;
+    run_shutdown_released();
     // Poll timeout: default 100 ms housekeeping tick, but clamp to the nearest blocked-
     // client deadline so BLPOP-style timeouts fire with millisecond precision instead
     // of up to a tick late (the upstream suite asserts ~150 ms slack on a 1 s timeout).
@@ -867,7 +914,9 @@ int run_server(const ServerConfig& config) {
       std::vector<int> idle_fds;
       for (auto& [cfd, session] : sessions) {
         if (session.replica_stream || session.blocked.type != BlockType::None ||
-            session.postponed || session.wait_state.has_value() || session.in_multi) continue;
+            session.postponed || session.blocked_on_shutdown || session.wait_state.has_value() ||
+            session.in_multi)
+          continue;
         if (session.last_interaction_ms == 0) continue;  // never issued a command yet
         if (loop_now_ms - session.last_interaction_ms < cutoff) continue;
         if (client_has_subscriptions(cfd)) continue;
@@ -884,6 +933,10 @@ int run_server(const ServerConfig& config) {
     // so they keep their place ahead of newer commands.
     if (client_pause_update()) resume_postponed();
 
+    // A replica's REPLCONF ACK arrived in this pass: the WAIT clients it completes are answered at
+    // the end of the pass, as Redis's beforeSleep() does, before the next pass's shutdown_cron()
+    // can finish a shutdown that waited for the same ACK.
+    bool replica_acked = false;
     for (int i = 0; i < nready; ++i) {
       // Once SHUTDOWN has succeeded no other command runs: the final save already happened.
       if (shutdown_requested()) break;
@@ -1082,11 +1135,12 @@ int run_server(const ServerConfig& config) {
       std::string batch_reply;
       bool should_close = false;
       auto& session = sessions[fd];
-      // A client CLIENT PAUSE holds only buffers what it sends until the pause ends.
-      if (session.postponed) continue;
+      // A client CLIENT PAUSE holds, or one blocked on SHUTDOWN, only buffers what it sends.
+      if (session.postponed || session.blocked_on_shutdown) continue;
       const bool was_blocked = session.blocked.type != BlockType::None;
       const bool was_waiting = session.wait_state.has_value();
       const bool was_replica = session.replica_stream;
+      const std::int64_t ack_before = session.repl_ack_offset;
 
       std::size_t consumed_total = 0;
       const bool output_pending = !write_buffers[fd].empty();
@@ -1117,7 +1171,9 @@ int run_server(const ServerConfig& config) {
         if (should_close) break;
         // Stop parsing when the session transitions into a blocking/waiting state.
         // Subsequent pipelined commands must not overtake the deferred reply.
-        if (session.blocked.type != BlockType::None || session.wait_state.has_value()) break;
+        if (session.blocked.type != BlockType::None || session.wait_state.has_value() ||
+            session.blocked_on_shutdown)
+          break;
       }
 
       // Track blocked/replica/wait state changes
@@ -1126,6 +1182,8 @@ int run_server(const ServerConfig& config) {
         session.blocked.seq = ++block_seq;  // FIFO serving order
       }
       if (!was_waiting && session.wait_state.has_value()) ++wait_count;
+      if (session.blocked_on_shutdown) ++shutdown_blocked_count;
+      if (session.repl_ack_offset != ack_before) replica_acked = true;
       if (!was_replica && session.replica_stream) {
         ++replica_count;
         replica_fds.insert(fd);
@@ -1174,7 +1232,11 @@ int run_server(const ServerConfig& config) {
       for (int cfd : to_close) close_client(cfd);
     }
 
-    // CLIENT UNPAUSE (or a less strict CLIENT PAUSE) ran above: release the held clients now.
+    // SHUTDOWN ABORT ran above: the clients blocked on SHUTDOWN have their answer, and run what
+    // they sent after it.
+    run_shutdown_released();
+    // CLIENT UNPAUSE, a less strict CLIENT PAUSE or the end of a shutdown's pause ran above:
+    // release the held clients now.
     if (client_pause_update()) resume_postponed();
 
     // Same-iteration unblock: writes processed above set the pending-wakeup flag; deliver
@@ -1183,6 +1245,8 @@ int run_server(const ServerConfig& config) {
     if (has_pending_wakeups()) {
       clear_pending_wakeups();
       recheck_blocked();
+      recheck_wait();
+    } else if (replica_acked) {
       recheck_wait();
     }
 
