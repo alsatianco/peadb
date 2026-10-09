@@ -54,6 +54,9 @@
 #include <dlfcn.h>
 #include <fnmatch.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <climits>
 #include <deque>
 #include <poll.h>
 #include <sys/resource.h>
@@ -1224,10 +1227,12 @@ void emit_keyspace_notifications(const std::string& cmd, const std::vector<std::
     {"EXPIREAT",{NOTIFY_GENERIC,"expire"}},{"PEXPIREAT",{NOTIFY_GENERIC,"expire"}},
     {"PERSIST",{NOTIFY_GENERIC,"persist"}},{"RENAME",{NOTIFY_GENERIC,"rename_from"}},
     {"COPY",{NOTIFY_GENERIC,"copy_to"}},{"RESTORE",{NOTIFY_GENERIC,"restore"}},
+    {"RESTORE-ASKING",{NOTIFY_GENERIC,"restore"}},
   };
   auto it = m.find(cmd);
   if (it == m.end()) return;
-  if (cmd == "RESTORE" && args.size() >= 2 && !store().key_exists_raw(args[1])) {
+  if ((cmd == "RESTORE" || cmd == "RESTORE-ASKING") && args.size() >= 2 &&
+      !store().key_exists_raw(args[1])) {
     // The TTL had passed and REPLACE deleted the key that was there (a RESTORE that changed
     // nothing sends nothing): Redis's restoreCommand() sends `del`.
     notify_keyspace_event(NOTIFY_GENERIC, "del", args[1], db);
@@ -1257,7 +1262,9 @@ void feed_monitors(const std::string& cmd, const std::vector<std::string>& args,
   std::string line = "+";
   line += ts;
   line += " [" + std::to_string(session.db_index) + " " + (session.addr.empty() ? "?:0" : session.addr) + "]";
-  for (const auto& a : args) {
+  // Passwords are shown as (redacted), as in SLOWLOG (Redis's redactClientCommandArgument() changes
+  // what both show).
+  for (const auto& a : redact_slowlog_args(args)) {
     line += " \"";
     for (char c : a) {
       switch (c) {
@@ -2077,7 +2084,7 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     else if (abs == -2) out = {"DEL", args[1]};
     else if (abs >= 0) out = {"PEXPIREAT", args[1], std::to_string(abs)};
     else emit = false;
-  } else if (cmd == "RESTORE" && args.size() >= 4) {
+  } else if ((cmd == "RESTORE" || cmd == "RESTORE-ASKING") && args.size() >= 4) {
     // Redis's restoreCommand(). A RESTORE that stored nothing and deleted nothing is not propagated
     // (g_write_changed_nothing).
     if (!key_exists(args[1])) {
@@ -2095,6 +2102,9 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
       }
     }
   } else if (cmd == "SCRIPT") {
+    emit = false;
+  } else if (cmd == "MIGRATE") {
+    // It propagates the DEL of the keys the target took itself (migrate_command()).
     emit = false;
   } else if (cmd == "BLMPOP" || cmd == "BZMPOP" || cmd == "LMPOP" || cmd == "ZMPOP") {
     // These handlers propagate their effect explicitly as deterministic LPOP/RPOP or
@@ -3044,66 +3054,176 @@ void try_send_cluster_meetback(const std::string& host, int port) {
   close(fd);
 }
 
-bool write_all(int fd, const char* data, std::size_t n) {
-  std::size_t sent = 0;
-  while (sent < n) {
-    const auto rc = write(fd, data + sent, n - sent);
-    if (rc <= 0) return false;
-    sent += static_cast<std::size_t>(rc);
-  }
-  return true;
+// ── MIGRATE's connections (Redis's cluster.c and syncio.c) ──────────────────────
+
+std::int64_t steady_ms() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
 }
 
-bool read_exact(int fd, char* out, std::size_t n) {
-  std::size_t got = 0;
-  while (got < n) {
-    const auto rc = recv(fd, out + got, n - got, 0);
-    if (rc <= 0) return false;
-    got += static_cast<std::size_t>(rc);
-  }
-  return true;
+// Redis's aeWait(): waits up to `ms` for `events` on `fd`.
+void ae_wait(int fd, short events, std::int64_t ms) {
+  pollfd pfd{fd, events, 0};
+  (void)poll(&pfd, 1, static_cast<int>(std::min<std::int64_t>(ms, INT_MAX)));
 }
 
-bool read_line_crlf(int fd, std::string& line) {
-  line.clear();
-  char c = 0;
+constexpr std::int64_t kSyncioResolutionMs = 10;  // Redis's SYNCIO__RESOLUTION
+
+// Redis's syncWrite() on a non-blocking socket: `size` on success; -1 when a write fails or the
+// whole buffer has not gone out within `timeout` ms (errno ETIMEDOUT then).
+ssize_t sync_write(int fd, const char* ptr, std::size_t size, std::int64_t timeout) {
+  const auto ret = static_cast<ssize_t>(size);
+  const std::int64_t start = steady_ms();
+  std::int64_t remaining = timeout;
   while (true) {
-    if (!read_exact(fd, &c, 1)) return false;
-    if (c == '\r') {
-      char lf = 0;
-      if (!read_exact(fd, &lf, 1)) return false;
-      if (lf != '\n') return false;
-      return true;
+    const std::int64_t wait = remaining > kSyncioResolutionMs ? remaining : kSyncioResolutionMs;
+    const ssize_t nwritten = ::write(fd, ptr, size);
+    if (nwritten == -1) {
+      if (errno != EAGAIN) return -1;
+    } else {
+      ptr += nwritten;
+      size -= static_cast<std::size_t>(nwritten);
+    }
+    if (size == 0) return ret;
+    ae_wait(fd, POLLOUT, wait);
+    const std::int64_t elapsed = steady_ms() - start;
+    if (elapsed >= timeout) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    remaining = timeout - elapsed;
+  }
+}
+
+// Redis's syncRead(): -1 on an error, on the end of the stream or when `size` bytes have not come
+// within `timeout` ms (errno ETIMEDOUT then).
+ssize_t sync_read(int fd, char* ptr, std::size_t size, std::int64_t timeout) {
+  ssize_t totread = 0;
+  const std::int64_t start = steady_ms();
+  std::int64_t remaining = timeout;
+  if (size == 0) return 0;
+  while (true) {
+    const std::int64_t wait = remaining > kSyncioResolutionMs ? remaining : kSyncioResolutionMs;
+    const ssize_t nread = ::read(fd, ptr, size);
+    if (nread == 0) return -1;  // short read
+    if (nread == -1) {
+      if (errno != EAGAIN) return -1;
+    } else {
+      ptr += nread;
+      size -= static_cast<std::size_t>(nread);
+      totread += nread;
+    }
+    if (size == 0) return totread;
+    ae_wait(fd, POLLIN, wait);
+    const std::int64_t elapsed = steady_ms() - start;
+    if (elapsed >= timeout) {
+      errno = ETIMEDOUT;
+      return -1;
+    }
+    remaining = timeout - elapsed;
+  }
+}
+
+// Redis's syncReadLine() into a buffer of `size` bytes: reads up to a '\n', each byte within
+// `timeout` ms, and returns the bytes before it (a '\r' counts but is not kept), at most size - 1
+// of them (the rest of a longer line stays unread); -1 on an error.
+ssize_t sync_read_line(int fd, std::string& line, std::size_t size, std::int64_t timeout) {
+  line.clear();
+  ssize_t nread = 0;
+  for (--size; size > 0; --size) {
+    char c = 0;
+    if (sync_read(fd, &c, 1, timeout) == -1) return -1;
+    if (c == '\n') {
+      if (!line.empty() && line.back() == '\r') line.pop_back();
+      return nread;
     }
     line.push_back(c);
+    ++nread;
   }
+  return nread;
 }
 
-bool read_resp_reply(int fd, std::string& payload, bool& is_err) {
-  payload.clear();
-  is_err = false;
-  char prefix = 0;
-  if (!read_exact(fd, &prefix, 1)) return false;
-  std::string line;
-  if (prefix == '+' || prefix == '-' || prefix == ':') {
-    if (!read_line_crlf(fd, line)) return false;
-    payload = line;
-    is_err = prefix == '-';
-    return true;
+// Redis's connBlockingConnect() for TCP (anetTcpNonBlockConnect(), then aeWait()): a non-blocking
+// connect to the first address of `host` that takes one (a name, IPv4 or IPv6), which may wait up
+// to `timeout` ms. As in Redis a connect still in progress then is not an error: the first write
+// fails or times out instead. -1 when no address takes a connect.
+int migrate_connect(const std::string& host, int port, std::int64_t timeout) {
+  char portstr[6];  // Redis's strlen("65535") + 1: a longer number is cut, as in Redis
+  std::snprintf(portstr, sizeof(portstr), "%d", port);
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* servinfo = nullptr;
+  if (getaddrinfo(host.c_str(), portstr, &hints, &servinfo) != 0) return -1;
+  int s = -1;
+  for (addrinfo* p = servinfo; p != nullptr; p = p->ai_next) {
+    s = ::socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (s == -1) continue;
+    const int yes = 1;
+    if (setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)) == -1 ||
+        fcntl(s, F_SETFL, fcntl(s, F_GETFL, 0) | O_NONBLOCK) == -1) {
+      ::close(s);
+      s = -1;
+      break;
+    }
+    if (::connect(s, p->ai_addr, p->ai_addrlen) == 0 || errno == EINPROGRESS) break;
+    ::close(s);
+    s = -1;
   }
-  if (prefix == '$') {
-    if (!read_line_crlf(fd, line)) return false;
-    std::int64_t n = -1;
-    if (!parse_i64(line, n)) return false;
-    if (n == -1) return true;
-    if (n < 0) return false;
-    payload.resize(static_cast<std::size_t>(n));
-    if (!read_exact(fd, payload.data(), static_cast<std::size_t>(n))) return false;
-    char crlf[2];
-    if (!read_exact(fd, crlf, 2)) return false;
-    return crlf[0] == '\r' && crlf[1] == '\n';
+  freeaddrinfo(servinfo);
+  if (s == -1) return -1;
+  ae_wait(s, POLLOUT, timeout);
+  const int yes = 1;
+  (void)setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+  return s;
+}
+
+// Redis's migrateCachedSocket: MIGRATE keeps its connection to each "host:port" (as the client
+// wrote them) and the database it last selected there, and closes it 10 seconds after its last
+// use (migrate_cron()); at most 64 are kept.
+struct MigrateCachedSocket {
+  int fd = -1;
+  std::int64_t last_dbid = -1;  // -1: send SELECT first
+  std::int64_t last_use_time = 0;  // unix seconds
+  bool authenticated = false;  // an AUTH sent on it succeeded
+};
+std::unordered_map<std::string, MigrateCachedSocket> g_migrate_cached_sockets;
+constexpr std::size_t kMigrateSocketCacheItems = 64;  // Redis's MIGRATE_SOCKET_CACHE_ITEMS
+constexpr std::int64_t kMigrateSocketCacheTtl = 10;   // Redis's MIGRATE_SOCKET_CACHE_TTL
+
+// Redis's migrateGetSocket(): the kept connection to `name`, or a new one (dropping a random kept
+// one when 64 are kept); nullptr when the connect fails.
+MigrateCachedSocket* migrate_get_socket(const std::string& name, const std::string& host,
+                                        const std::string& port, std::int64_t timeout) {
+  const std::int64_t now_s = now_ms() / 1000;
+  if (auto it = g_migrate_cached_sockets.find(name); it != g_migrate_cached_sockets.end()) {
+    it->second.last_use_time = now_s;
+    return &it->second;
   }
-  return false;
+  if (g_migrate_cached_sockets.size() == kMigrateSocketCacheItems) {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    auto victim = std::next(g_migrate_cached_sockets.begin(),
+                            static_cast<std::ptrdiff_t>(rng() % g_migrate_cached_sockets.size()));
+    ::close(victim->second.fd);
+    g_migrate_cached_sockets.erase(victim);
+  }
+  const int fd = migrate_connect(host, std::atoi(port.c_str()), timeout);
+  if (fd == -1) return nullptr;
+  MigrateCachedSocket& cs = g_migrate_cached_sockets[name];
+  cs.fd = fd;
+  cs.last_dbid = -1;
+  cs.last_use_time = now_s;
+  cs.authenticated = false;
+  return &cs;
+}
+
+// Redis's migrateCloseSocket(): forget the kept connection, so the next MIGRATE connects again.
+void migrate_close_socket(const std::string& name) {
+  auto it = g_migrate_cached_sockets.find(name);
+  if (it == g_migrate_cached_sockets.end()) return;
+  ::close(it->second.fd);
+  g_migrate_cached_sockets.erase(it);
 }
 
 std::string sha1_hex(const std::string& script) {
@@ -5287,6 +5407,223 @@ std::string eval_script(const std::string& source, const std::vector<std::string
   return out;
 }
 
+// Redis's addReplyErrorFormat("Target instance replied with error: %s") for the error line a
+// target sent (without its '-').
+std::string migrate_target_error(const std::string& line) {
+  std::string text = "Target instance replied with error: " + line.substr(1);
+  while (!text.empty() && (text.back() == '\r' || text.back() == '\n')) text.pop_back();
+  std::replace(text.begin(), text.end(), '\r', ' ');
+  return encode_error(text);
+}
+
+// Redis's migrateCommand():
+//   MIGRATE host port key|"" db timeout [COPY] [REPLACE] [AUTH password | AUTH2 username password]
+//           [KEYS key ...]
+// sends the keys it finds to the target on a kept connection (migrate_get_socket()), as RESTORE
+// (RESTORE-ASKING in cluster mode) after AUTH and a SELECT when the connection is in another
+// database, and deletes here the keys the target took, unless COPY. The deletions go to the AOF and
+// the replicas as one DEL of those keys, also when the target refused others (the reply is then the
+// target's first error), so a replica never runs MIGRATE itself. A broken kept connection is opened
+// again once, unless the time ran out. Three differences from Redis: the RESTOREs go out only after
+// AUTH and SELECT succeeded (Redis sends everything in one write, so a target that refused the
+// SELECT restored the keys into the connection's database), a MIGRATE without AUTH never uses a
+// connection that AUTH logged in, and a stream is refused, because PeaDB cannot write one in Redis's
+// DUMP format yet (compat/delta.md item 51).
+// The handler sends its own events, change counts and DEL; the dispatch must not do it again.
+std::string migrate_command(const std::vector<std::string>& args, SessionState& session) {
+  const std::int64_t start_ms = DataStore::now_ms();
+  bool copy = false;
+  bool replace = false;
+  const std::string* username = nullptr;
+  const std::string* password = nullptr;
+  std::size_t first_key = 3;  // the argument index of the first key
+  std::size_t num_keys = 1;
+  for (std::size_t j = 6; j < args.size(); ++j) {
+    const std::size_t moreargs = args.size() - 1 - j;
+    const std::string opt = upper(args[j]);
+    if (opt == "COPY") {
+      copy = true;
+    } else if (opt == "REPLACE") {
+      replace = true;
+    } else if (opt == "AUTH") {
+      if (moreargs == 0) return encode_error("syntax error");
+      password = &args[++j];
+    } else if (opt == "AUTH2") {
+      if (moreargs < 2) return encode_error("syntax error");
+      username = &args[++j];
+      password = &args[++j];
+    } else if (opt == "KEYS") {
+      if (!args[3].empty()) {
+        return encode_error(
+            "When using MIGRATE KEYS option, the key argument must be set to the empty string");
+      }
+      first_key = j + 1;
+      num_keys = args.size() - j - 1;
+      break;  // every argument after KEYS is a key
+    } else {
+      return encode_error("syntax error");
+    }
+  }
+  std::int64_t timeout = 0;
+  std::int64_t dbid = 0;
+  if (!parse_strict_int(args[5], timeout) || !parse_strict_int(args[4], dbid))
+    return encode_error("value is not an integer or out of range");
+  if (timeout <= 0) timeout = 1000;
+
+  // lookupKeyRead(): an expired key is deleted (with its DEL) and counts as missing, a key found
+  // counts as an access (unless CLIENT NO-TOUCH). No key found is not an error: it often expired
+  // meanwhile.
+  std::vector<const std::string*> keys;
+  bool has_stream = false;
+  for (std::size_t j = 0; j < num_keys; ++j) {
+    const std::string& key = args[first_key + j];
+    const std::string type = store().type_of(key);
+    if (type == "none") continue;
+    if (type == "stream") has_stream = true;
+    if (!session.no_touch) store().touch_key_for_eviction(key);
+    keys.push_back(&key);
+  }
+  if (keys.empty()) return encode_simple("NOKEY");
+  if (has_stream) {
+    return encode_error(
+        "MIGRATE of a stream is not supported by PeaDB yet (it cannot DUMP a stream in Redis's "
+        "format)");
+  }
+
+  // As in Redis, which reads every expire time against the command's start, a key found above is
+  // sent with what was left of its TTL then and deleted here once the target took it, even if the
+  // time passes while the data goes out.
+  const DataStore::LazyExpireDisabled no_lazy_expire(store());
+  std::string restores;
+  for (const std::string* key : keys) {
+    std::int64_t ttl = 0;
+    if (const std::int64_t expireat = store().pexpiretime(*key); expireat >= 0) {
+      ttl = expireat - start_ms;
+      if (ttl < 1) ttl = 1;
+    }
+    std::vector<std::string> restore = {g_cluster_enabled ? "RESTORE-ASKING" : "RESTORE", *key,
+                                        std::to_string(ttl), rdb_dump_key(*key)};
+    if (replace) restore.push_back("REPLACE");
+    restores += encode_command_resp(restore);
+  }
+
+  const std::string name = args[1] + ":" + args[2];
+  std::vector<std::string> deleted = {"DEL"};  // propagated for the keys the target took
+  std::string reply;
+  bool may_retry = true;
+  while (true) {  // Redis's try_again
+    MigrateCachedSocket* cs = migrate_get_socket(name, args[1], args[2], timeout);
+    // A connection that an earlier MIGRATE logged in with AUTH is not used by one without AUTH, so a
+    // client that does not know the target's password cannot write there with another client's
+    // login; it connects again. Redis 7.2.5 reuses the connection.
+    if (cs != nullptr && password == nullptr && cs->authenticated) {
+      migrate_close_socket(name);
+      cs = migrate_get_socket(name, args[1], args[2], timeout);
+    }
+    if (cs == nullptr) return "-IOERR error or timeout connecting to the client\r\n";
+    const int fd = cs->fd;
+    bool write_error = false;
+    int err = 0;
+    // Redis's 64 KB writes, each within the timeout.
+    const auto send_all = [&](const std::string& data) {
+      for (std::size_t pos = 0; pos < data.size();) {
+        const std::size_t towrite = std::min<std::size_t>(data.size() - pos, 64 * 1024);
+        if (sync_write(fd, data.data() + pos, towrite, timeout) != static_cast<ssize_t>(towrite)) {
+          err = errno;
+          write_error = true;
+          return false;
+        }
+        pos += towrite;
+      }
+      return true;
+    };
+
+    std::string prefix;
+    if (password != nullptr) {
+      prefix += username != nullptr ? encode_command_resp({"AUTH", *username, *password})
+                                    : encode_command_resp({"AUTH", *password});
+    }
+    const bool select = cs->last_dbid != dbid;
+    if (select) prefix += encode_command_resp({"SELECT", std::to_string(dbid)});
+    std::string auth_reply;
+    std::string select_reply;
+    errno = 0;
+    bool socket_failed = false;  // Redis's goto socket_err
+    if (!prefix.empty() && !send_all(prefix)) socket_failed = true;
+    if (!socket_failed && password != nullptr) {
+      if (sync_read_line(fd, auth_reply, 1024, timeout) <= 0) {
+        err = errno;
+        socket_failed = true;
+      } else if (auth_reply[0] != '-') {
+        cs->authenticated = true;  // also when the SELECT fails below
+      }
+    }
+    if (!socket_failed && select && sync_read_line(fd, select_reply, 1024, timeout) <= 0) {
+      err = errno;
+      socket_failed = true;
+    }
+    if (!socket_failed) {
+      if ((password != nullptr && auth_reply[0] == '-') || (select && select_reply[0] == '-')) {
+        cs->last_dbid = -1;
+        return migrate_target_error(password != nullptr && auth_reply[0] == '-' ? auth_reply
+                                                                                : select_reply);
+      }
+      if (!send_all(restores)) socket_failed = true;
+    }
+    if (socket_failed) {
+      // Redis's socket_err: forget the connection and try once more unless the time ran out.
+      migrate_close_socket(name);
+      if (err != ETIMEDOUT && may_retry) {
+        may_retry = false;
+        continue;
+      }
+      return std::string("-IOERR error or timeout ") + (write_error ? "writing" : "reading") +
+             " to target instance\r\n";
+    }
+
+    bool error_from_target = false;
+    bool socket_error = false;
+    std::size_t j = 0;
+    std::string restore_reply;
+    for (; j < keys.size(); ++j) {
+      if (sync_read_line(fd, restore_reply, 1024, timeout) <= 0) {
+        err = errno;
+        socket_error = true;
+        break;
+      }
+      if (restore_reply[0] == '-') {
+        if (!error_from_target) {
+          cs->last_dbid = -1;  // the target may have changed database
+          error_from_target = true;
+          reply = migrate_target_error(restore_reply);
+        }
+      } else if (!copy) {
+        // dbDelete(), signalModifiedKey(), the `del` event and one change for each key.
+        store().del(*keys[j]);
+        notify_keyspace_event(NOTIFY_GENERIC, "del", *keys[j], session.db_index);
+        store().increment_mutation_epoch();
+        deleted.push_back(*keys[j]);
+      }
+    }
+    // Retry only when nothing came back, so the target took nothing.
+    if (!error_from_target && socket_error && j == 0 && may_retry && err != ETIMEDOUT) {
+      migrate_close_socket(name);
+      may_retry = false;
+      continue;
+    }
+    if (socket_error) {
+      migrate_close_socket(name);
+      if (!error_from_target) reply = "-IOERR error or timeout reading to target instance\r\n";
+    } else if (!error_from_target) {
+      cs->last_dbid = dbid;
+      reply = encode_simple("OK");
+    }
+    break;
+  }
+  if (deleted.size() > 1) propagate_write(deleted, session, nullptr);
+  return reply;
+}
+
 const std::unordered_map<std::string, CommandSpec>& command_table() {
   static const std::unordered_map<std::string, CommandSpec> table = [] {
     std::unordered_map<std::string, CommandSpec> t;
@@ -6059,6 +6396,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "total_error_replies:" + std::to_string(g_total_error_replies) + "\r\n"
                    "latest_fork_usec:" + std::to_string(g_latest_fork_usec) + "\r\n"
                    "total_forks:" + std::to_string(g_total_forks) + "\r\n"
+                   "migrate_cached_sockets:" + std::to_string(g_migrate_cached_sockets.size()) +
+                       "\r\n"
                    "pubsub_channels:" + std::to_string(g_channel_subscribers.size()) + "\r\n"
                    "pubsub_patterns:" + std::to_string(g_pattern_subscribers.size()) + "\r\n"
                    "keyspace_hits:" + std::to_string(store().stat_keyspace_hits()) + "\r\n"
@@ -6789,6 +7128,33 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             } else if (gk_cmd == "LMOVE" && cmdline.size() >= 3) {
               add(cmdline[1], {"RW", "access", "delete"});
               add(cmdline[2], {"RW", "insert"});
+            } else if (gk_cmd == "MIGRATE" && cmdline.size() >= 4) {
+              // Redis's key specs: the key at index 3, unless a KEYS is found searching back from
+              // the second-last argument; then migrateGetKeys() (the options before KEYS skipped,
+              // and a non-empty key argument makes it an invalid call).
+              bool keyword = false;
+              for (std::size_t i = cmdline.size() - 2; i >= 1 && !keyword; --i)
+                keyword = upper(cmdline[i]) == "KEYS";
+              std::size_t first = 3;
+              std::size_t num = 1;
+              if (keyword && cmdline.size() > 6) {
+                for (std::size_t i = 6; i < cmdline.size(); ++i) {
+                  const auto opt = upper(cmdline[i]);
+                  if (opt == "KEYS") {
+                    if (!cmdline[3].empty()) {
+                      num = 0;
+                    } else {
+                      first = i + 1;
+                      num = cmdline.size() - first;
+                    }
+                    break;
+                  }
+                  if (opt == "AUTH") i += 1;
+                  else if (opt == "AUTH2") i += 2;
+                }
+              }
+              if (num == 0) return encode_error("Invalid arguments specified for command");
+              for (std::size_t i = first; i < first + num; ++i) add(cmdline[i], {"RW", "access", "delete"});
             } else if (gk_cmd == "SET" && cmdline.size() >= 2) {
               add(cmdline[1], {"OW", "update"});
             } else if (gk_cmd == "MSET" && cmdline.size() >= 2) {
@@ -6812,8 +7178,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::vector<std::string> out;
             for (const auto& [k, flags] : kf) {
               if (sub == "GETKEYSANDFLAGS") {
-                std::vector<std::string> fl;
-                for (const auto& f : flags) fl.push_back(encode_bulk(f));
+                std::vector<std::string> fl;  // status replies, as Redis's addReplyFlagsForKeyArgs()
+                for (const auto& f : flags) fl.push_back(encode_simple(f));
                 out.push_back(encode_array({encode_bulk(k), encode_array(fl)}));
               } else {
                 out.push_back(encode_bulk(k));
@@ -7876,113 +8242,19 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           return encode_simple("OK");
         }});
 
+    // RESTORE-ASKING is RESTORE, sent by MIGRATE in cluster mode; Redis flags it CMD_ASKING so an
+    // importing node takes it without an ASKING first (PeaDB has no importing side yet, item 66).
+    {
+      CommandSpec restore_asking = t.at("RESTORE");
+      restore_asking.name = "RESTORE-ASKING";
+      t.emplace("RESTORE-ASKING", std::move(restore_asking));
+    }
+
     t.emplace("MIGRATE", CommandSpec{"MIGRATE", -6, {"write"}, 0, 0, 0,
-        [](const std::vector<std::string>& args, SessionState&, bool&) {
-          const std::string host = args[1];
-          std::int64_t port = 0;
-          std::int64_t db = 0;
-          std::int64_t timeout = 0;
-          if (!parse_i64(args[2], port) || port <= 0 || port > 65535) {
-            return encode_error("invalid port");
-          }
-          const std::string key = args[3];
-          if (!parse_i64(args[4], db) || db < 0) {
-            return encode_error("value is not an integer or out of range");
-          }
-          if (!parse_i64(args[5], timeout) || timeout < 0) {
-            return encode_error("value is not an integer or out of range");
-          }
-          bool copy = false;
-          bool replace = false;
-          bool has_auth = false;
-          std::string auth_user, auth_pass;
-          for (std::size_t i = 6; i < args.size(); ++i) {
-            const auto opt = upper(args[i]);
-            if (opt == "COPY") { copy = true; continue; }
-            if (opt == "REPLACE") { replace = true; continue; }
-            if (opt == "AUTH" && i + 1 < args.size()) {   // AUTH <password>
-              auth_pass = args[i + 1]; has_auth = true; i += 1; continue;
-            }
-            if (opt == "AUTH2" && i + 2 < args.size()) {   // AUTH2 <username> <password>
-              auth_user = args[i + 1]; auth_pass = args[i + 2]; has_auth = true; i += 2; continue;
-            }
-            if (opt == "KEYS") return encode_error("Unsupported MIGRATE option");  // multi-key form (delta 19)
-            return encode_error("syntax error");
-          }
-
-          if (store().type_of(key) == "none") return encode_simple("NOKEY");
-          const std::string payload = rdb_dump_key(key);
-          if (payload.empty()) return encode_simple("NOKEY");
-          std::int64_t pttl = store().pttl(key);
-          if (pttl < 0) pttl = 0;
-
-          const int fd = socket(AF_INET, SOCK_STREAM, 0);
-          if (fd < 0) return std::string("-IOERR error or timeout connecting to the client\r\n");
-          timeval tv{};
-          tv.tv_sec = static_cast<long>(timeout / 1000);
-          tv.tv_usec = static_cast<suseconds_t>((timeout % 1000) * 1000);
-          if (timeout > 0) {
-            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-            setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-          }
-          sockaddr_in sa{};
-          sa.sin_family = AF_INET;
-          sa.sin_port = htons(static_cast<uint16_t>(port));
-          if (inet_pton(AF_INET, host.c_str(), &sa.sin_addr) != 1) {
-            close(fd);
-            return std::string("-IOERR error or timeout connecting to the client\r\n");
-          }
-          if (connect(fd, reinterpret_cast<sockaddr*>(&sa), sizeof(sa)) != 0) {
-            close(fd);
-            return std::string("-IOERR error or timeout connecting to the client\r\n");
-          }
-
-          std::string payload_reply;
-          bool is_err = false;
-          if (has_auth) {
-            std::vector<std::string> auth_args = auth_user.empty()
-                ? std::vector<std::string>{"AUTH", auth_pass}
-                : std::vector<std::string>{"AUTH", auth_user, auth_pass};
-            const auto auth_wire = encode_command_resp(auth_args);
-            if (!write_all(fd, auth_wire.data(), auth_wire.size()) ||
-                !read_resp_reply(fd, payload_reply, is_err) || is_err) {
-              close(fd);
-              return std::string("-IOERR Authentication to the target instance failed.\r\n");
-            }
-          }
-          std::vector<std::string> select_args = {"SELECT", std::to_string(db)};
-          const auto select_wire = encode_command_resp(select_args);
-          if (!write_all(fd, select_wire.data(), select_wire.size()) || !read_resp_reply(fd, payload_reply, is_err) || is_err) {
-            close(fd);
-            return std::string("-IOERR error or timeout writing to target instance\r\n");
-          }
-
-          std::vector<std::string> restore_args = {"RESTORE", key, std::to_string(pttl), payload};
-          if (replace) restore_args.push_back("REPLACE");
-          // Redis sends RESTORE-ASKING only when it runs in cluster mode (migrateCommand); a
-          // target without cluster mode refuses ASKING. PeaDB has no RESTORE-ASKING yet (item 68),
-          // so in cluster mode it sends ASKING before RESTORE.
-          if (g_cluster_enabled) {
-            std::vector<std::string> asking_args = {"ASKING"};
-            const auto asking_wire = encode_command_resp(asking_args);
-            if (!write_all(fd, asking_wire.data(), asking_wire.size()) || !read_resp_reply(fd, payload_reply, is_err) || is_err) {
-              close(fd);
-              return std::string("-IOERR error or timeout writing to target instance\r\n");
-            }
-          }
-          const auto restore_wire = encode_command_resp(restore_args);
-          if (!write_all(fd, restore_wire.data(), restore_wire.size()) || !read_resp_reply(fd, payload_reply, is_err)) {
-            close(fd);
-            return std::string("-IOERR error or timeout writing to target instance\r\n");
-          }
-          close(fd);
-          if (is_err) {
-            return std::string("-IOERR ") + payload_reply + "\r\n";
-          }
-          if (!copy) {
-            store().del(key);
-          }
-          return encode_simple("OK");
+        [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          std::string reply = migrate_command(args, session);
+          g_write_changed_nothing = true;  // it propagated, counted and announced its deletions
+          return reply;
         }});
 
     t.emplace("FLUSHALL", CommandSpec{"FLUSHALL", -1, {"write"}, 0, 0, 0,
@@ -12785,9 +13057,9 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // every policy (like Redis, which maintains the lru clock unconditionally) so that
   // OBJECT IDLETIME is honest even before an eviction policy is configured; the cost is
   // one hash find on the first key. Single-key/first-key approximation.
-  // RESTORE is exempt: it explicitly seeds the LRU/LFU (IDLETIME/FREQ) and, like Redis's
-  // dbAdd path, must not have that immediately overwritten by an access-time touch.
-  if (!is_error_reply(reply) && cmd != "RESTORE" &&
+  // RESTORE (and RESTORE-ASKING) is exempt: it explicitly seeds the LRU/LFU (IDLETIME/FREQ) and,
+  // like Redis's dbAdd path, must not have that immediately overwritten by an access-time touch.
+  if (!is_error_reply(reply) && cmd != "RESTORE" && cmd != "RESTORE-ASKING" &&
       spec.first_key > 0 && static_cast<std::size_t>(spec.first_key) < args.size()) {
     // Redis's LOOKUP_NOTOUCH commands inspect a key without counting as an access, so they
     // must not reset its idle time; CLIENT NO-TOUCH suppresses the update for everything the
@@ -13665,6 +13937,23 @@ void take_replica_wakeup() {
   while (g_replica_wakeup_read_fd >= 0 && ::read(g_replica_wakeup_read_fd, buf, sizeof(buf)) > 0) {
   }
   g_replica_wakeup_pending = false;
+}
+
+// Redis's migrateCloseTimedoutSockets(), run once a second from serverCron(): closes the MIGRATE
+// connections not used for more than 10 seconds.
+void migrate_cron(std::int64_t now) {
+  static std::int64_t last_run_ms = 0;
+  if (now - last_run_ms < 1000) return;
+  last_run_ms = now;
+  const std::int64_t now_s = now / 1000;
+  for (auto it = g_migrate_cached_sockets.begin(); it != g_migrate_cached_sockets.end();) {
+    if (now_s - it->second.last_use_time > kMigrateSocketCacheTtl) {
+      ::close(it->second.fd);
+      it = g_migrate_cached_sockets.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 void replication_cron(std::int64_t now) {
