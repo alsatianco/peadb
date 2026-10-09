@@ -44,11 +44,11 @@
     "unit/dump": {
       "last_counts": {
         "err": 0,
-        "ignored": 10,
-        "ok": 18
+        "ignored": 1,
+        "ok": 27
       },
       "mode": "native",
-      "skipfile_lines": 9
+      "skipfile_lines": 0
     },
     "unit/expire": {
       "last_counts": {

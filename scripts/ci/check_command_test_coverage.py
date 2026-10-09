@@ -47,7 +47,7 @@ Notes / limitations
       are rare, but false-positives (a command name appearing in a comment
       without a real test) are possible.  Treat this as a canary, not as
       proof of thorough coverage.
-    - Only uppercase [A-Z0-9_]+ names registered via t.emplace(...) are
+    - Only uppercase [A-Z0-9_-]+ names registered via t.emplace(...) are
       considered.
 """
 from __future__ import annotations
@@ -61,7 +61,8 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def main() -> int:
     cmd_src = (ROOT / 'src/command.cpp').read_text(encoding='utf-8', errors='ignore')
-    commands = sorted(set(re.findall(r't\.emplace\("([A-Z0-9_]+)"', cmd_src)))
+    # '-' for RESTORE-ASKING, Redis's only command name with one.
+    commands = sorted(set(re.findall(r't\.emplace\("([A-Z0-9_-]+)"', cmd_src)))
 
     texts = []
     for p in ROOT.joinpath('tests').rglob('*'):

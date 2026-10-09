@@ -242,6 +242,8 @@ void take_replica_wakeup();
 // Each event-loop pass, Redis's replicationCron() part: a replica tells its master every second
 // how much of its stream it has applied (REPLCONF ACK).
 void replication_cron(std::int64_t now_ms);
+// Event-loop cron: closes the MIGRATE connections idle for more than 10 seconds (once a second).
+void migrate_cron(std::int64_t now_ms);
 void notify_key_written(const std::string& key, int db_index);
 void register_key_waiter(const std::string& key, int fd);
 void unregister_key_waiter(int fd);

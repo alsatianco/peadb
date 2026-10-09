@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **235** commands — full: 10, upstream: 215, diff: 1, tested: 8, registered: 1
+Total: **236** commands — full: 10, upstream: 215, diff: 1, tested: 8, registered: 2
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -144,6 +144,7 @@ Total: **235** commands — full: 10, upstream: 215, diff: 1, tested: 8, registe
 | `REPLICAOF` | upstream | test_b8_repl_safety.py, test_m9_failover_promotion.py, test_p1_multi_state_abort.py, test_p1_replicaof_readonly.py |
 | `RESET` | upstream | test_p3_ecosystem_commands.py |
 | `RESTORE` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
+| `RESTORE-ASKING` | registered | — |
 | `ROLE` | tested | test_p3_ecosystem_commands.py |
 | `RPOP` | upstream | test_m4_list.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
 | `RPOPLPUSH` | upstream | test_p3_ecosystem_commands.py |
