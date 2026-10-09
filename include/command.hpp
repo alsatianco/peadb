@@ -57,6 +57,11 @@ struct SessionState {
   std::size_t repl_index = 0;
   bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
+  // The replication offset right after this client's last command that propagated something
+  // (Redis's c->woff): what WAIT waits for.
+  std::int64_t woff = 0;
+  // The replica said REPLCONF capa psync2: +CONTINUE then names the replication id.
+  bool repl_capa_psync2 = false;
   // A replica's last REPLCONF ACK (set when it starts streaming, as Redis's repl_ack_time), and
   // what it said with REPLCONF listening-port and ip-address: the shutdown's "Lagging replica"
   // log line names it by them (Redis's replicationGetSlaveName()).
@@ -213,7 +218,30 @@ void databases_cron();           // event-loop shrink of sparse keyspace tables 
 void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
 std::size_t replication_event_count();
-std::string replication_event_at(std::size_t idx);
+// The replication stream from offset `from` (counted from 0) to its end, for a replica. False when
+// the backlog no longer holds `from` (the replica cannot be served and must sync again).
+bool replication_stream_from(std::size_t from, std::string& out);
+// server.cpp has given every replica the whole replication backlog (backlog_append() needs to hand
+// out bytes at once only once more than the backlog size has been written since).
+void replicas_took_backlog();
+// beforeSleep()'s GETACK: WAIT asks the replicas for an ACK once per event-loop pass, after the
+// pass's commands (outside the WAIT, so it is not the client's write). replica_getack_pending()
+// says one waits (the event loop must not sleep then); send_pending_getack() adds it to the stream.
+bool replica_getack_pending();
+void send_pending_getack();
+// Copies into every replica's output buffer what it has not taken from the replication backlog
+// yet and then, when `data` is given, those bytes, which are about to be appended; called before
+// the backlog would overwrite bytes a replica still needs (compat/delta.md item 40). Wired by
+// server.cpp.
+extern std::function<void(const std::string* data)> g_feed_replicas_cb;
+// A pipe the replica's link thread writes a byte to when it has queued commands from its master,
+// so the event loop applies them at once instead of at its next 100 ms tick (server.cpp polls the
+// read end and calls take_replica_wakeup() when it is readable).
+void set_replica_wakeup_fd(int write_fd, int read_fd);
+void take_replica_wakeup();
+// Each event-loop pass, Redis's replicationCron() part: a replica tells its master every second
+// how much of its stream it has applied (REPLCONF ACK).
+void replication_cron(std::int64_t now_ms);
 void notify_key_written(const std::string& key, int db_index);
 void register_key_waiter(const std::string& key, int fd);
 void unregister_key_waiter(int fd);
@@ -262,6 +290,9 @@ void shutdown_signal_handler(int sig);
 // whole replication stream or shutdown-timeout has passed.
 void shutdown_cron();
 bool shutdown_signal_pending();
+// Redis's disconnectAllBlockedClients(): answers every client blocked on keys or in WAIT with
+// `error` (a RESP error line), when REPLICAOF makes this server a replica. Wired by server.cpp.
+extern std::function<void(const std::string& error)> g_unblock_blocked_clients_cb;
 // Calls fn for each replica's session (server.cpp walks its replica connections).
 extern std::function<void(const std::function<void(const SessionState&)>&)> g_for_each_replica_cb;
 // Redis's replyToClientsBlockedOnShutdown(): server.cpp unblocks every client blocked on SHUTDOWN,

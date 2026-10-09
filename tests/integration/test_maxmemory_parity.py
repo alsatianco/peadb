@@ -390,9 +390,10 @@ def check_not_counted(name, binary, work):
         rep = FakeReplica(PORTS[name])  # it reads nothing more, so its output buffer grows
         assert c('CONFIG', 'SET', 'maxmemory-policy', 'allkeys-lru') == '+OK'
         used = int(info(c, 'used_memory', 'memory'))
-        # Room for Redis's 1 MB backlog, which fills now and is counted (PeaDB's is allocated at start).
+        # Room for the 1 MB backlog, which both engines start with the first replica and count as
+        # it fills.
         assert c('CONFIG', 'SET', 'maxmemory', used + 3 * 1024 * 1024) == '+OK'
-        # Values well under the 1 MB backlog (a bigger write never reaches a PeaDB replica: delta 40).
+        # Small values, so the client's own query buffer stays well inside that room.
         value = 'x' * (100 * 1024)
         for i in range(400):
             assert c('SET', 'big', value) == '+OK'

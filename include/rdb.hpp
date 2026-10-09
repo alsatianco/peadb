@@ -39,17 +39,28 @@ void rdb_set_key_save_delay(int usec);
 int rdb_key_save_delay();
 void debug_delay(int usec);
 
-// Save all databases to an in-memory RDB blob (for PSYNC full-sync).
+// The replication state a full sync's RDB carries (Redis's rdbSaveInfo): the database the
+// replication stream has selected, and the replication id and offset the RDB was taken at.
+struct RdbReplicationInfo {
+  int stream_db = 0;
+  std::string replid;
+  std::int64_t offset = 0;
+};
+
+// Save all databases to an in-memory RDB blob (for PSYNC full-sync), with the repl-stream-db,
+// repl-id and repl-offset aux fields when `repl` is given.
 // Sets err on failure (e.g. unsupported key types); returns empty string.
-std::string rdb_save_to_string(std::string& err);
+std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl = nullptr);
 
 // Load a Redis-compatible RDB file into the datastore (startup, DEBUG RELOAD, a replica's full
 // sync). The header and the trailing CRC64 are checked first (the CRC64 unless rdbchecksum is no
 // or DEBUG SET-SKIP-CHECKSUM-VALIDATION is on); a file that fails them leaves the dataset as it
 // is (DEBUG RELOAD flushes it before the call, as Redis does). `before_replace` runs once those
 // checks pass, right before rdb_load() flushes the keyspace. A file cut short fails after that.
+// `repl_stream_db`, when given, receives the file's repl-stream-db aux field (-1 without one).
 bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace = nullptr);
+              const std::function<void()>& before_replace = nullptr,
+              int* repl_stream_db = nullptr);
 
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);

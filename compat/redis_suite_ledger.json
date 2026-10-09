@@ -4,11 +4,11 @@
     "integration/shutdown": {
       "last_counts": {
         "err": 0,
-        "ignored": 3,
-        "ok": 2
+        "ignored": 0,
+        "ok": 5
       },
       "mode": "native",
-      "skipfile_lines": 3
+      "skipfile_lines": 0
     },
     "unit/auth": {
       "last_counts": {
@@ -160,11 +160,11 @@
     "unit/pause": {
       "last_counts": {
         "err": 0,
-        "ignored": 4,
-        "ok": 15
+        "ignored": 3,
+        "ok": 17
       },
       "mode": "native",
-      "skipfile_lines": 3
+      "skipfile_lines": 1
     },
     "unit/printver": {
       "last_counts": {

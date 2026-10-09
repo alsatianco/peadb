@@ -1,5 +1,2 @@
 # PeaDB refuses the call, but its script errors lack Redis's " script: <sha>, on @user_script:<line>." suffix (compat/delta.md item 14).
 Test may-replicate commands are rejected in RO scripts
-# INFO has no slave_repl_offset or slave_read_repl_offset (compat/delta.md item 22), and a replica counts received bytes, not applied ones (item 44); tests/integration/test_client_pause_parity.py checks that a paused replica holds its master's writes.
-Test when replica paused, offset would not grow
-Test replica offset would grow after unpause

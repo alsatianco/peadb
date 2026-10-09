@@ -169,13 +169,82 @@ int g_shutdown_flags = 0;
 std::string g_aof_rewrite_buf;  // Parent buffers commands written during child rewrite
 bool g_aof_rewrite_buf_capped = false; // Set once when the 256 MiB cap is hit per rewrite
 std::string g_aof_last_bgrewrite_status = "ok"; // Reported by INFO PERSISTENCE
+// The replica has no synced link to its master (INFO master_link_status:down); the link thread
+// writes it.
+std::atomic<bool> g_replica_stale{false};
+// One command of the master's stream with its bytes as the master sent them: the replica applies
+// `args`, then adds `raw` to its own stream (its backlog and its replicas), as Redis's
+// commandProcessed() → replicationFeedStreamFromMasterStream() does, so its offset is the one of
+// the master's stream it has applied.
+struct MasterStreamCommand {
+  std::vector<std::string> args;
+  std::string raw;
+};
 // Queue for replication commands produced by the streaming thread and consumed
 // by the event loop. All DataStore mutations stay on the event loop thread.
 std::mutex g_replica_cmd_queue_mu;
-std::vector<std::vector<std::string>> g_replica_cmd_queue;
+std::vector<MasterStreamCommand> g_replica_cmd_queue;
 // Commands from the master taken off g_replica_cmd_queue but not applied yet, because
 // CLIENT PAUSE holds them; in arrival order. Event-loop thread only.
-std::deque<std::vector<std::string>> g_replica_cmd_held;
+std::deque<MasterStreamCommand> g_replica_cmd_held;
+// The session that applies the master's stream (Redis's master client); like Redis's it is new for
+// each full sync, so a MULTI whose EXEC never came before the old link broke is dropped (the master
+// ran the transaction whole, and the new dataset holds it). Its database is the one the stream has
+// selected, which a full sync to a replica of this replica passes on. Event-loop thread only.
+SessionState g_master_stream_session;
+// The bytes of a transaction from the master that has not reached its EXEC yet: Redis's replica
+// adds them to its stream, and counts them as applied, only once the EXEC has run.
+std::string g_master_stream_multi;
+// The replica's connection to its master, for the REPLCONF ACKs the event loop sends (Redis's
+// replicationSendAck()); -1 while there is no synced link. The streaming thread owns the socket:
+// it publishes it after the full sync and takes it back under this mutex before it closes it.
+std::mutex g_replica_link_mu;
+int g_replica_link_fd = -1;
+std::string g_replica_ack_out;  // the unsent rest of an ACK, under g_replica_link_mu
+std::int64_t g_last_replica_ack_ms = 0;
+// What the replica has read from its master's stream (Redis's master->read_reploff), and when it
+// last read anything (master->lastinteraction); written by the streaming thread.
+std::atomic<std::int64_t> g_replica_read_offset{0};
+std::atomic<std::int64_t> g_replica_last_io_ms{0};
+// Where the replica's link is (Redis's repl_state, as ROLE names it); written by the link thread.
+enum class ReplLinkState { Connect, Connecting, Handshake, Transfer, Connected };
+std::atomic<ReplLinkState> g_repl_link_state{ReplLinkState::Connect};
+// When the link to the master went down (Redis's repl_down_since; 0 = not since it was last up).
+std::atomic<std::int64_t> g_repl_down_since_ms{0};
+// The full sync's transfer, for INFO (Redis's REPL_STATE_TRANSFER and repl_transfer_*).
+std::atomic<bool> g_repl_transfer_in_progress{false};
+std::atomic<std::int64_t> g_repl_transfer_size{0};
+std::atomic<std::int64_t> g_repl_transfer_read{0};
+std::atomic<std::int64_t> g_repl_transfer_lastio_ms{0};
+// The wake-up pipe (set_replica_wakeup_fd()); a byte is written only when none is pending.
+std::atomic<int> g_replica_wakeup_write_fd{-1};
+int g_replica_wakeup_read_fd = -1;
+std::atomic<bool> g_replica_wakeup_pending{false};
+void wake_event_loop_for_replica() {
+  const int fd = g_replica_wakeup_write_fd.load();
+  if (fd < 0 || g_replica_wakeup_pending.exchange(true)) return;
+  const char byte = 1;
+  [[maybe_unused]] const ssize_t n = ::write(fd, &byte, 1);
+}
+// Sends what is left of the last ACK, then `ack` when given. The socket is the streaming thread's,
+// so a full send buffer drops the new ACK instead of blocking the event loop (the next one, at most
+// a second later, carries a larger offset).
+void send_to_master(const std::string* ack) {
+  std::lock_guard<std::mutex> lk(g_replica_link_mu);
+  if (g_replica_link_fd < 0) return;
+  auto flush = [] {
+    while (!g_replica_ack_out.empty()) {
+      const ssize_t n = ::send(g_replica_link_fd, g_replica_ack_out.data(),
+                               g_replica_ack_out.size(), MSG_DONTWAIT);
+      if (n <= 0) return false;
+      g_replica_ack_out.erase(0, static_cast<std::size_t>(n));
+    }
+    return true;
+  };
+  if (!flush() || ack == nullptr) return;
+  g_replica_ack_out = *ack;
+  flush();
+}
 // Drops every command from the master not applied yet: called when a full resync replaces the
 // dataset (which already holds their effects) and when REPLICAOF changes the master. The caller
 // bumps g_repl_generation first; the streaming thread checks it under the same mutex before it
@@ -185,12 +254,40 @@ void drop_queued_replica_commands() {
   g_replica_cmd_queue.clear();
   g_replica_cmd_held.clear();
 }
+// REPLICAOF, after it has bumped g_repl_generation: no ACK goes out on the old master's link any
+// more (its thread closes it), and the link is down. Under the mutex the old thread publishes its
+// link with, so it cannot mark the link up again for the new master.
+void release_master_link(bool link_down) {
+  std::lock_guard<std::mutex> lk(g_replica_link_mu);
+  g_replica_link_fd = -1;
+  g_replica_ack_out.clear();
+  if (link_down) g_replica_stale = true;
+}
+// Redis's disconnectSlaves(): this server's replicas must sync again (CLIENT KILL's server.cpp
+// path closes them).
+void disconnect_replicas() {
+  if (!g_client_kill_cb) return;
+  ClientKillFilter filter;
+  filter.type = ClientType::Slave;
+  bool kill_self = false;
+  g_client_kill_cb(filter, kill_self);
+}
 // Pending RDB load handed off from streaming thread to event loop. The streaming
 // thread sets g_replica_load_path + g_replica_load_pending=true and waits; the event
 // loop runs rdb_load() synchronously and signals completion via g_replica_load_pending=false.
-std::string g_replica_load_path; // protected by g_replica_cmd_queue_mu
+// The hand-off names the REPLICAOF generation it belongs to: a load from a link that a newer
+// REPLICAOF (or NO ONE) replaced is dropped, so it can neither replace the dataset nor touch the
+// new link's state. Everything here is protected by g_replica_cmd_queue_mu.
+std::string g_replica_load_path;
+std::uint64_t g_replica_load_gen = 0;
+std::uint64_t g_replica_load_seq = 0;       // counts hand-offs
+std::uint64_t g_replica_load_done_seq = 0;  // the last hand-off the event loop finished
+bool g_replica_load_ok = false;             // its result
+// The master's replication id and offset from its +FULLRESYNC, which the replica adopts once the
+// RDB has loaded.
+std::string g_replica_load_replid;
+std::int64_t g_replica_load_offset = 0;
 std::atomic<bool> g_replica_load_pending{false};
-std::atomic<bool> g_replica_load_ok{false};
 bool g_active_expire = true;
 bool g_pause_cron = false;  // DEBUG PAUSE-CRON: freezes active expiry + save-point cron
 int g_last_aof_db = -1;     // db of the last AOF append; -1 forces a SELECT on next append
@@ -334,11 +431,22 @@ struct ReplBacklog {
         return true;
     }
 
+    // An empty backlog whose next byte is stream offset `offset` + 1 (Redis's
+    // createReplicationBacklog(): repl_backlog->offset = master_repl_offset + 1).
+    void reset_at(std::int64_t offset) {
+        total = offset;
+        start_ = offset;
+        filled_ = 0;
+    }
+
     std::int64_t base() const {
         const std::int64_t wrapped = total > static_cast<std::int64_t>(size_)
                ? total - static_cast<std::int64_t>(size_) : 0;
         return std::max(wrapped, start_);
     }
+
+    // The bytes held (Redis's repl_backlog->histlen).
+    std::int64_t histlen() const { return total - base(); }
 
     // Copies at most two runs (the end of the ring, then its start); of a write bigger than the
     // ring only the last size_ bytes stay, as a byte-by-byte copy would leave them.
@@ -379,8 +487,18 @@ struct ReplBacklog {
     }
 };
 ReplBacklog g_repl_backlog;
-// Redis creates its backlog when the first replica connects; PeaDB fills its own from the start.
+// Redis creates its backlog when the first replica connects, or on a replica after its full sync;
+// PeaDB fills its own from the start, and starts it over then (start_backlog()).
 bool g_backlog_has_replica = false;
+// A replica takes its bytes from the ring once per event-loop pass (server.cpp, repl_index); every
+// replica has taken the ring up to at least this offset. Before a write would overwrite bytes some
+// replica has not taken, backlog_append() hands them out at once (g_feed_replicas_cb).
+std::int64_t g_replicas_taken_to = 0;
+
+// The backlog bytes used_memory() counts: what writes have filled, once a replica has attached.
+std::size_t backlog_memory() {
+  return g_backlog_has_replica ? g_repl_backlog.size_ - g_repl_backlog.unused_bytes() : 0;
+}
 
 // INFO's used_memory and what maxmemory starts from: the bytes the process holds on the heap
 // (zmalloc_used_memory()) less the part of the replication backlog that Redis would not hold: the
@@ -392,10 +510,30 @@ std::size_t used_memory() {
       g_backlog_has_replica ? g_repl_backlog.unused_bytes() : g_repl_backlog.size_;
   return total > left_out ? total - left_out : 0;
 }
-// Append a RESP-encoded command to the replication backlog and advance the master offset
+// Append to the replication stream: the backlog, and through it every replica, and advance the
+// master offset. Redis keeps every byte a replica still needs, however far it is behind (until its
+// output-buffer limit drops it); PeaDB's ring would overwrite them when more than its size is
+// written in one event-loop pass (one big value, a pipeline, a script), so then every replica gets
+// what it has not taken yet, and this write, in its output buffer first (compat/delta.md item 40).
 inline void backlog_append(const std::string& data) {
-    g_repl_backlog.append(data);
+    if (g_backlog_has_replica && g_feed_replicas_cb &&
+        g_repl_backlog.total + static_cast<std::int64_t>(data.size()) >
+            g_replicas_taken_to + static_cast<std::int64_t>(g_repl_backlog.size_)) {
+        g_feed_replicas_cb(&data);
+        g_repl_backlog.append(data);
+        g_replicas_taken_to = g_repl_backlog.total;
+    } else {
+        g_repl_backlog.append(data);
+    }
     g_master_repl_offset = g_repl_backlog.total;
+}
+
+// Redis's createReplicationBacklog(), for a master's first replica or for a replica after its full
+// sync: the backlog starts empty at the current offset.
+void start_backlog() {
+  g_repl_backlog.reset_at(g_master_repl_offset);
+  g_replicas_taken_to = g_master_repl_offset;
+  g_backlog_has_replica = true;
 }
 // Where a write goes (Redis's PROPAGATE_AOF and PROPAGATE_REPL).
 constexpr int kPropagateAof = 1;
@@ -419,7 +557,6 @@ int g_execution_nesting = 0;
 bool g_write_changed_nothing = false;
 bool g_executing_exec = false;
 int g_last_repl_db = 0;
-bool g_replica_stale = false;
 // Bumped on every REPLICAOF (including NO ONE). The reconnect supervisor and the
 // streaming loop compare against their captured generation and stop when it changes,
 // so a new REPLICAOF promptly supersedes an in-flight sync/stream.
@@ -647,6 +784,29 @@ inline std::string gen_hex_chars(std::size_t n) {
 // replica can't be wrongly served a +CONTINUE partial resync against a different stream.
 inline std::string gen_run_id() { return gen_hex_chars(40); }
 
+// syncCommand()'s refusal while this replica has no synced link to its own master, whose dataset
+// and stream it would pass on.
+std::string sync_refusal() {
+  if (g_replication_role == "slave" && g_replica_stale)
+    return "-NOMASTERLINK Can't SYNC while not connected with my master\r\n";
+  return std::string();
+}
+
+// syncCommand(): the client becomes a replica. A master's first replica creates the backlog, and
+// with no past history behind it the replication id changes and replid2 is cleared.
+void attach_replica(SessionState& session) {
+  session.replica_stream = true;
+  session.repl_ack_time_ms = now_ms();  // replicaPutOnline(): no false lag
+  g_last_repl_db = -1;                  // the stream starts with a SELECT
+  if (g_backlog_has_replica) return;
+  g_master_replid = gen_run_id();
+  g_master_replid2 = std::string(40, '0');
+  g_second_replid_offset = -1;
+  start_backlog();
+  log(LogLevel::Info, "Replication backlog created, my new replication IDs are '" +
+                          g_master_replid + "' and '" + g_master_replid2 + "'");
+}
+
 // Defined later (needs the AOF/backlog/notify propagation helpers): Redis's performEvictions()
 // (evict.c). Ok when memory is within maxmemory (or eviction is not safe now), Running when it
 // stopped at its time limit and the eviction timer goes on from the event loop, Fail when memory
@@ -656,6 +816,14 @@ EvictResult perform_evictions();
 void clear_buffer(std::string& buf);  // defined with the maxmemory code
 
 std::string encode_command_resp(const std::vector<std::string>& args);  // defined below
+
+// Redis's replicationSendAck(): REPLCONF ACK with the offset of the master's stream this replica
+// has applied (its master_repl_offset: everything applied is in its own stream).
+void send_replica_ack() {
+  const std::string ack =
+      encode_command_resp({"REPLCONF", "ACK", std::to_string(g_master_repl_offset)});
+  send_to_master(&ack);
+}
 
 // ── CLIENT PAUSE (Redis's pauseActions()/updatePausedActions(), networking.c) ──
 // What a pause stops. WRITE and ALL also stop key expiry, eviction and replica traffic, so the
@@ -709,6 +877,9 @@ std::uint32_t paused_actions_with_update(std::uint32_t mask) {
   update_paused_actions();
   return g_paused_actions & mask;
 }
+
+// beforeSleep(): the GETACK that WAIT asked for goes out once replica traffic may flow.
+bool getack_waiting() { return g_getack_pending && !paused_actions_with_update(kPauseReplica); }
 
 // pauseActions(): the actions given replace the purpose's current ones, and the later end time
 // of the two is kept.
@@ -1211,6 +1382,8 @@ std::function<int(const ClientKillFilter&, bool&)> g_client_kill_cb;
 std::function<void()> g_close_sockets_in_child_cb;
 std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
 std::function<void(const std::function<void(const SessionState&)>&)> g_for_each_replica_cb;
+std::function<void(const std::string*)> g_feed_replicas_cb;
+std::function<void(const std::string&)> g_unblock_blocked_clients_cb;
 std::function<void(const std::function<std::string(const SessionState&)>&)>
     g_reply_blocked_on_shutdown_cb;
 std::atomic<std::uint64_t> g_next_client_id{1};
@@ -2120,6 +2293,24 @@ class ExecutionUnit {
  private:
   const std::vector<std::string>* args_;
   bool may_wrap_;
+};
+
+// Redis's call(): c->woff is the replication offset right after the client's last command that
+// propagated something, which WAIT waits for. Declared before the command's ExecutionUnit, so it
+// reads the offset once the unit has propagated.
+class WriteOffsetTracker {
+ public:
+  explicit WriteOffsetTracker(SessionState& session)
+      : session_(session), before_(g_master_repl_offset) {}
+  ~WriteOffsetTracker() {
+    if (g_master_repl_offset != before_) session_.woff = g_master_repl_offset;
+  }
+  WriteOffsetTracker(const WriteOffsetTracker&) = delete;
+  WriteOffsetTracker& operator=(const WriteOffsetTracker&) = delete;
+
+ private:
+  SessionState& session_;
+  std::int64_t before_;
 };
 
 // A write a command made (Redis's call() → alsoPropagate()), as replicas and the AOF must run it
@@ -4568,6 +4759,12 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             // whole buffer at once (Redis grows it as data arrives), so a size that cannot be
             // allocated is refused instead.
             const long long size = std::max<long long>(std::stoll(v), 16 * 1024);
+            // A smaller ring keeps only its newest bytes: the replicas get what they have not
+            // taken yet first (compat/delta.md item 40).
+            if (g_backlog_has_replica && g_feed_replicas_cb) {
+              g_feed_replicas_cb(nullptr);
+              g_replicas_taken_to = g_repl_backlog.total;
+            }
             if (!g_repl_backlog.resize(static_cast<std::size_t>(size))) {
               err = "Unable to allocate a replication backlog of this size";
               return false;
@@ -4648,6 +4845,94 @@ std::string config_value(const RedisConfigSpec& spec) {
     return it->second;
   }
   return spec.default_value != nullptr ? spec.default_value : "";
+}
+
+// A replica's address as Redis's INFO slaveN line shows it: what it said with REPLCONF
+// ip-address, or the address it connected from.
+std::string replica_ip(const SessionState& replica) {
+  if (!replica.repl_ip_address.empty()) return replica.repl_ip_address;
+  const auto colon = replica.addr.rfind(':');
+  return colon == std::string::npos ? replica.addr : replica.addr.substr(0, colon);
+}
+
+// INFO's Replication section, field for field as Redis's genRedisInfoString() writes it.
+std::string info_replication_section() {
+  const std::int64_t now = now_ms();
+  const std::int64_t now_s = now / 1000;
+  const auto setting = [](const char* name) { return config_value(*find_redis_config(name)); };
+  const bool replica = g_replication_role == "slave";
+  std::string out = std::string("# Replication\r\nrole:") + (replica ? "slave" : "master") + "\r\n";
+  if (replica) {
+    const bool link_up = !g_replica_stale;
+    // The master's stream as read and as applied; with no link, the offset applied so far.
+    const std::int64_t applied = g_master_repl_offset;
+    const std::int64_t read = link_up ? g_replica_read_offset.load() : applied;
+    const bool transfer = g_repl_transfer_in_progress.load();
+    out += "master_host:" + g_replication_master_host + "\r\n"
+           "master_port:" + std::to_string(g_replication_master_port) + "\r\n"
+           "master_link_status:" + std::string(link_up ? "up" : "down") + "\r\n"
+           "master_last_io_seconds_ago:" +
+           std::to_string(link_up ? now_s - g_replica_last_io_ms.load() / 1000 : -1) + "\r\n"
+           "master_sync_in_progress:" + std::string(transfer ? "1" : "0") + "\r\n"
+           "slave_read_repl_offset:" + std::to_string(read) + "\r\n"
+           "slave_repl_offset:" + std::to_string(applied) + "\r\n";
+    if (transfer) {
+      const std::int64_t size = g_repl_transfer_size.load();
+      const std::int64_t done = g_repl_transfer_read.load();
+      char perc[32];
+      std::snprintf(perc, sizeof(perc), "%.2f",
+                    size > 0 ? static_cast<double>(done) / static_cast<double>(size) * 100 : 0.0);
+      out += "master_sync_total_bytes:" + std::to_string(size) + "\r\n"
+             "master_sync_read_bytes:" + std::to_string(done) + "\r\n"
+             "master_sync_left_bytes:" + std::to_string(size - done) + "\r\n"
+             "master_sync_perc:" + std::string(perc) + "\r\n"
+             "master_sync_last_io_seconds_ago:" +
+             std::to_string(now_s - g_repl_transfer_lastio_ms.load() / 1000) + "\r\n";
+    }
+    if (!link_up) {
+      const std::int64_t since = g_repl_down_since_ms.load();
+      out += "master_link_down_since_seconds:" +
+             std::to_string(since != 0 ? now_s - since / 1000 : -1) + "\r\n";
+    }
+    out += "slave_priority:" + setting("replica-priority") + "\r\n"
+           "slave_read_only:" + std::string(setting("replica-read-only") == "yes" ? "1" : "0") +
+           "\r\n"
+           "replica_announced:" + std::string(setting("replica-announced") == "yes" ? "1" : "0") +
+           "\r\n";
+  }
+  // Every replica is online once PSYNC has answered (the RDB goes out in the reply).
+  std::int64_t max_lag = 0;
+  parse_i64(setting("min-replicas-max-lag"), max_lag);
+  int count = 0;
+  int good = 0;
+  std::string lines;
+  if (g_for_each_replica_cb) {
+    g_for_each_replica_cb([&](const SessionState& r) {
+      const std::int64_t lag = now_s - r.repl_ack_time_ms / 1000;
+      if (lag <= max_lag) ++good;
+      lines += "slave" + std::to_string(count++) + ":ip=" + replica_ip(r) +
+               ",port=" + std::to_string(r.repl_listening_port) +
+               ",state=online,offset=" + std::to_string(r.repl_ack_offset) +
+               ",lag=" + std::to_string(lag) + "\r\n";
+    });
+  }
+  out += "connected_slaves:" + std::to_string(count) + "\r\n";
+  if (g_config_min_replicas_to_write != 0 && max_lag != 0)
+    out += "min_slaves_good_slaves:" + std::to_string(good) + "\r\n";
+  out += lines;
+  const bool backlog = g_backlog_has_replica;
+  out += "master_failover_state:no-failover\r\n"
+         "master_replid:" + g_master_replid + "\r\n"
+         "master_replid2:" + g_master_replid2 + "\r\n"
+         "master_repl_offset:" + std::to_string(g_master_repl_offset) + "\r\n"
+         "second_repl_offset:" + std::to_string(g_second_replid_offset) + "\r\n"
+         "repl_backlog_active:" + std::string(backlog ? "1" : "0") + "\r\n"
+         "repl_backlog_size:" + std::to_string(g_repl_backlog.size_) + "\r\n"
+         "repl_backlog_first_byte_offset:" +
+         std::to_string(backlog ? g_repl_backlog.base() + 1 : 0) + "\r\n"
+         "repl_backlog_histlen:" + std::to_string(backlog ? g_repl_backlog.histlen() : 0) +
+         "\r\n";
+  return out;
 }
 
 // allowProtectedAction(): what enable-protected-configs (and Redis's other "yes / local / no"
@@ -5091,11 +5376,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
-          session.replica_stream = true;
-          session.repl_ack_time_ms = now_ms();
-          g_backlog_has_replica = true;
+          if (session.replica_stream) return std::string();  // syncCommand(): already a replica
+          if (const std::string refused = sync_refusal(); !refused.empty()) return refused;
+          attach_replica(session);
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
-          g_last_repl_db = -1; // Force re-emit SELECT on next write
           // Plain SYNC sends an empty RDB and relies on the command stream. PeaDB's own
           // replica uses PSYNC (which serializes the full dataset, streams included).
           // Full-state plain SYNC for external clients remains a deferred item — serializing
@@ -5125,7 +5409,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     std::to_string(args[i + 1].size()) + " bytes");
               session.repl_ip_address = args[i + 1];
             } else if (opt == "CAPA") {
-              // Note capability
+              // Capabilities PeaDB does not know are ignored, as in Redis.
+              if (upper(args[i + 1]) == "PSYNC2") session.repl_capa_psync2 = true;
             } else if (opt == "ACK") {
               // replconfCommand(): only a replica's ACK counts, the offset never goes back, and
               // there is no reply.
@@ -5134,15 +5419,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (offset > session.repl_ack_offset) session.repl_ack_offset = offset;
               session.repl_ack_time_ms = now_ms();
               return std::string();
+            } else if (opt == "GETACK") {
+              // A replica answers its master with REPLCONF ACK and the offset it has applied,
+              // which does not count this GETACK yet (it is added to the replica's stream once it
+              // has run); nobody gets a reply (replconfCommand() → replicationSendAck()).
+              if (g_replication_role == "slave") send_replica_ack();
+              return std::string();
             }
-          }
-          if (args.size() >= 2 && upper(args[1]) == "GETACK") {
-            // Respond with our current offset
-            return encode_array({
-              encode_bulk("REPLCONF"),
-              encode_bulk("ACK"),
-              encode_bulk(std::to_string(g_master_repl_offset))
-            });
           }
           return encode_simple("OK");
         }});
@@ -5150,38 +5433,46 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("PSYNC", CommandSpec{"PSYNC", 3, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           // PSYNC <replid> <offset>
+          if (session.replica_stream) return std::string();  // syncCommand(): already a replica
+          if (const std::string refused = sync_refusal(); !refused.empty()) return refused;
           const std::string& replid = args[1];
           std::int64_t offset = -1;
           parse_i64(args[2], offset);
 
-          session.replica_stream = true;
-          session.repl_ack_time_ms = now_ms();  // replicaPutOnline(): no false lag
-          g_backlog_has_replica = true;
-          g_last_repl_db = -1;
-
           // Attempt partial resync if the requested replid matches our current id (or our
           // pre-promotion replid2 history, up to second_replid_offset) and the offset is
-          // still within the backlog window.
+          // still within the backlog window. Like Redis, only a backlog that exists can serve
+          // one (a master's backlog starts with its first replica).
           const bool id_ok = (replid == g_master_replid) ||
                              (replid == g_master_replid2 && g_second_replid_offset >= 0 &&
                               offset <= g_second_replid_offset);
           // Redis numbers the stream's bytes from 1: a replica that holds the stream up to offset
           // R asks for R + 1, the first byte it lacks (masterTryPartialResynchronization(): from
           // repl_backlog->offset to repl_backlog->offset + histlen). The backlog counts from 0.
-          if (id_ok && offset >= 1 && offset - 1 >= g_repl_backlog.base() &&
-              offset - 1 <= g_repl_backlog.total) {
+          if (g_backlog_has_replica && id_ok && offset >= 1 &&
+              offset - 1 >= g_repl_backlog.base() && offset - 1 <= g_repl_backlog.total) {
             std::string pending;
             g_repl_backlog.get_slice(offset - 1, pending);
+            attach_replica(session);
             session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
             g_sync_partial_ok.fetch_add(1, std::memory_order_relaxed);
+            // A PSYNC2 replica learns the current replication id (it may have changed with a
+            // promotion) and keeps the one it had as its replid2.
+            if (session.repl_capa_psync2) return "+CONTINUE " + g_master_replid + "\r\n" + pending;
             return "+CONTINUE\r\n" + pending;
           }
           // A partial resync was requested (replid given) but we can't serve it.
           if (replid != "?") g_sync_partial_err.fetch_add(1, std::memory_order_relaxed);
 
-          // Full resync
+          // Full resync. The RDB says which database the stream has selected: a replica's stream
+          // is its master's, which may be in any database; a master's starts with a SELECT.
+          RdbReplicationInfo rsi;
+          rsi.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index : 0;
+          attach_replica(session);
+          rsi.replid = g_master_replid;
+          rsi.offset = g_master_repl_offset;
           std::string rdb_err;
-          std::string rdb_data = rdb_save_to_string(rdb_err);
+          std::string rdb_data = rdb_save_to_string(rdb_err, &rsi);
           if (!rdb_err.empty()) {
             // Cannot serialize dataset — refuse full sync rather than sending a corrupt RDB.
             log(LogLevel::Error, "PSYNC: full-resync aborted: " + rdb_err);
@@ -5626,6 +5917,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           const std::pair<std::size_t, std::size_t> client_mem =
               g_client_buffers_cb ? g_client_buffers_cb()
                                   : std::pair<std::size_t, std::size_t>{0, 0};
+          // The replication buffers: the backlog bytes (as used_memory counts them) and what the
+          // replicas have not been sent yet (Redis keeps both in one shared buffer).
+          const std::size_t backlog_mem = backlog_memory();
+          const std::size_t replica_obufs =
+              g_replica_output_buffers_cb ? g_replica_output_buffers_cb() : 0;
           const std::int64_t current_eviction_exceeded_us =
               g_eviction_exceeded_since_us != 0 ? steady_now_us() - g_eviction_exceeded_since_us
                                                 : 0;
@@ -5715,6 +6011,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "used_memory_rss:" + std::to_string(rss_bytes > 0 ? rss_bytes : static_cast<std::int64_t>(used_mem)) + "\r\n"
                    "mem_fragmentation_ratio:" + fmt2(frag_ratio) + "\r\n"
                    "mem_not_counted_for_evict:" + std::to_string(free_memory_not_counted()) + "\r\n"
+                   "mem_replication_backlog:" + std::to_string(backlog_mem) + "\r\n"
+                   "mem_total_replication_buffers:" +
+                       std::to_string(backlog_mem + replica_obufs) + "\r\n"
                    "mem_clients_slaves:" + std::to_string(client_mem.second) + "\r\n"
                    "mem_clients_normal:" + std::to_string(client_mem.first) + "\r\n"
                    "mem_aof_buffer:" + std::to_string(zmalloc_string_bytes(g_aof_buf)) + "\r\n"
@@ -5774,26 +6073,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "sync_partial_ok:" + std::to_string(g_sync_partial_ok.load()) + "\r\n"
                    "sync_partial_err:" + std::to_string(g_sync_partial_err.load()) + "\r\n\r\n";
           }
-          if (want("REPLICATION")) {
-            const int connected_replicas =
-                g_count_connected_replicas ? g_count_connected_replicas() : 0;
-            out += "# Replication\r\n"
-                   "role:" + g_replication_role + "\r\n"
-                   "connected_slaves:" + std::to_string(connected_replicas) + "\r\n"
-                   "master_failover_state:no-failover\r\n"
-                   "master_replid:" + g_master_replid + "\r\n"
-                   "master_replid2:" + g_master_replid2 + "\r\n"
-                   "master_repl_offset:" + std::to_string(g_master_repl_offset) + "\r\n"
-                   "second_repl_offset:" + std::to_string(g_second_replid_offset) + "\r\n"
-                   "repl_backlog_active:0\r\n"
-                   "repl_backlog_size:" + std::to_string(g_repl_backlog.size_) + "\r\n";
-            if (g_replication_role != "master") {
-              out += "master_host:" + g_replication_master_host + "\r\n"
-                     "master_port:" + std::to_string(g_replication_master_port) + "\r\n"
-                     "master_link_status:" + (g_replica_stale ? "down" : "up") + "\r\n";
-            }
-            out += "\r\n";
-          }
+          if (want("REPLICATION")) out += info_replication_section() + "\r\n";
           if (want("CPU")) {
             out += "# CPU\r\n"
                    "used_cpu_sys:" + fmt6(cpu_sys) + "\r\n"
@@ -5924,34 +6204,33 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
     t.emplace("WAIT", CommandSpec{"WAIT", 3, {"noscript"}, 0, 0, 0,
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
+          // waitCommand(): a replica's writes are its own and never reach anybody.
+          if (g_replication_role == "slave")
+            return encode_error(
+                "WAIT cannot be used with replica instances. Please also note that since Redis "
+                "4.0 if a replica is configured to be writable (which is not the default) writes "
+                "to replicas are just local and are not propagated.");
           std::int64_t replicas = 0;
           std::int64_t timeout = 0;
-          if (!parse_i64(args[1], replicas) || !parse_i64(args[2], timeout) || replicas < 0 || timeout < 0) {
+          if (!parse_strict_int(args[1], replicas))
             return encode_error("value is not an integer or out of range");
-          }
-          // In Lua script context: return current count immediately (no blocking)
-          if (g_in_lua_script) {
-            if (g_count_synced_replicas) {
-              return encode_integer(g_count_synced_replicas(g_master_repl_offset));
-            }
-            return encode_integer(0);
-          }
-          // Check immediately — snapshot offset at call time (Redis semantics)
-          const std::int64_t target = g_master_repl_offset;
-          if (g_count_synced_replicas) {
-            int synced = g_count_synced_replicas(target);
-            if (synced >= replicas) return encode_integer(synced);
-          } else {
-            return encode_integer(0);
-          }
-          if (replicas == 0) return encode_integer(0);
+          if (!parse_strict_int(args[2], timeout))
+            return encode_error("timeout is not an integer or out of range");
+          if (timeout < 0) return encode_error("timeout is negative");
+          // WAIT waits for this client's own last write (c->woff), so a client that has written
+          // nothing is answered at once.
+          const std::int64_t target = session.woff;
+          const int synced = g_count_synced_replicas ? g_count_synced_replicas(target) : 0;
+          // A script or a transaction cannot block (CLIENT_DENY_BLOCKING): the count now.
+          if (synced >= replicas || g_in_lua_script || g_executing_exec)
+            return encode_integer(synced);
           // Ask replicas to ACK now instead of waiting for their ~1 Hz heartbeat, so WAIT
-          // resolves in ~1 RTT rather than up to a second. The GETACK rides the backlog the
-          // same way write commands do; replicas reply REPLCONF ACK out-of-band.
-          // While CLIENT PAUSE stops replica traffic the GETACK waits for the pause to end, so
-          // the replication offset does not move (Redis's beforeSleep()).
-          if (g_paused_actions & kPauseReplica) g_getack_pending = true;
-          else backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
+          // resolves in ~1 RTT rather than up to a second. The GETACK rides the stream the same
+          // way write commands do, once per event-loop pass after the pass's commands (Redis's
+          // replicationRequestAckFromSlaves() and beforeSleep(); so it is not this client's write
+          // either), and waits while CLIENT PAUSE stops replica traffic; each replica answers it
+          // once it has applied what came before it.
+          g_getack_pending = true;
           // Defer: event loop resolves when replicas ack or deadline passes
           const auto deadline = (timeout > 0) ? (now_ms() + timeout) : std::int64_t{0};
           session.wait_state = WaitState{target, deadline, replicas};
@@ -5965,6 +6244,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (upper(host) == "NO" && upper(port) == "ONE") {
             g_repl_generation.fetch_add(1);  // signal any running reconnect supervisor to stop
             drop_queued_replica_commands();  // nothing from the old master runs after this
+            release_master_link(false);
             const bool was_replica = g_replication_role == "slave";
             g_replication_role = "master";
             store().set_replica_expiry(false);  // a master deletes expired keys and sends their DEL
@@ -5972,25 +6252,43 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_replication_master_port = 0;
             g_replica_stale = false;
             g_loading_replication.store(false);
-            // On promotion, remember the old replication id in replid2 so siblings that
-            // shared the previous master's stream can partial-resync against history, then
-            // adopt a fresh replid for the new lineage (Redis PSYNC2 promotion semantics).
+            g_repl_down_since_ms = 0;
+            // Redis's replicationUnsetMaster(): the replication id inherited from the old master
+            // becomes replid2 up to the current offset, so replicas of the same stream (and the
+            // old master) can continue from this server's backlog, which holds the stream it has
+            // applied; a fresh replid starts the new history (shiftReplicationId()). Its replicas
+            // are disconnected to learn the new id, the new stream starts with a SELECT, and a
+            // transaction the old master had not finished is dropped.
             if (was_replica) {
               g_master_replid2 = g_master_replid;
               g_second_replid_offset = g_master_repl_offset + 1;  // shiftReplicationId()
               g_master_replid = gen_run_id();
+              g_last_repl_db = -1;
+              g_master_stream_session = SessionState{};
+              g_master_stream_multi.clear();
+              disconnect_replicas();
             }
             return encode_simple("OK");
           }
           std::int64_t p = 0;
           if (!parse_i64(port, p) || p < 0 || p > 65535) return encode_error("value is not an integer or out of range");
+          // replicationHandleMasterDisconnection(): leaving a master whose link was up starts
+          // master_link_down_since_seconds.
+          if (g_replication_role == "slave" && !g_replica_stale) g_repl_down_since_ms = now_ms();
           g_replication_master_host = host;
           g_replication_master_port = static_cast<int>(p);
           g_replication_role = "slave";
           store().set_replica_expiry(true);  // a replica keeps expired keys until its master's DEL
-          g_replica_stale = true;
           const std::uint64_t gen = g_repl_generation.fetch_add(1) + 1;
           drop_queued_replica_commands();  // nothing from the old master runs after this
+          release_master_link(true);
+          // replicationSetMaster() → disconnectAllBlockedClients(): a WAIT or a blocked pop would
+          // otherwise report a write that the full sync is about to replace, or be served by the
+          // master's stream.
+          if (g_unblock_blocked_clients_cb)
+            g_unblock_blocked_clients_cb(
+                "-UNBLOCKED force unblock from blocking operation, instance state changed (master "
+                "-> replica?)\r\n");
           if (p == 0) {
             return encode_simple("OK");
           }
@@ -10028,16 +10326,36 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     // ─── ROLE ────────────────────────────────────────────────────────────
     t.emplace("ROLE", CommandSpec{"ROLE", 1, {"readonly", "fast", "loading", "stale"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState&, bool&) -> std::string {
+          // roleCommand(): a master lists its online replicas with the offset each acknowledged;
+          // a replica shows its link's state and the offset of its master's stream it has applied
+          // (-1 without a link).
           std::vector<std::string> items;
           items.push_back(encode_bulk(g_replication_role));
           if (g_replication_role == "master") {
             items.push_back(encode_integer(g_master_repl_offset));
-            items.push_back(encode_array({})); // replica list
+            std::vector<std::string> replicas;
+            if (g_for_each_replica_cb) {
+              g_for_each_replica_cb([&](const SessionState& r) {
+                replicas.push_back(encode_array({encode_bulk(replica_ip(r)),
+                                                 encode_bulk(std::to_string(r.repl_listening_port)),
+                                                 encode_bulk(std::to_string(r.repl_ack_offset))}));
+              });
+            }
+            items.push_back(encode_array(replicas));
           } else {
+            const bool link_up = !g_replica_stale;
+            const char* state = "connect";
+            switch (g_repl_link_state.load()) {
+              case ReplLinkState::Connect: state = "connect"; break;
+              case ReplLinkState::Connecting: state = "connecting"; break;
+              case ReplLinkState::Handshake: state = "handshake"; break;
+              case ReplLinkState::Transfer: state = "sync"; break;
+              case ReplLinkState::Connected: state = link_up ? "connected" : "connect"; break;
+            }
             items.push_back(encode_bulk(g_replication_master_host));
             items.push_back(encode_integer(g_replication_master_port));
-            items.push_back(encode_bulk("connected"));
-            items.push_back(encode_integer(g_master_repl_offset));
+            items.push_back(encode_bulk(state));
+            items.push_back(encode_integer(link_up ? g_master_repl_offset : -1));
           }
           return encode_array(items);
         }});
@@ -12388,6 +12706,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   const std::string cmd_after = cmd;
   // What the command propagates, with the writes of the commands it runs (EXEC, scripts), is
   // written when the outermost one ends, before its reply goes out.
+  const WriteOffsetTracker write_offset(session);
   const ExecutionUnit unit(&args);
   const auto t_start = std::chrono::steady_clock::now();
   g_write_changed_nothing = false;
@@ -13087,11 +13406,7 @@ bool is_ready_to_shutdown() {
 // replicationGetSlaveName(): the address the replica gave (REPLCONF ip-address) or its peer
 // address, with the port it listens on (REPLCONF listening-port).
 std::string replica_name(const SessionState& replica) {
-  std::string ip = replica.repl_ip_address;
-  if (ip.empty()) {
-    const auto colon = replica.addr.rfind(':');
-    ip = colon == std::string::npos ? replica.addr : replica.addr.substr(0, colon);
-  }
+  const std::string ip = replica_ip(replica);
   if (replica.repl_listening_port == 0) return ip + ":<unknown-replica-port>";
   if (ip.find(':') != std::string::npos)  // formatAddr(): an IPv6 address goes in brackets
     return "[" + ip + "]:" + std::to_string(replica.repl_listening_port);
@@ -13319,11 +13634,43 @@ std::size_t replication_event_count() {
   return static_cast<std::size_t>(g_repl_backlog.total);
 }
 
-// Returns all backlog bytes from byte-offset `from` to current total.
-std::string replication_event_at(std::size_t from) {
-  std::string out;
-  g_repl_backlog.get_slice(static_cast<std::int64_t>(from), out);
-  return out;
+// All backlog bytes from byte-offset `from` to the current total; false when the backlog no longer
+// holds `from`.
+bool replication_stream_from(std::size_t from, std::string& out) {
+  return g_repl_backlog.get_slice(static_cast<std::int64_t>(from), out);
+}
+
+void replicas_took_backlog() { g_replicas_taken_to = g_repl_backlog.total; }
+
+bool replica_getack_pending() { return getack_waiting(); }
+
+void send_pending_getack() {
+  if (!getack_waiting()) return;
+  g_getack_pending = false;
+  // replicationFeedSlaves(): nothing goes out with no backlog (no replica has attached yet), and
+  // a replica's stream is its master's.
+  if (g_replication_role != "slave" && g_backlog_has_replica)
+    backlog_append(encode_command_resp({"REPLCONF", "GETACK", "*"}));
+}
+
+void set_replica_wakeup_fd(int write_fd, int read_fd) {
+  g_replica_wakeup_read_fd = read_fd;
+  g_replica_wakeup_write_fd = write_fd;
+}
+
+// Empties the pipe before the pending flag is cleared, so a byte the link thread writes after
+// this is seen by the next poll and a command it queued before it is seen by the next drain.
+void take_replica_wakeup() {
+  char buf[64];
+  while (g_replica_wakeup_read_fd >= 0 && ::read(g_replica_wakeup_read_fd, buf, sizeof(buf)) > 0) {
+  }
+  g_replica_wakeup_pending = false;
+}
+
+void replication_cron(std::int64_t now) {
+  if (g_replication_role != "slave" || now - g_last_replica_ack_ms < 1000) return;
+  g_last_replica_ack_ms = now;
+  send_replica_ack();
 }
 
 // ─── Blocking client support ──────────────────────────────────────────────
@@ -13560,6 +13907,7 @@ std::string try_unblock_client(SessionState& session) {
   const std::int64_t start_ms = session.blocked.block_start_ms;
   // A woken command is its own execution unit, as in Redis, so the writes it propagates (a woken
   // XREADGROUP's XCLAIMs and group id) are wrapped together.
+  const WriteOffsetTracker write_offset(session);
   const ExecutionUnit unit(&orig);
   std::string reply = try_unblock_client_impl(session);
   // A non-empty reply means the blocking command finally completed (served or timed out):
@@ -13628,37 +13976,71 @@ void aof_cron(std::int64_t now) {
 }
 
 void drain_replica_cmd_queue() {
-  // The session that applies the master's stream; like Redis's master client it is new for each
-  // full sync, so a MULTI whose EXEC never came before the old link broke is dropped (the master
-  // ran the transaction whole, and the new dataset holds it).
-  static SessionState repl_session;
   // Apply any pending replica RDB load on the event loop thread before processing
   // queued commands. Running rdb_load() here serializes flushall+restore with all
   // event-loop reads/writes, eliminating the race against the streaming thread.
   if (g_replica_load_pending.load()) {
-    repl_session = SessionState{};
     std::string path;
+    std::string replid;
+    std::int64_t offset = 0;
+    std::uint64_t seq = 0;
+    // REPLICAOF runs on this thread too, so the generation cannot change before the load is done.
+    bool current = false;
     {
       std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
       path = g_replica_load_path;
       g_replica_load_path.clear();
+      replid = g_replica_load_replid;
+      offset = g_replica_load_offset;
+      seq = g_replica_load_seq;
+      current = g_replica_load_gen == g_repl_generation.load();
       // Commands still queued or held came from the stream before this full sync; the new
       // dataset already holds their effects, so applying them now would apply them twice.
-      g_replica_cmd_queue.clear();
-      g_replica_cmd_held.clear();
+      if (current) {
+        g_replica_cmd_queue.clear();
+        g_replica_cmd_held.clear();
+      }
     }
-    std::string err;
-    // A full resync replaces the entire dataset, including server-level function libraries.
-    // rdb_load() flushes the keyspace but not functions, so it clears them once the file passes
-    // its checks — otherwise libraries that exist only on this node (before it became a replica)
-    // would survive and diverge from the master (Redis's emptyData clears functions on full
-    // sync). The checksum is checked as for any load (a real Redis master writes the same CRC64
-    // as PeaDB, or 0 with rdbchecksum no); on a mismatch keys and libraries are kept and the
-    // sync is tried again.
-    const bool ok = rdb_load(path, err, functions_flush_all);
-    if (!ok) log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
-    g_replica_load_ok.store(ok);
-    g_replica_load_pending.store(false);  // signal streaming thread
+    bool ok = false;
+    if (!current) {
+      log(LogLevel::Warn, "REPLICAOF: dropping a full sync from a master link that was replaced");
+    } else {
+      g_master_stream_session = SessionState{};
+      g_master_stream_multi.clear();
+      // Redis's replicationAttachToNewMaster(): this server's own replicas must sync again, since
+      // its dataset and its history are replaced.
+      disconnect_replicas();
+      std::string err;
+      // A full resync replaces the entire dataset, including server-level function libraries.
+      // rdb_load() flushes the keyspace but not functions, so it clears them once the file passes
+      // its checks — otherwise libraries that exist only on this node (from before it became a
+      // replica) would survive and diverge from the master (Redis's emptyData clears functions on
+      // full sync). The checksum is checked as for any load (a real Redis master writes the same
+      // CRC64 as PeaDB, or 0 with rdbchecksum no); on a mismatch keys and libraries are kept and
+      // the sync is tried again.
+      int stream_db = -1;
+      ok = rdb_load(path, err, functions_flush_all, &stream_db);
+      if (!ok) {
+        log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
+      } else {
+        // readSyncBulkPayload(): the replica takes the master's replication id and offset, a new
+        // history (replid2 cleared), and a backlog that starts empty there, so its replicas and a
+        // promotion continue from the stream it applies. Its master's stream starts in the database
+        // the RDB names (repl-stream-db).
+        g_master_replid = replid;
+        g_master_replid2 = std::string(40, '0');
+        g_second_replid_offset = -1;
+        g_master_repl_offset = offset;
+        start_backlog();
+        if (stream_db >= 0) g_master_stream_session.db_index = stream_db;
+      }
+    }
+    {
+      std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+      g_replica_load_done_seq = seq;
+      g_replica_load_ok = ok;
+      g_replica_load_pending.store(false);  // signal streaming thread
+    }
   }
 
   {
@@ -13672,18 +14054,43 @@ void drain_replica_cmd_queue() {
   // for the master's commands (Redis's expireIfNeeded() for its master client): the master ran
   // them while their keys were alive, and its DEL comes when it expires them.
   const DataStore::LazyExpireDisabled no_lazy_expire(store());
-  g_replaying_aof = true;
   bool close_flag = false;
+  SessionState& session = g_master_stream_session;
   // A paused replica holds what its master sends, as Redis pauses its master client: the first
   // command the pause holds and everything after it wait, in order, until the pause ends.
   while (!g_replica_cmd_held.empty()) {
-    const auto& args = g_replica_cmd_held.front();
-    if (g_paused_actions != 0 && !args.empty() && pause_applies(upper(args[0]), args, repl_session))
+    MasterStreamCommand& cmd = g_replica_cmd_held.front();
+    if (g_paused_actions != 0 && !cmd.args.empty() &&
+        pause_applies(upper(cmd.args[0]), cmd.args, session))
       break;
-    handle_command(args, repl_session, close_flag);
+    {
+      // The master's command bypasses the client-side checks; a failure is logged and the stream
+      // goes on, and nothing leaves g_replaying_aof set for the clients that come next.
+      struct Replaying {
+        Replaying() { g_replaying_aof = true; }
+        ~Replaying() { g_replaying_aof = false; }
+      } replaying;
+      try {
+        handle_command(cmd.args, session, close_flag);
+      } catch (const std::exception& e) {
+        log(LogLevel::Warn,
+            std::string("REPLICAOF: a command from the master failed: ") + e.what());
+      }
+    }
+    // commandProcessed(): what has been applied joins this server's own stream, its backlog and
+    // its replicas, byte for byte as the master sent it, which moves its replication offset (the
+    // one it acknowledges); a transaction only once its EXEC has run.
+    if (session.in_multi) {
+      g_master_stream_multi += cmd.raw;
+    } else if (g_master_stream_multi.empty()) {
+      backlog_append(cmd.raw);
+    } else {
+      g_master_stream_multi += cmd.raw;
+      backlog_append(g_master_stream_multi);
+      g_master_stream_multi.clear();
+    }
     g_replica_cmd_held.pop_front();
   }
-  g_replaying_aof = false;
 }
 
 // ── In-process replication client helpers ────────────────────────────────────
@@ -13748,6 +14155,15 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         log(LogLevel::Error, "REPLICAOF: socket() failed");
         return false;
     }
+    // ROLE's link states: connecting, the handshake (PING ... PSYNC), the transfer, connected;
+    // back to connect whenever this attempt ends.
+    struct LinkStateReset {
+        std::uint64_t gen;
+        ~LinkStateReset() {
+            if (g_repl_generation.load() == gen) g_repl_link_state = ReplLinkState::Connect;
+        }
+    } link_state_reset{gen};
+    g_repl_link_state = ReplLinkState::Connecting;
     if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
         log(LogLevel::Error, "REPLICAOF: connect to " + host + ":" + port_str + " failed: " + strerror(errno));
         ::freeaddrinfo(res);
@@ -13755,6 +14171,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         return false;
     }
     ::freeaddrinfo(res);
+    g_repl_link_state = ReplLinkState::Handshake;
 
     std::string line;
 
@@ -13812,17 +14229,30 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         ::close(fd);
         return false;
     }
-    // Parse replid and offset: "+FULLRESYNC <replid> <offset>"
+    // Parse replid and offset: "+FULLRESYNC <replid> <offset>". The event loop adopts them once
+    // the RDB has loaded.
     std::int64_t fullresync_offset = 0;
+    std::string fullresync_replid;
     {
         auto sp1 = line.find(' ');
         auto sp2 = line.find(' ', sp1 + 1);
         if (sp1 != std::string::npos && sp2 != std::string::npos) {
-            g_master_replid = line.substr(sp1 + 1, sp2 - sp1 - 1);
+            fullresync_replid = line.substr(sp1 + 1, sp2 - sp1 - 1);
             parse_i64(line.substr(sp2 + 1), fullresync_offset);
-            g_master_repl_offset = fullresync_offset;
         }
     }
+    // INFO's master_sync_in_progress and master_sync_* fields, until the RDB has loaded.
+    struct TransferState {
+        TransferState() {
+            g_repl_transfer_size = -1;
+            g_repl_transfer_read = 0;
+            g_repl_transfer_lastio_ms = now_ms();
+            g_repl_transfer_in_progress = true;
+            g_repl_link_state = ReplLinkState::Transfer;
+        }
+        void done() { g_repl_transfer_in_progress = false; }
+        ~TransferState() { done(); }
+    } transfer_state;
 
     // Read $<N>\r\n  (may be preceded by a stray \n from some masters)
     if (!repl_readline(fd, line)) { ::close(fd); return false; }
@@ -13840,13 +14270,19 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         ::close(fd);
         return false;
     }
+    g_repl_transfer_size = rdb_len;
 
-    // Stream RDB into a temp file then load it
-    const std::string tmp_path = "/tmp/peadb_fullsync_" + std::to_string(::getpid()) + ".rdb.tmp";
+    // Stream the RDB into a temp file in the working directory (`dir`), created new like Redis's
+    // readSyncBulkPayload() creates temp-<unixtime>.<pid>.rdb; the link's generation in the name
+    // keeps two links (an old one not stopped yet and a new one) apart.
+    const std::string tmp_path = "temp-" + std::to_string(std::time(nullptr)) + "." +
+                                 std::to_string(::getpid()) + "." + std::to_string(gen) + ".rdb";
     {
-        int rfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        int rfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
         if (rfd < 0) {
-            log(LogLevel::Error, "REPLICAOF: cannot open temp file " + tmp_path + ": " + strerror(errno));
+            log(LogLevel::Error,
+                "Opening the temp file needed for MASTER <-> REPLICA synchronization: " +
+                    std::string(strerror(errno)));
             ::close(fd);
             return false;
         }
@@ -13864,6 +14300,8 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
                 break;
             }
             remaining -= static_cast<std::int64_t>(want);
+            g_repl_transfer_read = rdb_len - remaining;
+            g_repl_transfer_lastio_ms = now_ms();
         }
         ::close(rfd);
         if (!write_ok) {
@@ -13879,16 +14317,45 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     // thread that serves client reads/writes — eliminating the DataStore race that the
     // previous in-thread rdb_load() created (libstdc++ unordered_map mutations are not
     // safe under concurrent access). The streaming thread waits here until completion.
-    {
-        std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-        g_replica_load_path = tmp_path;
-    }
-    g_loading_replication.store(true);  // visible via INFO persistence loading:1
-    g_replica_load_pending.store(true);
-    while (g_replica_load_pending.load()) {
+    // One hand-off at a time: an older link's may still wait for the event loop. A newer REPLICAOF
+    // makes this one give up.
+    std::uint64_t my_seq = 0;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+            if (g_repl_generation.load() != gen) break;
+            if (!g_replica_load_pending.load()) {
+                g_replica_load_path = tmp_path;
+                g_replica_load_gen = gen;
+                g_replica_load_replid = fullresync_replid;
+                g_replica_load_offset = fullresync_offset;
+                my_seq = ++g_replica_load_seq;
+                g_replica_load_pending.store(true);
+                break;
+            }
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
-    const bool load_ok = g_replica_load_ok.load();
+    if (my_seq == 0) {
+        ::unlink(tmp_path.c_str());
+        ::close(fd);
+        log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF before loading the RDB");
+        return false;
+    }
+    g_loading_replication.store(true);  // visible via INFO persistence loading:1
+    wake_event_loop_for_replica();
+    bool load_ok = false;
+    for (;;) {
+        {
+            std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+            if (g_replica_load_done_seq == my_seq) {
+                load_ok = g_replica_load_ok;
+                break;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    transfer_state.done();
     g_loading_replication.store(false);
     ::unlink(tmp_path.c_str());
     if (!load_ok) {
@@ -13902,28 +14369,35 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     // Streaming commands are enqueued in g_replica_cmd_queue and applied by the event loop,
     // so DataStore mutations stay on the event loop thread (no concurrent access).
     g_loading_replication.store(false);
-    g_replica_stale = false;
+    g_replica_read_offset = fullresync_offset;
+    g_replica_last_io_ms = now_ms();
+    g_repl_down_since_ms = 0;
+    {
+        // The event loop sends the REPLCONF ACKs on this socket from now on (it knows what it has
+        // applied); this thread only reads. A newer REPLICAOF has its own link.
+        std::lock_guard<std::mutex> lk(g_replica_link_mu);
+        if (g_repl_generation.load() == gen) {
+            g_replica_link_fd = fd;
+            g_replica_ack_out.clear();
+            g_replica_stale = false;
+            g_repl_link_state = ReplLinkState::Connected;
+        }
+    }
 
     // Stream subsequent replication commands from master.
     // The master sends a continuous RESP stream of write commands after the RDB.
-    // Commands are enqueued and applied by drain_replica_cmd_queue() in the event loop.
+    // Commands are enqueued and applied by drain_replica_cmd_queue() in the event loop, each with
+    // its bytes, which the event loop adds to this server's own stream once it has applied them.
     std::string stream_buf;
     stream_buf.reserve(65536);
     std::vector<char> recv_buf(65536);
 
-    // Local counter tracks the replica's absolute master-stream offset for REPLCONF ACK.
-    // Seeded from the master's +FULLRESYNC offset so WAIT (which compares against the
-    // master's absolute offset) counts this replica correctly when the master had a
-    // non-zero offset before REPLICAOF.
-    std::int64_t replica_rx_bytes = fullresync_offset;
-
-    // Set recv timeout once before the loop so we can send periodic ACKs.
+    // The recv timeout bounds how long a superseded link takes to notice the newer REPLICAOF.
     {
         struct timeval tv{1, 0};
         ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
-    auto last_ack_ms = now_ms();
     while (true) {
         // Stop promptly if a newer REPLICAOF (including NO ONE) superseded us. The 1s
         // recv timeout below bounds how long this takes.
@@ -13931,14 +14405,6 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
             log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF, stopping stream");
             break;
         }
-        // Non-blocking check: send REPLCONF ACK every ~1s
-        const auto now = now_ms();
-        if (now - last_ack_ms >= 1000) {
-            const std::string ack = repl_encode_cmd({"REPLCONF", "ACK", std::to_string(replica_rx_bytes)});
-            repl_send(fd, ack);
-            last_ack_ms = now;
-        }
-
         const ssize_t n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
         if (n == 0) {
             log(LogLevel::Warn, "REPLICAOF: master closed connection");
@@ -13950,12 +14416,13 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
             break;
         }
         stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
+        g_replica_read_offset += n;  // readQueryFromClient(): read_reploff
+        g_replica_last_io_ms = now_ms();
 
         // Parse commands and enqueue them for the event loop to apply.
         // This keeps all DataStore mutations on the event loop thread, eliminating
         // the data race between the streaming thread and concurrent client reads.
         std::size_t consumed = 0;
-        bool getack_seen = false;
         {
             std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
             // A newer REPLICAOF may have come in during the recv: queue nothing for it
@@ -13964,30 +14431,28 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
                 const std::string_view view(stream_buf.data() + consumed, stream_buf.size() - consumed);
                 auto parsed = parse_one_command(view);
                 if (!parsed.has_value()) break;
-                // The master sends REPLCONF GETACK * to demand an immediate ACK (e.g. behind
-                // a client's WAIT). Note it so we reply right after counting its bytes.
-                const auto& a = parsed->args;
-                if (a.size() >= 2 && upper(a[0]) == "REPLCONF" && upper(a[1]) == "GETACK") {
-                    getack_seen = true;
-                } else {
-                    g_replica_cmd_queue.push_back(a);
-                }
+                g_replica_cmd_queue.push_back(
+                    {std::move(parsed->args), std::string(view.substr(0, parsed->consumed))});
                 consumed += parsed->consumed;
-                replica_rx_bytes += static_cast<std::int64_t>(parsed->consumed);
             }
         }
 
         if (consumed > 0) {
             if (consumed == stream_buf.size()) stream_buf.clear();
             else stream_buf.erase(0, consumed);
+            wake_event_loop_for_replica();
         }
-        // Respond to GETACK immediately (the offset now includes the GETACK bytes).
-        if (getack_seen) {
-            repl_send(fd, repl_encode_cmd({"REPLCONF", "ACK", std::to_string(replica_rx_bytes)}));
-            last_ack_ms = now_ms();
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_replica_link_mu);
+        if (g_replica_link_fd == fd) {
+            g_replica_link_fd = -1;
+            g_replica_ack_out.clear();
         }
     }
     ::close(fd);
+    // replicationHandleMasterDisconnection(): repl_down_since.
+    if (g_repl_generation.load() == gen) g_repl_down_since_ms = now_ms();
     return true;
 }
 
