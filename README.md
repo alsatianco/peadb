@@ -140,7 +140,7 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `notify-keyspace-events` | `""` (off) | Keyspace notification classes (Redis flag syntax) |
 | `repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
 | `min-replicas-to-write` | `0` | Refuse writes unless this many replicas are connected (`min-replicas-max-lag` is not applied) |
-| `replica-serve-stale-data` | `yes` | Whether a replica answers reads while its master link is down |
+| `replica-serve-stale-data` | `yes` | Whether a replica answers reads while its master link is down (with `no`, only the commands Redis allows on a stale replica run) |
 | `busy-reply-threshold` (`lua-time-limit`) | `5000` | Milliseconds a script may run before other clients get `-BUSY` |
 | `lazyfree-lazy-server-del` | `no` | Propagate server-side deletes as `UNLINK` |
 | `stop-writes-on-bgsave-error` | `yes` | Refuse writes and `PING` with `-MISCONF` after a failed background save while save points are set, until a save succeeds (a failed `fork()` counts, as in Redis) |

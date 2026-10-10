@@ -62,11 +62,11 @@
     "unit/functions": {
       "last_counts": {
         "err": 0,
-        "ignored": 6,
-        "ok": 109
+        "ignored": 5,
+        "ok": 110
       },
       "mode": "native",
-      "skipfile_lines": 1
+      "skipfile_lines": 0
     },
     "unit/geo": {
       "last_counts": {
@@ -223,11 +223,11 @@
     "unit/scripting": {
       "last_counts": {
         "err": 0,
-        "ignored": 31,
-        "ok": 305
+        "ignored": 30,
+        "ok": 306
       },
       "mode": "native",
-      "skipfile_lines": 10
+      "skipfile_lines": 9
     },
     "unit/shutdown": {
       "last_counts": {

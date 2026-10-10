@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **236** commands — full: 10, upstream: 215, diff: 1, tested: 8, registered: 2
+Total: **236** commands — full: 11, upstream: 215, diff: 0, tested: 8, registered: 2
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -40,7 +40,7 @@ Total: **236** commands — full: 10, upstream: 215, diff: 1, tested: 8, registe
 | `DEL` | upstream | test_command_coverage_extras.py, test_p1_bitmap_xreadgroup.py, test_p1_multi_replication.py, test_p1_set_get_option.py, test_p1_string_range_ops.py, test_p2_sort_in_script.py, test_p3_ecosystem_commands.py |
 | `DISCARD` | upstream | test_m4_tx.py |
 | `DUMP` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
-| `ECHO` | diff | test_m1_commands.py |
+| `ECHO` | full | test_m1_commands.py |
 | `EVAL` | upstream | test_b14_lazyfree.py, test_m4_lua.py, test_m4_lua2_atomic.py, test_p1_eval_and_script_replication.py, test_p1_multi_busy_execabort.py, test_p2_noreplicas_scripting.py, test_p2_script_cache_info.py, test_p2_script_replication_shapes.py, test_p2_script_rewrite_ops.py, test_p2_scripting_debug_protocol.py, test_p2_shebang_oom.py, test_p2_sort_in_script.py |
 | `EVALSHA` | upstream | test_m4_lua.py, test_m4_lua2_atomic.py, test_p2_evalsha_sha1.py |
 | `EVALSHA_RO` | upstream | test_p3_sort_zmpop.py |

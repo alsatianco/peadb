@@ -6,7 +6,7 @@ PeaDB targets **Redis 7.2.5** (commit `f60370ce28b946c1146dcea77c9c399d39601aaa`
 
 Not yet for data you cannot afford to lose. PeaDB speaks RESP2 (and basic RESP3) on port `6379`, and standard clients work unmodified for core workloads — strings, hashes, lists, sets, sorted sets, streams, transactions, Lua scripting, and pub/sub. Explicitly tested clients: `redis-py` 5.0.1, `node-redis` 4.6.13, `go-redis/v9` 9.5.1. `redis-cli`, `redis-benchmark`, `memtier_benchmark`, Jedis, and Lettuce also work.
 
-But a verified review in 2026-10 found open defects that can lose or change data with no error: in RDB and AOF persistence, in replication, and on every migration path to and from Redis. They are [`compat/delta.md`](../compat/delta.md) items 24–77, and most are not fixed yet (each item says whether it is). Read them before you put data you need on PeaDB.
+But a verified review in 2026-10 found open defects that can lose or change data with no error: in RDB and AOF persistence, in replication, and on every migration path to and from Redis. They are [`compat/delta.md`](../compat/delta.md) items 24–79, and many are not fixed yet (each item says whether it is). Read them before you put data you need on PeaDB.
 
 ## Configuration
 

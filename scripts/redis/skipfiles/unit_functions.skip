@@ -1,5 +1,0 @@
-# Stale-replica allow-stale gating for functions requires per-inner-command stale-flag
-# enforcement inside a running function (the same replica-mode scripting feature that
-# unit_scripting.skip defers via "allow-stale shebang flag"). Tracked in compat/delta.md
-# under the replication/scripting workstream.
-FUNCTION - allow stale
