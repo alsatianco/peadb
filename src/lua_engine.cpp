@@ -601,12 +601,20 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
     return enc_error_raw("ERR This Redis command is not allowed from script");
   }
 
+  // scriptCall() (script.c) checks a stale replica first (scriptVerifyAllowStale()): only the
+  // commands Redis flags STALE run there.
+  if (script_command_refused_as_stale(args)) {
+    record_lua_script_rejected(cmd_upper);
+    g_lua_last_error_from_redis = true;
+    return enc_error_raw("ERR Can not execute the command on a stale replica");
+  }
+
   // A read-only script (no-writes, EVAL_RO, EVALSHA_RO, FCALL_RO) may not call a command that
   // writes or may replicate, by Redis's command flags (scriptVerifyWriteCommandAllow, script.c),
   // so PUBLISH and PFCOUNT are refused too and a script that runs during CLIENT PAUSE WRITE
   // cannot change the data.
   if (g_lua_readonly && (redis_command_flags(args) & (kRedisCmdWrite | kRedisCmdMayReplicate))) {
-    record_lua_script_rejected_write(cmd_upper);
+    record_lua_script_rejected(cmd_upper);
     g_lua_last_error_from_redis = true;
     return enc_error_raw("ERR Write commands are not allowed from read-only scripts.");
   }

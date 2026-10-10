@@ -12,9 +12,7 @@ SHUTDOWN NOSAVE can kill a timedout script anyway
 # The LDB (Lua debugger) session protocol is not implemented (SCRIPT DEBUG YES and SYNC are refused; compat/delta.md item 14).
 Test scripting debug protocol parsing
 Test scripting debug lua stack overflow
-# Replica-mode script gating (MASTERDOWN for EVAL under replica-serve-stale-data no,
-# no-writes shebang on replicas) not implemented yet — replication/scripting workstream.
-allow-stale shebang flag
+# PeaDB refuses the script's write on a replica, but its script errors lack Redis's " script: <sha>, on @user_script:<line>." suffix (compat/delta.md item 14).
 no-writes shebang flag on replica
 # Replica handshake cannot complete while a script blocks the event loop (busy-script I/O semantics).
 not enough good replicas state change during long script

@@ -318,7 +318,12 @@ def check_ack(name, binary, work):
         w.send('WAIT', '1', '0')
         assert not w.has_reply(0.2), name
         replica.ack()
-        assert w.read() == 1, name
+        got = w.read()
+        # Redis does not always answer: when the event-loop pass that reads the ACK also runs the
+        # due serverCron(), that finishes the shutdown and exits before beforeSleep() answers WAIT
+        # clients, and the connection closes (seen about once in 30 runs, under load). PeaDB
+        # answers before it exits.
+        assert got == 1 or (name == 'redis' and got is None), (name, got)
         assert wait_exit(proc) == 0, name
         assert c.read() is None, name
     finally:

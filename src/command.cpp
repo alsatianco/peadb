@@ -95,6 +95,11 @@ struct CommandSpec {
   std::function<std::string(const std::vector<std::string>&, SessionState&, bool&)> handler;
   std::uint32_t flag_bits = 0;
   bool is_write() const { return flag_bits & kFlagWrite; }
+  // Redis's lower-case name and command flags (kRedisCmd*), set once the table is built and kept
+  // under rename-command; redis_container: the command has subcommands with their own flags.
+  std::string redis_name;
+  std::uint64_t redis_flags = 0;
+  bool redis_container = false;
 };
 
 // proto-max-bulk-len (Redis default 512 MB): the largest bulk argument a client may send
@@ -946,6 +951,94 @@ std::string misconf_reply() {
   return {};
 }
 
+const char* const kMasterdownReply =
+    "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n";
+const char* const kReadonlyReplicaReply =
+    "-READONLY You can't write against a read only replica.\r\n";
+const char* const kNoReplicasReply = "-NOREPLICAS Not enough good replicas to write.\r\n";
+
+// Redis's running_stale: this server is a replica whose link to its master is not up, and
+// replica-serve-stale-data is no.
+bool running_stale() {
+  return g_replication_role == "slave" && g_replica_stale.load() &&
+         !g_config_replica_serve_stale_data;
+}
+
+// processCommand()'s replication checks, after -MISCONF, for a client's own command (to run, or
+// to queue in MULTI) or an EXEC by what it queued; never for the AOF or the master stream
+// (mustObeyClient()). A command that writes by Redis's flags (getCommandFlags(): a script or
+// function counts when it declares flags without no-writes) is refused while fewer good replicas
+// are connected than min-replicas-to-write, then on a replica, which is always read-only.
+std::string write_refusal(bool writes) {
+  if (!writes) return {};
+  if (noreplicas_should_reject()) return kNoReplicasReply;
+  if (g_replication_role == "slave") return kReadonlyReplicaReply;
+  return {};
+}
+
+// The last of those checks (after the pub/sub context one at the top level): on a stale replica
+// only the commands Redis flags STALE run; an EXEC only when all it queued are.
+std::string stale_refusal(bool deny_stale) {
+  return deny_stale && running_stale() ? kMasterdownReply : std::string();
+}
+
+// Both, for a command queued in MULTI (where the pub/sub context check cannot apply: a RESP2
+// client in that context cannot send MULTI).
+std::string replication_refusal(std::uint64_t flags) {
+  std::string refusal = write_refusal((flags & kRedisCmdWrite) != 0);
+  return refusal.empty() ? stale_refusal(!(flags & kRedisCmdStale)) : refusal;
+}
+
+// The -MISCONF reply of scriptPrepareForRun() for a script that declares it may write.
+std::string script_misconf_reply() {
+  if (g_stop_writes_on_bgsave_error && !g_save_params.empty() && g_last_bgsave_status == "err") {
+    return "-MISCONF Redis is configured to save RDB snapshots, but it's currently unable to "
+           "persist to disk. Writable scripts are blocked. Use 'no-writes' flag for read only "
+           "scripts.\r\n";
+  }
+  if (g_appendonly && (g_aof_write_error || g_aof_fsync_error)) {
+    const int err = g_aof_write_error ? g_aof_last_write_errno : g_aof_fsync_errno;
+    return "-MISCONF Redis is configured to persist data to AOF, but it's currently unable to "
+           "persist to disk. Writable scripts are blocked. Use 'no-writes' flag for read only "
+           "scripts. AOF error: " + std::string(std::strerror(err)) + "\r\n";
+  }
+  return {};
+}
+
+std::string encode_error(const std::string& value);  // defined below (encoder block)
+
+// Redis's scriptPrepareForRun(): what a script or function is checked for before it runs, by the
+// flags it declares (kFunc*; `declared` is false for a script without a shebang, Redis's
+// SCRIPT_FLAG_EVAL_COMPAT_MODE, which is only checked for a stale replica). `ro` is EVAL_RO,
+// EVALSHA_RO or FCALL_RO. The dispatch refuses most of these first, by the flags the command
+// takes from the script (processCommand()); these replies are seen when it could not know them,
+// for example for a script loaded inside the transaction that runs it. Never for the AOF or the
+// master stream.
+std::string script_prepare_refusal(bool declared, int flags, bool ro) {
+  if (g_replaying_aof) return {};
+  if (!declared) return running_stale() ? kMasterdownReply : std::string();
+  if ((flags & kFuncNoCluster) && g_cluster_enabled)
+    return encode_error("Can not run script on cluster, 'no-cluster' flag is set.");
+  if (running_stale() && !(flags & kFuncAllowStale)) {
+    return "-MASTERDOWN Link with MASTER is down, replica-serve-stale-data is set to 'no' and "
+           "'allow-stale' flag is not set on the script.\r\n";
+  }
+  if (!(flags & kFuncNoWrites)) {
+    if (g_replication_role == "slave")
+      return "-READONLY Can not run script with write flag on readonly replica\r\n";
+    if (std::string misconf = script_misconf_reply(); !misconf.empty()) return misconf;
+    if (ro) return encode_error("Can not execute a script with write flag using *_ro command.");
+    if (noreplicas_should_reject()) return kNoReplicasReply;
+  }
+  // The no-writes flag means allow-oom: only a script that may write is refused.
+  if (g_pre_command_oom_state && g_config_maxmemory > 0 &&
+      !(flags & (kFuncAllowOom | kFuncNoWrites))) {
+    return "-OOM allow-oom flag is not set on the script, can not run it when used memory > "
+           "'maxmemory'\r\n";
+  }
+  return {};
+}
+
 // Redis's hasActiveChildProcess(): a BGSAVE or AOF rewrite child is running.
 bool has_active_child_process() {
   return g_bgsave_in_progress.load() || g_bgrewrite_in_progress.load();
@@ -1725,8 +1818,6 @@ bool functions_restore(const std::string& payload, const std::string& policy, st
   return true;
 }
 
-std::string encode_error(const std::string& value);  // defined below (encoder block)
-
 // Shared FCALL / FCALL_RO body. `ro_command` is true for FCALL_RO.
 std::string do_fcall(const std::vector<std::string>& args, SessionState& session, bool ro_command) {
   auto idx = g_func_index.find(lower(args[1]));
@@ -1745,16 +1836,10 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
     return encode_error("Number of keys can't be greater than number of args");
 
   const bool no_writes = (entry->flags & kFuncNoWrites) != 0;
-  if (ro_command && !no_writes)
-    return encode_error("Can not execute a script with write flag using *_ro command.");
+  if (std::string refusal = script_prepare_refusal(true, entry->flags, ro_command);
+      !refusal.empty())
+    return refusal;
   const bool readonly = ro_command || no_writes;
-  // scriptPrepareForRun(): a function that may write and has no allow-oom flag does not run when
-  // memory was over maxmemory as the command started. The dispatch has already refused such an
-  // FCALL (its flags make it denyoom, scriptFlagsToCmdFlags()), so this is reached only when that
-  // check did not run.
-  if (!no_writes && !(entry->flags & kFuncAllowOom) && g_pre_command_oom_state &&
-      g_config_maxmemory > 0 && !g_replaying_aof)
-    return std::string("-OOM allow-oom flag is not set on the script, can not run it when used memory > 'maxmemory'\r\n");
 
   // Cooperative BUSY simulation for trivially-infinite functions, mirroring eval_miniscript: a
   // real infinite loop would block the single-threaded event loop, so instead we advertise BUSY
@@ -1795,27 +1880,6 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
   g_script_allow_oom = prev_allow_oom;
   g_script_write_dirty = prev_write_dirty;
   g_script_current_session = nullptr;
-  return out;
-}
-
-std::string normalize_script(std::string s) {
-  for (char& c : s) {
-    if (c == '\n' || c == '\r' || c == '\t') c = ' ';
-  }
-  std::string out;
-  out.reserve(s.size());
-  bool prev_space = false;
-  for (char c : s) {
-    const bool is_space = std::isspace(static_cast<unsigned char>(c));
-    if (is_space) {
-      if (!prev_space) out.push_back(' ');
-    } else {
-      out.push_back(c);
-    }
-    prev_space = is_space;
-  }
-  while (!out.empty() && out.front() == ' ') out.erase(out.begin());
-  while (!out.empty() && out.back() == ' ') out.pop_back();
   return out;
 }
 
@@ -1915,10 +1979,6 @@ void record_cmd_failed(const std::string& cmd) {
 
 std::string busy_script_error_reply() {
   return "-BUSY Redis is busy running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n";
-}
-
-std::string masterdown_stale_reply() {
-  return "-MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n";
 }
 
 std::string encode_command_resp(const std::vector<std::string>& args) {
@@ -2781,12 +2841,8 @@ bool maxmemory_refuses(const std::string& cmd, const std::vector<std::string>& a
   if (!out_of_memory) return false;
   if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "QUIT" && cmd != "RESET")
     return true;
-  if (command_flags(cmd, args) & kRedisCmdDenyoom) return true;
-  if (cmd == "EXEC" && session.in_multi) {
-    for (const auto& q : session.queued)
-      if (!q.empty() && (command_flags(upper(q[0]), q) & kRedisCmdDenyoom)) return true;
-  }
-  return false;
+  if (cmd == "EXEC" && session.in_multi) return (session.multi_flags & kRedisCmdDenyoom) != 0;
+  return (command_flags(cmd, args) & kRedisCmdDenyoom) != 0;
 }
 
 // scriptVerifyOOM(): inside a script, a denyoom command is refused only when memory was over the
@@ -5253,17 +5309,56 @@ std::optional<int> function_flags(const std::string& name) {
   return std::nullopt;
 }
 
-// Redis's getCommandFlags(): the command's flags from Redis's table, except that EVAL, EVALSHA,
-// FCALL and their _RO forms take the flags the script or function declares (evalGetCommandFlags(),
-// fcallGetCommandFlags()), mapped by scriptFlagsToCmdFlags(): declared flags mean "writes" unless
-// they include no-writes, and "denyoom" unless they include allow-oom or no-writes. A script
-// without a shebang keeps EVAL's own flags (it may replicate; its writes are checked one by one
-// when they run).
-std::uint64_t command_flags(const std::string& cmd, const std::vector<std::string>& args) {
-  std::uint64_t flags = redis_command_flags(args);
+// Redis's command table (the pinned command JSON): each command's and subcommand's flags.
+struct RedisCommandIndex {
+  std::unordered_map<std::string, std::uint64_t> flags;  // "name" or "name|sub", lower-case
+  std::unordered_set<std::string> containers;            // the commands that have subcommands
+};
+const RedisCommandIndex& redis_command_index() {
+  static const auto* const index = [] {
+    auto* ix = new RedisCommandIndex();
+    for (const auto& e : command_metadata()) {
+      const std::string name = e.full_name;
+      ix->flags[name] = e.flags;
+      if (const auto bar = name.find('|'); bar != std::string::npos)
+        ix->containers.insert(name.substr(0, bar));
+    }
+    return ix;
+  }();
+  return *index;
+}
+
+const std::unordered_map<std::string, CommandSpec>& command_table();  // below
+
+// Redis's flags of the command `spec` for `args`: a container command resolves to its subcommand,
+// as Redis's lookupCommand() does (an unknown one keeps the container's flags).
+std::uint64_t spec_redis_flags(const CommandSpec& spec, const std::vector<std::string>& args) {
+  if (spec.redis_container && args.size() >= 2) {
+    const auto& index = redis_command_index();
+    const auto sub = index.flags.find(spec.redis_name + "|" + lower(args[1]));
+    if (sub != index.flags.end()) return sub->second;
+  }
+  return spec.redis_flags;
+}
+
+// Whether `args` names a subcommand Redis does not have of the container command `spec`.
+bool spec_subcommand_unknown(const CommandSpec& spec, const std::vector<std::string>& args) {
+  return spec.redis_container && args.size() >= 2 &&
+         !redis_command_index().flags.count(spec.redis_name + "|" + lower(args[1]));
+}
+
+// Redis's getCommandFlags() for the command `spec` and `args`: Redis's flags, except that EVAL,
+// EVALSHA, FCALL and their _RO forms take the flags the script or function declares
+// (evalGetCommandFlags(), fcallGetCommandFlags()), mapped by scriptFlagsToCmdFlags(): declared
+// flags mean "writes" unless they include no-writes, and "denyoom" unless they include allow-oom
+// or no-writes. A script without a shebang keeps EVAL's own flags (it may replicate; its writes
+// are checked one by one when they run).
+std::uint64_t spec_command_flags(const CommandSpec& spec, const std::vector<std::string>& args) {
+  std::uint64_t flags = spec_redis_flags(spec, args);
+  const std::string& name = spec.redis_name;
   std::optional<int> declared;
-  const bool eval = cmd == "EVAL" || cmd == "EVAL_RO";
-  const bool evalsha = cmd == "EVALSHA" || cmd == "EVALSHA_RO";
+  const bool eval = name == "eval" || name == "eval_ro";
+  const bool evalsha = name == "evalsha" || name == "evalsha_ro";
   if ((eval || evalsha) && args.size() >= 2) {
     const std::string* body = &args[1];
     if (evalsha) {
@@ -5275,7 +5370,7 @@ std::uint64_t command_flags(const std::string& cmd, const std::vector<std::strin
       const auto she = parse_script_shebang(*body);
       if (she.has_shebang && she.err.empty()) declared = she.flags;
     }
-  } else if ((cmd == "FCALL" || cmd == "FCALL_RO") && args.size() >= 2) {
+  } else if ((name == "fcall" || name == "fcall_ro") && args.size() >= 2) {
     declared = function_flags(args[1]);
   }
   if (!declared) return flags;
@@ -5284,6 +5379,14 @@ std::uint64_t command_flags(const std::string& cmd, const std::vector<std::strin
   if (!(*declared & kFuncNoWrites)) flags |= kRedisCmdWrite;
   if (*declared & kFuncAllowStale) flags |= kRedisCmdStale;
   return flags;
+}
+
+// The same by the name the client sent (`cmd`, also a name given by rename-command); 0 for a
+// name that runs no command.
+std::uint64_t command_flags(const std::string& cmd, const std::vector<std::string>& args) {
+  const auto& table = command_table();
+  const auto it = table.find(upper(cmd));
+  return it == table.end() ? 0 : spec_command_flags(it->second, args);
 }
 
 // Whether a command writes or may replicate (CLIENT PAUSE WRITE holds it).
@@ -5302,12 +5405,9 @@ bool pause_applies(const std::string& cmd, const std::vector<std::string>& args,
                    const SessionState& session) {
   if (g_paused_actions & kPauseClientAll) return true;
   if (!(g_paused_actions & kPauseClientWrite)) return false;
-  if (cmd == "EXEC") {
-    if (!session.in_multi) return false;
-    for (const auto& q : session.queued)
-      if (!q.empty() && command_may_replicate(upper(q[0]), q)) return true;
-    return false;
-  }
+  if (cmd == "EXEC")
+    return session.in_multi &&
+           (session.multi_flags & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
   return command_may_replicate(cmd, args);
 }
 
@@ -5321,31 +5421,6 @@ bool pause_holds(const std::string& cmd, const std::vector<std::string>& args,
   if (session.replica_stream || g_replaying_aof || g_executing_exec || in_lua_script_context())
     return false;
   return pause_applies(cmd, args, session);
-}
-
-// A guess from the script text whether a script without a shebang writes, used only for the
-// NOREPLICAS check in eval_script(). This is code shaped to the tests, not Redis's behavior:
-// Redis checks min-replicas-to-write on each write command the script calls
-// (scriptVerifyWriteCommandAllow), so a script that writes with any other command runs here
-// (compat/delta.md item 54).
-bool script_has_write_intent(const std::string& src) {
-  const auto nsl = lower(normalize_script(src));
-  static const std::vector<std::string> markers = {
-    "redis.call('set'", "redis.call(\"set\"",
-    "redis.call('del'", "redis.call(\"del\"",
-    "redis.call('incr'", "redis.call(\"incr\"",
-    "redis.call('decr'", "redis.call(\"decr\"",
-    "redis.call('expire'", "redis.call(\"expire\"",
-    "redis.call('pexpire'", "redis.call(\"pexpire\"",
-    "redis.call('sadd'", "redis.call(\"sadd\"",
-    "redis.call('srem'", "redis.call(\"srem\"",
-    "redis.call('spop'", "redis.call(\"spop\"",
-    "redis.call('incrbyfloat'", "redis.call(\"incrbyfloat\""
-  };
-  for (const auto& m : markers) {
-    if (nsl.find(m) != std::string::npos) return true;
-  }
-  return false;
 }
 
 // The body of EVAL and EVALSHA: runs `source` (the script, shebang included) with the numkeys,
@@ -5372,25 +5447,15 @@ std::string eval_script(const std::string& source, const std::vector<std::string
   const std::string script_body = she.has_shebang ? source.substr(she.length) : source;
   const bool no_writes = (she.flags & kFuncNoWrites) != 0;
   const bool allow_oom = (she.flags & kFuncAllowOom) != 0 || no_writes;
-  // EVAL_RO and EVALSHA_RO run in a read-only context; a script that declares it may write is
-  // refused there (scriptPrepareForRun).
-  if (she.has_shebang && !no_writes && g_script_readonly_context) {
-    return encode_error("Can not execute a script with write flag using *_ro command.");
-  }
-  const bool write_intent = she.has_shebang ? !no_writes : script_has_write_intent(script_body);
-  // scriptPrepareForRun(), as for FCALL: the dispatch refuses a flagged script that may write and
-  // has no allow-oom flag before it gets here.
-  if (she.has_shebang && !allow_oom && g_pre_command_oom_state && g_config_maxmemory > 0 &&
-      !g_replaying_aof) {
-    return std::string(
-        "-OOM allow-oom flag is not set on the script, can not run it when used memory > "
-        "'maxmemory'\r\n");
-  }
-  if (write_intent && noreplicas_should_reject()) {
-    return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
-  }
-
+  // evalGenericCommand() caches the script before scriptPrepareForRun() can refuse it.
   if (cache) g_script_cache[sha1_hex(source)] = source;
+  // EVAL_RO and EVALSHA_RO run in a read-only context. A script without a shebang is checked by
+  // each command it calls (-NOREPLICAS at its first write, scriptVerifyWriteCommandAllow()).
+  if (std::string refusal =
+          script_prepare_refusal(she.has_shebang, she.flags, g_script_readonly_context);
+      !refusal.empty())
+    return refusal;
+
   g_script_client_resp_version = session.resp_version;
   g_script_current_session = &session;
   const bool prev_readonly = g_script_readonly_context;
@@ -5830,6 +5895,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.in_multi = true;
           session.multi_dirty = false;
           session.queued.clear();
+          session.multi_flags = 0;
+          session.multi_inv_flags = 0;
           return encode_simple("OK");
         }});
 
@@ -5896,27 +5963,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           session.queued.clear();
           session.watched_epoch.reset();
           session.watched_digests.clear();
-          const auto& table = command_table();
-          bool has_write = false;
-          bool has_read = false;
-          for (const auto& q : queued) {
-            if (q.empty()) continue;
-            const auto qc = upper(q[0]);
-            auto it = table.find(qc);
-            if (it == table.end()) continue;
-            if (it->second.is_write()) has_write = true;
-            else has_read = true;
-          }
-          // noreplicas_should_reject() never refuses the AOF or the master stream (Redis's
-          // mustObeyClient()), so a transaction they replay is never dropped. The dispatch has
-          // already run the maxmemory check for EXEC (processCommand()).
-          if (has_write && noreplicas_should_reject()) {
-            return std::string("-EXECABORT Transaction discarded because of previous errors: NOREPLICAS Not enough good replicas to write.\r\n");
-          }
-          if (has_read && !g_replaying_aof && g_replication_role == "slave" &&
-              !g_config_replica_serve_stale_data && g_replica_stale) {
-            return std::string("-EXECABORT Transaction discarded because of previous errors: MASTERDOWN Link with MASTER is down and replica-serve-stale-data is set to 'no'.\r\n");
-          }
+          // The dispatch has checked EXEC by the commands it queued (-OOM, -MISCONF, -NOREPLICAS,
+          // -READONLY, -MASTERDOWN, as processCommand() does), so the commands run without those
+          // checks, as Redis's execCommand() calls them.
           // The commands' writes join EXEC's execution unit, which wraps them in MULTI/EXEC for the
           // AOF and the replicas when there is more than one (propagate_pending_commands()). A
           // REPLICAOF inside the transaction makes this server a replica before the unit ends,
@@ -12570,6 +12619,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         else if (f == "stale") spec.flag_bits |= kFlagStale;
         else if (f == "no_auth") spec.flag_bits |= kFlagNoAuth;
       }
+      spec.redis_name = lower(spec.name);
+      const auto& index = redis_command_index();
+      const auto redis = index.flags.find(spec.redis_name);
+      spec.redis_flags = redis == index.flags.end() ? 0 : redis->second;
+      spec.redis_container = index.containers.count(spec.redis_name) != 0;
     }
 
     // Apply rename-command directives in config order. The config loader (src/config.cpp) has
@@ -12664,6 +12718,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
        cmd == "FCALL" || cmd == "FCALL_RO");
   if (is_script_cmd) {
     g_script_inner_error_seen = false;
+    (void)lua_engine_consume_last_error_from_redis();  // left set by an earlier script's error
     g_script_repl_flags = 3;  // redis.set_repl scope is a single script invocation
   }
   const auto& table = command_table();
@@ -12704,10 +12759,6 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   if (session.in_multi && cmd != "EXEC" && cmd != "DISCARD" && cmd != "MULTI" && cmd != "QUIT" &&
       cmd != "RESET") {
-    if (cmd == "SAVE" || cmd == "SHUTDOWN") {
-      session.multi_dirty = true;
-      return std::string("-ERR Command not allowed inside a transaction\r\n");
-    }
     const auto qit = table.find(cmd);
     if (qit == table.end()) {
       session.multi_dirty = true;
@@ -12716,6 +12767,14 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     if (!arity_ok(args.size(), qit->second.arity)) {
       session.multi_dirty = true;
       return encode_error("wrong number of arguments for '" + lower(cmd) + "' command");
+    }
+    const std::uint64_t flags = spec_command_flags(qit->second, args);
+    // Redis's CMD_NO_MULTI commands (SAVE, SHUTDOWN, SYNC, PSYNC) are refused inside MULTI.
+    if (flags & kRedisCmdNoMulti) {
+      session.multi_dirty = true;
+      record_cmd_rejected(cmd);
+      record_error_stat("ERR");
+      return encode_error("Command not allowed inside a transaction");
     }
     // processCommand() runs the maxmemory step before it queues: while memory is over the limit,
     // nothing is queued. Not for a transaction from the master stream or the AOF.
@@ -12727,21 +12786,32 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     }
     // WATCH is not queued: watchCommand() answers this, after processCommand()'s checks.
     if (cmd == "WATCH") return encode_error("WATCH inside MULTI is not allowed");
-    // processCommand() checks a command before it queues it, as at the top level below; not a
-    // transaction from the master stream or the AOF.
-    if (std::string misconf = g_replaying_aof ? std::string() : misconf_reply();
-        !misconf.empty() && (cmd == "PING" || command_writes(cmd, args))) {
-      session.multi_dirty = true;
-      record_cmd_rejected(cmd);
-      record_error_stat("MISCONF");
-      return misconf;
+    // processCommand() checks a command before it queues it, as at the top level below, and
+    // flags the transaction (-EXECABORT at EXEC); not a transaction from the master stream or
+    // the AOF.
+    if (!g_replaying_aof) {
+      std::string refusal = misconf_reply();
+      if (refusal.empty() || (cmd != "PING" && !(flags & kRedisCmdWrite)))
+        refusal = replication_refusal(flags);
+      if (!refusal.empty()) {
+        session.multi_dirty = true;
+        record_cmd_rejected(cmd);
+        record_error_stat(error_code_from_reply(refusal));
+        return refusal;
+      }
     }
     // Redis checks CLIENT PAUSE before it queues, so a write sent inside MULTI waits too.
     if (pause_holds(cmd, args, session)) {
       session.postponed = true;
       return std::string();
     }
-    session.queued.push_back(args);
+    // queueMultiCommand(): a transaction that already has an error stores nothing more, so the
+    // flags EXEC is checked by are those of what it holds.
+    if (!session.multi_dirty) {
+      session.queued.push_back(args);
+      session.multi_flags |= flags;
+      session.multi_inv_flags |= ~flags;
+    }
     return encode_simple("QUEUED");
   }
 
@@ -12775,110 +12845,70 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   }
   auto& top_stat = g_cmdstats[lower(cmd)];
   const bool spec_is_write = spec.is_write();
-  // EVAL/EVALSHA/FCALL/FCALL_RO are exempt from the top-level persistence/OOM/replica gates:
-  // the script or function decides for itself (via its flags), and its inner write commands are
-  // gated individually when they re-enter this dispatch.
-  const bool is_script_dispatch =
-      cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" || cmd == "EVALSHA_RO" ||
-      cmd == "FCALL" || cmd == "FCALL_RO";
   const bool in_script = in_lua_script_context();
-  // The maxmemory step of processCommand(), before the -MISCONF check: only for the client's own
-  // command; the commands EXEC runs are not checked again, and a script's are checked by
-  // script_refuses_for_oom() below.
-  if (!g_replaying_aof && !in_script && !g_executing_exec &&
-      maxmemory_refuses(cmd, args, session)) {
+  // processCommand()'s checks for the client's own command, in Redis's order and by Redis's
+  // command flags (command_flags(), getCommandFlags()): -OOM, -MISCONF, -NOREPLICAS, -READONLY,
+  // the pub/sub context, -MASTERDOWN. An EXEC is checked by the flags of what it queued (Redis's
+  // mstate flags) and refused with execCommandAbort()'s text, which discards the transaction.
+  // The commands EXEC runs are not checked again (execCommand() calls them), a script's commands
+  // are checked as scriptCall() does (below and in dispatch_from_lua()), and nothing replayed
+  // from the AOF or the master stream is checked (mustObeyClient()).
+  const bool client_command = !g_replaying_aof && !in_script && !g_executing_exec;
+  const bool queued_exec = cmd == "EXEC" && session.in_multi;
+  // Redis's rejectCommand().
+  auto reject = [&](const std::string& refusal) -> std::string {
     ++top_stat.rejected_calls;
-    if (cmd == "EXEC" && session.in_multi) {
-      // rejectCommand() on EXEC: execCommandAbort() discards the transaction.
-      record_error_stat("EXECABORT");
-      session.in_multi = false;
-      session.multi_dirty = false;
-      session.queued.clear();
-      session.watched_epoch.reset();
-      session.watched_digests.clear();
-      return "-EXECABORT Transaction discarded because of: OOM command not allowed when used "
-             "memory > 'maxmemory'.\r\n";
+    if (in_script) g_script_inner_error_seen = true;
+    if (!queued_exec) {
+      if (session.in_multi) session.multi_dirty = true;  // flagTransaction() (a MULTI inside one)
+      record_error_stat(error_code_from_reply(refusal));
+      return refusal;
     }
-    record_error_stat("OOM");
-    return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
-  }
-  // After the OOM check, as in Redis's processCommand(): while persistence is failing it refuses
-  // writes, PING, and an EXEC whose transaction writes (execCommandAbort() discards it). The
-  // commands EXEC runs are not checked again; a script's writes are (scriptCall()), until its
-  // first write (scriptVerifyWriteCommandAllow()): PeaDB writes the AOF per command, so the first
-  // write of a script can be the one that fails.
-  if (!g_replaying_aof && !(g_executing_exec && !in_script) &&
-      !(in_script && g_script_write_dirty)) {
-    std::string misconf = misconf_reply();
-    if (!misconf.empty()) {
-      bool refuse = (cmd == "PING" && !in_script) || command_writes(cmd, args);
-      if (cmd == "EXEC" && session.in_multi) {
-        for (const auto& q : session.queued) {
-          if (!q.empty() && command_writes(upper(q[0]), q)) refuse = true;
-        }
-      }
-      if (refuse) {
-        ++top_stat.rejected_calls;
-        // execCommandAbort() replies -EXECABORT, so Redis counts that error, not MISCONF.
-        record_error_stat(cmd == "EXEC" && session.in_multi ? "EXECABORT" : "MISCONF");
-        if (in_script) g_script_inner_error_seen = true;
-        if (cmd == "EXEC" && session.in_multi) {
-          session.in_multi = false;
-          session.multi_dirty = false;
-          session.queued.clear();
-          session.watched_epoch.reset();
-          session.watched_digests.clear();
-          return "-EXECABORT Transaction discarded because of: " + misconf.substr(1);
-        }
-        return misconf;
-      }
+    // execCommandAbort(): discard the transaction, and show the EXEC to MONITOR, which saw MULTI.
+    record_error_stat("EXECABORT");
+    session.in_multi = false;
+    session.multi_dirty = false;
+    session.queued.clear();
+    session.watched_epoch.reset();
+    session.watched_digests.clear();
+    feed_monitors(cmd, args, session);
+    return "-EXECABORT Transaction discarded because of: " + refusal.substr(1);
+  };
+  bool deny_stale = false;  // the -MASTERDOWN check, after the pub/sub context one
+  if (client_command) {
+    if (maxmemory_refuses(cmd, args, session))
+      return reject("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    // The flags are read only when a check can refuse, which keeps them off a master's hot path.
+    const std::string misconf = misconf_reply();
+    if (!misconf.empty() || g_replication_role == "slave" || g_config_min_replicas_to_write > 0) {
+      const std::uint64_t flags = queued_exec ? 0 : spec_command_flags(spec, args);
+      const bool writes = queued_exec ? (session.multi_flags & kRedisCmdWrite) != 0
+                                      : (flags & kRedisCmdWrite) != 0;
+      // While persistence is failing: writes and PING (writeCommandsDeniedByDiskError()).
+      if (!misconf.empty() && (writes || cmd == "PING")) return reject(misconf);
+      if (std::string refusal = write_refusal(writes); !refusal.empty()) return reject(refusal);
+      // EXEC itself is flagged STALE: it is refused when something it queued is not.
+      // Redis answers an unknown subcommand before these checks; PeaDB's handlers answer it.
+      deny_stale = queued_exec ? (session.multi_inv_flags & kRedisCmdStale) != 0
+                               : !(flags & kRedisCmdStale) && !spec_subcommand_unknown(spec, args);
     }
-  }
-  // scriptCall(): after the checks of scriptVerifyWriteCommandAllow() (-MISCONF above),
-  // scriptVerifyOOM(), then a write marks the script as having written.
-  if (in_script && script_refuses_for_oom(args)) {
-    ++top_stat.rejected_calls;
-    record_error_stat("OOM");
-    g_script_inner_error_seen = true;
-    return std::string("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
-  }
-  if (in_script && !g_script_write_dirty && command_writes(cmd, args)) g_script_write_dirty = true;
-  if (spec_is_write && noreplicas_should_reject() &&
-      !is_script_dispatch &&
-      cmd != "CONFIG" && cmd != "REPLICAOF" && cmd != "SLAVEOF") {
-    ++top_stat.rejected_calls;
-    record_error_stat("NOREPLICAS");
-    if (in_lua_script_context()) g_script_inner_error_seen = true;
-    return std::string("-NOREPLICAS Not enough good replicas to write.\r\n");
-  }
-  if (!spec_is_write && g_replication_role == "slave" && !g_config_replica_serve_stale_data &&
-      g_replica_stale && cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "INFO" &&
-      cmd != "MULTI" && cmd != "EXEC" && cmd != "DISCARD" &&
-      cmd != "COMMAND" && cmd != "CONFIG") {
-    return masterdown_stale_reply();
-  }
-  // The replica read-only gate needs the *effective* write-ness, which the static command flag
-  // doesn't capture for the scripting/function family: FCALL writes only if its target function
-  // lacks the no-writes flag, FCALL_RO never writes, and FUNCTION LOAD/DELETE/FLUSH/RESTORE
-  // mutate the function space (so they're rejected on a read-only replica — unless applied from
-  // the master/AOF stream, where g_replaying_aof is set and the whole gate is bypassed below).
-  bool readonly_gate_write = spec_is_write;
-  if (cmd == "FCALL_RO") {
-    readonly_gate_write = false;
-  } else if (cmd == "FCALL" && args.size() >= 2) {
-    const auto flags = function_flags(args[1]);
-    readonly_gate_write = !flags || !(*flags & kFuncNoWrites);
-  } else if (cmd == "FUNCTION" && args.size() >= 2) {
-    const auto sub = upper(args[1]);
-    if (sub == "LOAD" || sub == "DELETE" || sub == "FLUSH" || sub == "RESTORE") readonly_gate_write = true;
-  }
-  if (readonly_gate_write && g_replication_role == "slave" && !g_executing_exec &&
-      !g_replaying_aof &&
-      cmd != "REPLICAOF" && cmd != "SLAVEOF" && cmd != "PUBLISH" && cmd != "SPUBLISH") {
-    ++top_stat.rejected_calls;
-    record_error_stat("READONLY");
-    if (in_lua_script_context()) g_script_inner_error_seen = true;
-    return std::string("-READONLY You can't write against a read only replica.\r\n");
+  } else if (in_script) {
+    // scriptCall(): scriptVerifyWriteCommandAllow() refuses a write made before the script's
+    // first one (a script that has written is never stopped half done) on a replica, while
+    // persistence is failing and without enough good replicas; then scriptVerifyOOM(); then a
+    // write marks the script as having written (SCRIPT_WRITE_DIRTY). Its stale and read-only
+    // checks came first, in dispatch_from_lua().
+    const bool first_write =
+        !g_script_write_dirty && (spec_command_flags(spec, args) & kRedisCmdWrite) != 0;
+    if (first_write && !g_replaying_aof) {
+      std::string refusal =
+          g_replication_role == "slave" ? std::string(kReadonlyReplicaReply) : misconf_reply();
+      if (refusal.empty() && noreplicas_should_reject()) refusal = kNoReplicasReply;
+      if (!refusal.empty()) return reject(refusal);
+    }
+    if (script_refuses_for_oom(args))
+      return reject("-OOM command not allowed when used memory > 'maxmemory'.\r\n");
+    if (first_write) g_script_write_dirty = true;
   }
   // RESP2 clients with active subscriptions may only run the pub/sub control commands
   // (Redis server.c subscribe-mode gate; exemption is by command identity — PUBLISH is
@@ -12895,6 +12925,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
                         "': only (P|S)SUBSCRIBE / (P|S)UNSUBSCRIBE / PING / QUIT / RESET "
                         "are allowed in this context");
   }
+  if (std::string refusal = stale_refusal(deny_stale); !refusal.empty()) return reject(refusal);
 
   // CLIENT PAUSE: hold the command, after the checks that refuse it (as Redis's processCommand
   // does); the event loop runs it again when the pause ends.
@@ -13337,21 +13368,12 @@ void on_client_disconnect(int fd) {
   }
 }
 
+// By the command the name runs, so a command renamed with rename-command keeps Redis's flags.
 std::uint64_t redis_command_flags(const std::vector<std::string>& args) {
-  static const auto* const index = [] {
-    auto* m = new std::unordered_map<std::string, std::uint64_t>();
-    for (const auto& e : command_metadata()) (*m)[e.full_name] = e.flags;
-    return m;
-  }();
   if (args.empty()) return 0;
-  const std::string name = lower(args[0]);
-  // A container command resolves to its subcommand, as Redis's lookupCommand() does.
-  if (args.size() >= 2) {
-    const auto sub = index->find(name + "|" + lower(args[1]));
-    if (sub != index->end()) return sub->second;
-  }
-  const auto it = index->find(name);
-  return it == index->end() ? 0 : it->second;
+  const auto& table = command_table();
+  const auto it = table.find(upper(args[0]));
+  return it == table.end() ? 0 : spec_redis_flags(it->second, args);
 }
 
 bool client_pause_update() {
@@ -13614,11 +13636,23 @@ bool in_lua_script_context() {
   return g_in_lua_script;
 }
 
-void record_lua_script_rejected_write(const std::string& cmd) {
+void record_lua_script_rejected(const std::string& cmd) {
   auto& st = g_cmdstats[lower(cmd)];
   ++st.rejected_calls;
   record_error_stat("ERR");
   g_script_inner_error_seen = true;
+}
+
+// A command PeaDB does not know, or with the wrong number of arguments, is left to the dispatch,
+// which answers those first, as Redis's scriptCall() does.
+bool script_command_refused_as_stale(const std::vector<std::string>& args) {
+  if (args.empty() || g_replaying_aof || !running_stale()) return false;
+  const auto& table = command_table();
+  const auto it = table.find(upper(args[0]));
+  if (it == table.end() || !arity_ok(args.size(), it->second.arity) ||
+      spec_subcommand_unknown(it->second, args))
+    return false;
+  return !(spec_redis_flags(it->second, args) & kRedisCmdStale);
 }
 
 static std::atomic<bool> g_shutdown_requested{false};

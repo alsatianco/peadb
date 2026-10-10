@@ -50,6 +50,11 @@ struct SessionState {
   bool in_multi = false;
   bool multi_dirty = false;
   std::vector<std::vector<std::string>> queued;
+  // Redis's mstate.cmd_flags and cmd_inv_flags: the OR of the queued commands' flags (kRedisCmd*,
+  // as getCommandFlags() gave them when each was queued) and of their complements, by which
+  // processCommand() checks EXEC. Reset by MULTI.
+  std::uint64_t multi_flags = 0;
+  std::uint64_t multi_inv_flags = 0;
   std::optional<std::uint64_t> watched_epoch;
   std::unordered_map<std::string, std::optional<std::string>> watched_digests;
   bool asking = false;
@@ -115,7 +120,8 @@ struct SessionState {
 
 std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
 // Redis's command flags (kRedisCmd* in command_metadata.generated.hpp) of the command or
-// subcommand that `args` names, from the pinned Redis command JSON; 0 for a name Redis lacks.
+// subcommand that `args` runs (also under a name given by rename-command), from the pinned Redis
+// command JSON; 0 for a name that runs no command.
 std::uint64_t redis_command_flags(const std::vector<std::string>& args);
 // CLIENT PAUSE and the pause of a shutdown that waits for replicas, for the event loop: checks
 // whether a pause has timed out and returns true when the clients it held must run again
@@ -256,7 +262,11 @@ void drain_replica_cmd_queue();
 // ── Lua script context (set by lua_engine, read by blocking command handlers) ──
 void set_lua_script_context(bool in_script);
 bool in_lua_script_context();
-void record_lua_script_rejected_write(const std::string& cmd);
+// A command a script called was refused before it ran (its rejected_calls and an ERR errorstat).
+void record_lua_script_rejected(const std::string& cmd);
+// scriptVerifyAllowStale(): on a stale replica (link down, replica-serve-stale-data no) a script
+// may call only the commands Redis flags STALE.
+bool script_command_refused_as_stale(const std::vector<std::string>& args);
 
 // ── Shutdown ──
 // request_shutdown() makes the event loop stop; the SHUTDOWN command and shutdown_cron() call it
