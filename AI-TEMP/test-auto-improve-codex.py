@@ -206,10 +206,30 @@ class LoopTests(unittest.TestCase):
         self.assertIn('working tree has changes', self.run_loop(expected=1))
         self.assertEqual(self.calls(), [])
 
-    def test_allowed_untracked_file(self):
+    def test_allowed_untracked_notes_after_history_change(self):
         (self.root / 'todo.md').write_text('owner notes\n')
+        (self.root / 'auto_prompt.md').write_text('owner prompt\n')
+        self.git('commit', '--amend', '-qm', 'test: rewrite fixture history before startup')
         self.run_loop([{'status':'all_done'}])
         self.assertEqual(len(self.calls()), 1)
+
+    def test_custom_untracked_allowance_overrides_defaults(self):
+        (self.root / 'notes.md').write_text('custom notes\n')
+        self.run_loop([{'status':'all_done'}], ALLOW_UNTRACKED='notes.md')
+        self.assertEqual(len(self.calls()), 1)
+        (self.root / 'auto_prompt.md').write_text('owner prompt\n')
+        out = self.run_loop(expected=1, ALLOW_UNTRACKED='notes.md')
+        self.assertIn('?? auto_prompt.md', out)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_allowed_notes_still_block_tracked_edits(self):
+        (self.root / 'auto_prompt.md').write_text('tracked prompt\n')
+        self.git('add', 'auto_prompt.md')
+        self.git('commit', '-qm', 'test: track owner prompt')
+        (self.root / 'auto_prompt.md').write_text('edited prompt\n')
+        out = self.run_loop(expected=1)
+        self.assertIn(' M auto_prompt.md', out)
+        self.assertEqual(self.calls(), [])
 
     def test_no_checkboxes_still_requires_audit(self):
         (self.root / 'AI-TEMP/improve-plan.md').write_text('Owner still needs to publish.\n')

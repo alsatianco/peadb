@@ -9,10 +9,10 @@ bash AI-TEMP/auto-improve-codex.sh
 bash AI-TEMP/auto-improve-codex.sh watch  # another terminal
 ```
 
-The initial working tree must be clean and on `main`. `todo.md` is allowed by default. To explicitly allow the existing owner notes in this checkout:
+The initial working tree must be clean and on `main`, except for untracked local notes `todo.md` and `auto_prompt.md`, which are allowed by default. `ALLOW_UNTRACKED` overrides that list; tracked edits always stop the loop. For example, to allow another notes file:
 
 ```bash
-ALLOW_UNTRACKED='todo.md auto_prompt.md' bash AI-TEMP/auto-improve-codex.sh
+ALLOW_UNTRACKED='todo.md auto_prompt.md notes.md' bash AI-TEMP/auto-improve-codex.sh
 ```
 
 Logs, schemas, instructions, results, token counts, plan snapshots, and commit lists live under `AI-TEMP/auto-improve-codex/`. The shared lock remains at `AI-TEMP/auto-improve/lock`, preventing simultaneous Claude and Codex loops. An existing lock is never automatically deleted: inspect its PID and running processes before removing a stale lock.
@@ -55,7 +55,7 @@ shellcheck --shell=bash AI-TEMP/auto-improve-codex.sh
 python3 AI-TEMP/test-auto-improve-codex.py
 ```
 
-The 28 disposable-repository tests cover commits, plan updates, completion audits, token summaries, watcher output, rate-limit waits, resume, stale or malformed results, dirty trees, branch and history guards, active and stale locks, blocked results, idle/failure caps, unsupported CLI versions, settings validation, and signal cleanup. A rate-limit test caught a real `grep -q`/`pipefail` SIGPIPE bug; the loop now consumes the full error stream.
+The disposable-repository tests cover commits, plan updates, completion audits, token summaries, watcher output, rate-limit waits, resume, stale or malformed results, dirty trees, default and custom untracked-file allowances, tracked notes edits, branch and history guards, active and stale locks, blocked results, idle/failure caps, unsupported CLI versions, settings validation, and signal cleanup. A rate-limit test caught a real `grep -q`/`pipefail` SIGPIPE bug; the loop now consumes the full error stream.
 
 A real-model test is available separately; it makes model requests using the saved Codex login:
 

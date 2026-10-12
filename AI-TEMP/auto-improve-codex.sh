@@ -15,7 +15,7 @@
 #   MAX_IDLE=2                 stop after this many "task_done" sessions without both a commit and a plan update
 #   LIMIT_WAIT=1800            seconds to wait after a usage limit when the reset time is unknown
 #   MAX_LIMIT_WAITS=48         stop after this many usage-limit waits in a row
-#   ALLOW_UNTRACKED="todo.md"  untracked files (space-separated) that do not count as a dirty working tree
+#   ALLOW_UNTRACKED="todo.md auto_prompt.md"  untracked files (space-separated) that do not count as a dirty working tree
 #
 # Each session keeps a full record in AI-TEMP/auto-improve-codex/run-*/ (Codex JSONL transcript, structured result, token usage, stderr, the plan before and after, the new commits), and one line per session goes to AI-TEMP/auto-improve-codex/summary.tsv.
 #
@@ -53,7 +53,7 @@ MAX_FAILS=${MAX_FAILS:-2}
 MAX_IDLE=${MAX_IDLE:-2}
 LIMIT_WAIT=${LIMIT_WAIT:-1800}
 MAX_LIMIT_WAITS=${MAX_LIMIT_WAITS:-48}
-ALLOW_UNTRACKED=${ALLOW_UNTRACKED:-todo.md}
+ALLOW_UNTRACKED=${ALLOW_UNTRACKED:-"todo.md auto_prompt.md"}
 
 # Codex has no Claude --max-budget-usd equivalent; never silently ignore a cap.
 if [ -n "${MAX_BUDGET_USD:-}" ]; then
