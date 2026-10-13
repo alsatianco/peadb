@@ -1,5 +1,7 @@
 #pragma once
 
+#include "datastore.hpp"
+
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -76,6 +78,7 @@ bool rdb_parse_function_payload(const std::string& payload, std::vector<std::str
 
 // A value read from a DUMP payload by RESTORE, held apart from the keyspace until it is stored.
 struct DumpValue {
+  DataStore::StreamDump stream;
   std::uint8_t type = 0;                                    // the RDB type byte
   std::string str;                                          // string
   std::vector<std::string> items;                           // list items, set members

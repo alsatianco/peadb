@@ -1,12 +1,3 @@
-# Consumer seen-time / active-time survive a DUMP+RESTORE round-trip: PeaDB's stream RDB
-# encoding (type 200) does not yet serialize per-consumer seen/active timestamps, and the
-# test also makes tight wall-clock idle/inactive assertions. Tracked in compat/delta.md item 17.
-Consumer seen-time and active-time
 # total_blocking_keys / total_blocking_keys_on_nokey INFO Clients fields: PeaDB does not yet
 # expose blocking-key introspection counters. Tracked in compat/delta.md item 17.
 Blocking XREADGROUP for stream key that has clients blocked on list
-# RESTORE of a real-Redis listpack-encoded stream RDB payload (RDB_TYPE_STREAM_LISTPACKS_2/3):
-# PeaDB serializes streams under its own type byte (200) and cannot decode Redis's native
-# stream RDB layout, so these cross-engine legacy-format loads fail. Tracked in compat/delta.md item 5.
-Loading from legacy (Redis <= v6.2.x, rdb_ver < 10) persistence
-Loading from legacy (Redis <= v7.0.x, rdb_ver < 11) persistence

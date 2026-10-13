@@ -537,12 +537,16 @@ class DataStore {
     std::string name;
     std::string last_delivered_id;
     std::vector<StreamPel> pending;
+    std::int64_t entries_read = 0;
+    std::map<std::string, Entry::StreamConsumer> consumers;
   };
   struct StreamDump {
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> entries;
     std::uint64_t last_ms = 0;
     std::uint64_t last_seq = 0;
     std::vector<StreamGroupDump> groups;
+    std::optional<std::uint64_t> entries_added;  // absent in the old private RDB type
+    std::string max_deleted_id = "0-0";
   };
   bool dump_stream(const std::string& key, StreamDump& out);  // false if absent / not a stream
   void restore_stream(const std::string& key, const StreamDump& d);

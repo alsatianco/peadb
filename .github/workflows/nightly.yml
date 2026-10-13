@@ -16,6 +16,9 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y cmake g++ liblua5.1-0-dev redis-server tcl
 
+      - name: Prepare Redis 7.2.5 reference
+        run: bash scripts/ci/ensure_redis_reference.sh
+
       - name: Configure (ASAN+UBSAN)
         run: |
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
@@ -39,6 +42,9 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y cmake g++ liblua5.1-0-dev redis-server tcl
+
+      - name: Prepare Redis 7.2.5 reference
+        run: bash scripts/ci/ensure_redis_reference.sh
 
       - name: Configure (Release)
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release

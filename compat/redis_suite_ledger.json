@@ -326,11 +326,11 @@
     "unit/type/stream-cgroups": {
       "last_counts": {
         "err": 0,
-        "ignored": 9,
-        "ok": 60
+        "ignored": 6,
+        "ok": 63
       },
       "mode": "native",
-      "skipfile_lines": 4
+      "skipfile_lines": 1
     },
     "unit/type/string": {
       "last_counts": {

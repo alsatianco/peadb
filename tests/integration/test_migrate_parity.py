@@ -11,7 +11,7 @@ The same checks run on peadb-server and on the pinned redis-server (Redis side f
 - the connection to a target is kept (INFO `migrate_cached_sockets`, the target sees one connection and one SELECT per database), and a kept connection that the target closed is opened again without an error.
 - `RESTORE-ASKING` works like `RESTORE` and is propagated as it came.
 
-PeaDB only: MIGRATE of a stream is refused (PeaDB cannot write a stream in Redis's DUMP format yet, item 51) and nothing moves.
+Stream keys migrate with other keys and their deletion reaches replicas and AOF replay.
 
 Without a pinned Redis 7.2.x, only the PeaDB side runs.
 """
@@ -440,17 +440,15 @@ def check_engine(name, binary, work, seen):
         check_propagation(name, src, tgt, tport, Marker(src, fake, events))
         check_replies(name, src, sport, tgt, tport, closed_port, seen)
         check_introspection(name, src, tport)
-        if name == 'peadb':
-            # PeaDB cannot DUMP a stream (item 51): the whole MIGRATE is refused, nothing moves.
-            assert src('XADD', 'st', '1-1', 'f', 'v') == '1-1' and src('SET', 'sk', 'v') == '+OK'
-            reply = migrate(src, tport, '', 0, 5000, 'KEYS', 'sk', 'st')
-            assert reply.startswith('-ERR MIGRATE of a stream'), reply
-            assert src('EXISTS', 'sk', 'st') == 2 and tgt('EXISTS', 'sk', 'st') == 0
+        assert src('XADD', 'st', '1-1', 'f', 'v') == '1-1' and src('SET', 'sk', 'v') == '+OK'
+        assert migrate(src, tport, '', 0, 5000, 'KEYS', 'sk', 'st') == '+OK'
+        assert src('EXISTS', 'sk', 'st') == 0 and tgt('EXISTS', 'sk', 'st') == 2
+        assert tgt('XRANGE', 'st', '-', '+') == [['1-1', ['f', 'v']]]
         # The real replica and an AOF reload: the moved keys are gone, the copied ones stay.
         assert src('SET', 'last', 'x') == '+OK'
         wait_for(lambda: replica('GET', 'last') == 'x', 'the replica to catch up')
         moved = ['k1', 'a', 'c', 'e', 'b', 'd', 'f', 'big', 'biglist', 'r2', 's1', 's2', 's3', 's4',
-                 's5', 'al']
+                 's5', 'al', 'sk', 'st']
         assert replica('EXISTS', *moved) == 0, name
         assert replica('LRANGE', 'copied', 0, -1) == ['a', 'b'] and replica('GET', 't') == 'v', name
         assert replica('GET', 'r') == 'v' and replica('GET', 'neg') == 'v', name

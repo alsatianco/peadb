@@ -6,7 +6,7 @@
 //   - Sets (RDB_TYPE_SET = 2, RDB_TYPE_SET_INTSET = 11)
 //   - Hashes (RDB_TYPE_HASH = 4, RDB_TYPE_HASH_LISTPACK = 16)
 //   - Sorted sets (RDB_TYPE_ZSET_2 = 5, RDB_TYPE_ZSET_LISTPACK = 17)
-//   - Streams (PeaDB's own type 200; Redis's stream types are not read, compat/delta.md item 5)
+//   - Streams (Redis listpack types 15/19/21; writes type 21, reads old private type 200)
 // The zipmap and ziplist encodings of Redis before 7.0 (types 9, 10, 12, 13, 14) are refused.
 //
 // References: Redis src/rdb.h, src/rdb.c
@@ -15,6 +15,7 @@
 #include "datastore.hpp"
 #include "logger.hpp"
 
+#include <charconv>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -123,9 +124,10 @@ constexpr uint8_t RDB_TYPE_HASH_LISTPACK = 16;
 constexpr uint8_t RDB_TYPE_ZSET_LISTPACK = 17;
 constexpr uint8_t RDB_TYPE_LIST_QUICKLIST_2 = 18;
 constexpr uint8_t RDB_TYPE_SET_LISTPACK = 20;
-// PeaDB-specific stream encoding (NOT Redis byte-compatible — Redis can't load an RDB
-// containing this type; cross-engine stream migration still uses the AOF/bridge path).
-// Chosen outside Redis's type range so non-stream RDBs stay fully Redis-compatible.
+constexpr uint8_t RDB_TYPE_STREAM_LISTPACKS = 15;
+constexpr uint8_t RDB_TYPE_STREAM_LISTPACKS_2 = 19;
+constexpr uint8_t RDB_TYPE_STREAM_LISTPACKS_3 = 21;
+// Legacy private stream snapshots remain readable for local recovery; all new writes use 21.
 constexpr uint8_t RDB_TYPE_PEADB_STREAM = 200;
 
 constexpr uint8_t RDB_ENC_INT8 = 0;
@@ -133,7 +135,7 @@ constexpr uint8_t RDB_ENC_INT16 = 1;
 constexpr uint8_t RDB_ENC_INT32 = 2;
 constexpr uint8_t RDB_ENC_LZF = 3;
 
-constexpr int RDB_VERSION = 10;
+constexpr int RDB_VERSION = 11;
 // The newest RDB version Redis 7.2.5 reads (its rdb.h RDB_VERSION): a file or a DUMP payload with
 // a newer one is refused, as Redis refuses it.
 constexpr int RDB_VERSION_MAX_LOAD = 11;
@@ -485,12 +487,9 @@ class RdbReader {
     }
     std::string s;
     if (!read_bytes(s, len)) return false;
-    try {
-      v = std::stod(s);
-    } catch (...) {
-      return false;
-    }
-    return true;
+    char* end = nullptr;
+    v = std::strtod(s.c_str(), &end);
+    return !s.empty() && end == s.c_str() + s.size();
   }
 
  private:
@@ -596,8 +595,24 @@ class ListpackWriter {
   }
 
   void add_integer(int64_t v) {
-    // Encode as string for simplicity
-    add_string(std::to_string(v));
+    // Stream listpacks require actual integer entries (lpGetInteger), not numeric strings.
+    std::size_t n;
+    if (v >= 0 && v <= 127) {
+      entries_.push_back(static_cast<char>(v));
+      n = 1;
+    } else if (v >= -4096 && v <= 4095) {
+      const auto u = static_cast<uint64_t>(v) & 8191;
+      entries_.push_back(static_cast<char>(0xC0 | (u >> 8)));
+      entries_.push_back(static_cast<char>(u));
+      n = 2;
+    } else {
+      entries_.push_back(static_cast<char>(0xF4));
+      const auto u = static_cast<uint64_t>(v);
+      for (int i = 0; i < 8; ++i) entries_.push_back(static_cast<char>(u >> (8 * i)));
+      n = 9;
+    }
+    encode_backlen(n);
+    ++count_;
   }
 
   // The caller keeps the listpack under 4 GB (the total-bytes field is 32 bits): the list writer
@@ -667,8 +682,9 @@ class ListpackReader {
   // corrupt listpack. The entry count is not checked, as in Redis with sanitize-dump-payload no
   // (the default): the entries up to the 0xFF are what is read. So a list saved by PeaDB before
   // compat/delta.md item 29 was fixed, whose count was cut to 16 bits, loads with all its items.
-  bool parse(std::vector<std::string>& out) {
+  bool parse(std::vector<std::string>& out, std::vector<bool>* integers = nullptr) {
     out.clear();
+    if (integers) integers->clear();
     if (data_.size() < kListpackHeaderAndEnd) return false;
     if (read_u32_le_at(0) != data_.size()) return false;
     if (static_cast<uint8_t>(data_.back()) != 0xFF) return false;
@@ -676,6 +692,10 @@ class ListpackReader {
     if (num_entries != kListpackCountUnknown) out.reserve(num_entries);
     pos_ = 6;
     while (pos_ < data_.size() - 1) {
+      const auto enc = static_cast<uint8_t>(data_[pos_]);
+      if (integers)
+        integers->push_back(enc < 0x80 || (enc >= 0xC0 && enc < 0xE0) ||
+                            (enc >= 0xF1 && enc <= 0xF4));
       std::string val;
       if (!read_entry(val)) return false;
       out.push_back(std::move(val));
@@ -870,9 +890,432 @@ void write_quicklist(RdbWriter& w, const std::vector<std::string>& items, std::i
   }
 }
 
+// Redis stream IDs in radix-tree keys and PELs are two big-endian uint64s.
+using RdbStreamID = std::pair<uint64_t, uint64_t>;
+std::string stream_id_text(RdbStreamID id) {
+  return std::to_string(id.first) + "-" + std::to_string(id.second);
+}
+RdbStreamID stream_id_parts(const std::string& text) {
+  const auto dash = text.find('-');
+  RdbStreamID id{};
+  if (dash == std::string::npos) return id;
+  std::from_chars(text.data(), text.data() + dash, id.first);
+  std::from_chars(text.data() + dash + 1, text.data() + text.size(), id.second);
+  return id;
+}
+std::string stream_raw_id(RdbStreamID id) {
+  std::string raw;
+  for (auto part : {id.first, id.second})
+    for (int i = 7; i >= 0; --i) raw.push_back(static_cast<char>(part >> (i * 8)));
+  return raw;
+}
+bool stream_decode_raw_id(const std::string& raw, RdbStreamID& id) {
+  if (raw.size() != 16) return false;
+  id = {};
+  for (int i = 0; i < 8; ++i) {
+    id.first = (id.first << 8) | static_cast<uint8_t>(raw[i]);
+    id.second = (id.second << 8) | static_cast<uint8_t>(raw[8 + i]);
+  }
+  return true;
+}
+bool read_plain_length(RdbReader& r, uint64_t& n) {
+  bool encoded = false;
+  return r.read_length(n, encoded) && !encoded;
+}
+bool read_stream_id(RdbReader& r, RdbStreamID& id) {
+  return read_plain_length(r, id.first) && read_plain_length(r, id.second);
+}
+void write_stream_id(RdbWriter& w, RdbStreamID id) {
+  w.write_length(id.first);
+  w.write_length(id.second);
+}
+
+// rdbSaveObject(OBJ_STREAM), type 21. Nodes are bounded independently of the in-memory
+// representation; this preserves logical data, rather than Redis's allocation/trim boundaries.
+void write_stream(RdbWriter& w, const DataStore::StreamDump& d) {
+  struct Node {
+    RdbStreamID id;
+    std::string lp;
+  };
+  std::vector<Node> nodes;
+  for (std::size_t begin = 0; begin < d.entries.size();) {
+    const auto master = stream_id_parts(d.entries[begin].first);
+    // Bound each node to 100 entries / roughly 4 KiB, allowing a single larger entry.
+    std::size_t end = begin, bytes = 0;
+    do {
+      for (const auto& [f, v] : d.entries[end].second) bytes += f.size() + v.size() + 16;
+      ++end;
+    } while (end < d.entries.size() && end - begin < 100 && bytes < 4096);
+    ListpackWriter lp;
+    lp.add_integer(end - begin);
+    lp.add_integer(0);  // no tombstones; deleted IDs remain in history and in the PEL
+    const auto& master_fields = d.entries[begin].second;
+    lp.add_integer(master_fields.size());
+    for (const auto& [f, v] : master_fields) lp.add_string(f);
+    lp.add_integer(0);  // master terminator
+    for (std::size_t i = begin; i < end; ++i) {
+      const auto id = stream_id_parts(d.entries[i].first);
+      const auto& fields = d.entries[i].second;
+      bool same = fields.size() == master_fields.size();
+      for (std::size_t j = 0; same && j < fields.size(); ++j)
+        same = fields[j].first == master_fields[j].first;
+      lp.add_integer(same ? 2 : 0);  // STREAM_ITEM_FLAG_SAMEFIELDS
+      lp.add_integer(std::bit_cast<int64_t>(id.first - master.first));
+      lp.add_integer(std::bit_cast<int64_t>(id.second - master.second));
+      if (!same) lp.add_integer(fields.size());
+      for (const auto& [f, v] : fields) {
+        if (!same) lp.add_string(f);
+        lp.add_string(v);
+      }
+      lp.add_integer(3 + fields.size() + (same ? 0 : fields.size() + 1));
+    }
+    nodes.push_back({master, lp.finish()});
+    begin = end;
+  }
+  w.write_length(nodes.size());
+  for (const auto& node : nodes) {
+    w.write_string(stream_raw_id(node.id));
+    w.write_string(node.lp);
+  }
+  w.write_length(d.entries.size());
+  write_stream_id(w, {d.last_ms, d.last_seq});
+  write_stream_id(w, d.entries.empty() ? RdbStreamID{} : stream_id_parts(d.entries.front().first));
+  write_stream_id(w, stream_id_parts(d.max_deleted_id));
+  w.write_length(d.entries_added.value_or(d.entries.size()));
+  // Redis orders groups, consumers and their pending IDs lexicographically / numerically.
+  std::map<std::string, const DataStore::StreamGroupDump*> groups;
+  for (const auto& g : d.groups) groups.emplace(g.name, &g);
+  w.write_length(groups.size());
+  for (const auto& [name, gp] : groups) {
+    const auto& g = *gp;
+    w.write_string(name);
+    write_stream_id(w, stream_id_parts(g.last_delivered_id));
+    w.write_length(static_cast<uint64_t>(g.entries_read));
+    std::map<RdbStreamID, const DataStore::StreamPel*> pel;
+    for (const auto& p : g.pending) pel.emplace(stream_id_parts(p.id), &p);
+    w.write_length(pel.size());
+    for (const auto& [id, p] : pel) {
+      w.write_raw(stream_raw_id(id).data(), 16);
+      w.write_u64_le(static_cast<uint64_t>(p->delivery_ms));
+      w.write_length(static_cast<uint64_t>(p->delivery_count));
+    }
+    std::map<std::string, std::vector<RdbStreamID>> consumer_pels;
+    for (const auto& [id, p] : pel) consumer_pels[p->consumer].push_back(id);
+    w.write_length(g.consumers.size());
+    for (const auto& [consumer, times] : g.consumers) {
+      w.write_string(consumer);
+      w.write_u64_le(static_cast<uint64_t>(times.seen_time));
+      w.write_u64_le(static_cast<uint64_t>(times.active_time));
+      const auto& ids = consumer_pels[consumer];
+      w.write_length(ids.size());
+      for (auto id : ids) w.write_raw(stream_raw_id(id).data(), 16);
+    }
+  }
+}
+
+// rdbLoadObject's stream formats 15/19/21, with structural validation before key replacement.
+bool read_stream(RdbReader& r, uint8_t type, DataStore::StreamDump& d) {
+  uint64_t count;
+  if (!read_plain_length(r, count)) return false;
+  using Fields = std::vector<std::pair<std::string, std::string>>;
+  std::map<RdbStreamID, Fields> entries;
+  std::unordered_set<std::string> nodes;
+  while (count--) {
+    std::string raw, blob;
+    RdbStreamID master;
+    if (!r.read_string(raw) || !stream_decode_raw_id(raw, master) || !nodes.insert(raw).second ||
+        !r.read_string(blob))
+      return false;
+    std::vector<std::string> values;
+    std::vector<bool> integers;
+    if (!ListpackReader(blob).parse(values, &integers)) return false;
+    std::size_t pos = 0;
+    auto number = [&](int64_t& n) {
+      if (pos >= values.size() || !integers[pos]) return false;
+      const auto& v = values[pos++];
+      const auto result = std::from_chars(v.data(), v.data() + v.size(), n);
+      return result.ec == std::errc{} && result.ptr == v.data() + v.size();
+    };
+    int64_t live, deleted, nf, zero;
+    if (!number(live) || live < 0 || !number(deleted) || deleted < 0 ||
+        static_cast<uint64_t>(live) + static_cast<uint64_t>(deleted) > values.size() ||
+        !number(nf) || nf <= 0 || static_cast<uint64_t>(nf) > values.size() - pos)
+      return false;
+    std::vector<std::string> master_fields;
+    for (int64_t i = 0; i < nf; ++i) master_fields.push_back(values[pos++]);
+    if (!number(zero) || zero != 0) return false;
+    int64_t got_live = 0, got_deleted = 0;
+    std::optional<RdbStreamID> previous;
+    for (uint64_t i = 0, total = static_cast<uint64_t>(live) + deleted; i < total; ++i) {
+      int64_t flags, ms, seq, fields = nf;
+      if (!number(flags) || flags < 0 || flags > 3 || !number(ms) || !number(seq)) return false;
+      const RdbStreamID id{master.first + static_cast<uint64_t>(ms),
+                           master.second + static_cast<uint64_t>(seq)};
+      if (id == RdbStreamID{} || (previous && id <= *previous)) return false;
+      previous = id;
+      const bool same = (flags & 2) != 0;
+      if (!same && !number(fields)) return false;
+      const auto parts = same ? 1u : 2u;
+      if (fields <= 0 || static_cast<uint64_t>(fields) > (values.size() - pos) / parts)
+        return false;
+      Fields fv;
+      for (int64_t j = 0; j < fields; ++j) {
+        std::string field = same ? master_fields[j] : values[pos++];
+        fv.emplace_back(std::move(field), values[pos++]);
+      }
+      int64_t pieces;
+      if (!number(pieces) || pieces != 3 + fields + (same ? 0 : fields + 1)) return false;
+      if (flags & 1)
+        ++got_deleted;
+      else {
+        ++got_live;
+        if (!entries.emplace(id, std::move(fv)).second) return false;
+      }
+    }
+    if (pos != values.size() || got_live != live || got_deleted != deleted) return false;
+  }
+  for (auto& [id, fv] : entries) d.entries.emplace_back(stream_id_text(id), std::move(fv));
+  uint64_t length, added;
+  RdbStreamID last, first{}, max_deleted{};
+  if (!read_plain_length(r, length) || length != d.entries.size() || !read_stream_id(r, last))
+    return false;
+  if (type >= RDB_TYPE_STREAM_LISTPACKS_2) {
+    if (!read_stream_id(r, first) || !read_stream_id(r, max_deleted) ||
+        !read_plain_length(r, added))
+      return false;
+  } else {
+    added = length;
+    if (!entries.empty()) first = entries.begin()->first;
+  }
+  // The datastore derives first-id from surviving entries; refuse inconsistent metadata
+  // rather than silently changing it. All valid Redis streams obey these invariants.
+  if (type >= RDB_TYPE_STREAM_LISTPACKS_2 &&
+      (first != (entries.empty() ? RdbStreamID{} : entries.begin()->first) || added < length ||
+       max_deleted > last))
+    return false;
+  if (!entries.empty() && entries.rbegin()->first > last) return false;
+  d.last_ms = last.first;
+  d.last_seq = last.second;
+  d.entries_added = added;
+  d.max_deleted_id = stream_id_text(max_deleted);
+  if (!read_plain_length(r, count)) return false;
+  std::unordered_set<std::string> group_names;
+  while (count--) {
+    DataStore::StreamGroupDump g;
+    RdbStreamID cursor;
+    if (!r.read_string(g.name) || !group_names.insert(g.name).second || !read_stream_id(r, cursor))
+      return false;
+    g.last_delivered_id = stream_id_text(cursor);
+    if (type >= RDB_TYPE_STREAM_LISTPACKS_2) {
+      uint64_t read;
+      if (!read_plain_length(r, read)) return false;
+      g.entries_read = std::bit_cast<int64_t>(read);
+    } else {
+      // streamEstimateDistanceFromFirstEverEntry(), after the legacy history reset above.
+      if (length == 0)
+        g.entries_read = 0;
+      else if (cursor == last)
+        g.entries_read = length;
+      else if (cursor > last)
+        g.entries_read = -1;
+      else if (cursor < first)
+        g.entries_read = 0;
+      else if (cursor == first)
+        g.entries_read = 1;
+      else
+        g.entries_read = -1;
+    }
+    uint64_t pel_size;
+    if (!read_plain_length(r, pel_size)) return false;
+    std::map<RdbStreamID, std::size_t> pel;
+    while (pel_size--) {
+      DataStore::StreamPel p;
+      std::string raw;
+      RdbStreamID id;
+      uint64_t time, deliveries;
+      if (!r.read_bytes(raw, 16) || !stream_decode_raw_id(raw, id) || !r.read_u64_le(time) ||
+          !read_plain_length(r, deliveries) || !pel.emplace(id, g.pending.size()).second)
+        return false;
+      p.id = stream_id_text(id);
+      p.delivery_ms = std::bit_cast<int64_t>(time);
+      p.delivery_count = std::bit_cast<int64_t>(deliveries);
+      g.pending.push_back(std::move(p));
+    }
+    uint64_t consumers;
+    if (!read_plain_length(r, consumers)) return false;
+    std::unordered_set<std::size_t> owned;
+    while (consumers--) {
+      std::string name;
+      uint64_t seen, active;
+      if (!r.read_string(name) || g.consumers.contains(name) || !r.read_u64_le(seen)) return false;
+      active = seen;
+      if (type >= RDB_TYPE_STREAM_LISTPACKS_3 && !r.read_u64_le(active)) return false;
+      g.consumers.emplace(name, Entry::StreamConsumer{std::bit_cast<int64_t>(seen),
+                                                      std::bit_cast<int64_t>(active)});
+      uint64_t n;
+      if (!read_plain_length(r, n)) return false;
+      while (n--) {
+        std::string raw;
+        RdbStreamID id;
+        if (!r.read_bytes(raw, 16) || !stream_decode_raw_id(raw, id)) return false;
+        auto it = pel.find(id);
+        if (it == pel.end() || !owned.insert(it->second).second) return false;
+        g.pending[it->second].consumer = name;
+      }
+    }
+    // A dangling or multiply-owned NACK cannot be represented safely by the datastore.
+    if (owned.size() != g.pending.size()) return false;
+    d.groups.push_back(std::move(g));
+  }
+  return true;
+}
+
+// Shared RDB object decoder. RESTORE holds the decoded value outside the keyspace, so even
+// REPLACE cannot erase a key on a corrupt payload. RDB load may skip empty collection values.
+bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empty = false,
+                     std::string* load_error = nullptr) {
+  out = DumpValue{};
+  out.type = type;
+  auto corrupt = [&](const char* error) {
+    if (load_error) *load_error = error;
+    return false;
+  };
+  auto count = [&](uint64_t& len) {
+    return read_plain_length(r, len) && (allow_empty || len > 0);
+  };
+  auto unique = [](const auto& items, auto name_of) {
+    std::unordered_set<std::string_view> seen;
+    for (const auto& item : items)
+      if (!seen.insert(name_of(item)).second) return false;
+    return true;
+  };
+  uint64_t len = 0;
+  if (type == RDB_TYPE_STRING) {
+    return r.read_string(out.str);
+  } else if (type == RDB_TYPE_LIST || type == RDB_TYPE_SET) {
+    if (!count(len)) return false;
+    while (len--) {
+      std::string item;
+      if (!r.read_string(item)) return false;
+      out.items.push_back(std::move(item));
+    }
+  } else if (type == RDB_TYPE_LIST_QUICKLIST_2) {
+    if (!count(len)) return false;
+    while (len--) {
+      uint64_t container;
+      std::string blob;
+      if (!read_plain_length(r, container) || !r.read_string(blob) || blob.empty()) return false;
+      if (container != kQuicklistNodePlain && container != kQuicklistNodePacked)
+        return corrupt("Quicklist integrity check failed.");
+      if (container == kQuicklistNodePlain)
+        out.items.push_back(std::move(blob));
+      else {
+        std::vector<std::string> node;
+        if (!ListpackReader(blob).parse(node)) return corrupt("Listpack integrity check failed.");
+        for (auto& item : node) out.items.push_back(std::move(item));
+      }
+    }
+    out.type = RDB_TYPE_LIST;
+  } else if (type == RDB_TYPE_SET_INTSET) {
+    std::string blob;
+    if (!r.read_string(blob) || blob.size() < 8) return false;
+    auto u32 = [&](std::size_t off) {
+      uint32_t n = 0;
+      for (int i = 0; i < 4; ++i)
+        n |= static_cast<uint32_t>(static_cast<uint8_t>(blob[off + i])) << (8 * i);
+      return n;
+    };
+    const uint32_t encoding = u32(0), n = u32(4);
+    if ((encoding != 2 && encoding != 4 && encoding != 8) || n != (blob.size() - 8) / encoding ||
+        (blob.size() - 8) % encoding != 0)
+      return false;
+    std::optional<int64_t> previous;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint64_t bits = 0;
+      for (uint32_t j = 0; j < encoding; ++j)
+        bits |= static_cast<uint64_t>(
+                    static_cast<uint8_t>(blob[8 + static_cast<std::size_t>(i) * encoding + j]))
+                << (8 * j);
+      const int64_t value = encoding == 2   ? static_cast<int16_t>(bits)
+                            : encoding == 4 ? static_cast<int32_t>(bits)
+                                            : std::bit_cast<int64_t>(bits);
+      if (previous && value <= *previous) return false;
+      previous = value;
+      out.items.push_back(std::to_string(value));
+    }
+    out.type = RDB_TYPE_SET;
+  } else if (type == RDB_TYPE_HASH_LISTPACK || type == RDB_TYPE_ZSET_LISTPACK ||
+             type == RDB_TYPE_SET_LISTPACK) {
+    std::string blob;
+    std::vector<std::string> items;
+    const char* integrity = type == RDB_TYPE_SET_LISTPACK ? "Set listpack integrity check failed."
+                            : type == RDB_TYPE_HASH_LISTPACK
+                                ? "Hash listpack integrity check failed."
+                                : "Zset listpack integrity check failed.";
+    if (!r.read_string(blob) || !ListpackReader(blob).parse(items)) return corrupt(integrity);
+    if (type == RDB_TYPE_SET_LISTPACK) {
+      out.items = std::move(items);
+      out.type = RDB_TYPE_SET;
+    } else {
+      if (items.size() % 2 != 0) return corrupt(integrity);
+      if (type == RDB_TYPE_HASH_LISTPACK) {
+        for (std::size_t i = 0; i < items.size(); i += 2)
+          out.fields.emplace_back(std::move(items[i]), std::move(items[i + 1]));
+        out.type = RDB_TYPE_HASH;
+      } else {
+        for (std::size_t i = 0; i < items.size(); i += 2) {
+          // strtod preserves subnormal scores (std::stod throws on ERANGE and lost them).
+          const auto& text = items[i + 1];
+          char* end = nullptr;
+          const double score = std::strtod(text.c_str(), &end);
+          if (text.empty() || end != text.c_str() + text.size() || std::isnan(score)) return false;
+          out.scored.emplace_back(std::move(items[i]), score);
+        }
+        out.type = RDB_TYPE_ZSET_2;
+      }
+    }
+  } else if (type == RDB_TYPE_HASH) {
+    if (!count(len)) return false;
+    while (len--) {
+      std::string f, v;
+      if (!r.read_string(f) || !r.read_string(v)) return false;
+      out.fields.emplace_back(std::move(f), std::move(v));
+    }
+  } else if (type == RDB_TYPE_ZSET_2 || type == RDB_TYPE_ZSET) {
+    if (!count(len)) return false;
+    while (len--) {
+      std::string member;
+      double score;
+      if (!r.read_string(member) ||
+          !(type == RDB_TYPE_ZSET_2 ? r.read_double_binary(score) : r.read_double_old(score)) ||
+          std::isnan(score))
+        return false;
+      out.scored.emplace_back(std::move(member), score);
+    }
+  } else if (type == RDB_TYPE_STREAM_LISTPACKS || type == RDB_TYPE_STREAM_LISTPACKS_2 ||
+             type == RDB_TYPE_STREAM_LISTPACKS_3) {
+    return read_stream(r, type, out.stream);
+  } else
+    return false;
+  if (out.type == RDB_TYPE_LIST || out.type == RDB_TYPE_SET) {
+    if (!allow_empty && out.items.empty()) return false;
+    if (out.type == RDB_TYPE_SET &&
+        !unique(out.items, [](const auto& s) -> std::string_view { return s; }))
+      return false;
+  } else if (out.type == RDB_TYPE_HASH) {
+    if (!allow_empty && out.fields.empty()) return false;
+    if (!unique(out.fields, [](const auto& fv) -> std::string_view { return fv.first; }))
+      return false;
+  } else {
+    if (!allow_empty && out.scored.empty()) return false;
+    if (!unique(out.scored, [](const auto& ms) -> std::string_view { return ms.first; }))
+      return false;
+  }
+  return true;
+}
+
 // `key_save_delay`: wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
-// Only the file saves wait: Redis builds a full sync in a child, but PeaDB builds it on the event
-// loop (compat/delta.md item 46), where a wait would stop every client.
+// File saves and full syncs run in a fork child; in-memory DUMP payloads do not delay.
 std::string rdb_build_string(std::string& err, bool key_save_delay,
                              const RdbReplicationInfo* repl = nullptr) {
   err.clear();
@@ -1006,31 +1449,9 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
       } else if (type_str == "stream") {
         DataStore::StreamDump d;
         if (!ds.dump_stream(key, d)) continue;
-        w.write_u8(RDB_TYPE_PEADB_STREAM);
+        w.write_u8(RDB_TYPE_STREAM_LISTPACKS_3);
         w.write_string(key);
-        w.write_length(d.entries.size());
-        for (const auto& [id, fields] : d.entries) {
-          w.write_string(id);
-          w.write_length(fields.size());
-          for (const auto& [f, v] : fields) {
-            w.write_string(f);
-            w.write_string(v);
-          }
-        }
-        w.write_length(d.last_ms);
-        w.write_length(d.last_seq);
-        w.write_length(d.groups.size());
-        for (const auto& gd : d.groups) {
-          w.write_string(gd.name);
-          w.write_string(gd.last_delivered_id);
-          w.write_length(gd.pending.size());
-          for (const auto& p : gd.pending) {
-            w.write_string(p.id);
-            w.write_string(p.consumer);
-            w.write_length(static_cast<uint64_t>(p.delivery_ms));
-            w.write_length(static_cast<uint64_t>(p.delivery_count));
-          }
-        }
+        write_stream(w, d);
       }
     }
   }
@@ -1322,293 +1743,23 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     std::optional<int64_t> expire_at = pending_expire;
     pending_expire.reset();
 
-    if (type == RDB_TYPE_STRING) {
-      std::string val;
-      if (!r.read_string(val)) {
-        err = "malformed string value";
+    if (type != RDB_TYPE_PEADB_STREAM) {
+      DumpValue value;
+      std::string load_error;
+      if (!read_dump_value(r, type, value, true, &load_error)) {
+        err = load_error.empty() ? "Bad data format (RDB type " + std::to_string(type) + ")"
+                                 : load_error;
+        if (type == RDB_TYPE_HASH_ZIPMAP || type == RDB_TYPE_LIST_ZIPLIST ||
+            type == RDB_TYPE_ZSET_ZIPLIST || type == RDB_TYPE_HASH_ZIPLIST ||
+            type == RDB_TYPE_LIST_QUICKLIST)
+          err = "unsupported RDB type " + std::to_string(type) +
+                " (an encoding written by Redis before 7.0: load the file in Redis 7 and save it "
+                "again)";
         ds.select_db(prev_db);
         return false;
       }
-      ds.set(key, val, false, false, expire_at, false);
-
-    } else if (type == RDB_TYPE_LIST) {
-      // Encoded list (linked list of strings)
-      uint64_t len;
-      bool enc;
-      if (!r.read_length(len, enc) || enc) {
-        err = "malformed list";
-        ds.select_db(prev_db);
-        return false;
-      }
-      std::vector<std::string> items;
-      for (uint64_t i = 0; i < len; ++i) {
-        std::string val;
-        if (!r.read_string(val)) {
-          err = "malformed list item";
-          ds.select_db(prev_db);
-          return false;
-        }
-        items.push_back(std::move(val));
-      }
-      bool wt = false;
-      ds.rpush(key, items, wt);
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_LIST_QUICKLIST_2) {
-      // Redis's rdbLoadObject(): the node count, then per node its container and a string. A
-      // PLAIN node is one element as it is, a PACKED node a listpack of elements; any other
-      // container, an empty string or a listpack that fails the checks is a corrupt file.
-      // Empty listpacks are skipped, and a list with no element is not loaded, as in Redis.
-      uint64_t node_count;
-      bool enc;
-      if (!r.read_length(node_count, enc) || enc) {
-        err = "malformed quicklist";
-        ds.select_db(prev_db);
-        return false;
-      }
-      std::vector<std::string> all_items;
-      for (uint64_t n = 0; n < node_count; ++n) {
-        uint64_t container;
-        bool enc2;
-        if (!r.read_length(container, enc2) || enc2) {
-          err = "malformed quicklist2 container";
-          ds.select_db(prev_db);
-          return false;
-        }
-        if (container != kQuicklistNodePlain && container != kQuicklistNodePacked) {
-          err = "Quicklist integrity check failed.";
-          ds.select_db(prev_db);
-          return false;
-        }
-        std::string node_data;
-        if (!r.read_string(node_data) || node_data.empty()) {
-          err = "malformed quicklist node";
-          ds.select_db(prev_db);
-          return false;
-        }
-        if (container == kQuicklistNodePlain) {
-          all_items.push_back(std::move(node_data));
-          continue;
-        }
-        ListpackReader lpr(node_data);
-        std::vector<std::string> entries;
-        if (!lpr.parse(entries)) {
-          err = "Listpack integrity check failed.";
-          ds.select_db(prev_db);
-          return false;
-        }
-        for (auto& e : entries) all_items.push_back(std::move(e));
-      }
-      if (!all_items.empty()) {
-        bool wt = false;
-        ds.rpush(key, all_items, wt);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_HASH_ZIPMAP || type == RDB_TYPE_LIST_ZIPLIST ||
-               type == RDB_TYPE_ZSET_ZIPLIST || type == RDB_TYPE_HASH_ZIPLIST ||
-               type == RDB_TYPE_LIST_QUICKLIST) {
-      // Encodings that only Redis before 7.0 writes: a zipmap, a ziplist, or a quicklist whose
-      // nodes are ziplists. PeaDB has no zipmap or ziplist reader yet (compat/delta.md item 53),
-      // so the load stops instead of reading them as listpacks, which gave wrong data.
-      err =
-          "unsupported RDB type " + std::to_string(type) +
-          " (an encoding written by Redis before 7.0: load the file in Redis 7 and save it again)";
-      ds.select_db(prev_db);
-      return false;
-
-    } else if (type == RDB_TYPE_SET) {
-      uint64_t len;
-      bool enc;
-      if (!r.read_length(len, enc) || enc) {
-        err = "malformed set";
-        ds.select_db(prev_db);
-        return false;
-      }
-      std::vector<std::string> members;
-      for (uint64_t i = 0; i < len; ++i) {
-        std::string m;
-        if (!r.read_string(m)) {
-          err = "malformed set member";
-          ds.select_db(prev_db);
-          return false;
-        }
-        members.push_back(std::move(m));
-      }
-      bool wt = false;
-      ds.sadd(key, members, wt);
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_SET_INTSET) {
-      std::string blob;
-      if (!r.read_string(blob)) {
-        err = "malformed intset";
-        ds.select_db(prev_db);
-        return false;
-      }
-      // Intset format: encoding(u32) length(u32) entries...
-      if (blob.size() >= 8) {
-        uint32_t encoding = static_cast<uint32_t>(static_cast<uint8_t>(blob[0])) |
-                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[1])) << 8) |
-                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[2])) << 16) |
-                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[3])) << 24);
-        uint32_t num = static_cast<uint32_t>(static_cast<uint8_t>(blob[4])) |
-                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[5])) << 8) |
-                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[6])) << 16) |
-                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[7])) << 24);
-        std::vector<std::string> members;
-        size_t entry_size = (encoding == 2) ? 2 : (encoding == 4) ? 4 : 8;
-        for (uint32_t i = 0; i < num; ++i) {
-          size_t off = 8 + i * entry_size;
-          if (off + entry_size > blob.size()) break;
-          int64_t val = 0;
-          if (entry_size == 2) {
-            val = static_cast<int16_t>(
-                static_cast<uint16_t>(static_cast<uint8_t>(blob[off])) |
-                (static_cast<uint16_t>(static_cast<uint8_t>(blob[off + 1])) << 8));
-          } else if (entry_size == 4) {
-            val = static_cast<int32_t>(
-                static_cast<uint32_t>(static_cast<uint8_t>(blob[off])) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 1])) << 8) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 2])) << 16) |
-                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 3])) << 24));
-          } else {
-            uint64_t uv = 0;
-            for (int b = 0; b < 8; ++b)
-              uv |= static_cast<uint64_t>(static_cast<uint8_t>(blob[off + b])) << (b * 8);
-            val = static_cast<int64_t>(uv);
-          }
-          members.push_back(std::to_string(val));
-        }
-        bool wt = false;
-        ds.sadd(key, members, wt);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_SET_LISTPACK) {
-      std::string blob;
-      if (!r.read_string(blob)) {
-        err = "malformed set listpack";
-        ds.select_db(prev_db);
-        return false;
-      }
-      ListpackReader lpr(blob);
-      std::vector<std::string> entries;
-      if (!lpr.parse(entries)) {
-        err = "Set listpack integrity check failed.";
-        ds.select_db(prev_db);
-        return false;
-      }
-      if (!entries.empty()) {
-        bool wt = false;
-        ds.sadd(key, entries, wt);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_HASH) {
-      uint64_t len;
-      bool enc;
-      if (!r.read_length(len, enc) || enc) {
-        err = "malformed hash";
-        ds.select_db(prev_db);
-        return false;
-      }
-      std::vector<std::pair<std::string, std::string>> fields;
-      for (uint64_t i = 0; i < len; ++i) {
-        std::string f, v;
-        if (!r.read_string(f) || !r.read_string(v)) {
-          err = "malformed hash field";
-          ds.select_db(prev_db);
-          return false;
-        }
-        fields.push_back({std::move(f), std::move(v)});
-      }
-      bool wt = false;
-      ds.hset(key, fields, wt);
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_HASH_LISTPACK) {
-      std::string blob;
-      if (!r.read_string(blob)) {
-        err = "malformed hash listpack";
-        ds.select_db(prev_db);
-        return false;
-      }
-      ListpackReader lpr(blob);
-      std::vector<std::string> entries;
-      if (!lpr.parse(entries) || entries.size() % 2 != 0) {
-        err = "Hash listpack integrity check failed.";
-        ds.select_db(prev_db);
-        return false;
-      }
-      std::vector<std::pair<std::string, std::string>> fields;
-      for (size_t i = 0; i + 1 < entries.size(); i += 2) {
-        fields.push_back({entries[i], entries[i + 1]});
-      }
-      if (!fields.empty()) {
-        bool wt = false;
-        ds.hset(key, fields, wt);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_ZSET || type == RDB_TYPE_ZSET_2) {
-      uint64_t len;
-      bool enc;
-      if (!r.read_length(len, enc) || enc) {
-        err = "malformed zset";
-        ds.select_db(prev_db);
-        return false;
-      }
-      for (uint64_t i = 0; i < len; ++i) {
-        std::string member;
-        if (!r.read_string(member)) {
-          err = "malformed zset member";
-          ds.select_db(prev_db);
-          return false;
-        }
-        double score;
-        if (type == RDB_TYPE_ZSET_2) {
-          if (!r.read_double_binary(score)) {
-            err = "malformed zset score";
-            ds.select_db(prev_db);
-            return false;
-          }
-        } else {
-          if (!r.read_double_old(score)) {
-            err = "malformed zset score";
-            ds.select_db(prev_db);
-            return false;
-          }
-        }
-        ds.zadd_one(key, score, member, false, false, false, false, false);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_ZSET_LISTPACK) {
-      std::string blob;
-      if (!r.read_string(blob)) {
-        err = "malformed zset listpack";
-        ds.select_db(prev_db);
-        return false;
-      }
-      ListpackReader lpr(blob);
-      std::vector<std::string> entries;
-      if (!lpr.parse(entries) || entries.size() % 2 != 0) {
-        err = "Zset listpack integrity check failed.";
-        ds.select_db(prev_db);
-        return false;
-      }
-      for (size_t i = 0; i + 1 < entries.size(); i += 2) {
-        double score = 0;
-        try {
-          score = std::stod(entries[i + 1]);
-        } catch (...) {
-        }
-        ds.zadd_one(key, score, entries[i], false, false, false, false, false);
-      }
-      if (expire_at) ds.expire(key, *expire_at);
-
-    } else if (type == RDB_TYPE_PEADB_STREAM) {
+      rdb_store_dump_value(key, std::move(value), expire_at);
+    } else {
       DataStore::StreamDump d;
       uint64_t nentries = 0;
       bool enc = false;
@@ -1686,13 +1837,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
       ds.restore_stream(key, d);
       if (expire_at) ds.expire(key, *expire_at);
-
-    } else {
-      // Unknown type — skip by reading and discarding a string
-      // This may not work for all types but is best-effort
-      err = "unsupported RDB type " + std::to_string(type);
-      ds.select_db(prev_db);
-      return false;
     }
     // Redis's rdbLoadRio(): a master does not load a key that has already expired.
     if (expire_at && *expire_at < load_now && !ds.replica_expiry()) ds.del(key);
@@ -1785,6 +1929,11 @@ std::string rdb_dump_key(const std::string& key) {
       w.write_string(m);
       w.write_double_string(s);
     }
+  } else if (type_str == "stream") {
+    DataStore::StreamDump d;
+    if (!ds.dump_stream(key, d)) return {};
+    w.write_u8(RDB_TYPE_STREAM_LISTPACKS_3);
+    write_stream(w, d);
   } else {
     return {};
   }
@@ -1849,66 +1998,8 @@ bool rdb_decode_dump_payload(const std::string& payload, DumpValue& out, std::st
   // an empty collection, a set member, hash field or zset member twice, and a NaN score fail too.
   err = "Bad data format";
   RdbReader r(payload.data(), payload.size() - 10);
-  if (!r.read_u8(out.type)) return false;
-  // Redis's rdbLoadObject() refuses a collection with no element (RDB_LOAD_ERR_EMPTY_KEY).
-  auto read_count = [&r](uint64_t& len) {
-    bool enc = false;
-    return r.read_length(len, enc) && !enc && len > 0;
-  };
-  // Views into the decoded strings, which do not move once read.
-  auto unique = [](auto first, auto last, auto name_of) {
-    std::unordered_set<std::string_view> seen;
-    for (; first != last; ++first) {
-      if (!seen.insert(name_of(*first)).second) return false;
-    }
-    return true;
-  };
-  uint64_t len = 0;
-  if (out.type == RDB_TYPE_STRING) {
-    if (!r.read_string(out.str)) return false;
-  } else if (out.type == RDB_TYPE_LIST || out.type == RDB_TYPE_SET) {
-    if (!read_count(len)) return false;
-    for (uint64_t i = 0; i < len; ++i) {
-      std::string item;
-      if (!r.read_string(item)) return false;
-      out.items.push_back(std::move(item));
-    }
-    if (out.type == RDB_TYPE_SET &&
-        !unique(out.items.begin(), out.items.end(),
-                [](const std::string& m) -> std::string_view { return m; }))
-      return false;  // "Duplicate set members detected"
-  } else if (out.type == RDB_TYPE_HASH) {
-    if (!read_count(len)) return false;
-    for (uint64_t i = 0; i < len; ++i) {
-      std::string f, v;
-      if (!r.read_string(f) || !r.read_string(v)) return false;
-      out.fields.emplace_back(std::move(f), std::move(v));
-    }
-    // Redis 7.2.5 with sanitize-dump-payload no takes a field twice in a hash small enough for a
-    // listpack as a broken listpack, and refuses it otherwise; PeaDB cannot hold a field twice, so
-    // it always refuses (compat/delta.md item 42).
-    if (!unique(out.fields.begin(), out.fields.end(),
-                [](const auto& fv) -> std::string_view { return fv.first; }))
-      return false;
-  } else if (out.type == RDB_TYPE_ZSET_2 || out.type == RDB_TYPE_ZSET) {
-    if (!read_count(len)) return false;
-    for (uint64_t i = 0; i < len; ++i) {
-      std::string member;
-      double score = 0;
-      if (!r.read_string(member)) return false;
-      if (out.type == RDB_TYPE_ZSET_2 ? !r.read_double_binary(score) : !r.read_double_old(score))
-        return false;
-      if (std::isnan(score)) return false;  // "Zset with NAN score detected"
-      out.scored.emplace_back(std::move(member), score);
-    }
-    if (!unique(out.scored.begin(), out.scored.end(),
-                [](const auto& ms) -> std::string_view { return ms.first; }))
-      return false;  // "Duplicate zset fields detected"
-  } else {
-    // The compact encodings Redis's DUMP writes (listpack, intset, quicklist) and streams are not
-    // read yet (compat/delta.md item 51).
-    return false;
-  }
+  uint8_t type;
+  if (!r.read_u8(type) || !read_dump_value(r, type, out)) return false;
   err.clear();
   return true;
 }
@@ -1927,6 +2018,9 @@ void rdb_store_dump_value(const std::string& key, DumpValue&& value,
     ds.sadd(key, value.items, wrongtype);
   } else if (value.type == RDB_TYPE_HASH) {
     ds.hset(key, value.fields, wrongtype);
+  } else if (value.type == RDB_TYPE_STREAM_LISTPACKS || value.type == RDB_TYPE_STREAM_LISTPACKS_2 ||
+             value.type == RDB_TYPE_STREAM_LISTPACKS_3) {
+    ds.restore_stream(key, value.stream);
   } else {
     for (const auto& [member, score] : value.scored)
       ds.zadd_one(key, score, member, false, false, false, false, false);
