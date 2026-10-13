@@ -839,7 +839,14 @@ int run_server(const ServerConfig& config) {
     last_sync_keepalive_ms = now;
     std::vector<int> failed;
     for (int fd : replica_fds) {
-      const auto state = sessions.at(fd).repl_sync_state;
+      const auto& session = sessions.at(fd);
+      const auto state = session.repl_sync_state;
+      if (state == ReplicaSyncState::Online && !session.repl_legacy_sync &&
+          now / 1000 - session.repl_ack_time_ms / 1000 > replication_timeout_seconds()) {
+        log(LogLevel::Warn, "Disconnecting timedout replica (streaming sync)");
+        failed.push_back(fd);
+        continue;
+      }
       if (state != ReplicaSyncState::WaitSnapshot && state != ReplicaSyncState::SaveSnapshot)
         continue;
       auto ti = snapshot_transfers.find(fd);

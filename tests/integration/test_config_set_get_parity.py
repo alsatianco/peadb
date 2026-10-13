@@ -222,7 +222,7 @@ PEADB_ONLY = [
      "cluster-announce-ip must not resolve to a wildcard address ('0.0.0.0'); no peer could dial "
      "it back"),
     (('CONFIG', 'GET', 'maxmemory'), ['maxmemory', '0']),
-    # A Redis setting PeaDB does not apply keeps its value (with a warning in the log).
+    # Replication heartbeat settings are live (delta 47); their config replies match Redis.
     (('CONFIG', 'SET', 'repl-ping-replica-period', '3600'), '+OK'),
     (('CONFIG', 'GET', 'repl-ping-replica-period'), ['repl-ping-replica-period', '3600']),
     (('CONFIG', 'SET', 'repl-ping-replica-period', '10'), '+OK'),

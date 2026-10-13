@@ -216,11 +216,25 @@ std::string g_master_stream_multi;
 std::mutex g_replica_link_mu;
 int g_replica_link_fd = -1;
 std::string g_replica_ack_out;  // the unsent rest of an ACK, under g_replica_link_mu
-std::int64_t g_last_replica_ack_ms = 0;
 // What the replica has read from its master's stream (Redis's master->read_reploff), and when it
 // last read anything (master->lastinteraction); written by the streaming thread.
 std::atomic<std::int64_t> g_replica_read_offset{0};
 std::atomic<std::int64_t> g_replica_last_io_ms{0};
+std::atomic<int> g_repl_timeout{60};
+int g_repl_ping_replica_period = 10;
+// Event-loop-owned cached master. Unapplied input and MULTI are discarded on a link drop;
+// the selected database, applied offset, dataset and backlog survive (replicationCacheMaster).
+bool g_cached_master = false;
+struct MasterLinkRequest {
+  std::uint64_t gen;
+  bool resume = false;
+  std::string replid;
+  std::int64_t offset = -1;
+  bool cached = false;
+  int keepalive = 0;
+  std::atomic<bool> done{false};
+};
+std::shared_ptr<MasterLinkRequest> g_master_link_request;  // under g_replica_cmd_queue_mu
 // Where the replica's link is (Redis's repl_state, as ROLE names it); written by the link thread.
 enum class ReplLinkState { Connect, Connecting, Handshake, Transfer, Connected };
 std::atomic<ReplLinkState> g_repl_link_state{ReplLinkState::Connect};
@@ -586,11 +600,13 @@ void start_master_link(const std::string& host, int port, std::uint64_t gen) {
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
     int backoff_ms = 500;
     while (g_repl_generation.load() == gen) {
-      g_loading_replication.store(true);
       const bool ok = replica_do_fullsync(host, port, gen);
-      g_loading_replication.store(false);
       if (g_repl_generation.load() != gen) break;
-      g_replica_stale = true;
+      {
+        std::lock_guard<std::mutex> lk(g_replica_link_mu);
+        if (g_repl_generation.load() != gen) break;
+        g_replica_stale = true;
+      }
       backoff_ms = ok ? 500 : std::min(backoff_ms * 2, 30000);
       std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
     }
@@ -4899,6 +4915,13 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
           }}},
         {"timeout", live_number(g_config_timeout)},
         {"tcp-keepalive", live_number(g_tcp_keepalive)},
+        {"repl-timeout",
+         {[] { return std::to_string(g_repl_timeout.load()); },
+          [](const std::string& v, std::string&) {
+            g_repl_timeout = std::stoi(v);
+            return true;
+          }}},
+        {"repl-ping-replica-period", live_number(g_repl_ping_replica_period)},
         {"loglevel",
          {[] { return g_loglevel_name; },
           [](const std::string& v, std::string&) {
@@ -6699,6 +6722,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_repl_generation.fetch_add(1);  // signal any running reconnect supervisor to stop
             drop_queued_replica_commands();  // nothing from the old master runs after this
             release_master_link(false);
+            g_cached_master = false;
             const bool was_replica = g_replication_role == "slave";
             g_replication_role = "master";
             store().set_replica_expiry(false);  // a master deletes expired keys and sends their DEL
@@ -6727,6 +6751,15 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           }
           std::int64_t p = 0;
           if (!parse_i64(port, p) || p < 0 || p > 65535) return encode_error("value is not an integer or out of range");
+          if (g_replication_role == "slave" && host == g_replication_master_host &&
+              p == g_replication_master_port)
+            return encode_simple("OK Already connected to specified master");
+          // replicationCacheMasterUsingMyself(): a demoted master can resume from the replica
+          // just promoted from its own history. A replica keeps its existing cached history.
+          if (g_replication_role == "master") {
+            g_cached_master = true;
+            g_master_stream_session = SessionState{};
+          }
           // replicationHandleMasterDisconnection(): leaving a master whose link was up starts
           // master_link_down_since_seconds.
           if (g_replication_role == "slave" && !g_replica_stale) g_repl_down_since_ms = now_ms();
@@ -13336,6 +13369,10 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("proto-max-bulk-len", g_proto_max_bulk_len);
   num("client-query-buffer-limit", g_client_query_buffer_limit);
   num("tcp-keepalive", g_tcp_keepalive);
+  int repl_timeout = g_repl_timeout.load();
+  num("repl-timeout", repl_timeout);
+  g_repl_timeout = repl_timeout;
+  num("repl-ping-replica-period", g_repl_ping_replica_period);
   num("maxmemory-eviction-tenacity", g_maxmemory_eviction_tenacity);
   num("shutdown-timeout", g_shutdown_timeout);
   int lfu_log_factor = store().lfu_log_factor();
@@ -13353,6 +13390,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
 std::int64_t proto_max_bulk_len() { return g_proto_max_bulk_len; }
 std::int64_t client_query_buffer_limit() { return g_client_query_buffer_limit; }
 int tcp_keepalive_seconds() { return g_tcp_keepalive; }
+int replication_timeout_seconds() { return g_repl_timeout.load(); }
 
 void script_set_repl_flags(int flags) { g_script_repl_flags = flags; }
 
@@ -14102,9 +14140,18 @@ void migrate_cron(std::int64_t now) {
 }
 
 void replication_cron(std::int64_t now) {
-  if (g_replication_role != "slave" || now - g_last_replica_ack_ms < 1000) return;
-  g_last_replica_ack_ms = now;
-  send_replica_ack();
+  static std::int64_t last_run = 0;
+  static std::uint64_t loops = 0;
+  if (now - last_run < 1000) return;
+  last_run = now;
+  if (g_replication_role == "slave") {
+    send_replica_ack();
+  } else if (loops % g_repl_ping_replica_period == 0 && g_count_connected_replicas &&
+             g_count_connected_replicas() > 0) {
+    // replicationFeedSlaves(..., -1): PING has no SELECT and never reaches the AOF.
+    backlog_append("*1\r\n$4\r\nPING\r\n");
+  }
+  ++loops;
 }
 
 // ─── Blocking client support ──────────────────────────────────────────────
@@ -14410,6 +14457,48 @@ void aof_cron(std::int64_t now) {
 }
 
 void drain_replica_cmd_queue() {
+  std::shared_ptr<MasterLinkRequest> request;
+  {
+    std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+    request = std::move(g_master_link_request);
+    if (request && request->gen == g_repl_generation.load() && !request->resume) {
+      // freeClient() does not cache a CLIENT_BLOCKED master (CLIENT PAUSE). Its held
+      // input cannot be resurrected; the next link must replace the dataset in full.
+      const MasterStreamCommand* pending = !g_replica_cmd_held.empty()
+                                              ? &g_replica_cmd_held.front()
+                                              : (!g_replica_cmd_queue.empty()
+                                                     ? &g_replica_cmd_queue.front() : nullptr);
+      if (pending && !pending->args.empty() && g_paused_actions != 0 &&
+          pause_applies(upper(pending->args[0]), pending->args, g_master_stream_session))
+        g_cached_master = false;
+      g_replica_cmd_queue.clear();
+      g_replica_cmd_held.clear();
+    }
+  }
+  if (request) {
+    if (request->gen == g_repl_generation.load()) {
+      if (!request->resume) {
+        const int db = g_master_stream_session.db_index;
+        g_master_stream_session = SessionState{};
+        g_master_stream_session.db_index = db;
+        g_master_stream_multi.clear();
+        request->keepalive = g_tcp_keepalive;
+        request->cached = g_cached_master;
+        request->replid = g_cached_master ? g_master_replid : "?";
+        request->offset = g_cached_master ? g_master_repl_offset : -1;
+        g_replica_read_offset = g_master_repl_offset;
+      } else if (g_cached_master) {
+        if (request->replid != g_master_replid) {
+          g_master_replid2 = g_master_replid;
+          g_second_replid_offset = g_master_repl_offset + 1;
+          g_master_replid = request->replid;
+          disconnect_replicas();
+        }
+        request->cached = true;
+      }
+    }
+    request->done = true;
+  }
   // Apply any pending replica RDB load on the event loop thread before processing
   // queued commands. Running rdb_load() here serializes flushall+restore with all
   // event-loop reads/writes, eliminating the race against the streaming thread.
@@ -14439,11 +14528,6 @@ void drain_replica_cmd_queue() {
     if (!current) {
       log(LogLevel::Warn, "REPLICAOF: dropping a full sync from a master link that was replaced");
     } else {
-      g_master_stream_session = SessionState{};
-      g_master_stream_multi.clear();
-      // Redis's replicationAttachToNewMaster(): this server's own replicas must sync again, since
-      // its dataset and its history are replaced.
-      disconnect_replicas();
       std::string err;
       // A full resync replaces the entire dataset, including server-level function libraries.
       // rdb_load() flushes the keyspace but not functions, so it clears them once the file passes
@@ -14455,6 +14539,16 @@ void drain_replica_cmd_queue() {
       int stream_db = -1;
       try {
         ok = rdb_load(path, err, [&] {
+          // replicationAttachToNewMaster(): only after header/checksum validation discard the
+          // old cached master and backlog. A decoding failure after this boundary may have
+          // replaced part of the dataset; neither reconnect nor promotion can reuse its history.
+          g_cached_master = false;
+          g_master_stream_session = SessionState{};
+          g_master_stream_multi.clear();
+          disconnect_replicas();
+          g_repl_backlog.reset_at(g_master_repl_offset);
+          g_replicas_taken_to = g_master_repl_offset;
+          g_backlog_has_replica = false;
           // readSyncBulkPayload(): an old save/rewrite must never overwrite the new dataset.
           // Do this after checksum validation, so a corrupt transfer keeps the old disk files.
           kill_rdb_child();
@@ -14489,6 +14583,7 @@ void drain_replica_cmd_queue() {
         g_master_replid2 = std::string(40, '0');
         g_second_replid_offset = -1;
         g_master_repl_offset = offset;
+        g_cached_master = true;
         start_backlog();
         if (stream_db >= 0) g_master_stream_session.db_index = stream_db;
         note_rdb_saved(static_cast<std::int64_t>(store().mutation_epoch()));
@@ -14565,41 +14660,95 @@ void drain_replica_cmd_queue() {
 
 // ── In-process replication client helpers ────────────────────────────────────
 
-static bool repl_readline(int fd, std::string& out) {
+// Generation-tagged event-loop hand-off: the link never reads or edits stream history itself.
+static bool master_link_request(const std::shared_ptr<MasterLinkRequest>& request) {
+  for (;;) {
+    {
+      std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+      if (g_repl_generation.load() != request->gen) return false;
+      if (!g_master_link_request) {
+        g_master_link_request = request;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  wake_event_loop_for_replica();
+  while (!request->done.load()) {
+    if (g_repl_generation.load() != request->gen) return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  return g_repl_generation.load() == request->gen;
+}
+
+template <typename F>
+static bool update_master_link(std::uint64_t gen, F&& update) {
+  std::lock_guard<std::mutex> lk(g_replica_link_mu);
+  if (g_repl_generation.load() != gen) return false;
+  update();
+  return true;
+}
+
+// Nonblocking handshake/transfer I/O with the same inactivity limit as the connected stream.
+// A byte of progress (including a keep-alive newline) resets the timer; CONFIG SET is live.
+class ReplicationIo {
+ public:
+  ReplicationIo(int fd, std::uint64_t gen) : fd_(fd), gen_(gen), last_io_(now_ms()) {}
+  bool wait(short events) {
+    while (g_repl_generation.load() == gen_) {
+      if (now_ms() / 1000 - last_io_ / 1000 > g_repl_timeout.load()) {
+        log(LogLevel::Warn, "Timeout connecting to or receiving bulk data from MASTER...");
+        return false;
+      }
+      pollfd p{fd_, events, 0};
+      const int n = ::poll(&p, 1, 100);
+      if (n > 0) return true;  // recv/send reports EOF or the socket error
+      if (n < 0 && errno != EINTR) return false;
+    }
+    return false;
+  }
+  bool readExact(void* buf, std::size_t len) {
+    auto* p = static_cast<char*>(buf);
+    while (len > 0 && wait(POLLIN)) {
+      const ssize_t n = ::recv(fd_, p, len, 0);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      if (n <= 0) return false;
+      last_io_ = now_ms();
+      update_master_link(gen_, [&] { g_repl_transfer_lastio_ms = last_io_; });
+      p += n;
+      len -= static_cast<std::size_t>(n);
+    }
+    return len == 0;
+  }
+  bool readLine(std::string& out) {
     out.clear();
     char c;
-    while (true) {
-        ssize_t n = ::read(fd, &c, 1);
-        if (n <= 0) return false;
-        if (c == '\n') {
-            if (!out.empty() && out.back() == '\r') out.pop_back();
-            return true;
-        }
-        out += c;
-        if (out.size() > 65536) return false;
+    while (readExact(&c, 1)) {
+      if (c == '\n') {
+        if (!out.empty() && out.back() == '\r') out.pop_back();
+        return true;
+      }
+      out += c;
+      if (out.size() > 65536) return false;
     }
-}
-
-static bool repl_read_exact(int fd, void* buf, std::size_t len) {
-    auto* p = static_cast<char*>(buf);
-    std::size_t done = 0;
-    while (done < len) {
-        ssize_t n = ::read(fd, p + done, len - done);
-        if (n <= 0) return false;
-        done += static_cast<std::size_t>(n);
+    return false;
+  }
+  bool send(const std::string& data) {
+    std::size_t sent = 0;
+    while (sent < data.size() && wait(POLLOUT)) {
+      const ssize_t n = ::send(fd_, data.data() + sent, data.size() - sent, 0);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      if (n <= 0) return false;
+      sent += static_cast<std::size_t>(n);
+      last_io_ = now_ms();
     }
-    return true;
-}
-
-static bool repl_send(int fd, const std::string& data) {
-    std::size_t done = 0;
-    while (done < data.size()) {
-        ssize_t n = ::write(fd, data.c_str() + done, data.size() - done);
-        if (n <= 0) return false;
-        done += static_cast<std::size_t>(n);
-    }
-    return true;
-}
+    return sent == data.size();
+  }
+ private:
+  int fd_;
+  std::uint64_t gen_;
+  std::int64_t last_io_;
+};
 
 static std::string repl_encode_cmd(const std::vector<std::string>& parts) {
     std::string out = "*" + std::to_string(parts.size()) + "\r\n";
@@ -14610,6 +14759,9 @@ static std::string repl_encode_cmd(const std::vector<std::string>& parts) {
 
 // Perform a full PSYNC handshake with master at host:port and load the RDB snapshot.
 bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
+    auto cached = std::make_shared<MasterLinkRequest>();
+    cached->gen = gen;
+    if (!master_link_request(cached)) return false;
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
@@ -14625,28 +14777,56 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         log(LogLevel::Error, "REPLICAOF: socket() failed");
         return false;
     }
+    ::fcntl(fd, F_SETFD, FD_CLOEXEC);
+    ::fcntl(fd, F_SETFL, ::fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
+    ReplicationIo io(fd, gen);
+    if (cached->keepalive > 0) {
+      const int yes = 1;
+      ::setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+      const int interval = cached->keepalive;
+#ifdef __linux__
+      const int probe_interval = std::max(interval / 3, 1), probes = 3;
+      ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &interval, sizeof(interval));
+      ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &probe_interval, sizeof(probe_interval));
+      ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &probes, sizeof(probes));
+#elif defined(__APPLE__)
+      ::setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &interval, sizeof(interval));
+#endif
+    }
     // ROLE's link states: connecting, the handshake (PING ... PSYNC), the transfer, connected;
     // back to connect whenever this attempt ends.
     struct LinkStateReset {
         std::uint64_t gen;
         ~LinkStateReset() {
-            if (g_repl_generation.load() == gen) g_repl_link_state = ReplLinkState::Connect;
+            update_master_link(gen, [] { g_repl_link_state = ReplLinkState::Connect; });
         }
     } link_state_reset{gen};
-    g_repl_link_state = ReplLinkState::Connecting;
-    if (::connect(fd, res->ai_addr, res->ai_addrlen) != 0) {
+    if (!update_master_link(gen, [] { g_repl_link_state = ReplLinkState::Connecting; })) {
+      ::freeaddrinfo(res);
+      ::close(fd);
+      return false;
+    }
+    int connected = ::connect(fd, res->ai_addr, res->ai_addrlen);
+    if (connected != 0 && errno == EINPROGRESS && io.wait(POLLOUT)) {
+      int error = 0;
+      socklen_t len = sizeof(error);
+      if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0 && error == 0)
+        connected = 0;
+      else if (error != 0) errno = error;
+    }
+    if (connected != 0) {
         log(LogLevel::Error, "REPLICAOF: connect to " + host + ":" + port_str + " failed: " + strerror(errno));
         ::freeaddrinfo(res);
         ::close(fd);
         return false;
     }
     ::freeaddrinfo(res);
-    g_repl_link_state = ReplLinkState::Handshake;
+    update_master_link(gen, [] { g_repl_link_state = ReplLinkState::Handshake; });
 
     std::string line;
 
     // PING
-    if (!repl_send(fd, "*1\r\n$4\r\nPING\r\n") || !repl_readline(fd, line)) {
+    if (!io.send("*1\r\n$4\r\nPING\r\n") || !io.readLine(line)) {
         log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
         ::close(fd);
         return false;
@@ -14662,8 +14842,8 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
 
     // AUTH masterauth (if the master requires a password)
     if (const std::string masterauth = masterauth_copy(); !masterauth.empty()) {
-        if (!repl_send(fd, repl_encode_cmd({"AUTH", masterauth})) ||
-            !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+        if (!io.send(repl_encode_cmd({"AUTH", masterauth})) ||
+            !io.readLine(line) || line.rfind("+OK", 0) != 0) {
             // Redis's syncWithMaster logs exactly this on a rejected AUTH; tooling and tests
             // (unit/auth MASTERAUTH) match on the "Unable to AUTH to MASTER" phrasing.
             log(LogLevel::Error, "Unable to AUTH to MASTER: " + line);
@@ -14673,29 +14853,40 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     }
 
     // REPLCONF listening-port
-    if (!repl_send(fd, repl_encode_cmd({"REPLCONF", "listening-port", std::to_string(g_server_port)})) ||
-        !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+    if (!io.send(repl_encode_cmd({"REPLCONF", "listening-port", std::to_string(g_server_port)})) ||
+        !io.readLine(line) || line.rfind("+OK", 0) != 0) {
         log(LogLevel::Error, "REPLICAOF: REPLCONF listening-port failed: " + line);
         ::close(fd);
         return false;
     }
 
     // REPLCONF capa psync2
-    if (!repl_send(fd, repl_encode_cmd({"REPLCONF", "capa", "psync2"})) ||
-        !repl_readline(fd, line) || line.rfind("+OK", 0) != 0) {
+    if (!io.send(repl_encode_cmd({"REPLCONF", "capa", "psync2"})) ||
+        !io.readLine(line) || line.rfind("+OK", 0) != 0) {
         log(LogLevel::Error, "REPLICAOF: REPLCONF capa failed: " + line);
         ::close(fd);
         return false;
     }
 
     // Keep-alives can precede FULLRESYNC while the master waits for another child.
-    if (!repl_send(fd, repl_encode_cmd({"PSYNC", "?", "-1"}))) {
+    if (!io.send(repl_encode_cmd({"PSYNC", cached->replid,
+                                      std::to_string(cached->cached ? cached->offset + 1 : -1)}))) {
         ::close(fd);
         return false;
     }
     do {
-        if (!repl_readline(fd, line)) { ::close(fd); return false; }
+        if (!io.readLine(line)) { ::close(fd); return false; }
     } while (line.empty());
+    const bool partial = line == "+CONTINUE" || line.rfind("+CONTINUE ", 0) == 0;
+    if (partial) {
+      if (!cached->cached) { ::close(fd); return false; }
+      auto resume = std::make_shared<MasterLinkRequest>();
+      resume->gen = gen;
+      resume->resume = true;
+      resume->replid = line.size() == 50 ? line.substr(10) : cached->replid;
+      if (!master_link_request(resume) || !resume->cached) { ::close(fd); return false; }
+      log(LogLevel::Info, "Successful partial resynchronization with master.");
+    } else {
     if (line.rfind("+FULLRESYNC", 0) != 0) {
         log(LogLevel::Error, "REPLICAOF: expected +FULLRESYNC, got: " + line);
         ::close(fd);
@@ -14715,21 +14906,25 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     }
     // INFO's master_sync_in_progress and master_sync_* fields, until the RDB has loaded.
     struct TransferState {
-        TransferState() {
+        std::uint64_t gen;
+        explicit TransferState(std::uint64_t generation) : gen(generation) {
+          update_master_link(gen, [] {
             g_repl_transfer_size = -1;
             g_repl_transfer_read = 0;
             g_repl_transfer_lastio_ms = now_ms();
             g_repl_transfer_in_progress = true;
             g_repl_link_state = ReplLinkState::Transfer;
+          });
         }
-        void done() { g_repl_transfer_in_progress = false; }
+        void done() {
+          update_master_link(gen, [] { g_repl_transfer_in_progress = false; });
+        }
         ~TransferState() { done(); }
-    } transfer_state;
+    } transfer_state{gen};
 
     // Redis sends a keep-alive newline every second during a disk-backed BGSAVE.
     do {
-        if (!repl_readline(fd, line)) { ::close(fd); return false; }
-        g_repl_transfer_lastio_ms = now_ms();
+        if (!io.readLine(line)) { ::close(fd); return false; }
     } while (line.empty());
     if (line.empty() || line[0] != '$') {
         log(LogLevel::Error, "REPLICAOF: expected $<len>, got: " + line);
@@ -14742,7 +14937,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         ::close(fd);
         return false;
     }
-    g_repl_transfer_size = rdb_len;
+    update_master_link(gen, [&] { g_repl_transfer_size = rdb_len; });
 
     // Stream the RDB into a temp file in the working directory (`dir`), created new like Redis's
     // readSyncBulkPayload() creates temp-<unixtime>.<pid>.rdb; the link's generation in the name
@@ -14763,7 +14958,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         bool write_ok = true;
         while (remaining > 0 && write_ok) {
             std::size_t want = static_cast<std::size_t>(std::min(remaining, static_cast<std::int64_t>(chunk.size())));
-            if (!repl_read_exact(fd, chunk.data(), want)) {
+            if (!io.readExact(chunk.data(), want)) {
                 write_ok = false;
                 break;
             }
@@ -14778,8 +14973,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
                 written += static_cast<std::size_t>(n);
             }
             remaining -= static_cast<std::int64_t>(want);
-            g_repl_transfer_read = rdb_len - remaining;
-            g_repl_transfer_lastio_ms = now_ms();
+            update_master_link(gen, [&] { g_repl_transfer_read = rdb_len - remaining; });
         }
         if (write_ok && ::fsync(rfd) != 0) write_ok = false;
         if (::close(rfd) != 0) write_ok = false;
@@ -14821,7 +15015,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF before loading the RDB");
         return false;
     }
-    g_loading_replication.store(true);  // visible via INFO persistence loading:1
+    update_master_link(gen, [] { g_loading_replication = true; });
     wake_event_loop_for_replica();
     bool load_ok = false;
     for (;;) {
@@ -14835,27 +15029,30 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     transfer_state.done();
-    g_loading_replication.store(false);
+    update_master_link(gen, [] { g_loading_replication = false; });
     ::unlink(tmp_path.c_str());
     if (!load_ok) {
         ::close(fd);
         log(LogLevel::Error, "REPLICAOF: rdb_load failed (event-loop)");
         return false;
     }
+    cached->offset = fullresync_offset;
     log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
+
+    }  // full resync; CONTINUE keeps the dataset and backlog
 
     // Release loading gate; from here the event loop's READONLY guard rejects client writes.
     // Streaming commands are enqueued in g_replica_cmd_queue and applied by the event loop,
     // so DataStore mutations stay on the event loop thread (no concurrent access).
-    g_loading_replication.store(false);
-    g_replica_read_offset = fullresync_offset;
-    g_replica_last_io_ms = now_ms();
-    g_repl_down_since_ms = 0;
+    update_master_link(gen, [] { g_loading_replication = false; });
     {
         // The event loop sends the REPLCONF ACKs on this socket from now on (it knows what it has
         // applied); this thread only reads. A newer REPLICAOF has its own link.
         std::lock_guard<std::mutex> lk(g_replica_link_mu);
         if (g_repl_generation.load() == gen) {
+            g_replica_read_offset = cached->offset;
+            g_replica_last_io_ms = now_ms();
+            g_repl_down_since_ms = 0;
             g_replica_link_fd = fd;
             g_replica_ack_out.clear();
             g_replica_stale = false;
@@ -14871,19 +15068,20 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     stream_buf.reserve(65536);
     std::vector<char> recv_buf(65536);
 
-    // The recv timeout bounds how long a superseded link takes to notice the newer REPLICAOF.
-    {
-        struct timeval tv{1, 0};
-        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    }
-
     while (true) {
-        // Stop promptly if a newer REPLICAOF (including NO ONE) superseded us. The 1s
-        // recv timeout below bounds how long this takes.
+        // The 100 ms poll bounds how long a superseded stream takes to release its socket.
         if (g_repl_generation.load() != gen) {
             log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF, stopping stream");
             break;
         }
+        if (now_ms() / 1000 - g_replica_last_io_ms.load() / 1000 > g_repl_timeout.load()) {
+            log(LogLevel::Warn, "MASTER timeout: no data nor PING received...");
+            break;
+        }
+        pollfd readable{fd, POLLIN, 0};
+        const int ready = ::poll(&readable, 1, 100);
+        if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+        if (ready < 0) break;
         const ssize_t n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
         if (n == 0) {
             log(LogLevel::Warn, "REPLICAOF: master closed connection");
@@ -14895,8 +15093,10 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
             break;
         }
         stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
-        g_replica_read_offset += n;  // readQueryFromClient(): read_reploff
-        g_replica_last_io_ms = now_ms();
+        if (!update_master_link(gen, [&] {
+              g_replica_read_offset += n;  // readQueryFromClient(): read_reploff
+              g_replica_last_io_ms = now_ms();
+            })) break;
 
         // Parse commands and enqueue them for the event loop to apply.
         // This keeps all DataStore mutations on the event loop thread, eliminating
@@ -14931,7 +15131,14 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     }
     ::close(fd);
     // replicationHandleMasterDisconnection(): repl_down_since.
-    if (g_repl_generation.load() == gen) g_repl_down_since_ms = now_ms();
+    if (update_master_link(gen, [] {
+      g_repl_down_since_ms = now_ms();
+      g_replica_stale = true;
+    })) {
+      auto reset = std::make_shared<MasterLinkRequest>();
+      reset->gen = gen;
+      master_link_request(reset);
+    }
     return true;
 }
 

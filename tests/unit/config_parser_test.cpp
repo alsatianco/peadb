@@ -135,6 +135,11 @@ void test_line_errors() {
 }
 
 void test_value_checks() {
+  const auto replication = expect_ok("repl-timeout 7\nrepl-ping-slave-period 3\n");
+  expect(replication.warnings.empty(), "replication liveness settings are applied, not warned");
+  expect(replication.raw.at("repl-timeout") == "7" &&
+             replication.raw.at("repl-ping-replica-period") == "3",
+         "replication liveness config and alias values");
   expect_error("appendonly maybe\n", "argument must be 'yes' or 'no'");
   expect_error("port 70000\n", "argument must be between 0 and 65535 inclusive");
   expect_error("port 6379x\n", "argument couldn't be parsed into an integer");
