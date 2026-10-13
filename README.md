@@ -117,7 +117,8 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `appendfsync` | `everysec` | AOF fsync policy (`always` / `everysec` / `no`) |
 | `requirepass` | — | Require clients to `AUTH` with this password (empty = open, like Redis) |
 | `replicaof` (`slaveof`) | — | Start as a replica of `host port`; `no one` starts as a master. See [replica persistence and restart](compat/delta.md) item 45 |
-| `masterauth` | — | Password a replica sends to its master during sync |
+| `masterauth` | — | Password a replica sends during each master handshake; empty skips AUTH |
+| `masteruser` | — | Master ACL username; empty uses password-only AUTH. Config/CLI/CONFIG SET, effective on reconnect; see [replication authentication](compat/delta.md) item 50 |
 | `protected-mode` | `yes` | Refuse non-loopback clients when no password is set |
 | `enable-module-command` | `no` | Gate `MODULE LOAD` (`yes` / `no` / `local`) — `MODULE LOAD` runs arbitrary native code |
 | `enable-protected-configs` | `no` | Allow `CONFIG SET dir` and `CONFIG SET dbfilename` (`yes`, or `local` for loopback and unix-socket clients) |

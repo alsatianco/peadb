@@ -85,6 +85,7 @@ void test_basic_settings() {
       "cluster-announce-bus-port 17100\n"
       "requirepass Str0ng#Pass-2026\n"
       "masterauth \"with space#and hash\"\n"
+      "masteruser replication-user\n"
       "maxmemory 1gb\n"
       "repl-backlog-size 2MB\n"
       "appendonly YES\n"
@@ -101,6 +102,7 @@ void test_basic_settings() {
   expect(cfg.cluster_announce_bus_port == "17100", "cluster-announce-bus-port");
   expect(cfg.requirepass == "Str0ng#Pass-2026", "a # inside a value is kept");
   expect(cfg.masterauth == "with space#and hash", "quoted value");
+  expect(cfg.masteruser == "replication-user", "replication ACL username");
   expect(cfg.maxmemory == "1073741824", "maxmemory unit");
   expect(cfg.repl_backlog_size == "2097152", "repl-backlog-size unit");
   expect(cfg.appendonly, "appendonly YES");
@@ -208,7 +210,8 @@ void test_refused_and_ignored() {
   cfg = expect_ok("replicaof \"\" 0\n");
   expect(cfg.replica && cfg.master_host.empty(), "an empty host is still a configured replica");
   expect_error("replicaof 10.0.0.1 nope\n", "Invalid master port");
-  expect_error("masteruser repl\n", "named ACL user");
+  cfg = expect_ok("masteruser repl\nmasteruser \"\"\n");
+  expect(cfg.masteruser.empty(), "empty masteruser selects password-only AUTH");
   expect_error("enable-debug-command no\n", "rename-command DEBUG");
   expect_error("sentinel monitor m 127.0.0.1 6379 2\n", "sentinel directive while not in sentinel mode");
   expect_error("bind 127.0.0.1 -::1\n", "exactly one bind address");
