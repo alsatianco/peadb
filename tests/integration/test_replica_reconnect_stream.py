@@ -70,7 +70,7 @@ class ControlledMaster:
         check(not self.thread.is_alive() and not self.errors, f'fixture failed: {self.errors}')
 
 
-def run(binary, rdb, unsupported_rdb=None):
+def run(binary, rdb, invalid_rdb=None):
     p, child_port = ports(2)
     fake = ControlledMaster()
     proc, r, child_proc, child = None, None, None, None
@@ -161,16 +161,17 @@ def run(binary, rdb, unsupported_rdb=None):
             wait_for(lambda: r('GET', 'counter') == '3', 'paused replay exactly once')
             check(int(info(r, 'slave_repl_offset', 'replication')) == len(replacement),
                   'applied stream offset')
-            if unsupported_rdb is not None:
-                # This is a valid Redis stream snapshot, still unsupported by PeaDB. A load
-                # failure must discard cached history, even if decoding already replaced keys.
+            if invalid_rdb is not None:
+                # A snapshot whose checksum is valid but whose object type is invalid must
+                # discard cached history, even after its valid prefix has replaced keys.
                 link.shutdown(socket.SHUT_RDWR); link.close()
                 link, args = fake.accept()
                 check(args[1] == NEXT_ID, 'cached master before rejected snapshot')
-                link.sendall(f'+FULLRESYNC {REPLID} 0\r\n${len(unsupported_rdb)}\r\n'.encode() +
-                             unsupported_rdb)
+                link.sendall(f'+FULLRESYNC {REPLID} 0\r\n${len(invalid_rdb)}\r\n'.encode() +
+                             invalid_rdb)
                 link, args = fake.accept()
                 check(args == ['PSYNC', '?', '-1'], f'failed load cannot resume: {args}')
+                check(r('GET', 'counter') == 'untrusted', 'valid prefix was decoded before failure')
                 full = int(info(r, 'sync_full', 'stats'))
                 r('REPLICAOF', 'NO', 'ONE')
                 wait_for(lambda: int(info(r, 'sync_full', 'stats')) > full,
@@ -189,23 +190,29 @@ def run(binary, rdb, unsupported_rdb=None):
                 stop(proc)
 
 
-def empty_rdb(with_stream=False):
+def empty_rdb():
     p = ports(1)[0]
     with tempfile.TemporaryDirectory(prefix='peadb-reconnect-rdb-') as td:
         proc = start(REDIS or PEADB, p, td)
         try:
             c = Conn(p)
             c('CONFIG', 'SET', 'repl-diskless-sync', 'no')
-            if with_stream:
-                c('XADD', 'unsupported-stream', '*', 'field', 'value')
             c.close()
             return read_rdb(p)
         finally:
             stop(proc)
 
 
+def malformed_rdb():
+    # Ordinary RDB corruption fixture: one readable DB-5 string before an unknown type.
+    # Unlike a checksum failure, this reaches the dataset/history replacement boundary.
+    from test_rdb_redis_interop import with_checksum
+    body = b'REDIS0011\xfe\x05\x00\x07counter\x09untrusted\x63\x06broken\xff'
+    return with_checksum(body)
+
+
 if __name__ == '__main__':
     rdb = empty_rdb()
     if REDIS:
         run(REDIS, rdb)
-    run(PEADB, rdb, empty_rdb(with_stream=True) if REDIS else None)
+    run(PEADB, rdb, malformed_rdb())

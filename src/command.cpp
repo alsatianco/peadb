@@ -6193,21 +6193,14 @@ std::string migrate_command(const std::vector<std::string>& args, SessionState& 
   // counts as an access (unless CLIENT NO-TOUCH). No key found is not an error: it often expired
   // meanwhile.
   std::vector<const std::string*> keys;
-  bool has_stream = false;
   for (std::size_t j = 0; j < num_keys; ++j) {
     const std::string& key = args[first_key + j];
     const std::string type = store().type_of(key);
     if (type == "none") continue;
-    if (type == "stream") has_stream = true;
     if (!session.no_touch) store().touch_key_for_eviction(key);
     keys.push_back(&key);
   }
   if (keys.empty()) return encode_simple("NOKEY");
-  if (has_stream) {
-    return encode_error(
-        "MIGRATE of a stream is not supported by PeaDB yet (it cannot DUMP a stream in Redis's "
-        "format)");
-  }
 
   // As in Redis, which reads every expire time against the command's start, a key found above is
   // sent with what was left of its TTL then and deleted here once the target took it, even if the

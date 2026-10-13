@@ -2474,11 +2474,15 @@ bool DataStore::dump_stream(const std::string& key, StreamDump& out) {
   out.entries = e.stream_entries();
   out.last_ms = e.stream_last_ms();
   out.last_seq = e.stream_last_seq();
+  out.entries_added = e.stream().entries_added;
+  out.max_deleted_id = e.stream().max_deleted_id;
   out.groups.clear();
   for (const auto& [gname, g] : e.stream_groups()) {
     StreamGroupDump gd;
     gd.name = gname;
     gd.last_delivered_id = g.last_delivered_id;
+    gd.entries_read = g.entries_read;
+    gd.consumers = g.consumers;
     for (const auto& [id, consumer] : g.pending_to_consumer) {
       StreamPel p;
       p.id = id;
@@ -2500,16 +2504,18 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   e = Entry{};
   e.stream();
   e.stream_entries() = d.entries;
-  // The private RDB encoding predates entries-added and stores no historical counter. Its
-  // minimum valid value is the surviving length: leaving it at zero makes the next AOF rewrite
-  // emit an XSETID that refuses to load. Historical metadata remains compat/delta.md item 5.
-  e.stream().entries_added = d.entries.size();
+  // Old private snapshots have no historical counter; retain their minimum valid value.
+  e.stream().entries_added = d.entries_added.value_or(d.entries.size());
+  e.stream().max_deleted_id = d.max_deleted_id;
   e.stream_last_ms() = d.last_ms;
   e.stream_last_seq() = d.last_seq;
   for (const auto& gd : d.groups) {
     Entry::StreamGroup g;
     g.last_delivered_id = gd.last_delivered_id;
+    g.entries_read = gd.entries_read;
+    g.consumers = gd.consumers;
     for (const auto& p : gd.pending) {
+      g.consumers.try_emplace(p.consumer);
       g.pending_to_consumer[p.id] = p.consumer;
       g.pending_per_consumer[p.consumer] += 1;
       g.pending_delivery_ms[p.id] = p.delivery_ms;
