@@ -404,6 +404,22 @@ class DataStore {
                      const std::int64_t* entries_read = nullptr);
   bool xgroup_setid(const std::string& key, const std::string& group, const std::string& id,
                     bool& wrongtype, std::string& err, const std::int64_t* entries_read = nullptr);
+  // Snapshot each PEL mutation before another claim can change it (including duplicate IDs).
+  // Deleted entries retain their old owner/time/count so replay removes the same NACK.
+  struct StreamClaimEffect {
+    std::string key, group, consumer, id, last_id;
+    std::int64_t delivery_ms, delivery_count;
+  };
+  struct StreamClaimOptions {
+    std::optional<std::int64_t> time;
+    std::optional<std::int64_t> idle;
+    std::int64_t retrycount = -1;
+  };
+  // NOACK cursors must be captured per occurrence, including duplicate stream names.
+  struct StreamGroupEffect {
+    std::string key, group, last_id;
+    std::int64_t entries_read;
+  };
   // count=0 means "no limit". noack skips adding delivered entries to the PEL. An idreq of
   // ">" delivers new entries (advancing the group's last-delivered-id and, unless noack,
   // adding to the consumer's PEL); any other id is a history read of the consumer's own PEL
@@ -414,7 +430,10 @@ class DataStore {
       std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>>
   xreadgroup(const std::string& group, const std::string& consumer,
              const std::vector<std::pair<std::string, std::string>>& streams, std::size_t count,
-             bool noack, bool& wrongtype, std::string& err, bool* consumer_created = nullptr);
+             bool noack, bool& wrongtype, std::string& err, bool* consumer_created = nullptr,
+             std::vector<StreamClaimEffect>* effects = nullptr,
+             std::vector<std::string>* created_keys = nullptr,
+             std::vector<StreamGroupEffect>* group_effects = nullptr);
   // Fetch a group's current last-delivered-id and entries-read (for NOACK propagation).
   bool stream_group_ids(const std::string& key, const std::string& group, std::string& last_id,
                         std::int64_t& entries_read);
@@ -539,7 +558,8 @@ class DataStore {
       const std::string& key, const std::string& group, const std::string& consumer,
       std::int64_t min_idle_ms, const std::vector<std::string>& ids, bool justid, bool force,
       bool& wrongtype, std::string& err, const std::string* last_id = nullptr,
-      bool* consumer_created = nullptr);
+      bool* consumer_created = nullptr, const StreamClaimOptions* options = nullptr,
+      std::vector<StreamClaimEffect>* effects = nullptr);
   // XAUTOCLAIM: from start cursor, claim up to count idle entries; returns {next_cursor, entries,
   // deleted}.
   struct AutoClaimResult {
@@ -547,10 +567,12 @@ class DataStore {
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> claimed;
     std::vector<std::string> deleted;
   };
+  static bool validate_xautoclaim_start(const std::string& start, std::string& err);
   AutoClaimResult xautoclaim(const std::string& key, const std::string& group,
                              const std::string& consumer, std::int64_t min_idle_ms,
                              const std::string& start, std::int64_t count, bool justid,
-                             bool& wrongtype, std::string& err, bool* consumer_created = nullptr);
+                             bool& wrongtype, std::string& err, bool* consumer_created = nullptr,
+                             std::vector<StreamClaimEffect>* effects = nullptr);
 
   void flushall();
   void flushdb();

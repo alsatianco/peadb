@@ -1871,7 +1871,9 @@ std::vector<std::pair<
 DataStore::xreadgroup(const std::string& group, const std::string& consumer,
                       const std::vector<std::pair<std::string, std::string>>& streams,
                       std::size_t count, bool noack, bool& wrongtype, std::string& err,
-                      bool* consumer_created) {
+                      bool* consumer_created, std::vector<StreamClaimEffect>* effects,
+                      std::vector<std::string>* created_keys,
+                      std::vector<StreamGroupEffect>* group_effects) {
   wrongtype = false;
   err.clear();
   if (consumer_created) *consumer_created = false;
@@ -1880,6 +1882,37 @@ DataStore::xreadgroup(const std::string& group, const std::string& consumer,
       std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>>
       out;
   auto& db = dbs_[current_db_];
+
+  // Redis validates every stream/group/ID before serving any of them.
+  for (const auto& [key, idreq] : streams) {
+    expire_if_needed(db, key);
+    auto it = db.find(key);
+    if (it != db.end() && it->second.type() != ValueType::Stream) {
+      wrongtype = true;
+      return {};
+    }
+    if (it == db.end() ||
+        it->second.stream_groups().find(group) == it->second.stream_groups().end()) {
+      err = "NOGROUP No such key '" + key + "' or consumer group '" + group +
+            "' in XREADGROUP with GROUP option";
+      return {};
+    }
+    StreamID id;
+    if (idreq == "$") {
+      err =
+          "The $ ID is meaningless in the context of XREADGROUP: you want to read the history of "
+          "this consumer by specifying a proper ID, or use the > ID to get new messages. The $ ID "
+          "would just return an empty result set.";
+      return {};
+    }
+    if (idreq != ">" && !stream_id_parse_strict(idreq, id)) {
+      err = "Invalid stream ID specified as stream command argument";
+      return {};
+    }
+  }
+  // No validated key can expire between validation and the last stream's mutation.
+  const LazyExpireDisabled no_lazy_expire(*this);
+  const std::int64_t now = now_ms();
 
   for (const auto& [key, idreq] : streams) {
     expire_if_needed(db, key);
@@ -1906,11 +1939,12 @@ DataStore::xreadgroup(const std::string& group, const std::string& consumer,
     // Redis. active-time is only bumped when data is actually delivered.
     {
       const bool is_new = g.consumers.find(consumer) == g.consumers.end();
-      g.consumers[consumer].seen_time = now_ms();
+      g.consumers[consumer].seen_time = now;
       if (consumer_created && is_new) *consumer_created = true;
+      if (created_keys && is_new) created_keys->push_back(key);
     }
     auto mark_active = [&]() {
-      g.consumers[consumer].active_time = now_ms();
+      g.consumers[consumer].active_time = now;
     };
 
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> rows;
@@ -1920,9 +1954,15 @@ DataStore::xreadgroup(const std::string& group, const std::string& consumer,
         if (!stream_id_gt(e.first, g.last_delivered_id)) continue;
         rows.push_back(e);
         if (!noack) {
+          auto old = g.pending_to_consumer.find(e.first);
+          if (old != g.pending_to_consumer.end()) {
+            auto cit = g.pending_per_consumer.find(old->second);
+            if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
+              g.pending_per_consumer.erase(cit);
+          }
           g.pending_to_consumer[e.first] = consumer;
           g.pending_per_consumer[consumer] += 1;
-          g.pending_delivery_ms[e.first] = now_ms();
+          g.pending_delivery_ms[e.first] = now;
           g.pending_delivery_count[e.first] = 1;
         }
         // Advance the read counter: increment when it's valid and no tombstone lies ahead,
@@ -1936,10 +1976,15 @@ DataStore::xreadgroup(const std::string& group, const std::string& consumer,
           g.entries_read = stream_estimate_distance(stt, eid);
         }
         g.last_delivered_id = e.first;
+        if (!noack && effects)
+          effects->push_back({key, group, consumer, e.first, g.last_delivered_id,
+                              g.pending_delivery_ms[e.first], g.pending_delivery_count[e.first]});
         if (count && rows.size() >= count) break;
       }
       if (!rows.empty()) {
         mark_active();
+        if (noack && group_effects)
+          group_effects->push_back({key, group, g.last_delivered_id, g.entries_read});
         out.push_back({key, std::move(rows)});
       }
     } else {
@@ -1966,8 +2011,9 @@ DataStore::xreadgroup(const std::string& group, const std::string& consumer,
                                 [&](const auto& e) { return e.first == pid; });
         if (eit != entries.end()) {
           rows.push_back(*eit);
-          g.pending_delivery_ms[pid] = now_ms();
-          g.pending_delivery_count[pid] += 1;  // Redis bumps the counter on history re-read
+          g.pending_delivery_ms[pid] = now;
+          g.pending_delivery_count[pid] = static_cast<std::int64_t>(
+              static_cast<std::uint64_t>(g.pending_delivery_count[pid]) + 1);
         } else {
           // Pending id whose stream entry was removed: emit id + empty fields (null sentinel).
           rows.push_back({pid, {}});
@@ -2547,7 +2593,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
 DataStore::xclaim(const std::string& key, const std::string& group, const std::string& consumer,
                   std::int64_t min_idle_ms, const std::vector<std::string>& ids_in, bool justid,
                   bool force, bool& wrongtype, std::string& err, const std::string* last_id,
-                  bool* consumer_created) {
+                  bool* consumer_created, const StreamClaimOptions* options,
+                  std::vector<StreamClaimEffect>* effects) {
   wrongtype = false;
   err.clear();
   if (consumer_created) *consumer_created = false;
@@ -2569,28 +2616,40 @@ DataStore::xclaim(const std::string& key, const std::string& group, const std::s
     return out;
   }
   auto& g = git->second;
-  // XCLAIM creates the target consumer as a side effect (needed so a replayed XCLAIM restores
-  // the consumer even when the read that produced it was propagated as bare XCLAIMs).
-  if (consumer_created && g.consumers.find(consumer) == g.consumers.end()) *consumer_created = true;
-  g.consumers[consumer].seen_time = now_ms();
-  // LASTID advances the group cursor (used by XREADGROUP-effect propagation for ACK reads).
-  if (last_id) {
-    StreamID lid;
-    if (stream_id_parse_strict(*last_id, lid)) {
-      StreamID cur{0, 0};
-      stream_id_parse_strict(g.last_delivered_id.empty() ? "0-0" : g.last_delivered_id, cur);
-      if (stream_id_cmp(lid, cur) > 0) g.last_delivered_id = stream_id_str(lid);
-    }
-  }
-  const std::int64_t now = now_ms();
-  auto& entries = it->second.stream_entries();
-  // Canonicalize requested ids ("5" -> "5-0") to match the stored PEL keys.
+  // Validate before LASTID, consumer creation or any PEL mutation.
   std::vector<std::string> ids;
   ids.reserve(ids_in.size());
   for (const auto& raw : ids_in) {
-    StreamID k;
-    ids.push_back(stream_id_parse_strict(raw, k) ? stream_id_str(k) : raw);
+    StreamID id;
+    if (!stream_id_parse_strict(raw, id)) {
+      err = "ERR Invalid stream ID specified as stream command argument";
+      return out;
+    }
+    ids.push_back(stream_id_str(id));
   }
+  StreamID lid;
+  if (last_id && !stream_id_parse_strict(*last_id, lid)) {
+    err = "ERR Invalid stream ID specified as stream command argument";
+    return out;
+  }
+  const std::int64_t now = now_ms();
+  std::int64_t delivery = now;
+  if (options) {
+    if (options->time && *options->time >= 0 && *options->time <= now) delivery = *options->time;
+    // Clamp bogus past/future values without overflowing the signed subtraction.
+    if (options->idle && *options->idle >= 0 && *options->idle <= now)
+      delivery = now - *options->idle;
+  }
+  // XCLAIM creates the target consumer as a side effect (needed so a replayed XCLAIM restores
+  // the consumer even when the read that produced it was propagated as bare XCLAIMs).
+  if (consumer_created && g.consumers.find(consumer) == g.consumers.end()) *consumer_created = true;
+  g.consumers[consumer].seen_time = now;
+  if (last_id) {
+    StreamID cur{0, 0};
+    stream_id_parse_strict(g.last_delivered_id, cur);
+    if (stream_id_cmp(lid, cur) > 0) g.last_delivered_id = stream_id_str(lid);
+  }
+  auto& entries = it->second.stream_entries();
   bool got_data = false;
   for (const auto& id : ids) {
     auto pit = g.pending_to_consumer.find(id);
@@ -2600,6 +2659,9 @@ DataStore::xclaim(const std::string& key, const std::string& group, const std::s
         std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
     if (eit == entries.end()) {  // entry was deleted from the stream — drop the dangling PEL entry
       if (in_pel) {
+        if (effects)
+          effects->push_back({key, group, pit->second, id, g.last_delivered_id,
+                              g.pending_delivery_ms[id], g.pending_delivery_count[id]});
         auto cit = g.pending_per_consumer.find(pit->second);
         if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
           g.pending_per_consumer.erase(cit);
@@ -2612,7 +2674,7 @@ DataStore::xclaim(const std::string& key, const std::string& group, const std::s
     if (in_pel) {
       const auto dm = g.pending_delivery_ms.find(id);
       const std::int64_t idle = now - (dm != g.pending_delivery_ms.end() ? dm->second : 0);
-      if (idle < min_idle_ms) continue;
+      if (min_idle_ms > 0 && idle < min_idle_ms) continue;
       if (pit->second != consumer) {
         auto cit = g.pending_per_consumer.find(pit->second);
         if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
@@ -2625,25 +2687,47 @@ DataStore::xclaim(const std::string& key, const std::string& group, const std::s
       g.pending_per_consumer[consumer] += 1;
       g.pending_delivery_count[id] = 0;
     }
-    g.pending_delivery_ms[id] = now;
-    if (!justid) g.pending_delivery_count[id] += 1;
+    g.pending_delivery_ms[id] = delivery;
+    if (options && options->retrycount >= 0)
+      g.pending_delivery_count[id] = options->retrycount;
+    else if (!justid)
+      g.pending_delivery_count[id] =
+          static_cast<std::int64_t>(static_cast<std::uint64_t>(g.pending_delivery_count[id]) + 1);
+    if (effects)
+      effects->push_back({key, group, consumer, id, g.last_delivered_id, g.pending_delivery_ms[id],
+                          g.pending_delivery_count[id]});
     out.push_back(*eit);
     got_data = true;
   }
-  if (got_data) g.consumers[consumer].active_time = now_ms();
+  if (got_data) g.consumers[consumer].active_time = now;
   return out;
+}
+
+bool DataStore::validate_xautoclaim_start(const std::string& start, std::string& err) {
+  StreamID id;
+  if (stream_id_parse_bound(start, true, id)) return true;
+  const bool overflow = !start.empty() && start[0] == '(' &&
+                        stream_id_parse_strict(start.substr(1), id) && id.ms == UINT64_MAX &&
+                        id.seq == UINT64_MAX;
+  err = overflow ? "invalid start ID for the interval"
+                 : "Invalid stream ID specified as stream command argument";
+  return false;
 }
 
 DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const std::string& group,
                                                  const std::string& consumer,
                                                  std::int64_t min_idle_ms, const std::string& start,
                                                  std::int64_t count, bool justid, bool& wrongtype,
-                                                 std::string& err, bool* consumer_created) {
+                                                 std::string& err, bool* consumer_created,
+                                                 std::vector<StreamClaimEffect>* effects) {
   wrongtype = false;
   err.clear();
   if (consumer_created) *consumer_created = false;
   AutoClaimResult res;
   res.next_cursor = "0-0";
+  StreamID startk{0, 0};
+  if (!validate_xautoclaim_start(start, err)) return res;
+  stream_id_parse_bound(start, true, startk);
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
@@ -2669,8 +2753,6 @@ DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const s
     auto& c = g.consumers[consumer];
     c.seen_time = now;
   }
-  StreamID startk{0, 0};
-  stream_id_parse_strict(start == "-" ? "0-0" : start, startk);
   // Iterate the group PEL (id-ordered) from the start cursor — this is what lets XAUTOCLAIM
   // surface entries that were XDELed from the stream but still linger in the PEL.
   std::vector<std::string> pel;
@@ -2692,6 +2774,9 @@ DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const s
   auto remove_pel = [&](const std::string& id) {
     auto pit = g.pending_to_consumer.find(id);
     if (pit != g.pending_to_consumer.end()) {
+      if (effects)
+        effects->push_back({key, group, pit->second, id, g.last_delivered_id,
+                            g.pending_delivery_ms[id], g.pending_delivery_count[id]});
       auto cit = g.pending_per_consumer.find(pit->second);
       if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
         g.pending_per_consumer.erase(cit);
@@ -2725,7 +2810,12 @@ DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const s
       g.pending_per_consumer[consumer] += 1;
     }
     g.pending_delivery_ms[id] = now;
-    if (!justid) g.pending_delivery_count[id] += 1;
+    if (!justid)
+      g.pending_delivery_count[id] =
+          static_cast<std::int64_t>(static_cast<std::uint64_t>(g.pending_delivery_count[id]) + 1);
+    if (effects)
+      effects->push_back({key, group, consumer, id, g.last_delivered_id, g.pending_delivery_ms[id],
+                          g.pending_delivery_count[id]});
     auto eit =
         std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
     res.claimed.push_back(*eit);

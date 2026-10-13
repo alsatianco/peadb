@@ -94,6 +94,8 @@ struct CommandSpec {
   int key_step;
   std::function<std::string(const std::vector<std::string>&, SessionState&, bool&)> handler;
   std::uint32_t flag_bits = 0;
+  // Keep this with the dispatch flags rather than the colder Redis metadata below.
+  bool propagates_effects = false;  // Handler emits deterministic writes instead of its argv.
   bool is_write() const {
     return flag_bits & kFlagWrite;
   }
@@ -2711,6 +2713,23 @@ void propagate_write(const std::vector<std::string>& args, const SessionState& s
   also_propagate(session.db_index, std::move(out), target, last_of_unit);
 }
 
+// Redis's stream helpers use alsoPropagate(AOF|REPL), including under redis.set_repl(NONE).
+// AOF loading emits nothing; a master stream still persists its effects in the local AOF.
+void propagate_stream_effect(std::vector<std::string> argv, const SessionState& session) {
+  if (g_replaying_aof && !g_applying_master_stream) return;
+  also_propagate(session.db_index, std::move(argv), kPropagateAof | kPropagateRepl);
+}
+
+// Snapshot-based claims are idempotent on a delayed replica and on AOF replay.
+void propagate_stream_claims(const std::vector<DataStore::StreamClaimEffect>& effects,
+                             const SessionState& session) {
+  for (const auto& e : effects)
+    propagate_stream_effect(
+        {"XCLAIM", e.key, e.group, e.consumer, "0", e.id, "TIME", std::to_string(e.delivery_ms),
+         "RETRYCOUNT", std::to_string(e.delivery_count), "FORCE", "JUSTID", "LASTID", e.last_id},
+        session);
+}
+
 // Redis's deleteExpiredKeyAndPropagate() and propagateDeletion(), called by DataStore for each key
 // a master deletes because its TTL has passed (a lookup, SCAN, RANDOMKEY or the active cycle): the
 // DEL goes to the AOF and to the replicas whatever redis.set_repl() says (not through
@@ -3918,7 +3937,10 @@ bool stream_id_is_valid(const std::string& s) {
     if (t.empty()) return false;
     for (char c : t)
       if (!std::isdigit(static_cast<unsigned char>(c))) return false;
-    return true;
+    errno = 0;
+    char* end = nullptr;
+    std::strtoull(t.c_str(), &end, 10);
+    return errno != ERANGE && end == t.c_str() + t.size();
   };
   const auto d = s.find('-');
   if (d == std::string::npos) return all_digits(s);
@@ -3969,6 +3991,38 @@ bool parse_strict_int(const std::string& s, std::int64_t& out) {
   } catch (...) {
     return false;
   }
+}
+
+// Redis streamParseStrictIDOrReply()/string2ull() for claim IDs. Unlike signed options,
+// unsigned ID components also accept strtoull's forms (for example "+1" and " 1").
+// Normalize before the datastore lookup so a real master's raw XCLAIM IDs are not dropped.
+bool normalize_claim_stream_id(const std::string& input, std::string& out,
+                               bool allow_special = false) {
+  if (input.empty() || input.size() >= 128) return false;
+  const std::string id(input.c_str());  // Redis parses its bounded, NUL-terminated ID buffer.
+  if (id == "+" || id == "-") {
+    if (!allow_special) return false;
+    out = id == "-" ? "0-0" : "18446744073709551615-18446744073709551615";
+    return true;
+  }
+  auto component = [](const std::string& text, std::uint64_t& value) {
+    std::int64_t signed_value;
+    if (parse_strict_int(text, signed_value)) {
+      if (signed_value < 0) return false;
+      value = static_cast<std::uint64_t>(signed_value);
+      return true;
+    }
+    errno = 0;
+    char* end = nullptr;
+    value = std::strtoull(text.c_str(), &end, 10);
+    return !text.empty() && errno != ERANGE && errno != EINVAL && end == text.c_str() + text.size();
+  };
+  const auto dash = id.find('-');
+  std::uint64_t ms, seq = 0;
+  if (!component(id.substr(0, dash), ms)) return false;
+  if (dash != std::string::npos && !component(id.substr(dash + 1), seq)) return false;
+  out = std::to_string(ms) + "-" + std::to_string(seq);
+  return true;
 }
 
 // Redis's parseScanCursorOrReply(): strtoul() in base 10, so a sign is read ("-1" is the largest
@@ -12038,33 +12092,33 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               bool wrongtype = false;
               std::string err;
               bool consumer_created = false;
-              auto rows = store().xreadgroup(group, consumer, streams, req_count, noack, wrongtype,
-                                             err, &consumer_created);
+              std::vector<DataStore::StreamClaimEffect> effects;
+              std::vector<DataStore::StreamGroupEffect> group_effects;
+              std::vector<std::string> created_keys;
+              auto rows =
+                  store().xreadgroup(group, consumer, streams, req_count, noack, wrongtype, err,
+                                     &consumer_created, &effects, &created_keys, &group_effects);
               if (wrongtype) return wrongtype_error_reply();
               if (!err.empty()) return encode_stream_error(err);
+              propagate_stream_claims(effects, session);
 
               // XREADGROUP is not propagated verbatim (canonicalize sets emit=false); instead we
               // propagate its deterministic effects to BOTH the AOF and the replication backlog.
               auto propagate = [&](std::vector<std::string> cmd) {
-                propagate_write(cmd, session, nullptr);
+                propagate_stream_effect(std::move(cmd), session);
               };
               // For a NOACK read there is no XCLAIM to carry the consumer, so a newly-created
               // consumer is propagated as XGROUP CREATECONSUMER up front (Redis creates it when
               // the command is processed, even if the read then blocks or returns nothing). ACK
               // reads instead let the per-entry XCLAIM (below) create the consumer on replay.
-              if (consumer_created && noack) {
-                for (const auto& s : streams)
-                  if (s.second == ">")
-                    propagate({"XGROUP", "CREATECONSUMER", s.first, group, consumer});
+              for (const auto& key : created_keys) {
+                if (noack) propagate({"XGROUP", "CREATECONSUMER", key, group, consumer});
+                notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", key,
+                                      session.db_index);
               }
-              // A freshly-created consumer fires an "xgroup-createconsumer" keyspace event
-              // (ACK or NOACK), on each stream whose group it was created in.
-              if (consumer_created) {
-                for (const auto& s : streams)
-                  if (s.second == ">")
-                    notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", s.first,
-                                          session.db_index);
-              }
+              for (const auto& e : group_effects)
+                propagate({"XGROUP", "SETID", e.key, e.group, e.last_id, "ENTRIESREAD",
+                           std::to_string(e.entries_read)});
 
               if (rows.empty()) {
                 // Block only when reading new messages (all ids are ">"), like Redis.
@@ -12089,21 +12143,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 return encode_null(RespVersion::Resp2);
               }
 
-              // Propagate deterministic effects (Redis streamReplyWithRange): an ACK read emits
-              // one idempotent XCLAIM per delivered entry, carrying LASTID so the replica/AOF
-              // advances the group cursor (and FORCE creates the consumer + PEL). A NOACK read has
-              // no PEL, so it emits a single XGROUP SETID (last-id + entries-read). History
-              // re-reads (id != ">") change no ownership → nothing to propagate.
-              std::unordered_map<std::string, std::string> idreq_of;
-              for (const auto& s : streams) idreq_of[s.first] = s.second;
+              // ACK effects were snapshotted by the datastore and propagated above. NOACK
+              // reads carry the group cursor with XGROUP SETID. Redis does not propagate the
+              // local delivery-time/count changes of history reads (id != ">"), so neither do we.
               std::vector<std::string> out;
               for (const auto& [key, entries] : rows) {
-                const bool is_new = idreq_of[key] == ">";
                 std::vector<std::string> encoded_entries;
                 for (const auto& [id, fields] : entries) {
-                  if (is_new && !noack)
-                    propagate({"XCLAIM", key, group, consumer, "0", id, "TIME", "0", "RETRYCOUNT",
-                               "1", "FORCE", "JUSTID", "LASTID", id});
                   if (fields.empty()) {
                     // Null-fields sentinel: a pending id whose stream entry was removed.
                     encoded_entries.push_back(encode_array({encode_bulk(id), encode_null_array()}));
@@ -12115,13 +12161,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     fv.push_back(encode_bulk(v));
                   }
                   encoded_entries.push_back(encode_array({encode_bulk(id), encode_array(fv)}));
-                }
-                if (is_new && noack && !entries.empty()) {
-                  std::string lid;
-                  std::int64_t er = 0;
-                  if (store().stream_group_ids(key, group, lid, er))
-                    propagate(
-                        {"XGROUP", "SETID", key, group, lid, "ENTRIESREAD", std::to_string(er)});
                 }
                 out.push_back(encode_array({encode_bulk(key), encode_array(encoded_entries)}));
               }
@@ -15348,105 +15387,144 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     };
 
     t.emplace("XAUTOCLAIM",
-              CommandSpec{"XAUTOCLAIM",
-                          -6,
-                          {"write"},
-                          1,
-                          1,
-                          1,
-                          [encode_stream_entry](const std::vector<std::string>& args,
-                                                SessionState& session, bool&) -> std::string {
-                            // XAUTOCLAIM key group consumer min-idle-time start [COUNT n] [JUSTID]
-                            std::int64_t min_idle = 0;
-                            if (!parse_i64(args[4], min_idle) || min_idle < 0)
-                              return encode_error("Invalid min-idle-time argument for XAUTOCLAIM");
-                            std::int64_t count = 100;
-                            bool justid = false;
-                            // Redis caps COUNT at LONG_MAX / max(sizeof(streamID)=16,
-                            // attempts_factor=10) = LONG_MAX/16.
-                            constexpr std::int64_t kMaxCount = 9223372036854775807LL / 16;
-                            for (std::size_t i = 6; i < args.size(); ++i) {
-                              const auto o = upper(args[i]);
-                              if (o == "COUNT" && i + 1 < args.size()) {
-                                if (!parse_i64(args[++i], count) || count < 1 || count > kMaxCount)
-                                  return encode_error("COUNT must be > 0");
-                              } else if (o == "JUSTID")
-                                justid = true;
-                              else
-                                return encode_error("syntax error");
-                            }
-                            bool wt = false;
-                            std::string err;
-                            bool consumer_created = false;
-                            auto res =
-                                store().xautoclaim(args[1], args[2], args[3], min_idle, args[5],
-                                                   count, justid, wt, err, &consumer_created);
-                            if (wt) return wrongtype_error_reply();
-                            if (!err.empty()) return encode_stream_error(err);
-                            if (consumer_created)
-                              notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1],
-                                                    session.db_index);
-                            std::vector<std::string> ents;
-                            for (const auto& [id, fields] : res.claimed)
-                              ents.push_back(encode_stream_entry(id, fields, justid));
-                            std::vector<std::string> del;
-                            for (const auto& d : res.deleted) del.push_back(encode_bulk(d));
-                            return encode_array({encode_bulk(res.next_cursor), encode_array(ents),
-                                                 encode_array(del)});
-                          }});
+              CommandSpec{
+                  "XAUTOCLAIM",
+                  -6,
+                  {"write"},
+                  1,
+                  1,
+                  1,
+                  [encode_stream_entry](const std::vector<std::string>& args, SessionState& session,
+                                        bool&) -> std::string {
+                    std::int64_t min_idle = 0;
+                    if (!parse_strict_int(args[4], min_idle))
+                      return encode_error("Invalid min-idle-time argument for XAUTOCLAIM");
+                    if (min_idle < 0) min_idle = 0;
+                    std::string start_error, start;
+                    const bool exclusive = args[5].size() > 1 && args[5][0] == '(';
+                    const std::string raw_start = exclusive ? args[5].substr(1) : args[5];
+                    if (!normalize_claim_stream_id(raw_start, start, !exclusive))
+                      return encode_error("Invalid stream ID specified as stream command argument");
+                    if (exclusive) start.insert(start.begin(), '(');
+                    if (!DataStore::validate_xautoclaim_start(start, start_error))
+                      return encode_stream_error(start_error);
+                    std::int64_t count = 100;
+                    bool justid = false;
+                    constexpr std::int64_t kMaxCount = 9223372036854775807LL / 16;
+                    for (std::size_t i = 6; i < args.size(); ++i) {
+                      const auto o = upper(args[i]);
+                      if (o == "COUNT" && i + 1 < args.size()) {
+                        if (!parse_strict_int(args[++i], count) || count < 1 || count > kMaxCount)
+                          return encode_error("COUNT must be > 0");
+                      } else if (o == "JUSTID")
+                        justid = true;
+                      else
+                        return encode_error("syntax error");
+                    }
+                    bool wt = false, consumer_created = false;
+                    std::string err;
+                    std::vector<DataStore::StreamClaimEffect> effects;
+                    auto res = store().xautoclaim(args[1], args[2], args[3], min_idle, start, count,
+                                                  justid, wt, err, &consumer_created, &effects);
+                    if (wt) return wrongtype_error_reply();
+                    if (!err.empty()) return encode_stream_error(err);
+                    propagate_stream_claims(effects, session);
+                    if (effects.empty() && !consumer_created) g_write_changed_nothing = true;
+                    if (consumer_created)
+                      notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1],
+                                            session.db_index);
+                    std::vector<std::string> ents, del;
+                    for (const auto& [id, fields] : res.claimed)
+                      ents.push_back(encode_stream_entry(id, fields, justid));
+                    for (const auto& d : res.deleted) del.push_back(encode_bulk(d));
+                    return encode_array(
+                        {encode_bulk(res.next_cursor), encode_array(ents), encode_array(del)});
+                  }});
 
-    t.emplace("XCLAIM",
-              CommandSpec{"XCLAIM",
-                          -6,
-                          {"write", "fast"},
-                          1,
-                          1,
-                          1,
-                          [encode_stream_entry](const std::vector<std::string>& args,
-                                                SessionState& session, bool&) -> std::string {
-                            // XCLAIM key group consumer min-idle-time id [id...] [IDLE ms][TIME
-                            // ms][RETRYCOUNT n][FORCE][JUSTID][LASTID id]
-                            std::int64_t min_idle = 0;
-                            if (!parse_i64(args[4], min_idle) || min_idle < 0)
-                              return encode_error("Invalid min-idle-time argument for XCLAIM");
-                            std::vector<std::string> ids;
-                            bool justid = false, force = false;
-                            std::string last_id;
-                            bool have_last_id = false;
-                            for (std::size_t i = 5; i < args.size(); ++i) {
-                              const auto o = upper(args[i]);
-                              if (o == "LASTID" && i + 1 < args.size()) {
-                                last_id = args[i + 1];
-                                have_last_id = true;
-                                ++i;
-                              } else if ((o == "IDLE" || o == "TIME" || o == "RETRYCOUNT") &&
-                                         i + 1 < args.size()) {
-                                ++i;
-                              } else if (o == "FORCE")
-                                force = true;
-                              else if (o == "JUSTID")
-                                justid = true;
-                              else
-                                ids.push_back(args[i]);
-                            }
-                            if (ids.empty())
-                              return encode_error("wrong number of arguments for 'xclaim' command");
-                            bool wt = false;
-                            std::string err;
-                            bool consumer_created = false;
-                            auto claimed = store().xclaim(
-                                args[1], args[2], args[3], min_idle, ids, justid, force, wt, err,
-                                have_last_id ? &last_id : nullptr, &consumer_created);
-                            if (wt) return wrongtype_error_reply();
-                            if (!err.empty()) return "-" + err + "\r\n";
-                            if (consumer_created)
-                              notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1],
-                                                    session.db_index);
-                            std::vector<std::string> out;
-                            for (const auto& [id, fields] : claimed)
-                              out.push_back(encode_stream_entry(id, fields, justid));
-                            return encode_array(out);
-                          }});
+    t.emplace(
+        "XCLAIM",
+        CommandSpec{
+            "XCLAIM",
+            -6,
+            {"write", "fast"},
+            1,
+            1,
+            1,
+            [encode_stream_entry](const std::vector<std::string>& args, SessionState& session,
+                                  bool&) -> std::string {
+              // Redis looks up the key/group before parsing XCLAIM options.
+              if (store().is_wrongtype_for_stream(args[1])) return wrongtype_error_reply();
+              std::string before_id;
+              std::int64_t entries_read = 0;
+              if (!store().stream_group_ids(args[1], args[2], before_id, entries_read))
+                return "-NOGROUP No such key '" + args[1] + "' or consumer group '" + args[2] +
+                       "'\r\n";
+              std::int64_t min_idle = 0;
+              if (!parse_strict_int(args[4], min_idle))
+                return encode_error("Invalid min-idle-time argument for XCLAIM");
+              if (min_idle < 0) min_idle = 0;
+              std::vector<std::string> ids;
+              std::size_t i = 5;
+              std::string normalized_id;
+              while (i < args.size() && normalize_claim_stream_id(args[i], normalized_id)) {
+                ids.push_back(normalized_id);
+                ++i;
+              }
+              bool justid = false, force = false;
+              std::string last_id;
+              bool have_last_id = false;
+              DataStore::StreamClaimOptions options;
+              for (; i < args.size(); ++i) {
+                const auto o = upper(args[i]);
+                if (o == "FORCE")
+                  force = true;
+                else if (o == "JUSTID")
+                  justid = true;
+                else if ((o == "IDLE" || o == "TIME" || o == "RETRYCOUNT") && i + 1 < args.size()) {
+                  std::int64_t value;
+                  if (!parse_strict_int(args[++i], value))
+                    return encode_error("Invalid " + o + " option argument for XCLAIM");
+                  if (o == "RETRYCOUNT")
+                    options.retrycount = value;
+                  else if (o == "IDLE") {
+                    options.idle = value;
+                    options.time.reset();
+                  } else {
+                    options.time = value;
+                    options.idle.reset();
+                  }
+                } else if (o == "LASTID" && i + 1 < args.size()) {
+                  if (!normalize_claim_stream_id(args[++i], last_id))
+                    return encode_error("Invalid stream ID specified as stream command argument");
+                  have_last_id = true;
+                } else
+                  return encode_error("Unrecognized XCLAIM option '" + args[i] + "'");
+              }
+              bool wt = false, consumer_created = false;
+              std::string err;
+              std::vector<DataStore::StreamClaimEffect> effects;
+              auto claimed = store().xclaim(args[1], args[2], args[3], min_idle, ids, justid, force,
+                                            wt, err, have_last_id ? &last_id : nullptr,
+                                            &consumer_created, &options, &effects);
+              if (wt) return wrongtype_error_reply();
+              if (!err.empty()) return encode_stream_error(err);
+              propagate_stream_claims(effects, session);
+              std::string after_id;
+              store().stream_group_ids(args[1], args[2], after_id, entries_read);
+              if (effects.empty() && after_id != before_id)
+                propagate_stream_effect({"XGROUP", "SETID", args[1], args[2], after_id,
+                                         "ENTRIESREAD", std::to_string(entries_read)},
+                                        session);
+              if (effects.empty() && after_id == before_id && !consumer_created)
+                g_write_changed_nothing = true;
+              if (consumer_created)
+                notify_keyspace_event(NOTIFY_STREAM, "xgroup-createconsumer", args[1],
+                                      session.db_index);
+              std::vector<std::string> out;
+              for (const auto& [id, fields] : claimed)
+                out.push_back(encode_stream_entry(id, fields, justid));
+              return encode_array(out);
+            }});
 
     t.emplace(
         "XSETID",
@@ -15820,6 +15898,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           spec.flag_bits |= kFlagNoAuth;
       }
       spec.redis_name = lower(spec.name);
+      spec.propagates_effects = spec.redis_name == "xreadgroup" || spec.redis_name == "xclaim" ||
+                                spec.redis_name == "xautoclaim";
       const auto& index = redis_command_index();
       const auto redis = index.flags.find(spec.redis_name);
       spec.redis_flags = redis == index.flags.end() ? 0 : redis->second;
@@ -16298,9 +16378,10 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
     // only, as Redis's forceCommandPropagation(c, PROPAGATE_REPL) sends them.
     // The outermost command's write is the last of its unit: nothing after this propagates.
     const bool publish = cmd_after == "PUBLISH" || cmd_after == "SPUBLISH";
-    propagate_write(args, session, &reply,
-                    publish ? kPropagateRepl : kPropagateAof | kPropagateRepl,
-                    g_execution_nesting == 1);
+    if (!spec.propagates_effects)
+      propagate_write(args, session, &reply,
+                      publish ? kPropagateRepl : kPropagateAof | kPropagateRepl,
+                      g_execution_nesting == 1);
     {
       // These checks read back what the command did (Redis sends the events from inside it), so
       // a key it left with a past expire time is not deleted here.

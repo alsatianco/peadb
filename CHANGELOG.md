@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ### Changed
 
+- Apply Redis stream claim timing/retry options and propagate exact PEL effects through delayed replicas, transactions, scripts, blocked reads and AOF replay/rewrite. Preserve renamed stream handlers, NOACK consumer creation and per-occurrence group cursors (including duplicate stream names), and atomic multi-stream validation; re-enable four upstream stream-group replication tests (delta 48).
+
 - Repair the PR formatting gate with a clang-format 18.1.8 source baseline, pin the formatter in CI, format generated command metadata with the same version, and keep coverage/scoreboard command discovery complete across formatter line breaks.
 
 - Resume replica links from cached applied history with PSYNC, handle changed CONTINUE ids and downstream reconnects, and fall back to a full sync for blocked clients or backlog misses. Apply live replication timeouts, master PINGs, replica TCP keepalive and ACK-silence disconnects; discard old history before replacing a snapshot so failed loads cannot resume into another dataset (delta 47).
