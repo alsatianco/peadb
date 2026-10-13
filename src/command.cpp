@@ -114,7 +114,8 @@ std::unordered_map<std::string, std::string> g_script_cache;
 // Relative to the working directory, which is the configured `dir` (Redis chdir()s into it).
 std::filesystem::path g_snapshot_path = "dump.rdb";
 std::filesystem::path g_aof_path = "appendonly.aof";
-bool g_appendonly = false;  // the appendonly setting; true whenever g_aof_state is not Off
+bool g_appendonly = false;  // the configured setting, also true while full sync suspends the AOF
+bool g_aof_sync_suspended = false;  // enabled, but stopped while a full sync replaces the dataset
 // Redis's aof_state. CONFIG SET appendonly yes moves Off -> WaitRewrite: writes then go only to
 // the rewrite buffer until the first rewrite of the dataset is in place, and then the AOF is On.
 enum class AofState { Off, WaitRewrite, On };
@@ -275,6 +276,7 @@ void release_master_link(bool link_down) {
   g_replica_ack_out.clear();
   if (link_down) g_replica_stale = true;
 }
+
 // Redis's disconnectSlaves(): this server's replicas must sync again (CLIENT KILL's server.cpp
 // path closes them).
 void disconnect_replicas() {
@@ -574,6 +576,24 @@ int g_last_repl_db = 0;
 // so a new REPLICAOF promptly supersedes an in-flight sync/stream.
 std::atomic<std::uint64_t> g_repl_generation{0};
 std::atomic<bool> g_loading_replication{false};
+// Both startup and REPLICAOF use the same supervised link. The role is set before this starts;
+// the thread only receives data and hands it to the event loop, never mutating the datastore.
+void start_master_link(const std::string& host, int port, std::uint64_t gen) {
+  if (port == 0) return;
+  std::thread([host, port, gen]() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int backoff_ms = 500;
+    while (g_repl_generation.load() == gen) {
+      g_loading_replication.store(true);
+      const bool ok = replica_do_fullsync(host, port, gen);
+      g_loading_replication.store(false);
+      if (g_repl_generation.load() != gen) break;
+      g_replica_stale = true;
+      backoff_ms = ok ? 500 : std::min(backoff_ms * 2, 30000);
+      std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
+    }
+  }).detach();
+}
 bool g_script_allow_oom = false;
 // Redis's SCRIPT_WRITE_DIRTY: the running script has already passed a write command, so the disk
 // error check no longer refuses its writes (a script must not stop half applied).
@@ -2407,11 +2427,12 @@ class WriteOffsetTracker {
 
 // A write a command made (Redis's call() → alsoPropagate()), as replicas and the AOF must run it
 // (canonicalize_propagated_command()). A script's redis.set_repl() drops targets: bit 1 keeps the
-// AOF, bit 2 the replicas. Nothing is propagated while the AOF or the master stream is applied.
+// AOF, bit 2 the replicas. AOF replay propagates nothing; master commands propagate their
+// deterministic effects to the local AOF, while their raw bytes feed the replication backlog.
 void propagate_write(const std::vector<std::string>& args, const SessionState& session,
                      const std::string* reply_ptr, int target = kPropagateAof | kPropagateRepl,
                      bool last_of_unit = false) {
-  if (args.empty() || g_replaying_aof) return;
+  if (args.empty() || (g_replaying_aof && !g_applying_master_stream)) return;
   if (in_lua_script_context()) {
     if (!(g_script_repl_flags & 1)) target &= ~kPropagateAof;
     if (!(g_script_repl_flags & 2)) target &= ~kPropagateRepl;
@@ -2660,7 +2681,7 @@ void flush_append_only_file(std::string_view payload) {
 // Adds the AOF bytes of one execution unit (propagate_pending_commands()) to the file and, while
 // a rewrite runs, to its buffer; a whole unit always lands in both, never half of it.
 void append_aof_payload(std::string_view payload) {
-  if (!g_appendonly || g_replaying_aof || payload.empty()) return;
+  if (!g_appendonly || (g_replaying_aof && !g_applying_master_stream) || payload.empty()) return;
   // While the AOF waits for its first rewrite (CONFIG SET appendonly yes) there is no file to
   // append to yet: the command goes only to the rewrite buffer below. After a failed write the
   // bytes wait, and aof_cron() tries them once per event-loop pass, as Redis's beforeSleep() does.
@@ -2951,6 +2972,7 @@ void kill_aof_rewrite_child() {
 // CONFIG SET appendonly yes (startAppendOnly()): the AOF starts with a rewrite of the current
 // dataset, and every write from now on is kept for it.
 bool start_append_only(std::string& err) {
+  g_aof_sync_suspended = false;
   g_appendonly = true;
   g_aof_state = AofState::WaitRewrite;
   // A rewrite started while the AOF was off has not kept the writes made since it started, so its
@@ -3000,6 +3022,7 @@ bool start_append_only(std::string& err) {
 // CONFIG SET appendonly no (stopAppendOnly()). Bytes a failed write left are dropped (the AOF is
 // off), but the write and fsync errors stay for INFO until the AOF is turned on again.
 void stop_append_only() {
+  g_aof_sync_suspended = false;
   if (g_aof_state == AofState::On) flush_append_only_file({});
   if (g_aof_fd >= 0) {
     if (::fsync(g_aof_fd) != 0) {
@@ -3015,6 +3038,22 @@ void stop_append_only() {
   g_aof_state = AofState::Off;
   g_aof_rewrite_scheduled = false;
   kill_aof_rewrite_child();
+}
+
+// Redis's restartAOFAfterSYNC(): a new full sync must replace the old AOF's entire dataset.
+// While its first rewrite runs, streaming writes join the rewrite buffer. A replica that cannot
+// start the rewrite after ten attempts exits rather than advertising unreliable persistence.
+void restart_aof_after_sync() {
+  for (int attempt = 0; attempt < 10; ++attempt) {
+    std::string err;
+    if (start_append_only(err)) return;
+    log(LogLevel::Warn, "Failed enabling the AOF after successful master synchronization! "
+                        "Trying it again in one second.");
+    ::sleep(1);
+  }
+  log(LogLevel::Error, "FATAL: this replica instance finished the synchronization with "
+                       "its master, but the AOF can't be turned on. Exiting now.");
+  ::_exit(1);
 }
 
 bool rewrite_aof_file(std::string& err) {
@@ -6665,6 +6704,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_replica_stale = false;
             g_loading_replication.store(false);
             g_repl_down_since_ms = 0;
+            if (g_aof_sync_suspended) restart_aof_after_sync();
             // Redis's replicationUnsetMaster(): the replication id inherited from the old master
             // becomes replid2 up to the current offset, so replicas of the same stream (and the
             // old master) can continue from this server's backlog, which holds the stream it has
@@ -6701,28 +6741,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_unblock_blocked_clients_cb(
                 "-UNBLOCKED force unblock from blocking operation, instance state changed (master "
                 "-> replica?)\r\n");
-          if (p == 0) {
-            return encode_simple("OK");
-          }
-          // Supervised reconnect loop: connect → full sync → stream until disconnect,
-          // then retry with exponential backoff. Exits when a newer REPLICAOF bumps the
-          // generation. Threading invariant: this thread only touches atomics + enqueues
-          // commands for the event loop (see replica_do_fullsync); it never mutates the
-          // DataStore directly or calls into the Lua engine / session state.
-          std::thread([host, p, gen]() {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-            int backoff_ms = 500;
-            while (g_repl_generation.load() == gen) {
-              g_loading_replication.store(true);
-              const bool ok = replica_do_fullsync(host, static_cast<int>(p), gen);
-              g_loading_replication.store(false);
-              if (g_repl_generation.load() != gen) break;  // superseded mid-sync
-              // Link dropped (or connect failed): mark stale and reconnect after backoff.
-              g_replica_stale = true;
-              backoff_ms = ok ? 500 : std::min(backoff_ms * 2, 30000);
-              std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
-            }
-          }).detach();
+          start_master_link(host, static_cast<int>(p), gen);
           return encode_simple("OK");
         }});
 
@@ -13221,6 +13240,21 @@ void configure_maxmemory_samples(const std::string& spec) {
   else log(LogLevel::Warn, "ignoring invalid maxmemory-samples: " + spec);
 }
 
+void configure_replication(bool replica, const std::string& host, int port) {
+  g_replication_master_host = host;
+  g_replication_master_port = port;
+  g_replication_role = replica ? "slave" : "master";
+  g_replica_stale = replica;
+  store().set_replica_expiry(replica);
+}
+
+void start_configured_replication() {
+  if (g_replication_role == "slave") {
+    const auto gen = g_repl_generation.fetch_add(1) + 1;
+    start_master_link(g_replication_master_host, g_replication_master_port, gen);
+  }
+}
+
 void init_replication_id() {
   g_master_replid = gen_run_id();
 }
@@ -14404,7 +14438,31 @@ void drain_replica_cmd_queue() {
       // CRC64 as PeaDB, or 0 with rdbchecksum no); on a mismatch keys and libraries are kept and
       // the sync is tried again.
       int stream_db = -1;
-      ok = rdb_load(path, err, functions_flush_all, &stream_db);
+      try {
+        ok = rdb_load(path, err, [&] {
+          // readSyncBulkPayload(): an old save/rewrite must never overwrite the new dataset.
+          // Do this after checksum validation, so a corrupt transfer keeps the old disk files.
+          kill_rdb_child();
+          if (g_appendonly && !g_aof_sync_suspended) {
+            stop_append_only();
+            g_appendonly = true;  // keep the configured setting while the AOF is suspended
+            g_aof_sync_suspended = true;
+          }
+          if (::rename(path.c_str(), g_snapshot_path.c_str()) != 0) {
+            throw std::runtime_error(
+                "Failed trying to rename the temp DB into " + g_snapshot_path.string() +
+                " in MASTER <-> REPLICA synchronization: " + std::strerror(errno));
+          }
+          if (!fsync_parent_dir(g_snapshot_path)) {
+            throw std::runtime_error(
+                "Failed trying to sync DB directory in MASTER <-> REPLICA synchronization: " +
+                std::string(std::strerror(errno)));
+          }
+          functions_flush_all();
+        }, &stream_db);
+      } catch (const std::exception& e) {
+        err = e.what();
+      }
       if (!ok) {
         log(LogLevel::Error, "REPLICAOF: rdb_load on event loop failed: " + err);
       } else {
@@ -14418,6 +14476,8 @@ void drain_replica_cmd_queue() {
         g_master_repl_offset = offset;
         start_backlog();
         if (stream_db >= 0) g_master_stream_session.db_index = stream_db;
+        note_rdb_saved(static_cast<std::int64_t>(store().mutation_epoch()));
+        if (g_aof_sync_suspended) restart_aof_after_sync();
       }
     }
     {
@@ -14434,8 +14494,8 @@ void drain_replica_cmd_queue() {
     g_replica_cmd_queue.clear();
   }
   if (g_replica_cmd_held.empty()) return;
-  // Apply on the event loop thread: g_replaying_aof suppresses AOF writes and
-  // backlog updates so master commands are not re-replicated or double-logged. No key expires
+  // Apply on the event loop thread: must-obey skips client gates, but master commands write
+  // their effects to the local AOF. Raw bytes feed the backlog separately below. No key expires
   // for the master's commands (Redis's expireIfNeeded() for its master client): the master ran
   // them while their keys were alive, and its DEL comes when it expires them.
   const DataStore::LazyExpireDisabled no_lazy_expire(store());
@@ -14690,15 +14750,22 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
                 write_ok = false;
                 break;
             }
-            if (::write(rfd, chunk.data(), want) != static_cast<ssize_t>(want)) {
-                write_ok = false;
-                break;
+            std::size_t written = 0;
+            while (written < want) {
+                const ssize_t n = ::write(rfd, chunk.data() + written, want - written);
+                if (n < 0 && errno == EINTR) continue;
+                if (n <= 0) {
+                    write_ok = false;
+                    break;
+                }
+                written += static_cast<std::size_t>(n);
             }
             remaining -= static_cast<std::int64_t>(want);
             g_repl_transfer_read = rdb_len - remaining;
             g_repl_transfer_lastio_ms = now_ms();
         }
-        ::close(rfd);
+        if (write_ok && ::fsync(rfd) != 0) write_ok = false;
+        if (::close(rfd) != 0) write_ok = false;
         if (!write_ok) {
             ::unlink(tmp_path.c_str());
             ::close(fd);

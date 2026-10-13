@@ -10,6 +10,8 @@ import socket
 import subprocess
 import time
 
+from _isolated_server import IsolatedServer
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SERVER = ROOT / "peadb-server"
 
@@ -77,7 +79,7 @@ def expect(c, m):
 
 
 def start(port):
-    return subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
+    return IsolatedServer([str(SERVER), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
 
 
 def test_unlink_big_key():

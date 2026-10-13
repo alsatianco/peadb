@@ -100,11 +100,14 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+VALIDATION_DIR=""
+
 cleanup() {
   [[ -n "$PRIMARY_PID" ]] && kill "$PRIMARY_PID" 2>/dev/null || true
   [[ -n "$REPLICA_PID" ]] && kill "$REPLICA_PID" 2>/dev/null || true
   wait "$PRIMARY_PID" 2>/dev/null || true
   wait "$REPLICA_PID" 2>/dev/null || true
+  [[ -z "$VALIDATION_DIR" ]] || rm -rf "$VALIDATION_DIR"
 }
 trap cleanup EXIT
 
@@ -135,13 +138,16 @@ if ! command -v redis-cli >/dev/null 2>&1; then
 fi
 [[ -x "$PEADB_BIN" ]] || fail "peadb-server binary not found at $PEADB_BIN"
 
+VALIDATION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/peadb-repl-validation.XXXXXX")"
+mkdir "$VALIDATION_DIR/primary" "$VALIDATION_DIR/replica"
+
 echo "=== Starting primary on port $PRIMARY_PORT ==="
-"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel warning &
+"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel warning --dir "$VALIDATION_DIR/primary" &
 PRIMARY_PID=$!
 sleep 1
 
 echo "=== Starting replica on port $REPLICA_PORT ==="
-"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel warning &
+"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel warning --dir "$VALIDATION_DIR/replica" &
 REPLICA_PID=$!
 sleep 1
 

@@ -196,8 +196,12 @@ void test_refused_and_ignored() {
   expect_error("tls-port 6380\n", "Failed finding TLS support");
   expect_error("tls-replication yes\n", "Failed finding TLS support");
   expect_error("tls-cluster yes\n", "Failed finding TLS support");
-  expect_error("replicaof 10.0.0.1 6379\n", "cannot start as a replica");
-  expect_error("slaveof 10.0.0.1 6379\n", "cannot start as a replica");
+  auto cfg = expect_ok("replicaof 10.0.0.1 6379\n");
+  expect(cfg.master_host == "10.0.0.1" && cfg.master_port == 6379, "configured master");
+  cfg = expect_ok("slaveof 10.0.0.2 6380\n");
+  expect(cfg.master_host == "10.0.0.2" && cfg.master_port == 6380, "slaveof alias");
+  cfg = expect_ok("replicaof \"\" 0\n");
+  expect(cfg.replica && cfg.master_host.empty(), "an empty host is still a configured replica");
   expect_error("replicaof 10.0.0.1 nope\n", "Invalid master port");
   expect_error("masteruser repl\n", "named ACL user");
   expect_error("enable-debug-command no\n", "rename-command DEBUG");
@@ -205,7 +209,7 @@ void test_refused_and_ignored() {
   expect_error("bind 127.0.0.1 -::1\n", "exactly one bind address");
 
   // Redis settings whose value is what PeaDB always does: accepted with no warning.
-  auto cfg = expect_ok(
+  cfg = expect_ok(
       "daemonize no\ndatabases 16\nlogfile \"\"\nsupervised no\ntls-port 0\ntls-replication no\n"
       "aclfile \"\"\nreplicaof no one\nenable-debug-command yes\nrdbcompression no\n"
       "list-max-ziplist-entries 5\nsentinel\n");
@@ -300,10 +304,18 @@ void test_last_value_wins() {
   // A refusal or warning is decided on the final value: a later line or option can undo it.
   auto cfg = expect_ok("bind 127.0.0.1 -::1\nbind 0.0.0.0\n");
   expect(cfg.bind == "0.0.0.0", "a later single bind replaces a refused multi-address bind");
-  expect_ok("replicaof 10.0.0.1 6379\nreplicaof no one\n");
+  cfg = expect_ok("replicaof 10.0.0.1 6379\nreplicaof no one\n");
+  expect(!cfg.replica && cfg.master_host.empty() && cfg.master_port == 0,
+         "no one clears configured role");
   expect_ok("tls-port 6380\ntls-port 0\n");
   expect_ok("enable-debug-command no\nenable-debug-command yes\n");
-  expect_error("replicaof no one\nreplicaof 10.0.0.1 6379\n", "at line 2");
+  cfg = expect_ok("replicaof no one\nreplicaof 10.0.0.1 6379\n");
+  expect(cfg.master_host == "10.0.0.1" && cfg.master_port == 6379, "last replicaof wins");
+  expect_error("replicaof 127.0.0.1 6379\ncluster-enabled yes\n",
+               "replicaof directive not allowed in cluster mode");
+  expect_error("cluster-enabled yes\nslaveof 127.0.0.1 6379\n",
+               "replicaof directive not allowed in cluster mode");
+  expect_ok("cluster-enabled yes\nreplicaof 127.0.0.1 6379\nreplicaof no one\n");
   cfg = expect_ok("daemonize yes\ndaemonize no\n");
   expect(cfg.warnings.empty(), "no warning when the final value is what PeaDB does");
   cfg = expect_ok("hz 10\nhz 20\n");

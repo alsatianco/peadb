@@ -555,9 +555,6 @@ const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
       {"enable-debug-command", {"yes", "PeaDB cannot restrict the DEBUG command yet "
                                        "(compat/delta.md item 61): remove this setting and "
                                        "disable DEBUG with: rename-command DEBUG \"\""}},
-      {"replicaof", {"no one", "PeaDB cannot start as a replica from its config file "
-                               "(compat/delta.md item 45): start it as a master and send it "
-                               "REPLICAOF <host> <port>"}},
   };
   return kMap;
 }
@@ -637,7 +634,11 @@ bool apply_setting(LoadState& st, const RedisConfigSpec& spec, const std::vector
   else if (name == "appendfsync") cfg.appendfsync = value;
   else if (name == "requirepass") cfg.requirepass = value;
   else if (name == "masterauth") cfg.masterauth = value;
-  else if (name == "protected-mode") cfg.protected_mode = value == "yes";
+  else if (name == "replicaof") {
+    cfg.replica = value != "no one";
+    cfg.master_host = cfg.replica ? args[0] : std::string();
+    cfg.master_port = cfg.replica ? static_cast<int>(std::strtol(args[1].c_str(), nullptr, 10)) : 0;
+  } else if (name == "protected-mode") cfg.protected_mode = value == "yes";
   else if (name == "enable-module-command") cfg.enable_module_command = value;
   else if (name == "maxmemory") cfg.maxmemory = value;
   else if (name == "maxmemory-policy") cfg.maxmemory_policy = value;
@@ -835,6 +836,11 @@ bool finish_load(LoadState& st, std::string& error) {
       return false;
     }
     std::fclose(fp);
+  }
+  // Redis checks the final values after every config line/CLI override has been read.
+  if (st.cfg.cluster_enabled && st.cfg.replica) {
+    error = format_config_error("", "replicaof directive not allowed in cluster mode");
+    return false;
   }
   // Redis applies locale-collate with setlocale() at startup and exits when that fails.
   const auto locale = st.cfg.raw.find("locale-collate");

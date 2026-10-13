@@ -142,6 +142,9 @@ bool load_aof_file(const std::string& path, std::string& err);
 void aof_cron(std::int64_t now_ms);
 void reap_background_children();
 void configure_runtime_port(int port);
+// Set the configured role before loading persistence; connect once the event loop is ready.
+void configure_replication(bool replica, const std::string& host, int port);
+void start_configured_replication();
 void configure_max_clients(int max_clients);
 int configured_max_clients();  // read live by the accept loop, so CONFIG SET maxclients applies
 // Raises the open-files soft limit so `max_clients` clients fit (Redis's adjustOpenFilesLimit())

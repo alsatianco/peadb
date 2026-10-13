@@ -140,6 +140,7 @@ REFUSED_BY_BOTH = [
     ("sentinel monitor m 127.0.0.1 6379 2", [], "sentinel directive while not in sentinel mode"),
     ("include /no/such/peadb-include.conf", [], "Fatal error, can't open config file '/no/such/peadb-include.conf'"),
     ("tls-port 6390", [], "Failed finding TLS support"),
+    ("replicaof 127.0.0.1 7399\ncluster-enabled yes", [], "replicaof directive not allowed in cluster mode"),
     (None, ["--no-such-option", "1"], "Bad directive or wrong number of arguments"),
     (None, ["--loglevel", "error"], "argument(s) must be one of the following"),
     (None, ["--maxmemory", "lots"], "argument must be a memory value"),
@@ -149,7 +150,6 @@ REFUSED_BY_BOTH = [
 REFUSED_BY_PEADB_ONLY = [
     ("user default on >secret ~* +@all", [], "PeaDB has no ACL users"),
     ("aclfile /etc/redis/users.acl", [], "cannot load an ACL file"),
-    ("replicaof 127.0.0.1 7399", [], "cannot start as a replica"),
     ("masteruser repl", [], "named ACL user"),
     ("enable-debug-command no", [], "cannot restrict the DEBUG command"),
     ("loadmodule /no/such/module.so", [], "PeaDB cannot load Redis modules"),

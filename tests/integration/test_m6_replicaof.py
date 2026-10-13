@@ -3,6 +3,8 @@ import pathlib, subprocess, sys, tempfile, time
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _readiness import wait_until_ready
 from _redis_path import skip_if_no_redis_server, skip_if_no_redis_cli
+from _isolated_server import IsolatedServer
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 REDIS_SERVER = skip_if_no_redis_server()
 REDIS_CLI = skip_if_no_redis_cli()
@@ -18,7 +20,7 @@ def start_redis(port, d):
  return p
 
 def start_peadb(port):
- p=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','warning'])
+ p=IsolatedServer([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','warning'])
  wait_until_ready(port)
  return p
 
