@@ -342,8 +342,8 @@ def check_fork_failure(name, binary, work, shim):
 def check_replica_keeps_applying(work, shim):
     """PeaDB only: a replica whose own BGSAVE failed still applies everything its master sends,
     MULTI/EXEC blocks included (the master stream is never refused, compat/delta.md item 43).
-    Redis 7.2.5 stops such a replica (serverPanic) unless replica-ignore-disk-write-errors is yes,
-    and then applies them like this."""
+    Redis 7.2.5 and PeaDB stop such a replica unless replica-ignore-disk-write-errors is yes,
+    and then apply them like this."""
     master_dir = os.path.join(work, 'peadb-repl-master')
     replica_dir = os.path.join(work, 'peadb-repl-replica')
     flag = os.path.join(replica_dir, 'fail-fork')
@@ -351,7 +351,7 @@ def check_replica_keeps_applying(work, shim):
     replica = None
     try:
         replica = start_with_shim('peadb', PEADB, REPLICA_PORT, replica_dir, shim, flag,
-                                  '--save', '3600 1')
+                                  '--save', '3600 1', '--replica-ignore-disk-write-errors', 'yes')
         if replica is None:
             return
         m, r = Conn(PORTS['peadb']), Conn(REPLICA_PORT)

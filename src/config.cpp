@@ -513,6 +513,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
       "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
       "zset-max-listpack-entries", "zset-max-listpack-value",
       "min-replicas-to-write", "replica-serve-stale-data", "busy-reply-threshold",
+      "replica-ignore-disk-write-errors",
       "lazyfree-lazy-server-del", "stop-writes-on-bgsave-error", "aof-load-truncated",
       "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold",
       "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
