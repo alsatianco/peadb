@@ -179,7 +179,7 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 
 **Sorted Sets** — `ZADD` (NX/XX/GT/LT/INCR), `ZRANGE`, `ZSCAN`, `ZPOPMIN`, `ZPOPMAX`, `ZMPOP`, `BZPOPMIN`, `BZPOPMAX`
 
-**Streams** — `XADD`, `XDEL`, `XLEN`, `XRANGE`, `XREVRANGE`, `XGROUP`, `XREADGROUP`, `XREAD` (blocking), `XACK`, `XPENDING`, `XINFO`, `XSETID`, `XTRIM`, `XCLAIM`, `XAUTOCLAIM` — with a full PEL (delivery time/count) and **RDB persistence + replication** of streams
+**Streams** — `XADD`, `XDEL`, `XLEN`, `XRANGE`, `XREVRANGE`, `XGROUP`, `XREADGROUP`, `XREAD` (blocking), `XACK`, `XPENDING`, `XINFO`, `XSETID`, `XTRIM`, `XCLAIM`, `XAUTOCLAIM` — with a full PEL (delivery time/count), deterministic claim effects through replication and AOF replay/rewrite ([delta 48](compat/delta.md)), and **RDB persistence + replication** of streams
 
 **Pub/Sub** — `SUBSCRIBE`, `UNSUBSCRIBE`, `PSUBSCRIBE`, `PUNSUBSCRIBE`, `PUBLISH`, `PUBSUB` (CHANNELS/NUMSUB/NUMPAT), `SSUBSCRIBE`/`SUNSUBSCRIBE`/`SPUBLISH` (sharded aliases)
 

@@ -10,11 +10,3 @@ Blocking XREADGROUP for stream key that has clients blocked on list
 # stream RDB layout, so these cross-engine legacy-format loads fail. Tracked in compat/delta.md item 5.
 Loading from legacy (Redis <= v6.2.x, rdb_ver < 10) persistence
 Loading from legacy (Redis <= v7.0.x, rdb_ver < 11) persistence
-# These use wait_for_ofs_sync, which needs a replica to report the master's byte offset as
-# master_repl_offset. PeaDB's in-process streaming replica applies commands correctly but
-# does not yet track the master replication byte offset (always reports 0), so offset sync
-# times out. Precise replica offset tracking is a Phase-4 item — compat/delta.md item 8.
-Consumer group last ID propagation to slave (NOACK=0)
-Consumer group last ID propagation to slave (NOACK=1)
-Replication tests of XCLAIM with deleted entries (autclaim=0)
-Replication tests of XCLAIM with deleted entries (autclaim=1)
