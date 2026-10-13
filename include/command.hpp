@@ -44,6 +44,8 @@ struct WaitState {
   std::int64_t min_replicas = 0;    // number of replicas to wait for
 };
 
+enum class ReplicaSyncState { Online, WaitSnapshot, SaveSnapshot, SendSnapshot };
+
 struct SessionState {
   RespVersion resp_version = RespVersion::Resp2;
   int db_index = 0;
@@ -59,6 +61,8 @@ struct SessionState {
   std::unordered_map<std::string, std::optional<std::string>> watched_digests;
   bool asking = false;
   bool replica_stream = false;
+  ReplicaSyncState repl_sync_state = ReplicaSyncState::Online;
+  bool repl_legacy_sync = false;
   std::size_t repl_index = 0;
   bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
@@ -233,6 +237,11 @@ bool replication_stream_from(std::size_t from, std::string& out);
 // server.cpp has given every replica the whole replication backlog (backlog_append() needs to hand
 // out bytes at once only once more than the backlog size has been written since).
 void replicas_took_backlog();
+// Start a disk-backed replication BGSAVE: 1 started, 0 another child is running, -1 failed.
+// The event loop batches waiting replicas onto this snapshot's id/offset before more writes.
+struct RdbReplicationInfo;
+int start_replication_snapshot(RdbReplicationInfo& info);
+extern std::function<void(const std::string& path, bool success)> g_replication_snapshot_done_cb;
 // beforeSleep()'s GETACK: WAIT asks the replicas for an ACK once per event-loop pass, after the
 // pass's commands (outside the WAIT, so it is not the client's write). replica_getack_pending()
 // says one waits (the event loop must not sleep then); send_pending_getack() adds it to the stream.

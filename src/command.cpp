@@ -162,6 +162,8 @@ std::int64_t g_lastbgsave_try = 0;
 std::int64_t g_rdb_save_time_last = -1;
 std::int64_t g_stat_rdb_saves = 0;
 bool g_rdb_bgsave_scheduled = false;
+bool g_bgsave_for_replication = false;
+std::string g_bgsave_snapshot_path;
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
 // A shutdown asked for by SIGTERM or SIGINT (Redis's server.shutdown_asap and last_sig_received):
@@ -818,9 +820,11 @@ inline std::string gen_run_id() { return gen_hex_chars(40); }
 
 // syncCommand()'s refusal while this replica has no synced link to its own master, whose dataset
 // and stream it would pass on.
-std::string sync_refusal() {
+std::string sync_refusal(const SessionState& session) {
   if (g_replication_role == "slave" && g_replica_stale)
     return "-NOMASTERLINK Can't SYNC while not connected with my master\r\n";
+  if (session.has_pending_replies)
+    return "-ERR SYNC and PSYNC are invalid with pending output\r\n";
   return std::string();
 }
 
@@ -1112,7 +1116,7 @@ void note_rdb_saved(std::int64_t epoch_at_start) {
 // save points. A failed fork() marks the BGSAVE as failed (rdb_last_bgsave_status:err, so writes
 // are refused while save points are set) and is logged. The change count and the save time move
 // only when the child succeeds (reap_background_children()). Returns false when no child started.
-bool do_bgsave_fork() {
+bool do_bgsave_fork(const RdbReplicationInfo* repl = nullptr) {
   if (has_active_child_process()) return false;
   ++g_stat_rdb_saves;
   g_dirty_before_bgsave = static_cast<std::int64_t>(store().mutation_epoch());
@@ -1121,7 +1125,7 @@ bool do_bgsave_fork() {
   const pid_t pid = fork_child();
   if (pid == 0) {
     std::string err;
-    const bool ok = rdb_save(g_snapshot_path, err);
+    const bool ok = rdb_save(g_snapshot_path, err, repl);
     if (ok) {
       log(LogLevel::Info, "DB saved on disk");
     } else {
@@ -1141,6 +1145,9 @@ bool do_bgsave_fork() {
   g_bgsave_in_progress.store(true);
   g_bgsave_child_pid.store(pid);
   g_bgsave_start_time = now_ms();
+  g_bgsave_for_replication = repl != nullptr;
+  // CONFIG SET dir/dbfilename can run while the child saves; it keeps the old cwd/path.
+  g_bgsave_snapshot_path = std::filesystem::absolute(g_snapshot_path).string();
   return true;
 }
 
@@ -1160,12 +1167,18 @@ void bgsave_done(pid_t pid, int status, bool stopped) {
   } else {
     const int sig = WIFSIGNALED(status) ? WTERMSIG(status) : 0;
     log(LogLevel::Warn, "Background saving terminated by signal " + std::to_string(sig));
-    rdb_remove_temp_file(pid);
+    ::unlink(rdb_temp_file_name(g_bgsave_snapshot_path, pid).c_str());
     if (!stopped && sig != SIGUSR1) g_last_bgsave_status = "err";
   }
   g_rdb_save_time_last = now_ms() / 1000 - g_bgsave_start_time / 1000;
   g_bgsave_child_pid.store(0);
   g_bgsave_in_progress.store(false);
+  if (g_bgsave_for_replication) {
+    g_bgsave_for_replication = false;
+    if (g_replication_snapshot_done_cb)
+      g_replication_snapshot_done_cb(g_bgsave_snapshot_path,
+                                    !stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+  }
 }
 
 // Redis's killRDBChild() and rdbRemoveTempFile(), for a shutdown and FLUSHALL: stops a running
@@ -1186,9 +1199,14 @@ void kill_rdb_child() {
     return;
   }
   // Already reaped elsewhere, so how it ended is unknown: count it as stopped.
-  rdb_remove_temp_file(pid);
+  ::unlink(rdb_temp_file_name(g_bgsave_snapshot_path, pid).c_str());
   g_bgsave_child_pid.store(0);
   g_bgsave_in_progress.store(false);
+  if (g_bgsave_for_replication) {
+    g_bgsave_for_replication = false;
+    if (g_replication_snapshot_done_cb)
+      g_replication_snapshot_done_cb(g_bgsave_snapshot_path, false);
+  }
 }
 
 // ── SLOWLOG / LATENCY recording ──
@@ -5138,7 +5156,7 @@ std::string info_replication_section() {
            "replica_announced:" + std::string(setting("replica-announced") == "yes" ? "1" : "0") +
            "\r\n";
   }
-  // Every replica is online once PSYNC has answered (the RDB goes out in the reply).
+  // As in Redis, syncing replicas appear in INFO but only online ones count as good.
   std::int64_t max_lag = 0;
   parse_i64(setting("min-replicas-max-lag"), max_lag);
   int count = 0;
@@ -5147,10 +5165,12 @@ std::string info_replication_section() {
   if (g_for_each_replica_cb) {
     g_for_each_replica_cb([&](const SessionState& r) {
       const std::int64_t lag = now_s - r.repl_ack_time_ms / 1000;
-      if (lag <= max_lag) ++good;
+      if (r.repl_sync_state == ReplicaSyncState::Online && lag <= max_lag) ++good;
       lines += "slave" + std::to_string(count++) + ":ip=" + replica_ip(r) +
                ",port=" + std::to_string(r.repl_listening_port) +
-               ",state=online,offset=" + std::to_string(r.repl_ack_offset) +
+               ",state=" + std::string(r.repl_sync_state == ReplicaSyncState::Online ? "online" :
+                   r.repl_sync_state == ReplicaSyncState::SendSnapshot ? "send_bulk" : "wait_bgsave") +
+               ",offset=" + std::to_string(r.repl_ack_offset) +
                ",lag=" + std::to_string(lag) + "\r\n";
     });
   }
@@ -5841,15 +5861,13 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
     t.emplace("SYNC", CommandSpec{"SYNC", 1, {"admin"}, 0, 0, 0,
         [](const std::vector<std::string>&, SessionState& session, bool&) {
           if (session.replica_stream) return std::string();  // syncCommand(): already a replica
-          if (const std::string refused = sync_refusal(); !refused.empty()) return refused;
+          if (const std::string refused = sync_refusal(session); !refused.empty()) return refused;
           attach_replica(session);
           session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
-          // Plain SYNC sends an empty RDB and relies on the command stream. PeaDB's own
-          // replica uses PSYNC (which serializes the full dataset, streams included).
-          // Full-state plain SYNC for external clients remains a deferred item — serializing
-          // the dataset here interacts with lazy expiry during RDB build and is low-value
-          // relative to PSYNC; see compat/delta.md.
-          return std::string("$0\r\n");
+          g_sync_full.fetch_add(1, std::memory_order_relaxed);
+          session.repl_sync_state = ReplicaSyncState::WaitSnapshot;
+          session.repl_legacy_sync = true;
+          return std::string();
         }});
 
     t.emplace("REPLCONF", CommandSpec{"REPLCONF", -1, {"admin"}, 0, 0, 0,
@@ -5898,7 +5916,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
         [](const std::vector<std::string>& args, SessionState& session, bool&) {
           // PSYNC <replid> <offset>
           if (session.replica_stream) return std::string();  // syncCommand(): already a replica
-          if (const std::string refused = sync_refusal(); !refused.empty()) return refused;
+          if (const std::string refused = sync_refusal(session); !refused.empty()) return refused;
           const std::string& replid = args[1];
           std::int64_t offset = -1;
           parse_i64(args[2], offset);
@@ -5928,27 +5946,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           // A partial resync was requested (replid given) but we can't serve it.
           if (replid != "?") g_sync_partial_err.fetch_add(1, std::memory_order_relaxed);
 
-          // Full resync. The RDB says which database the stream has selected: a replica's stream
-          // is its master's, which may be in any database; a master's starts with a SELECT.
-          RdbReplicationInfo rsi;
-          rsi.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index : 0;
+          // The event loop batches requests and forks between commands, outside an execution
+          // unit. While waiting for another child, no part of the stream belongs to this sync.
           attach_replica(session);
-          rsi.replid = g_master_replid;
-          rsi.offset = g_master_repl_offset;
-          std::string rdb_err;
-          std::string rdb_data = rdb_save_to_string(rdb_err, &rsi);
-          if (!rdb_err.empty()) {
-            // Cannot serialize dataset — refuse full sync rather than sending a corrupt RDB.
-            log(LogLevel::Error, "PSYNC: full-resync aborted: " + rdb_err);
-            session.replica_stream = false;
-            return "-ERR Full sync failed: " + rdb_err + "\r\n";
-          }
-          session.repl_index = static_cast<std::size_t>(g_master_repl_offset);
           g_sync_full.fetch_add(1, std::memory_order_relaxed);
-          std::string reply = "+FULLRESYNC " + g_master_replid + " " +
-                              std::to_string(g_master_repl_offset) + "\r\n";
-          reply += "$" + std::to_string(rdb_data.size()) + "\r\n" + rdb_data;
-          return reply;
+          session.repl_sync_state = ReplicaSyncState::WaitSnapshot;
+          return std::string();
         }});
 
     t.emplace("MULTI", CommandSpec{"MULTI", 1, {"fast"}, 0, 0, 0,
@@ -10701,6 +10704,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             std::vector<std::string> replicas;
             if (g_for_each_replica_cb) {
               g_for_each_replica_cb([&](const SessionState& r) {
+                if (r.repl_sync_state != ReplicaSyncState::Online) return;
                 replicas.push_back(encode_array({encode_bulk(replica_ip(r)),
                                                  encode_bulk(std::to_string(r.repl_listening_port)),
                                                  encode_bulk(std::to_string(r.repl_ack_offset))}));
@@ -14042,6 +14046,17 @@ bool replication_stream_from(std::size_t from, std::string& out) {
   return g_repl_backlog.get_slice(static_cast<std::int64_t>(from), out);
 }
 
+std::function<void(const std::string&, bool)> g_replication_snapshot_done_cb;
+
+int start_replication_snapshot(RdbReplicationInfo& info) {
+  if (has_active_child_process()) return 0;
+  info.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index : 0;
+  info.replid = g_master_replid;
+  info.offset = g_master_repl_offset;
+  if (!do_bgsave_fork(&info)) return -1;
+  return 1;
+}
+
 void replicas_took_backlog() { g_replicas_taken_to = g_repl_backlog.total; }
 
 bool replica_getack_pending() { return getack_waiting(); }
@@ -14673,12 +14688,14 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         return false;
     }
 
-    // PSYNC ? -1 (request full resync)
-    if (!repl_send(fd, repl_encode_cmd({"PSYNC", "?", "-1"})) ||
-        !repl_readline(fd, line)) {
+    // Keep-alives can precede FULLRESYNC while the master waits for another child.
+    if (!repl_send(fd, repl_encode_cmd({"PSYNC", "?", "-1"}))) {
         ::close(fd);
         return false;
     }
+    do {
+        if (!repl_readline(fd, line)) { ::close(fd); return false; }
+    } while (line.empty());
     if (line.rfind("+FULLRESYNC", 0) != 0) {
         log(LogLevel::Error, "REPLICAOF: expected +FULLRESYNC, got: " + line);
         ::close(fd);
@@ -14709,11 +14726,11 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         ~TransferState() { done(); }
     } transfer_state;
 
-    // Read $<N>\r\n  (may be preceded by a stray \n from some masters)
-    if (!repl_readline(fd, line)) { ::close(fd); return false; }
-    if (line.empty()) {
+    // Redis sends a keep-alive newline every second during a disk-backed BGSAVE.
+    do {
         if (!repl_readline(fd, line)) { ::close(fd); return false; }
-    }
+        g_repl_transfer_lastio_ms = now_ms();
+    } while (line.empty());
     if (line.empty() || line[0] != '$') {
         log(LogLevel::Error, "REPLICAOF: expected $<len>, got: " + line);
         ::close(fd);
