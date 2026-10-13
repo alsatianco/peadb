@@ -40,6 +40,7 @@ struct ServerConfig {
   // ── Security ──
   std::string requirepass;  // empty = no auth required (Redis default)
   std::string masterauth;   // password the replica sends to its master
+  std::string masteruser;   // empty = AUTH password, otherwise AUTH username password
   bool replica = false;     // replicaof/slaveof; independent of the host text
   std::string master_host;
   int master_port = 0;

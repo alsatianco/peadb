@@ -186,6 +186,10 @@ SAME_REPLY = [
     ('CONFIG', 'GET', 'lfu-log-factor'),
     ('CONFIG', 'SET', 'tcp-keepalive', '300', 'lfu-log-factor', '10', 'timeout', '0'),
     ('CONFIG', 'SET', 'port', 'PORT_SELF'),
+    ('CONFIG', 'SET', 'masteruser', 'repl', 'masterauth', 'password'),
+    ('CONFIG', 'GET', 'masteruser'),
+    ('CONFIG', 'GET', 'masterauth'),
+    ('CONFIG', 'SET', 'masteruser', '', 'masterauth', ''),
     # Every CONFIG subcommand except HELP is NOSCRIPT.
     ('EVAL', "return redis.pcall('config','get','maxmemory')", '0'),
     ('EVAL', "return redis.pcall('config','set','maxmemory','1')", '0'),
@@ -201,9 +205,6 @@ PEADB_ONLY = [
     (('CONFIG', 'SET', 'replica-read-only', 'no'),
      "-ERR CONFIG SET failed (possibly related to argument 'replica-read-only') - PeaDB always "
      "uses 'yes' for this setting and cannot change it (compat/delta.md item 24)"),
-    (('CONFIG', 'SET', 'masteruser', 'repl'),
-     "-ERR CONFIG SET failed (possibly related to argument 'masteruser') - PeaDB replicas cannot "
-     "authenticate to their master as a named ACL user (compat/delta.md item 50)"),
     (('CONFIG', 'SET', 'port', '1'),
      "-ERR CONFIG SET failed (possibly related to argument 'port') - PeaDB cannot change this "
      "setting while it runs yet (compat/delta.md item 25)"),

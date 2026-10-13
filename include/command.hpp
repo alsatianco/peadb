@@ -177,7 +177,8 @@ int cluster_announced_bus_port();
 bool is_wildcard_announce_host(const std::string& host);
 // ── Security configuration (wired from main.cpp at startup) ──
 void configure_security(const std::string& requirepass, const std::string& masterauth,
-                        bool protected_mode, const std::string& enable_module_command,
+                        const std::string& masteruser, bool protected_mode,
+                        const std::string& enable_module_command,
                         const std::vector<RenameCommandDirective>& rename_commands);
 // Builds the command table and applies the rename-command directives (already checked by the
 // config loader against Redis's command table). Returns a config error report if a rename

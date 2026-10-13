@@ -604,10 +604,6 @@ const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
        {"",
         "PeaDB has no ACL users and cannot load an ACL file (compat/delta.md item "
         "24): set the default user's password with requirepass instead"}},
-      {"masteruser",
-       {"",
-        "PeaDB replicas cannot authenticate to their master as a named ACL "
-        "user (compat/delta.md item 50)"}},
       {"enable-debug-command",
        {"yes",
         "PeaDB cannot restrict the DEBUG command yet "
@@ -705,6 +701,8 @@ bool apply_setting(LoadState& st, const RedisConfigSpec& spec, const std::vector
     cfg.requirepass = value;
   else if (name == "masterauth")
     cfg.masterauth = value;
+  else if (name == "masteruser")
+    cfg.masteruser = value.c_str();  // Redis's createStringConfig, not an SDS like masterauth.
   else if (name == "replicaof") {
     cfg.replica = value != "no one";
     cfg.master_host = cfg.replica ? args[0] : std::string();

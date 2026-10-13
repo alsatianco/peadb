@@ -377,11 +377,14 @@ bool g_config_replica_serve_stale_data = true;
 // ── Security ──
 std::string g_requirepass;  // empty = no auth required (Redis default)
 std::string g_masterauth;   // sent to master during replica handshake
-// The replica thread reads g_masterauth while CONFIG SET may change it on the event loop.
-std::mutex g_masterauth_mu;
-std::string masterauth_copy() {
-  std::lock_guard<std::mutex> lock(g_masterauth_mu);
-  return g_masterauth;
+std::string g_masteruser;   // optional ACL username on the master
+// Take both credentials together: CONFIG SET runs on the event loop, the handshake on its thread.
+// CONFIG SET holds this across all applies/rollbacks when either credential changes;
+// individual live-config getters/setters take it too.
+std::recursive_mutex g_masterauth_mu;
+std::pair<std::string, std::string> master_credentials_copy() {
+  std::lock_guard<std::recursive_mutex> lock(g_masterauth_mu);
+  return {g_masteruser, g_masterauth};
 }
 bool g_protected_mode = true;                // refuse non-loopback clients when no auth set
 std::string g_enable_module_command = "no";  // "yes" | "no" | "local" — gates MODULE LOAD
@@ -5474,10 +5477,17 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
         {"shutdown-timeout", live_number(g_shutdown_timeout)},
         {"requirepass", live_string(g_requirepass)},
         {"masterauth",
-         {[] { return masterauth_copy(); },
+         {[] { return master_credentials_copy().second; },
           [](const std::string& v, std::string&) {
-            std::lock_guard<std::mutex> lock(g_masterauth_mu);
+            std::lock_guard<std::recursive_mutex> lock(g_masterauth_mu);
             g_masterauth = v;
+            return true;
+          }}},
+        {"masteruser",
+         {[] { return master_credentials_copy().first; },
+          [](const std::string& v, std::string&) {
+            std::lock_guard<std::recursive_mutex> lock(g_masterauth_mu);
+            g_masteruser = v.c_str();  // Redis stores this setting as a C string.
             return true;
           }}},
         {"protected-mode", live_bool(g_protected_mode)},
@@ -5837,6 +5847,12 @@ std::string config_set_reply(const std::vector<std::string>& args, const Session
     }
   }
   std::vector<std::pair<const Change*, std::string>> applied;  // with the value it replaced
+  std::unique_lock<std::recursive_mutex> credentials_lock(g_masterauth_mu, std::defer_lock);
+  if (std::any_of(changes.begin(), changes.end(), [](const Change& c) {
+        return std::strcmp(c.spec->name, "masteruser") == 0 ||
+               std::strcmp(c.spec->name, "masterauth") == 0;
+      }))
+    credentials_lock.lock();
   for (const auto& c : changes) {
     const std::string old = config_value(*c.spec);
     if (c.live != nullptr) {
@@ -16423,10 +16439,15 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
 }
 
 void configure_security(const std::string& requirepass, const std::string& masterauth,
-                        bool protected_mode, const std::string& enable_module_command,
+                        const std::string& masteruser, bool protected_mode,
+                        const std::string& enable_module_command,
                         const std::vector<RenameCommandDirective>& rename_commands) {
   g_requirepass = requirepass;
-  g_masterauth = masterauth;
+  {
+    std::lock_guard<std::recursive_mutex> lock(g_masterauth_mu);
+    g_masterauth = masterauth;
+    g_masteruser = masteruser;
+  }
   g_protected_mode = protected_mode;
   g_enable_module_command = enable_module_command;
   g_rename_commands = rename_commands;
@@ -18102,17 +18123,20 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
   }
   // Redis's syncWithMaster tolerates -NOAUTH / -NOPERM / "operation not permitted" replies
   // to the pre-AUTH PING: the master is alive, so replication continues to the AUTH step.
-  if (line.rfind("+PONG", 0) != 0 && line.rfind("-NOAUTH", 0) != 0 &&
-      line.rfind("-NOPERM", 0) != 0 && line.rfind("-ERR operation not permitted", 0) != 0) {
+  if (line.rfind("+", 0) != 0 && line.rfind("-NOAUTH", 0) != 0 && line.rfind("-NOPERM", 0) != 0 &&
+      line.rfind("-ERR operation not permitted", 0) != 0) {
     log(LogLevel::Error, "REPLICAOF: PING failed, got: " + line);
     ::close(fd);
     return false;
   }
 
-  // AUTH masterauth (if the master requires a password)
-  if (const std::string masterauth = masterauth_copy(); !masterauth.empty()) {
-    if (!io.send(repl_encode_cmd({"AUTH", masterauth})) || !io.readLine(line) ||
-        line.rfind("+OK", 0) != 0) {
+  // syncWithMaster: an empty password skips AUTH even if masteruser is set. The password is
+  // binary-safe (Redis's SDS), while an empty username selects the password-only form.
+  if (const auto credentials = master_credentials_copy(); !credentials.second.empty()) {
+    const auto& [masteruser, masterauth] = credentials;
+    const auto auth = masteruser.empty() ? repl_encode_cmd({"AUTH", masterauth})
+                                         : repl_encode_cmd({"AUTH", masteruser, masterauth});
+    if (!io.send(auth) || !io.readLine(line) || line.rfind("-", 0) == 0) {
       // Redis's syncWithMaster logs exactly this on a rejected AUTH; tooling and tests
       // (unit/auth MASTERAUTH) match on the "Unable to AUTH to MASTER" phrasing.
       log(LogLevel::Error, "Unable to AUTH to MASTER: " + line);
@@ -18123,19 +18147,23 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
 
   // REPLCONF listening-port
   if (!io.send(repl_encode_cmd({"REPLCONF", "listening-port", std::to_string(g_server_port)})) ||
-      !io.readLine(line) || line.rfind("+OK", 0) != 0) {
+      !io.readLine(line)) {
     log(LogLevel::Error, "REPLICAOF: REPLCONF listening-port failed: " + line);
     ::close(fd);
     return false;
   }
+  if (line.rfind("-", 0) == 0)
+    log(LogLevel::Info,
+        "(Non critical) Master does not understand REPLCONF listening-port: " + line);
 
   // REPLCONF capa psync2
-  if (!io.send(repl_encode_cmd({"REPLCONF", "capa", "psync2"})) || !io.readLine(line) ||
-      line.rfind("+OK", 0) != 0) {
+  if (!io.send(repl_encode_cmd({"REPLCONF", "capa", "psync2"})) || !io.readLine(line)) {
     log(LogLevel::Error, "REPLICAOF: REPLCONF capa failed: " + line);
     ::close(fd);
     return false;
   }
+  if (line.rfind("-", 0) == 0)
+    log(LogLevel::Info, "(Non critical) Master does not understand REPLCONF capa: " + line);
 
   // Keep-alives can precede FULLRESYNC while the master waits for another child.
   if (!io.send(repl_encode_cmd(

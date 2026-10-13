@@ -161,8 +161,9 @@ int main(int argc, char** argv) {
   }
   // Must run before the first command_table() build (AOF replay below builds it) so
   // rename-command directives take effect on the live table.
-  peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
-                            config.enable_module_command, config.rename_commands);
+  peadb::configure_security(config.requirepass, config.masterauth, config.masteruser,
+                            config.protected_mode, config.enable_module_command,
+                            config.rename_commands);
   peadb::init_replication_id();  // unique per-process replid (PSYNC2 safety)
   peadb::configure_maxmemory(config.maxmemory);
   peadb::configure_maxmemory_policy(config.maxmemory_policy);

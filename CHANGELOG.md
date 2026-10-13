@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ### Changed
 
+- Support startup/runtime `masteruser` and consistent username/password replication handshakes, including ACL-hardened Redis masters with the default user disabled. Preserve live links until reconnect, handle authentication rejection and optional handshake replies like Redis 7.2.5, and verify authenticated full/partial sync plus password-only compatibility (delta 50).
+
 - Apply Redis stream claim timing/retry options and propagate exact PEL effects through delayed replicas, transactions, scripts, blocked reads and AOF replay/rewrite. Preserve renamed stream handlers, NOACK consumer creation and per-occurrence group cursors (including duplicate stream names), and atomic multi-stream validation; re-enable four upstream stream-group replication tests (delta 48).
 
 - Repair the PR formatting gate with a clang-format 18.1.8 source baseline, pin the formatter in CI, format generated command metadata with the same version, and keep coverage/scoreboard command discovery complete across formatter line breaks.

@@ -150,7 +150,6 @@ REFUSED_BY_BOTH = [
 REFUSED_BY_PEADB_ONLY = [
     ("user default on >secret ~* +@all", [], "PeaDB has no ACL users"),
     ("aclfile /etc/redis/users.acl", [], "cannot load an ACL file"),
-    ("masteruser repl", [], "named ACL user"),
     ("enable-debug-command no", [], "cannot restrict the DEBUG command"),
     ("loadmodule /no/such/module.so", [], "PeaDB cannot load Redis modules"),
     ("bind 127.0.0.1 -::1", [], "exactly one bind address"),
