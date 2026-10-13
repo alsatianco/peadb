@@ -26,6 +26,11 @@ git('config', 'user.email', 'codex-test@example.invalid')
 git('add', '.')
 git('commit', '-qm', 'test: initialize disposable CLI fixture')
 shutil.copy(source, root / 'AI-TEMP/auto-improve-codex.sh')
+# Keep this fixture independent of PeaDB's remote CI and any GitHub credentials.
+(root / 'AI-TEMP/bin').mkdir()
+gh_fixture = root / 'AI-TEMP/bin/gh'
+gh_fixture.write_text("#!/bin/sh\nprintf '%s\\n' '{\"workflow_runs\":[]}'\n")
+gh_fixture.chmod(0o755)
 (root / 'AI-TEMP/improve-plan.md').write_text('''# Disposable CLI smoke test
 ## Part 0
 This is a disposable fixture for testing the automation script, not the PeaDB implementation.
@@ -37,6 +42,8 @@ None.
 ''')
 env = {**os.environ, 'AUTO_IMPROVE_AWAKE':'1', 'MODEL':'gpt-6.1-sol', 'EFFORT':'high', 'MAX_RUNS':'1', 'MAX_FAILS':'1', 'MAX_IDLE':'2', 'MAX_LIMIT_WAITS':'0'}
 env.pop('MAX_BUDGET_USD', None)
+env['GH_TOKEN'] = 'fixture-read-token'
+env['PATH'] = str(gh_fixture.parent) + os.pathsep + os.environ['PATH']
 print(f'Live fixture: {root}', flush=True)
 with (validation / 'live-loop.log').open('w') as log:
     completed = subprocess.run(['/bin/bash', str(root / 'AI-TEMP/auto-improve-codex.sh')], cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT, timeout=300)

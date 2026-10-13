@@ -17,9 +17,9 @@
 #   MAX_LIMIT_WAITS=48         stop after this many usage-limit waits in a row
 #   ALLOW_UNTRACKED="todo.md auto_prompt.md"  untracked files (space-separated) that do not count as a dirty working tree
 #
-# Each session keeps a full record in AI-TEMP/auto-improve-codex/run-*/ (Codex JSONL transcript, structured result, token usage, stderr, the plan before and after, the new commits), and one line per session goes to AI-TEMP/auto-improve-codex/summary.tsv.
+# Records live in AI-TEMP/auto-improve-codex/run-*/ and cleanup-*/ (JSONL transcript, result, usage, stderr, plans, commits). Task sessions also go to summary.tsv; cleanup records include stash hashes.
 #
-# The loop stops when two fresh sessions agree no agent task remains, work is blocked, changes are left uncommitted, the repo leaves main, history is rewritten, or sessions repeatedly fail or stall.
+# The loop stops when two fresh sessions agree no agent task remains, work is blocked, cleanup fails, the repo leaves main, history is rewritten, or sessions repeatedly fail or stall.
 #
 # Written for macOS's bash 3.2 (no mapfile, no ${var,,}, no associative arrays).
 
@@ -75,20 +75,24 @@ case "$EFFORT" in
   *) echo "auto-improve-codex: unsupported EFFORT=$EFFORT" >&2; exit 2 ;;
 esac
 
-PROMPT='please read AI-TEMP/improve-plan.md and do the next task. after done, pls update that file AI-TEMP/improve-plan.md so we know what to do next in the next session'
+PROMPT='Before doing the next plan task, review the fresh GitHub Actions report attached below for https://github.com/alsatianco/peadb/actions. Inspect the failed jobs and logs with gh run view --repo alsatianco/peadb RUN_ID --log-failed (use --attempt RUN_ATTEMPT). Fix every outstanding failure that applies to this checkout, run the relevant checks, and commit each coherent fix before proceeding. If unpublished local commits already fix a remote failure, verify that with the failed log and local checks; record the evidence in AI-TEMP/improve-plan.md instead of making a duplicate fix. For failures on other branches, determine whether their cause applies here and record the reason if it does not. Do not treat running, cancelled or skipped checks as passed. If logs cannot be read or a relevant failure cannot be fixed, report blocked or failed and do not advance the plan. Then read AI-TEMP/improve-plan.md and do the next task. After finishing, update that file so the next session knows what to do.'
 
-RESUME_PROMPT='This session stopped before it reported its result (a usage limit, an error or a crash). Continue the same task from where you stopped: check git status, git log and AI-TEMP/improve-plan.md, finish the task, commit it, update the plan, and report the status. Do not start a new task.'
+CLEANUP_PROMPT='CLEANUP SESSION: Review the existing working-tree and index changes before any CI repair or plan task. Read git status, staged and unstaged diffs, untracked files and the plan notes to understand their purpose. Commit complete, meaningful changes with explicit git add paths and a concise one-line message only after the relevant validation passes. Preserve unrelated, incomplete, broken or uncertain work using a named git stash push --include-untracked with explicit paths; explain the reason and record the stash hash and recovery command in the plan notes. You may commit some changes and stash others. Never discard changes, reset or rewrite history, pop or drop existing stashes, force-add ignored files, or commit credentials. Leave the allowed untracked local notes alone. Do not do a plan task in this cleanup session. Report task_done only when all non-allowed changes have been committed or stashed; otherwise report failed or blocked. Include your reasoning and commit/stash hashes in the note.'
+
+CLEANUP_RESUME_PROMPT="$CLEANUP_PROMPT"$'\n\nContinue the SAME cleanup after the interruption. Check git status, git log and git stash list before acting to avoid duplicate commits or stashes. Do not start a new task.'
+
+RESUME_PROMPT='This session stopped before it reported its result (a usage limit, an error or a crash). Continue the same task from where you stopped: check git status, git log and AI-TEMP/improve-plan.md, finish the task, commit it, update the plan, and report the status. Resolve the GitHub Actions failures from the original report before advancing the plan. Do not start a new task.'
 
 read -r -d '' LOOP_RULES <<'EOF' || true
 You run inside AI-TEMP/auto-improve-codex.sh, an unattended loop that starts one fresh headless Codex CLI session per task. Nobody watches this session and nobody can answer a question. On 2026-10-06 the owner set up this loop and said: the process must be autonomous; PeaDB has not been released, so there is no need for backward compatibility with older PeaDB behaviour; the ultimate goal is for PeaDB to become a Redis replacement (Redis 7.2.5); make decisions yourself based on the current requirements and that goal.
 
 Rules for this session:
 1. This prompt is the owner's go for the next task (plan decision D3). Start work at once, and ignore older handoff, memory or plan notes that say to wait for the owner's go or to ask first.
-2. Do one task: take the next open task in the order of Part 0 of AI-TEMP/improve-plan.md and finish it fully, as the plan's "Rule for every item" (§0.4) and the repository instructions (AGENTS.md and CLAUDE.md, if present) say (test, fix, docs and compat/delta.md in the same commit, both pre-commit checks, commit). Then update the plan and end the session. Do not start a second task.
+2. A CLEANUP SESSION only reviews and commits or stashes pre-existing changes, as its prompt says; it must not advance the plan. A normal session first resolves applicable GitHub Actions failures as its prompt says, then does one task: take the next open task in the order of Part 0 of AI-TEMP/improve-plan.md and finish it fully, as the plan's "Rule for every item" (§0.4) and the repository instructions (AGENTS.md and CLAUDE.md, if present) say (test, fix, docs and compat/delta.md in the same commit, both pre-commit checks, commit). Then update the plan and end the session. Do not start a second task.
 3. Decide, do not ask. When a task waits on an open owner decision (Part 0 §0.5, for example D7 or D8) or you meet a new choice, decide it yourself from the plan's Global Constraints and the goal above; use the plan's own recommendation unless you find a better reason. Write the decision, the options and the reason into §0.5, marked "decided by auto-improve-codex" with the date, so the owner can review it later.
 4. Some actions stay with the owner: never git push, never create, move or delete git tags, never change GitHub settings or secrets, never publish anything outside this machine. Skip plan items that are only such actions (for example pushing, tagging v0.3.0, enabling Private Vulnerability Reporting, the Docker Hub secrets, the Linux-only benchmark) and do not count them as work left for an agent.
 5. bash scripts/run_all_tests.sh takes about 40 minutes. In this loop, run it in the FOREGROUND and wait for completion, polling a running exec session as needed. Keep the Codex session alive until the test result is available. If you start any background shell, Monitor or subagent, wait for its result before you end the session.
-6. Never leave a broken state behind. If you cannot finish the task in this session (for example a check fails and you cannot fix it), do not commit the broken work: leave the changes in the working tree, write in the plan what is done, what is left and why, and report status "failed". The loop then stops so the owner can look.
+6. Never leave a broken state behind. If you cannot finish the task in this session (for example a check fails and you cannot fix it), do not commit the broken work: leave the changes in the working tree, write in the plan what is done, what is left and why, and report status "failed". Before the next task, the loop reviews leftover changes and commits validated work or stashes unfinished work with recovery notes. Never mark unfinished work complete just because it was stashed.
 7. If automatic approval review denies an action, use a permitted alternative or report status "blocked" with the reason; nobody can answer an approval prompt. Never bypass a denial or weaken the permission settings.
 8. Read prose, tables, deferred tasks and acceptance gates as well as checkboxes. Never infer completion from an absence of unchecked boxes. Do not weaken tests or call skipped, interrupted, unrun or failed checks successful. If the previous session reported all_done, independently audit its claim against the source and plan and resume authorized work if anything remains. Keep ignored plans and runtime logs local; never force-add them. Never display or commit credentials.
 9. At the end, report: status "task_done" when you committed the task and updated the plan; "all_done" when the plan has no open task left that an agent can do (only owner actions remain; list them in note); "blocked" when unfinished agent work requires permissions or external prerequisites and no independent authorized work remains; "failed" otherwise. In "task", name the task; in "commits", list the commit hashes you made; in "note", say in one or two sentences what changed and what the next task is.
@@ -151,24 +155,60 @@ dirty_files() {
   done
 }
 
-# Fails (and says why) when the repo is not on main or has changes that a session left behind.
+# Branch guards also apply before and after cleanup.
 check_repo() {
-  local branch dirty
+  local branch
   branch=$(git symbolic-ref --quiet --short HEAD) || branch="(detached HEAD)"
   if [ "$branch" != main ]; then
     log "STOP: the repo is on $branch, not main"
     return 1
   fi
-  dirty=$(dirty_files)
-  if [ -n "$dirty" ]; then
-    log "STOP: the working tree has changes; look at them (and at the plan's notes) before you start the loop again:"
-    printf '%s\n' "$dirty" | tee -a "$STATE_DIR/loop.log"
-    return 1
-  fi
+  return 0
 }
 
 open_boxes() {
   grep -c -E '^[[:space:]]*[-*] \[ \]' "$PLAN" || true
+}
+
+# Use the owner's read token only in this process, without printing it.
+github() (
+  if [ -z "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ] && [ -r "$HOME/.secrets/github_token" ]; then
+    GH_TOKEN=$(cat "$HOME/.secrets/github_token") || exit 1
+    export GH_TOKEN
+  fi
+  gh "$@"
+)
+
+# Fetch every page, then retain the latest completed run per workflow/branch/event.
+# A newer pending run does not hide an unresolved failure; a later success does.
+check_actions() {
+  if ! github api --paginate 'repos/alsatianco/peadb/actions/runs?per_page=100' >"$RUN_DIR/actions-pages.json" 2>"$RUN_DIR/actions-stderr.txt"; then
+    log "STOP: cannot check GitHub Actions; see $RUN_DIR/actions-stderr.txt"
+    return 1
+  fi
+  if ! jq -s -e '
+    if length == 0 or any(.[]; (.workflow_runs | type) != "array") then
+      error("invalid Actions response")
+    else
+      [.[].workflow_runs[]] as $runs | $runs |
+      {pending: map(select(.status != "completed") |
+        {id, run_attempt, name, head_branch, head_sha, status, html_url}),
+       latest_completed: (map(select(.status == "completed")) |
+         group_by([.workflow_id, .head_branch, .event]) |
+         map(sort_by(.run_number, .run_attempt) | last |
+           {id, run_attempt, name, head_branch, head_sha, event, conclusion, html_url}))} |
+      . + {failures: [$runs[] | select(.status == "completed" and
+        .conclusion != "cancelled" and .conclusion != "skipped" and .conclusion != "neutral")] |
+        group_by([.workflow_id, .head_branch, .event]) |
+        map(sort_by(.run_number, .run_attempt) | last) | map(select(
+        .conclusion == "failure" or .conclusion == "timed_out" or
+        .conclusion == "startup_failure" or .conclusion == "action_required") |
+          {id, run_attempt, name, head_branch, head_sha, event, conclusion, html_url})}
+    end' "$RUN_DIR/actions-pages.json" >"$RUN_DIR/actions.json"; then
+    log "STOP: invalid GitHub Actions response; see $RUN_DIR/actions-pages.json"
+    return 1
+  fi
+  log "session $runs: GitHub Actions checked; $(jq '.failures | length' "$RUN_DIR/actions.json") outstanding failed workflow(s)"
 }
 
 # Parent exec flags must precede `resume`: resume has no --approve-for-me flag.
@@ -231,6 +271,92 @@ hit_limit() {
   } | grep -Ei 'usage limit|session limit|weekly limit|rate.?limit|too many requests|hit your .*limit|(^|[^0-9])429([^0-9]|$)' >/dev/null
 }
 
+# Cleanup and plan sessions share retry/usage-limit handling, with phase-specific prompts.
+execute_session() {
+  local initial_prompt=$1 resume_prompt=$2 prompt=$1 retries limit_waits from now pause
+  SESSION_ID=""
+  retries=0
+  limit_waits=0
+  while :; do
+    from=$(wc -l <"$STREAM" | tr -d ' ')
+    run_codex "$STREAM" "$prompt" "$SESSION_ID"
+    rc=$?
+    read_attempt "$STREAM" "$from"
+    [ -n "$STATUS" ] && break
+
+    if hit_limit; then
+      limit_waits=$((limit_waits + 1))
+      if [ "$limit_waits" -gt "$MAX_LIMIT_WAITS" ]; then
+        log "STOP: $MAX_LIMIT_WAITS usage-limit waits in a row"
+        return 1
+      fi
+      now=$(date +%s)
+      pause=$LIMIT_WAIT
+      log "session $runs: usage limit; waiting until $(fmt_time $((now + pause))), then resuming the same session"
+      sleep "$pause" &
+      CODEX_PID=$!
+      wait "$CODEX_PID"
+      CODEX_PID=""
+    elif [ "$retries" -lt 1 ] && [ -n "$SESSION_ID" ]; then
+      retries=$((retries + 1))
+      log "session $runs: ended without a status (exit $rc); resuming it once"
+    else
+      log "session $runs: ended without a status (exit $rc); see $RUN_DIR/stderr.txt and $STREAM"
+      break
+    fi
+    # A session that stopped before it started has nothing to resume, so it gets the first prompt again.
+    if [ -n "$SESSION_ID" ]; then prompt=$resume_prompt; else prompt=$initial_prompt; fi
+  done
+  return 0
+}
+
+# Local variables keep cleanup results separate from the preceding plan session.
+reconcile_tree() {
+  local dirty cleanup_head stash_before stash_after RUN_DIR RUN_NAME STREAM
+  local SESSION_ID STATUS RESULT USAGE rc
+  TREE_RECONCILED=0
+  check_repo || return 1
+  dirty=$(dirty_files) || { log "STOP: cannot inspect working-tree changes"; return 1; }
+  [ -n "$dirty" ] || return 0
+  cleanup_head=$(git rev-parse HEAD)
+  stash_before=$(git rev-parse --verify -q refs/stash || true)
+  RUN_DIR=$(mktemp -d "$STATE_DIR/cleanup-$(date '+%Y%m%d-%H%M%S').XXXXXX") || return 1
+  RUN_NAME=${RUN_DIR##*/}
+  ln -sfn "$RUN_NAME" "$STATE_DIR/latest"
+  STREAM=$RUN_DIR/stream.jsonl
+  : >"$STREAM"
+  printf '%s\n' "$SCHEMA" >"$RUN_DIR/schema.json"
+  printf '%s\n' "$LOOP_RULES" >"$RUN_DIR/instructions.txt"
+  printf '%s\n' "$dirty" >"$RUN_DIR/dirty-before.txt"
+  cp "$PLAN" "$RUN_DIR/plan-before.md"
+  log "cleanup ($RUN_NAME): analysing working-tree changes for a meaningful commit or stash"
+  printf '%s\n' "$dirty" | tee -a "$STATE_DIR/loop.log"
+  execute_session "$CLEANUP_PROMPT"$'\n\nAllowed untracked notes: '"$ALLOW_UNTRACKED" "$CLEANUP_RESUME_PROMPT"$'\n\nAllowed untracked notes: '"$ALLOW_UNTRACKED" || return 1
+  check_repo || return 1
+  git merge-base --is-ancestor "$cleanup_head" HEAD || {
+    log "STOP: cleanup rewrote history"; return 1;
+  }
+  [ -s "$PLAN" ] || { log "STOP: cleanup removed or emptied $PLAN"; return 1; }
+  cp "$PLAN" "$RUN_DIR/plan-after.md"
+  git log --oneline "$cleanup_head..HEAD" >"$RUN_DIR/commits.txt"
+  stash_after=$(git rev-parse --verify -q refs/stash || true)
+  printf '%s\n' "$stash_after" >"$RUN_DIR/stash-after.txt"
+  log "cleanup: status=${STATUS:-none}; $(printf '%s' "$RESULT" | jq -r '.note // empty')"
+  dirty=$(dirty_files) || { log "STOP: cannot inspect working-tree changes"; return 1; }
+  if [ "$STATUS" != task_done ] || [ -n "$dirty" ]; then
+    log "STOP: cleanup did not commit or stash all changes; see $RUN_DIR"
+    return 1
+  fi
+  if [ "$cleanup_head" = "$(git rev-parse HEAD)" ] && [ "$stash_before" = "$stash_after" ]; then
+    log "STOP: cleanup left no commit or new stash; see $RUN_DIR"
+    return 1
+  fi
+  TREE_RECONCILED=1
+  [ -n "$USAGE" ] || USAGE='{}'
+  printf '%s\n' "$USAGE" >"$RUN_DIR/usage.json"
+  log "cleanup: ready to continue; commits in $RUN_DIR/commits.txt, stash=${stash_after:-none}"
+}
+
 # Run Codex as a background job so the shell handles Ctrl-C promptly.
 # Stop its child commands as well; a killed test must not keep running in this checkout.
 stop_children() {
@@ -250,6 +376,8 @@ on_signal() {
   fi
   exit 130
 }
+
+command -v gh >/dev/null 2>&1 || { echo "auto-improve-codex: gh not found on PATH" >&2; exit 2; }
 
 [ -s "$PLAN" ] || { echo "auto-improve-codex: $PLAN missing or empty" >&2; exit 2; }
 mkdir -p "$STATE_DIR" "$(dirname "$LOCK")" || exit 2
@@ -283,7 +411,7 @@ while :; do
     log "STOP: MAX_RUNS=$MAX_RUNS sessions done; completion has not been audited twice"
     exit 2
   fi
-  check_repo || exit 1
+  reconcile_tree || exit 1
 
   runs=$((runs + 1))
   RUN_DIR=$(mktemp -d "$STATE_DIR/run-$(date '+%Y%m%d-%H%M%S')-$runs.XXXXXX") || exit 2
@@ -297,43 +425,12 @@ while :; do
   head_before=$(git rev-parse HEAD)
   log "session $runs ($RUN_NAME): starting; watch it with: bash AI-TEMP/auto-improve-codex.sh watch"
 
-  SESSION_ID=""
-  prompt=$PROMPT
+  check_actions || exit 2
+  prompt="$PROMPT"$'\n\nFresh GitHub Actions report (also saved in '"$RUN_DIR/actions.json"$'):\n'"$(cat "$RUN_DIR/actions.json")"$'\n\nFor read-only GitHub commands, use gh with the existing GH_TOKEN/GITHUB_TOKEN or process-local GH_TOKEN loaded from ~/.secrets/github_token. Never print token contents.'
   if [ "$all_done_streak" -gt 0 ]; then
-    prompt="$PROMPT"$'\n\nThe previous session reported all_done. This is the independent completion audit.'
+    prompt="$prompt"$'\n\nThe previous session reported all_done. This is the independent completion audit.'
   fi
-  retries=0
-  limit_waits=0
-  while :; do
-    from=$(wc -l <"$STREAM" | tr -d ' ')
-    run_codex "$STREAM" "$prompt" "$SESSION_ID"
-    rc=$?
-    read_attempt "$STREAM" "$from"
-    [ -n "$STATUS" ] && break
-
-    if hit_limit; then
-      limit_waits=$((limit_waits + 1))
-      if [ "$limit_waits" -gt "$MAX_LIMIT_WAITS" ]; then
-        log "STOP: $MAX_LIMIT_WAITS usage-limit waits in a row"
-        exit 1
-      fi
-      now=$(date +%s)
-      pause=$LIMIT_WAIT
-      log "session $runs: usage limit; waiting until $(fmt_time $((now + pause))), then resuming the same session"
-      sleep "$pause" &
-      CODEX_PID=$!
-      wait "$CODEX_PID"
-      CODEX_PID=""
-    elif [ "$retries" -lt 1 ] && [ -n "$SESSION_ID" ]; then
-      retries=$((retries + 1))
-      log "session $runs: ended without a status (exit $rc); resuming it once"
-    else
-      log "session $runs: ended without a status (exit $rc); see $RUN_DIR/stderr.txt and $STREAM"
-      break
-    fi
-    # A session that stopped before it started has nothing to resume, so it gets the first prompt again.
-    if [ -n "$SESSION_ID" ]; then prompt=$RESUME_PROMPT; else prompt=$PROMPT; fi
-  done
+  execute_session "$prompt" "$RESUME_PROMPT" || exit 1
 
   [ -s "$PLAN" ] || { log "STOP: session removed or emptied $PLAN"; exit 1; }
   cp "$PLAN" "$RUN_DIR/plan-after.md"
@@ -359,7 +456,7 @@ while :; do
     log "  warning: the session did not change $PLAN"
   fi
 
-  check_repo || exit 1
+  reconcile_tree || exit 1
 
   case "$STATUS" in
     task_done)
@@ -376,6 +473,11 @@ while :; do
       fi
       ;;
     all_done)
+      if [ "$TREE_RECONCILED" -eq 1 ]; then
+        all_done_streak=0
+        log "session $runs: cleanup changed the checkout; require fresh completion audits"
+        continue
+      fi
       fails=0
       idle=0
       all_done_streak=$((all_done_streak + 1))

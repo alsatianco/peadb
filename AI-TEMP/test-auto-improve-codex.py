@@ -31,9 +31,10 @@ assert 'approvals_reviewer="auto_review"' in args, args
 assert 'model_reasoning_effort="high"' in args, args
 assert args[args.index('--model') + 1] == 'gpt-6.1-sol', args
 assert '--json' in args, args
-state = pathlib.Path('AI-TEMP/mock-calls.json')
+cleanup = args[-1].startswith('CLEANUP SESSION:')
+state = pathlib.Path('AI-TEMP/mock-cleanup-calls.json' if cleanup else 'AI-TEMP/mock-calls.json')
 calls = json.loads(state.read_text()) if state.exists() else []
-scenario = json.loads(os.environ['MOCK_SCENARIO'])
+scenario = json.loads(os.environ.get('MOCK_CLEANUP', '[{"stash":true}]') if cleanup else os.environ['MOCK_SCENARIO'])
 step = scenario[min(len(calls), len(scenario) - 1)]
 calls.append(args); state.write_text(json.dumps(calls))
 def option(name): return pathlib.Path(args[args.index(name) + 1])
@@ -58,12 +59,23 @@ if step.get('hang'):
     child.wait(); sys.exit(0)
 if step.get('dirty'):
     pathlib.Path('tracked.txt').write_text('uncommitted change\n')
+if step.get('stash'):
+    paths = subprocess.check_output(['git', 'status', '--porcelain', '-z'], text=True).split('\0')
+    paths = [p[3:] for p in paths if p and not (p.startswith('?? ') and p[3:] in os.environ.get('ALLOW_UNTRACKED', 'todo.md auto_prompt.md').split())]
+    subprocess.run(['git', 'stash', 'push', '-qu', '-m', 'auto-improve: fixture unfinished work', '--', *paths], check=True)
+if step.get('discard'):
+    subprocess.run(['git', 'restore', 'tracked.txt'], check=True)
 if step.get('commit'):
-    pathlib.Path('tracked.txt').write_text('task committed\n')
+    if not cleanup: pathlib.Path('tracked.txt').write_text('task committed\n')
     subprocess.run(['git', 'add', 'tracked.txt'], check=True)
     subprocess.run(['git', 'commit', '-qm', 'test: finish fixture task'], check=True)
 if step.get('empty_plan'):
     pathlib.Path('AI-TEMP/improve-plan.md').write_text('')
+if cleanup:
+    assert 'Do not do a plan task' in args[-1]
+else:
+    assert 'Fresh GitHub Actions report' in args[-1] or 'resume' in args
+    assert pathlib.Path(option('--output-schema').parent / 'actions.json').exists()
 if step.get('tick'):
     plan = pathlib.Path('AI-TEMP/improve-plan.md')
     plan.write_text(plan.read_text().replace('[ ]', '[x]'))
@@ -89,6 +101,21 @@ sys.exit(step.get('rc', 0))
 '''
 
 
+GH_MOCK = r'''#!/usr/bin/env python3
+import json, os, pathlib, sys
+state = pathlib.Path('AI-TEMP/mock-gh-calls.json')
+calls = json.loads(state.read_text()) if state.exists() else []
+calls.append(sys.argv[1:]); state.write_text(json.dumps(calls))
+assert sys.argv[1:] == ['api', '--paginate', 'repos/alsatianco/peadb/actions/runs?per_page=100']
+if os.environ.get('MOCK_GH_ERROR'):
+    print('fixture GitHub authentication/network failure', file=sys.stderr); sys.exit(1)
+if os.environ.get('MOCK_GH_INVALID'):
+    print('{"message":"not a runs response"}'); sys.exit(0)
+reports = json.loads(os.environ.get('MOCK_ACTIONS', '[[{"workflow_runs":[]}]]'))
+for page in reports[min(len(calls) - 1, len(reports) - 1)]: print(json.dumps(page))
+'''
+
+
 class LoopTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='codex-loop-test-')
@@ -107,8 +134,11 @@ class LoopTests(unittest.TestCase):
         mock = self.root / 'AI-TEMP/bin/codex'
         mock.write_text(MOCK)
         mock.chmod(0o755)
-        self.env = {k:v for k,v in os.environ.items() if k not in ('MODEL', 'EFFORT', 'MAX_BUDGET_USD', 'MAX_RUNS', 'MAX_FAILS', 'MAX_IDLE', 'LIMIT_WAIT', 'MAX_LIMIT_WAITS', 'ALLOW_UNTRACKED')}
-        self.env.update(PATH=str(mock.parent) + os.pathsep + os.environ['PATH'], AUTO_IMPROVE_AWAKE='1', MAX_RUNS='1', MAX_FAILS='1', LIMIT_WAIT='0', MAX_LIMIT_WAITS='2')
+        gh = mock.with_name('gh')
+        gh.write_text(GH_MOCK)
+        gh.chmod(0o755)
+        self.env = {k:v for k,v in os.environ.items() if k not in ('MODEL', 'EFFORT', 'MAX_BUDGET_USD', 'MAX_RUNS', 'MAX_FAILS', 'MAX_IDLE', 'LIMIT_WAIT', 'MAX_LIMIT_WAITS', 'ALLOW_UNTRACKED', 'MOCK_ACTIONS', 'MOCK_CLEANUP', 'MOCK_GH_ERROR', 'MOCK_GH_INVALID')}
+        self.env.update(GH_TOKEN='fixture-read-token', PATH=str(mock.parent) + os.pathsep + os.environ['PATH'], AUTO_IMPROVE_AWAKE='1', MAX_RUNS='1', MAX_FAILS='1', LIMIT_WAIT='0', MAX_LIMIT_WAITS='2')
 
     def git(self, *args):
         return subprocess.check_output(['git', *args], cwd=self.root, text=True).strip()
@@ -178,10 +208,14 @@ class LoopTests(unittest.TestCase):
         self.assertIn('2 usage-limit waits', out)
         self.assertEqual(len(self.calls()), 3)
 
-    def test_dirty_result_stops_immediately(self):
-        out = self.run_loop([{'dirty':True}], expected=1, MAX_RUNS='0')
-        self.assertIn('working tree has changes', out)
-        self.assertEqual(len(self.calls()), 1)
+    def test_dirty_result_is_stashed_before_next_iteration(self):
+        out = self.run_loop([{'dirty':True, 'tick':True}, {'status':'all_done'}], MAX_RUNS='2')
+        self.assertIn('cleanup: ready to continue', out)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(self.git('show', 'stash@{0}:tracked.txt'), 'uncommitted change')
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        summary = (self.root / 'AI-TEMP/auto-improve-codex/summary.tsv').read_text()
+        self.assertIn('\ttask_done\t0\t100\t50\t10\t', summary)
 
     def test_idle_cap(self):
         out = self.run_loop(expected=1, MAX_RUNS='0', MAX_IDLE='2')
@@ -197,14 +231,122 @@ class LoopTests(unittest.TestCase):
         out = self.run_loop([{'rewrite':True}], expected=1)
         self.assertIn('history was rewritten', out)
 
-    def test_wrong_branch_and_dirty_start_never_launch(self):
+    def test_wrong_branch_never_launches(self):
         self.git('checkout', '-qb', 'fixture-branch')
         self.assertIn('not main', self.run_loop(expected=1))
         self.assertEqual(self.calls(), [])
-        self.git('checkout', '-q', 'main')
-        (self.root / 'unexpected.txt').write_text('dirty\n')
-        self.assertIn('working tree has changes', self.run_loop(expected=1))
+
+    def test_dirty_start_stashes_untracked_work_and_keeps_allowed_notes(self):
+        (self.root / 'unexpected.txt').write_text('unfinished\n')
+        (self.root / 'todo.md').write_text('owner notes\n')
+        old_head = self.git('rev-parse', 'HEAD')
+        out = self.run_loop([{'status':'all_done'}])
+        self.assertIn('cleanup: ready to continue', out)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.git('rev-parse', 'HEAD'), old_head)
+        self.assertEqual(self.git('show', 'stash@{0}^3:unexpected.txt'), 'unfinished')
+        self.assertEqual((self.root / 'todo.md').read_text(), 'owner notes\n')
+
+    def test_dirty_start_commits_staged_and_unstaged_work(self):
+        (self.root / 'tracked.txt').write_text('meaningful work\n')
+        self.git('add', 'tracked.txt')
+        (self.root / 'tracked.txt').write_text('complete meaningful work\n')
+        self.run_loop([{'status':'all_done'}], MOCK_CLEANUP='[{"commit":true}]')
+        self.assertEqual(self.git('show', 'HEAD:tracked.txt'), 'complete meaningful work')
+        self.assertEqual(self.git('rev-list', '--count', 'HEAD'), '2')
+        self.assertEqual(self.git('status', '--porcelain'), '')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_cleanup_preserves_existing_stashes(self):
+        (self.root / 'tracked.txt').write_text('earlier unfinished work\n')
+        self.git('stash', 'push', '-qm', 'owner stash')
+        old_stash = self.git('rev-parse', 'refs/stash')
+        (self.root / 'tracked.txt').write_text('new unfinished work\n')
+        self.run_loop([{'status':'all_done'}])
+        self.assertEqual(self.git('rev-parse', 'stash@{1}'), old_stash)
+        self.assertEqual(self.git('show', 'stash@{0}:tracked.txt'), 'new unfinished work')
+
+    def test_cleanup_invalidates_completion_audit(self):
+        out = self.run_loop([{'status':'all_done', 'dirty':True}, {'status':'all_done'}], expected=0, MAX_RUNS='0')
+        self.assertIn('require fresh completion audits', out)
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_cleanup_failure_blocks_plan(self):
+        (self.root / 'tracked.txt').write_text('unfinished\n')
+        out = self.run_loop(expected=1, MOCK_CLEANUP='[{}]')
+        self.assertIn('cleanup did not commit or stash all changes', out)
         self.assertEqual(self.calls(), [])
+        self.assertEqual((self.root / 'tracked.txt').read_text(), 'unfinished\n')
+
+    def test_cleanup_discard_without_commit_or_stash_is_rejected(self):
+        (self.root / 'tracked.txt').write_text('unfinished\n')
+        out = self.run_loop(expected=1, MOCK_CLEANUP='[{"discard":true}]')
+        self.assertIn('cleanup left no commit or new stash', out)
+        self.assertEqual(self.calls(), [])
+
+    def test_cleanup_limit_resumes_cleanup_not_plan(self):
+        (self.root / 'tracked.txt').write_text('unfinished\n')
+        self.run_loop([{'status':'all_done'}], MOCK_CLEANUP=json.dumps([
+            {'error':'usage limit', 'result':False}, {'stash':True}]))
+        calls = json.loads((self.root / 'AI-TEMP/mock-cleanup-calls.json').read_text())
+        self.assertEqual(len(calls), 2)
+        self.assertIn('resume', calls[1])
+        self.assertIn('SAME cleanup', calls[1][-1])
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_cleanup_history_rewrite_is_rejected(self):
+        (self.root / 'tracked.txt').write_text('unfinished\n')
+        out = self.run_loop(expected=1, MOCK_CLEANUP='[{"rewrite":true}]')
+        self.assertIn('cleanup rewrote history', out)
+        self.assertEqual(self.calls(), [])
+
+    def test_actions_fetch_failure_blocks_plan(self):
+        out = self.run_loop(expected=2, MOCK_GH_ERROR='1')
+        self.assertIn('cannot check GitHub Actions', out)
+        self.assertEqual(self.calls(), [])
+
+    def test_invalid_actions_response_blocks_plan(self):
+        out = self.run_loop(expected=2, MOCK_GH_INVALID='1')
+        self.assertIn('invalid GitHub Actions response', out)
+        self.assertEqual(self.calls(), [])
+
+    @staticmethod
+    def action(run_id, workflow=1, branch='main', event='push', status='completed', conclusion='failure', attempt=1):
+        return dict(id=run_id, workflow_id=workflow, head_branch=branch, event=event,
+                    run_number=run_id, run_attempt=attempt, status=status, conclusion=conclusion,
+                    head_sha='fixture-sha', html_url=f'https://github.com/alsatianco/peadb/actions/runs/{run_id}', name='Fixture')
+
+    def test_actions_pagination_latest_runs_pending_and_attempts(self):
+        pages = [{'workflow_runs':[
+            self.action(5, status='in_progress', conclusion=None),
+            self.action(4, workflow=2, conclusion='timed_out'),
+            self.action(3, conclusion='success'),
+            self.action(3, branch='feature', event='pull_request'),
+            self.action(2, workflow=3, attempt=2, conclusion='success')]},
+            {'workflow_runs':[self.action(2, workflow=3), self.action(1)]}]
+        self.run_loop([{'status':'all_done'}], MOCK_ACTIONS=json.dumps([pages]))
+        latest = self.root / 'AI-TEMP/auto-improve-codex/latest'
+        report = json.loads((latest / 'actions.json').read_text())
+        self.assertEqual({r['id'] for r in report['failures']}, {3, 4})
+        self.assertEqual([r['id'] for r in report['pending']], [5])
+        self.assertIn('Fresh GitHub Actions report', self.calls()[0][-1])
+        self.assertIn('Fix every outstanding failure', self.calls()[0][-1])
+
+    def test_actions_cancelled_or_skipped_runs_do_not_hide_failure(self):
+        pages = [{'workflow_runs':[self.action(1), self.action(2, conclusion='cancelled'),
+                                   self.action(3, conclusion='skipped')]}]
+        self.run_loop([{'status':'all_done'}], MOCK_ACTIONS=json.dumps([pages]))
+        report = json.loads((self.root / 'AI-TEMP/auto-improve-codex/latest/actions.json').read_text())
+        self.assertEqual([r['id'] for r in report['failures']], [1])
+        self.assertEqual([r['id'] for r in report['latest_completed']], [3])
+
+    def test_actions_rechecked_before_every_fresh_iteration(self):
+        reports = [[{'workflow_runs':[]}], [{'workflow_runs':[self.action(9)]}]]
+        self.run_loop([{'status':'all_done'}], expected=0, MAX_RUNS='0', MOCK_ACTIONS=json.dumps(reports))
+        gh_calls = json.loads((self.root / 'AI-TEMP/mock-gh-calls.json').read_text())
+        self.assertEqual(len(gh_calls), 2)
+        self.assertNotIn('"id": 9', self.calls()[0][-1])
+        self.assertIn('"id": 9', self.calls()[1][-1])
 
     def test_allowed_untracked_notes_after_history_change(self):
         (self.root / 'todo.md').write_text('owner notes\n')
@@ -218,18 +360,19 @@ class LoopTests(unittest.TestCase):
         self.run_loop([{'status':'all_done'}], ALLOW_UNTRACKED='notes.md')
         self.assertEqual(len(self.calls()), 1)
         (self.root / 'auto_prompt.md').write_text('owner prompt\n')
-        out = self.run_loop(expected=1, ALLOW_UNTRACKED='notes.md')
+        out = self.run_loop([{'status':'all_done'}], ALLOW_UNTRACKED='notes.md')
         self.assertIn('?? auto_prompt.md', out)
-        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(len(self.calls()), 2)
 
-    def test_allowed_notes_still_block_tracked_edits(self):
+    def test_allowed_notes_tracked_edits_are_stashed(self):
         (self.root / 'auto_prompt.md').write_text('tracked prompt\n')
         self.git('add', 'auto_prompt.md')
         self.git('commit', '-qm', 'test: track owner prompt')
         (self.root / 'auto_prompt.md').write_text('edited prompt\n')
-        out = self.run_loop(expected=1)
+        out = self.run_loop([{'status':'all_done'}])
         self.assertIn(' M auto_prompt.md', out)
-        self.assertEqual(self.calls(), [])
+        self.assertEqual(self.git('show', 'stash@{0}:auto_prompt.md'), 'edited prompt')
+        self.assertEqual(len(self.calls()), 1)
 
     def test_no_checkboxes_still_requires_audit(self):
         (self.root / 'AI-TEMP/improve-plan.md').write_text('Owner still needs to publish.\n')
