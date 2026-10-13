@@ -157,6 +157,7 @@ int adjust_open_files_limit(int max_clients);
 std::int64_t proto_max_bulk_len();          // proto-max-bulk-len, for the RESP parser
 std::int64_t client_query_buffer_limit();   // client-query-buffer-limit
 int tcp_keepalive_seconds();                 // tcp-keepalive (0 = off), for new connections
+int replication_timeout_seconds();           // repl-timeout, also bounds replica ACK silence
 // ── Cluster configuration (wired from main.cpp at startup; startup-only, like Redis's
 // IMMUTABLE_CONFIG for cluster-enabled) ──
 void configure_cluster(bool enabled, const std::string& bind, int port, const std::string& announce_ip,
