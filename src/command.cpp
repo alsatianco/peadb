@@ -125,10 +125,14 @@ std::int64_t g_aofrw_consecutive_failures = 0;  // INFO aof_rewrites_consecutive
 // replay flag so setting it in one thread never silently suppresses AOF writes
 // or bypasses READONLY enforcement in the other.
 thread_local bool g_replaying_aof = false;
-// Redis's mustObeyClient(): a command replayed from the AOF or applied from the master stream
-// is not held to the client limits (proto-max-bulk-len), or a replica or a reload whose limit
-// is lower than the one the data was written under would drop it.
+thread_local bool g_applying_master_stream = false;
+// Redis's mustObeyClient(): AOF and master-stream commands bypass client checks and routing,
+// so a replica or a reload cannot discard data under different limits or a different slot map.
 inline bool must_obey_client() { return g_replaying_aof; }
+bool g_replica_ignore_disk_write_errors = false;
+std::int64_t g_replica_disk_error_last_log_ms = 0;
+// Redis's c->lastcmd remains EXEC while its queued commands run.
+std::string g_master_stream_command_name;
 // Set while re-dispatching a blocked XREAD/XREADGROUP from try_unblock_client so the
 // handler reads once instead of re-registering a block.
 thread_local bool g_block_disabled = false;
@@ -927,7 +931,7 @@ bool g_pre_command_oom_state = false;
 // checkGoodReplicasStatus()).
 inline bool noreplicas_should_reject() {
   if (g_config_min_replicas_to_write <= 0) return false;
-  if (g_replaying_aof || g_replication_role == "slave") return false;
+  if (must_obey_client() || g_replication_role == "slave") return false;
   const int connected = g_count_connected_replicas ? g_count_connected_replicas() : 0;
   return connected < g_config_min_replicas_to_write;
 }
@@ -949,6 +953,23 @@ std::string misconf_reply() {
     return "-MISCONF Errors writing to the AOF file: " + std::string(std::strerror(err)) + "\r\n";
   }
   return {};
+}
+
+// processCommand(): after command/arity checks, a replica with a local persistence error
+// stops on a master write unless configured to ignore disk errors. PING only warns. The
+// callers also check at queue time, before a transaction can be acknowledged as applied.
+void obey_master_disk_error(const std::string& cmd, std::uint64_t flags) {
+  if (cmd != "PING" && !(flags & kRedisCmdWrite)) return;
+  if (!g_replica_ignore_disk_write_errors && cmd != "PING") {
+    log(LogLevel::Error, "Replica was unable to write command to disk.");
+    std::abort();
+  }
+  const std::int64_t now = now_ms();
+  if (now > g_replica_disk_error_last_log_ms + 10000) {
+    g_replica_disk_error_last_log_ms = now;
+    log(LogLevel::Warn,
+        "Replica is applying a command even though it is unable to write to disk.");
+  }
 }
 
 const char* const kMasterdownReply =
@@ -1015,7 +1036,7 @@ std::string encode_error(const std::string& value);  // defined below (encoder b
 // for example for a script loaded inside the transaction that runs it. Never for the AOF or the
 // master stream.
 std::string script_prepare_refusal(bool declared, int flags, bool ro) {
-  if (g_replaying_aof) return {};
+  if (must_obey_client()) return {};
   if (!declared) return running_stale() ? kMasterdownReply : std::string();
   if ((flags & kFuncNoCluster) && g_cluster_enabled)
     return encode_error("Can not run script on cluster, 'no-cluster' flag is set.");
@@ -1452,6 +1473,7 @@ std::uint64_t g_script_prng_state = 0x12345678ULL;
 std::unordered_map<std::string, CmdStats> g_cmdstats;
 std::unordered_map<std::string, std::int64_t> g_errorstats;
 std::int64_t g_total_error_replies = 0;
+std::int64_t g_unexpected_error_replies = 0;
 
 } // end anonymous namespace
 
@@ -2751,7 +2773,7 @@ std::uint64_t eviction_time_limit_us() {
 // replica (replica-ignore-maxmemory yes, a fixed setting), while CLIENT PAUSE stops eviction, or
 // while a script is busy.
 bool is_safe_to_perform_evictions() {
-  if (g_replaying_aof || g_replication_role == "slave") return false;
+  if (must_obey_client() || g_replication_role == "slave") return false;
   if (g_script_busy.load(std::memory_order_relaxed)) return false;
   return !paused_actions_with_update(kPauseEvict);
 }
@@ -2849,7 +2871,7 @@ bool maxmemory_refuses(const std::string& cmd, const std::vector<std::string>& a
 // limit as the script's command started and the script has not written yet (a script is never
 // stopped half done), unless it runs with allow-oom.
 bool script_refuses_for_oom(const std::vector<std::string>& args) {
-  if (g_script_allow_oom || g_config_maxmemory <= 0 || g_replaying_aof) return false;
+  if (g_script_allow_oom || g_config_maxmemory <= 0 || must_obey_client()) return false;
   if (g_script_write_dirty || !g_pre_command_oom_state) return false;
   return (redis_command_flags(args) & kRedisCmdDenyoom) != 0;
 }
@@ -4949,6 +4971,7 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
           }}},
         {"min-replicas-to-write", live_number(g_config_min_replicas_to_write)},
         {"replica-serve-stale-data", live_bool(g_config_replica_serve_stale_data)},
+        {"replica-ignore-disk-write-errors", live_bool(g_replica_ignore_disk_write_errors)},
         {"busy-reply-threshold", live_number(g_config_lua_time_limit)},
         {"proto-max-bulk-len", live_number(g_proto_max_bulk_len)},
         {"client-query-buffer-limit", live_number(g_client_query_buffer_limit)},
@@ -6443,6 +6466,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                    "total_commands_processed:" + std::to_string(g_total_commands_processed.load()) + "\r\n"
                    "instantaneous_ops_per_sec:" + std::to_string(inst_ops) + "\r\n"
                    "total_error_replies:" + std::to_string(g_total_error_replies) + "\r\n"
+                   "unexpected_error_replies:" + std::to_string(g_unexpected_error_replies) + "\r\n"
                    "latest_fork_usec:" + std::to_string(g_latest_fork_usec) + "\r\n"
                    "total_forks:" + std::to_string(g_total_forks) + "\r\n"
                    "migrate_cached_sockets:" + std::to_string(g_migrate_cached_sockets.size()) +
@@ -7306,6 +7330,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             g_cmd_latency_hist.clear();  // LATENCY HISTOGRAM resets with commandstats
             g_errorstats.clear();
             g_total_error_replies = 0;
+            g_unexpected_error_replies = 0;
             g_stat_rdb_saves = 0;
             return encode_simple("OK");
           }
@@ -12667,7 +12692,37 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
 } // namespace
 
-std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close) {
+static std::string handle_command_impl(const std::vector<std::string>& args, SessionState& session,
+                                      bool& should_close);
+
+std::string handle_command(const std::vector<std::string>& args, SessionState& session,
+                           bool& should_close) {
+  // Normal client commands need no replay diagnostics; keep their dispatch a tail call.
+  if (!must_obey_client()) return handle_command_impl(args, session, should_close);
+  const std::string reply = handle_command_impl(args, session, should_close);
+  // Redis's afterErrorReply(): report every failed master command, including a queued command
+  // that fails inside EXEC (the outer array is not an error). Lua's temporary client is not the
+  // master/AOF client: a redis.pcall error is reported only if the script returns it.
+  if (must_obey_client() && !in_lua_script_context() && is_error_reply(reply)) {
+    ++g_unexpected_error_replies;
+    const bool master = g_applying_master_stream;
+    std::string name = g_master_stream_command_name;
+    if (!master) {
+      name = !args.empty() && command_table().count(upper(args[0])) ? lower(args[0]) : "<unknown>";
+    }
+    std::string error = reply.substr(0, std::min<std::size_t>(reply.size(), 4096));
+    if (error.size() >= 2 && error.compare(error.size() - 2, 2, "\r\n") == 0)
+      error.resize(error.size() - 2);
+    log(LogLevel::Warn, "== CRITICAL == This " + std::string(master ? "replica" : "server") +
+                            " is sending an error to its " +
+                            (master ? "master" : "AOF-loading-client") + ": '" + error +
+                            "' after processing the command '" + name + "'");
+  }
+  return reply;
+}
+
+static std::string handle_command_impl(const std::vector<std::string>& args, SessionState& session,
+                                      bool& should_close) {
   // Empty inline lines and non-positive multibulk counts are no-ops in Redis: consumed
   // silently with no reply and no close (the parser emits __empty__ for both).
   if (args.empty() || args[0] == "__empty__") {
@@ -12735,8 +12790,8 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       (upper(args[1]) == "STATS" || upper(args[1]) == "LIST" || upper(args[1]) == "DUMP");
   // HELLO/AUTH/RESET/QUIT carry Redis's allow-busy flag: connection management must
   // work even while a script blocks the server.
-  if (g_script_busy.load() && !is_script_kill && !is_busy_allowed_function && cmd != "SHUTDOWN" &&
-      cmd != "HELLO" && cmd != "AUTH" && cmd != "RESET" && cmd != "QUIT") {
+  if (!must_obey_client() && g_script_busy.load() && !is_script_kill && !is_busy_allowed_function &&
+      cmd != "SHUTDOWN" && cmd != "HELLO" && cmd != "AUTH" && cmd != "RESET" && cmd != "QUIT") {
     if (cmd == "PING" && g_busy_script_session == &session) {
       return args.size() == 2 ? encode_bulk(args[1]) : encode_simple("PONG");
     }
@@ -12776,9 +12831,11 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
       record_error_stat("ERR");
       return encode_error("Command not allowed inside a transaction");
     }
+    if (g_applying_master_stream && !misconf_reply().empty())
+      obey_master_disk_error(cmd, flags);
     // processCommand() runs the maxmemory step before it queues: while memory is over the limit,
     // nothing is queued. Not for a transaction from the master stream or the AOF.
-    if (!g_replaying_aof && maxmemory_refuses(cmd, args, session)) {
+    if (!must_obey_client() && maxmemory_refuses(cmd, args, session)) {
       session.multi_dirty = true;
       record_cmd_rejected(cmd);
       record_error_stat("OOM");
@@ -12789,7 +12846,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     // processCommand() checks a command before it queues it, as at the top level below, and
     // flags the transaction (-EXECABORT at EXEC); not a transaction from the master stream or
     // the AOF.
-    if (!g_replaying_aof) {
+    if (!must_obey_client()) {
       std::string refusal = misconf_reply();
       if (refusal.empty() || (cmd != "PING" && !(flags & kRedisCmdWrite)))
         refusal = replication_refusal(flags);
@@ -12820,7 +12877,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // Skipped when no password is configured (open, like Redis with no requirepass) and
   // for internally replayed/replicated commands (g_replaying_aof). Commands flagged
   // no_auth (AUTH/HELLO/QUIT/RESET) are always allowed so a client can authenticate.
-  if (!g_requirepass.empty() && !session.authenticated && !g_replaying_aof) {
+  if (!g_requirepass.empty() && !session.authenticated && !must_obey_client()) {
     const bool no_auth = (it != table.end()) && (it->second.flag_bits & kFlagNoAuth);
     if (!no_auth) {
       record_error_stat("NOAUTH");
@@ -12853,7 +12910,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // The commands EXEC runs are not checked again (execCommand() calls them), a script's commands
   // are checked as scriptCall() does (below and in dispatch_from_lua()), and nothing replayed
   // from the AOF or the master stream is checked (mustObeyClient()).
-  const bool client_command = !g_replaying_aof && !in_script && !g_executing_exec;
+  const bool client_command = !must_obey_client() && !in_script && !g_executing_exec;
   const bool queued_exec = cmd == "EXEC" && session.in_multi;
   // Redis's rejectCommand().
   auto reject = [&](const std::string& refusal) -> std::string {
@@ -12874,6 +12931,10 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     feed_monitors(cmd, args, session);
     return "-EXECABORT Transaction discarded because of: " + refusal.substr(1);
   };
+  if (g_applying_master_stream && !g_executing_exec && !misconf_reply().empty()) {
+    const std::uint64_t flags = queued_exec ? session.multi_flags : spec_command_flags(spec, args);
+    obey_master_disk_error(cmd, flags);
+  }
   bool deny_stale = false;  // the -MASTERDOWN check, after the pub/sub context one
   if (client_command) {
     if (maxmemory_refuses(cmd, args, session))
@@ -12900,7 +12961,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
     // checks came first, in dispatch_from_lua().
     const bool first_write =
         !g_script_write_dirty && (spec_command_flags(spec, args) & kRedisCmdWrite) != 0;
-    if (first_write && !g_replaying_aof) {
+    if (first_write && !must_obey_client()) {
       std::string refusal =
           g_replication_role == "slave" ? std::string(kReadonlyReplicaReply) : misconf_reply();
       if (refusal.empty() && noreplicas_should_reject()) refusal = kNoReplicasReply;
@@ -12913,7 +12974,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // RESP2 clients with active subscriptions may only run the pub/sub control commands
   // (Redis server.c subscribe-mode gate; exemption is by command identity — PUBLISH is
   // deliberately NOT exempt). RESP3 clients have no restrictions.
-  if (session.resp_version == RespVersion::Resp2 && !g_replaying_aof &&
+  if (session.resp_version == RespVersion::Resp2 && !must_obey_client() &&
       !in_lua_script_context() && client_has_subscriptions(session.fd) &&
       cmd != "PING" && cmd != "QUIT" && cmd != "RESET" &&
       cmd != "SUBSCRIBE" && cmd != "UNSUBSCRIBE" &&
@@ -12939,7 +13000,7 @@ std::string handle_command(const std::vector<std::string>& args, SessionState& s
   // A standalone (cluster-disabled) node must never redirect: g_slot_routes defaults to
   // Unassigned and ADDSLOTS/SETSLOT are gated on cluster-enabled, so this is also true in
   // practice — but skip the whole check rather than rely on that alone.
-  if (g_cluster_enabled && spec.first_key > 0 &&
+  if (g_cluster_enabled && !must_obey_client() && spec.first_key > 0 &&
       static_cast<std::size_t>(spec.first_key) < args.size()) {
     const auto slot = cluster_keyslot(args[static_cast<std::size_t>(spec.first_key)]);
     const auto route = g_slot_routes[static_cast<std::size_t>(slot)];
@@ -13223,6 +13284,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   };
   num("min-replicas-to-write", g_config_min_replicas_to_write);
   yes("replica-serve-stale-data", g_config_replica_serve_stale_data);
+  yes("replica-ignore-disk-write-errors", g_replica_ignore_disk_write_errors);
   num("busy-reply-threshold", g_config_lua_time_limit);
   yes("lazyfree-lazy-server-del", g_lazyfree_lazy_server_del);
   yes("stop-writes-on-bgsave-error", g_stop_writes_on_bgsave_error);
@@ -13646,7 +13708,7 @@ void record_lua_script_rejected(const std::string& cmd) {
 // A command PeaDB does not know, or with the wrong number of arguments, is left to the dispatch,
 // which answers those first, as Redis's scriptCall() does.
 bool script_command_refused_as_stale(const std::vector<std::string>& args) {
-  if (args.empty() || g_replaying_aof || !running_stale()) return false;
+  if (args.empty() || must_obey_client() || !running_stale()) return false;
   const auto& table = command_table();
   const auto it = table.find(upper(args[0]));
   if (it == table.end() || !arity_ok(args.size(), it->second.arity) ||
@@ -14390,15 +14452,25 @@ void drain_replica_cmd_queue() {
       // The master's command bypasses the client-side checks; a failure is logged and the stream
       // goes on, and nothing leaves g_replaying_aof set for the clients that come next.
       struct Replaying {
-        Replaying() { g_replaying_aof = true; }
-        ~Replaying() { g_replaying_aof = false; }
+        Replaying() {
+          g_replaying_aof = true;
+          g_applying_master_stream = true;
+        }
+        ~Replaying() {
+          g_replaying_aof = false;
+          g_applying_master_stream = false;
+        }
       } replaying;
+      g_master_stream_command_name =
+          !cmd.args.empty() && command_table().count(upper(cmd.args[0]))
+              ? full_command_name(upper(cmd.args[0]), cmd.args) : "<unknown>";
       try {
         handle_command(cmd.args, session, close_flag);
       } catch (const std::exception& e) {
         log(LogLevel::Warn,
             std::string("REPLICAOF: a command from the master failed: ") + e.what());
       }
+      g_master_stream_command_name.clear();
     }
     // commandProcessed(): what has been applied joins this server's own stream, its backlog and
     // its replicas, byte for byte as the master sent it, which moves its replication offset (the
