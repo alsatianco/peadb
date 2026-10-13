@@ -40,6 +40,9 @@ struct ServerConfig {
   // ── Security ──
   std::string requirepass;                 // empty = no auth required (Redis default)
   std::string masterauth;                  // password the replica sends to its master
+  bool replica = false;                   // replicaof/slaveof; independent of the host text
+  std::string master_host;
+  int master_port = 0;
   bool protected_mode = true;              // refuse non-loopback clients when no auth set
   std::string enable_module_command = "no"; // "yes" | "no" | "local" — gates MODULE LOAD
   std::vector<RenameCommandDirective> rename_commands;  // in config order

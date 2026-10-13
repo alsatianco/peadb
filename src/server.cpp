@@ -948,6 +948,7 @@ int run_server(const ServerConfig& config) {
     }
   };
 
+  start_configured_replication();
   while (!shutdown_requested()) {
     // A SIGTERM or SIGINT asked for a shutdown, or a shutdown waits for replicas: run it here,
     // between commands, as Redis does from serverCron() (it is not safe inside the signal

@@ -2283,6 +2283,10 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   e = Entry{};
   e.stream();
   e.stream_entries() = d.entries;
+  // The private RDB encoding predates entries-added and stores no historical counter. Its
+  // minimum valid value is the surviving length: leaving it at zero makes the next AOF rewrite
+  // emit an XSETID that refuses to load. Historical metadata remains compat/delta.md item 5.
+  e.stream().entries_added = d.entries.size();
   e.stream_last_ms() = d.last_ms;
   e.stream_last_seq() = d.last_seq;
   for (const auto& gd : d.groups) {

@@ -4,6 +4,8 @@ import socket
 import subprocess
 import time
 
+from _isolated_server import IsolatedServer
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -55,8 +57,8 @@ def cmd(s, *a):
 
 
 def main():
-    m = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6436", "--bind", "127.0.0.1", "--loglevel", "warning"])
-    r = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6437", "--bind", "127.0.0.1", "--loglevel", "warning"])
+    m = IsolatedServer([str(ROOT / "peadb-server"), "--port", "6436", "--bind", "127.0.0.1", "--loglevel", "warning"])
+    r = IsolatedServer([str(ROOT / "peadb-server"), "--port", "6437", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
         wait_until_ready(6436)
         wait_until_ready(6437)

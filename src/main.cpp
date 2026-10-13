@@ -167,6 +167,7 @@ int main(int argc, char** argv) {
   peadb::configure_tcp_backlog(config.tcp_backlog);
   peadb::configure_encoding_limits(config.raw);
   peadb::configure_runtime_settings(config.raw, config_path);
+  peadb::configure_replication(config.replica, config.master_host, config.master_port);
   peadb::configure_client_output_buffer_limit(config.client_output_buffer_limit);
   peadb::configure_save(config.save);
   peadb::configure_repl_backlog_size(config.repl_backlog_size);

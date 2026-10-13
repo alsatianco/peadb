@@ -11,6 +11,8 @@ import subprocess
 import sys
 import time
 
+from _isolated_server import IsolatedServer
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _readiness import wait_until_ready
@@ -26,7 +28,7 @@ def rc(port, *args):
 
 
 def start(port, *extra):
-    p = subprocess.Popen([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
+    p = IsolatedServer([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
                           "--loglevel", "warning", *extra])
     wait_until_ready(port)
     return p
