@@ -4,6 +4,7 @@
 #include "datastore.hpp"
 #include "logger.hpp"
 #include "poller.hpp"
+#include "rdb.hpp"
 #include "zmalloc.hpp"
 #include "protocol.hpp"
 #include "server_context.hpp"
@@ -126,6 +127,20 @@ struct WriteBuf {
       offset = 0;
     }
   }
+};
+
+// The RDB never enters WriteBuf: it is read/sent in bounded chunks, separate from the
+// post-fork command stream. Owning the open inode keeps a later SAVE from replacing it.
+struct SnapshotTransfer {
+  SnapshotTransfer() = default;
+  SnapshotTransfer(const SnapshotTransfer&) = delete;
+  SnapshotTransfer& operator=(const SnapshotTransfer&) = delete;
+  int file_fd = -1;
+  std::int64_t bytes_left = 0;
+  std::string chunk;
+  std::size_t offset = 0;
+
+  ~SnapshotTransfer() { if (file_fd >= 0) ::close(file_fd); }
 };
 
 // Empties a client buffer that has been used up. Redis gives such memory back (a reply block is
@@ -354,6 +369,8 @@ int run_server(const ServerConfig& config) {
   int blocked_count = 0;
   int wait_count = 0;
   int replica_count = 0;
+  std::unordered_map<int, SnapshotTransfer> snapshot_transfers;
+  std::int64_t last_sync_keepalive_ms = 0;
   // The replicas' connections, so what walks only replicas does not walk every client.
   std::unordered_set<int> replica_fds;
   // Clients whose command CLIENT PAUSE holds (SessionState::postponed). Redis counts them in
@@ -373,7 +390,8 @@ int run_server(const ServerConfig& config) {
   g_count_synced_replicas = [&](std::int64_t target_offset) -> int {
     int count = 0;
     for (auto& [fd, sess] : sessions) {
-      if (sess.replica_stream && sess.repl_ack_offset >= target_offset) ++count;
+      if (sess.replica_stream && sess.repl_sync_state == ReplicaSyncState::Online &&
+          sess.repl_ack_offset >= target_offset) ++count;
     }
     return count;
   };
@@ -486,7 +504,10 @@ int run_server(const ServerConfig& config) {
     auto& wbuf = write_buffers[fd];
     const bool was_empty = wbuf.empty();
     wbuf.append(data);
-    while (!wbuf.empty()) {
+    const auto sit = sessions.find(fd);
+    const bool snapshot_pending = sit != sessions.end() && sit->second.replica_stream &&
+        sit->second.repl_sync_state != ReplicaSyncState::Online;
+    while (!snapshot_pending && !wbuf.empty()) {
       const ssize_t n = ::write(fd, wbuf.ptr(), wbuf.remaining());
       if (n < 0) {
         if (errno == EINTR) continue;
@@ -520,14 +541,67 @@ int run_server(const ServerConfig& config) {
       wbuf.compact();
     }
     // Register write interest if data remains in the write buffer.
-    if (!wbuf.empty() && was_empty) {
+    if (!snapshot_pending && !wbuf.empty() && was_empty) {
       poller.set_readwrite(fd);
+    }
+    return true;
+  };
+
+  auto flush_snapshot = [&](int fd, SessionState& session) -> bool {
+    auto ti = snapshot_transfers.find(fd);
+    if (ti == snapshot_transfers.end()) return true;
+    auto& transfer = ti->second;
+    std::size_t budget = 64 * 1024;
+    while (budget != 0) {
+      if (transfer.offset == transfer.chunk.size()) {
+        transfer.chunk.clear();
+        transfer.offset = 0;
+        if (transfer.file_fd < 0) {
+          poller.set_read_only(fd);  // wait for the child, rather than spin on EPOLLOUT
+          return true;
+        }
+        if (transfer.bytes_left == 0) {
+          snapshot_transfers.erase(ti);
+          session.repl_sync_state = ReplicaSyncState::Online;
+          session.repl_ack_time_ms = DataStore::now_ms();
+          // Disk-based Redis replicas read the command stream as soon as the RDB ends.
+          return true;
+        }
+        transfer.chunk.resize(static_cast<std::size_t>(
+            std::min<std::int64_t>(transfer.bytes_left, 16 * 1024)));
+        ssize_t n;
+        do { n = ::read(transfer.file_fd, transfer.chunk.data(), transfer.chunk.size()); }
+        while (n < 0 && errno == EINTR);
+        if (n <= 0) {
+          log(LogLevel::Warn, "Read error sending DB to replica: " +
+                                 std::string(n == 0 ? "premature EOF" : std::strerror(errno)));
+          return false;
+        }
+        transfer.chunk.resize(static_cast<std::size_t>(n));
+        transfer.bytes_left -= n;
+      }
+      const std::size_t left = std::min(budget, transfer.chunk.size() - transfer.offset);
+      const ssize_t n = ::write(fd, transfer.chunk.data() + transfer.offset, left);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) return true;
+        return false;
+      }
+      if (n == 0) return true;
+      transfer.offset += static_cast<std::size_t>(n);
+      budget -= static_cast<std::size_t>(n);
     }
     return true;
   };
 
   // Helper: flush any pending output for a client fd.
   auto flush_output = [&](int fd) -> bool {
+    auto si = sessions.find(fd);
+    if (si != sessions.end() && si->second.replica_stream &&
+        si->second.repl_sync_state != ReplicaSyncState::Online) {
+      if (!flush_snapshot(fd, si->second)) return false;
+      if (si->second.repl_sync_state != ReplicaSyncState::Online) return true;
+    }
     auto it = write_buffers.find(fd);
     if (it == write_buffers.end() || it->second.empty()) return true;
     auto& wbuf = it->second;
@@ -589,6 +663,8 @@ int run_server(const ServerConfig& config) {
     ::close(fd);
     buffers.erase(fd);
     write_buffers.erase(fd);
+    snapshot_transfers.erase(fd);
+    if (scit != sessions.end() && scit->second.replica_stream) --replica_count;
     sessions.erase(fd);
     replica_fds.erase(fd);
     g_connected_clients.fetch_sub(1);
@@ -602,6 +678,9 @@ int run_server(const ServerConfig& config) {
     if (cbus_fd >= 0) ::close(cbus_fd);
     for (const auto& entry : cbus_buffers) ::close(entry.first);
     for (const auto& entry : sessions) ::close(entry.first);
+    for (const auto& entry : snapshot_transfers) {
+      if (entry.second.file_fd >= 0) ::close(entry.second.file_fd);
+    }
   };
 
   // CLIENT KILL: close clients matching a filter, except skip_fd (the caller, which
@@ -654,7 +733,8 @@ int run_server(const ServerConfig& config) {
   };
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
-    if (!session.replica_stream) return true;
+    if (!session.replica_stream ||
+        session.repl_sync_state == ReplicaSyncState::WaitSnapshot) return true;
     // Over its output-buffer limit already: it is closed at the end of the pass.
     if (!obuf_overflow_fds.empty() &&
         std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(), fd) !=
@@ -688,6 +768,7 @@ int run_server(const ServerConfig& config) {
       const auto it = sessions.find(rfd);
       if (it == sessions.end()) continue;
       SessionState& session = it->second;
+      if (session.repl_sync_state == ReplicaSyncState::WaitSnapshot) continue;
       const std::pair<int, std::uint64_t> id{rfd, session.client_id};
       if (std::find(replica_failed_fds.begin(), replica_failed_fds.end(), id) !=
           replica_failed_fds.end())
@@ -701,6 +782,74 @@ int run_server(const ServerConfig& config) {
       }
       session.repl_index = total_after;
     }
+  };
+
+  g_replication_snapshot_done_cb = [&](const std::string& path, bool success) {
+    std::vector<int> failed;
+    for (int fd : replica_fds) {
+      auto& session = sessions.at(fd);
+      if (session.repl_sync_state != ReplicaSyncState::SaveSnapshot) continue;
+      if (!success) { failed.push_back(fd); continue; }
+      auto& transfer = snapshot_transfers.at(fd);
+      transfer.file_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+      struct stat st {};
+      if (transfer.file_fd < 0 || ::fstat(transfer.file_fd, &st) != 0 || st.st_size <= 0) {
+        log(LogLevel::Warn, "Failed opening the RDB file for SYNC: " +
+                               std::string(transfer.file_fd < 0 || st.st_size < 0
+                                               ? std::strerror(errno) : "invalid snapshot"));
+        failed.push_back(fd);
+        continue;
+      }
+      transfer.bytes_left = st.st_size;
+      // A partially sent FULLRESYNC header must precede the bulk length.
+      transfer.chunk += "$" + std::to_string(st.st_size) + "\r\n";
+      session.repl_sync_state = ReplicaSyncState::SendSnapshot;
+      poller.set_readwrite(fd);
+    }
+    // A command (FLUSHALL, REPLICAOF, SHUTDOWN) may have stopped the child. Defer
+    // closes until dispatch ends, since the command could be running on this very fd.
+    for (int fd : failed) replica_failed_fds.emplace_back(fd, sessions.at(fd).client_id);
+  };
+
+  auto replication_snapshot_cron = [&](std::int64_t now) {
+    bool waiting = false;
+    for (int fd : replica_fds) {
+      if (sessions.at(fd).repl_sync_state == ReplicaSyncState::WaitSnapshot) waiting = true;
+    }
+    if (waiting) {
+      RdbReplicationInfo info;
+      const int result = start_replication_snapshot(info);
+      std::vector<int> failed;
+      for (int fd : replica_fds) {
+        auto& session = sessions.at(fd);
+        if (session.repl_sync_state != ReplicaSyncState::WaitSnapshot) continue;
+        if (result < 0) { failed.push_back(fd); continue; }
+        if (result == 0) continue;
+        session.repl_sync_state = ReplicaSyncState::SaveSnapshot;
+        session.repl_index = static_cast<std::size_t>(info.offset);
+        auto& transfer = snapshot_transfers[fd];
+        if (!session.repl_legacy_sync)
+          transfer.chunk = "+FULLRESYNC " + info.replid + " " +
+                           std::to_string(info.offset) + "\r\n";
+        poller.set_readwrite(fd);
+      }
+      for (int fd : failed) close_client(fd);
+    }
+    if (now - last_sync_keepalive_ms < 1000) return;
+    last_sync_keepalive_ms = now;
+    std::vector<int> failed;
+    for (int fd : replica_fds) {
+      const auto state = sessions.at(fd).repl_sync_state;
+      if (state != ReplicaSyncState::WaitSnapshot && state != ReplicaSyncState::SaveSnapshot)
+        continue;
+      auto ti = snapshot_transfers.find(fd);
+      if (ti != snapshot_transfers.end() && ti->second.offset != ti->second.chunk.size())
+        continue;  // never insert a newline in a partially sent FULLRESYNC header
+      const ssize_t n = ::write(fd, "\n", 1);
+      if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
+        failed.push_back(fd);
+    }
+    for (int fd : failed) close_client(fd);
   };
 
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
@@ -999,6 +1148,7 @@ int run_server(const ServerConfig& config) {
     run_eviction_cycle();  // background eviction when over maxmemory (e.g. lowered via CONFIG SET)
     databases_cron();      // shrink sparse keyspace tables, as Redis's databasesCron() does
     reap_background_children();
+    replication_snapshot_cron(loop_now_ms);
     drain_replica_cmd_queue();
 
     // ── Idle-client timeout reaping ──────────────────────────────────────
@@ -1383,6 +1533,8 @@ int run_server(const ServerConfig& config) {
   for (auto& [fd, _] : sessions) ::close(fd);
   for (auto& [fd, _] : cbus_buffers) ::close(fd);
   if (reserved_fd >= 0) close(reserved_fd);
+  g_replication_snapshot_done_cb = nullptr;
+  snapshot_transfers.clear();
   g_feed_replicas_cb = nullptr;  // it refers to this function's sessions
   g_unblock_blocked_clients_cb = nullptr;
   // The wake-up pipe stays open until the process exits: a replica link thread may still write.

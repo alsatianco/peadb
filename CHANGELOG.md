@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Full sync forks a disk-backed BGSAVE and streams bounded chunks without charging RDB bytes to the replica output-buffer limit; the master keeps serving clients and retains all post-fork writes. SYNC shares the full-state path, failed/cancelled saves close recipients, syncing replicas do not satisfy WAIT, and PeaDB accepts repeated snapshot keep-alives. Redis parity and a >256 MiB transfer/load regression cover the change (delta 46; newline half of delta 50).
+
 ### Changed
 
 - Persist replica full-sync snapshots and replicated AOF effects, including transaction/script effects, so promotion and restart retain received data; replace the old AOF after full sync and stop old persistence children. Apply `replicaof`/`slaveof` from config/CLI before loading persistence, including when REPLICAOF is renamed or disabled. Infer a valid minimum entries-added counter when loading a private stream RDB so its next AOF rewrite can restart; historical stream metadata remains delta items 5/17. Runtime role changes still require editing startup configuration; see delta item 45.

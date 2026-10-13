@@ -24,7 +24,9 @@ void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 
 // Save all databases to a Redis-compatible RDB file, through temp-<pid>.rdb next to it (Redis's
 // rdbSave()). On failure `err` is the line Redis logs for it.
-bool rdb_save(const std::filesystem::path& path, std::string& err);
+struct RdbReplicationInfo;
+bool rdb_save(const std::filesystem::path& path, std::string& err,
+              const RdbReplicationInfo* repl = nullptr);
 
 // The temp file rdb_save() writes in process `pid` before the rename: temp-<pid>.rdb in the
 // dump's directory. rdb_remove_temp_file() deletes the one in the working directory (Redis's
@@ -47,7 +49,7 @@ struct RdbReplicationInfo {
   std::int64_t offset = 0;
 };
 
-// Save all databases to an in-memory RDB blob (for PSYNC full-sync), with the repl-stream-db,
+// Serialize all databases to an in-memory RDB blob, with the repl-stream-db,
 // repl-id and repl-offset aux fields when `repl` is given.
 // Sets err on failure (e.g. unsupported key types); returns empty string.
 std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl = nullptr);

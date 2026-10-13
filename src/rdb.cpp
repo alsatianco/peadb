@@ -1002,7 +1002,8 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
 }
 } // end anonymous namespace
 
-bool rdb_save(const std::filesystem::path& path, std::string& err) {
+bool rdb_save(const std::filesystem::path& path, std::string& err,
+              const RdbReplicationInfo* repl) {
   err.clear();
   auto cwd = [] {
     std::error_code ec;
@@ -1022,7 +1023,7 @@ bool rdb_save(const std::filesystem::path& path, std::string& err) {
   }
   std::string data;
   try {
-    data = rdb_build_string(err, /*key_save_delay=*/true);
+    data = rdb_build_string(err, /*key_save_delay=*/true, repl);
   } catch (const std::exception& e) {  // e.g. out of memory: the whole file is built in memory
     err = std::string("Error saving DB: ") + e.what();
   }
