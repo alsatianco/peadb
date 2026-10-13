@@ -24,4 +24,4 @@ std::optional<ParsedCommand> parse_one_command(
     std::string_view buffer, bool unauthenticated = false,
     std::int64_t max_bulk_len = std::numeric_limits<std::int64_t>::max());
 
-} // namespace peadb
+}  // namespace peadb

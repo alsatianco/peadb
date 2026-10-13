@@ -28,20 +28,20 @@ enum class BlockType {
 
 struct BlockedState {
   BlockType type = BlockType::None;
-  std::vector<std::string> keys;     // keys being watched
-  bool pop_left = true;              // for list: BLPOP vs BRPOP
-  bool zpop_max = false;             // for zset: BZPOPMIN vs BZPOPMAX
-  std::int64_t deadline_ms = 0;      // 0 = infinite
-  std::uint64_t seq = 0;             // FIFO serving order (set when the block registers)
-  std::vector<std::string> original_args; // original command args for context
-  std::int64_t block_start_ms = 0;   // wall-clock when the command first blocked (0 = unset);
-                                      // slowlog logs the command only on unblock, with this span
+  std::vector<std::string> keys;           // keys being watched
+  bool pop_left = true;                    // for list: BLPOP vs BRPOP
+  bool zpop_max = false;                   // for zset: BZPOPMIN vs BZPOPMAX
+  std::int64_t deadline_ms = 0;            // 0 = infinite
+  std::uint64_t seq = 0;                   // FIFO serving order (set when the block registers)
+  std::vector<std::string> original_args;  // original command args for context
+  std::int64_t block_start_ms = 0;         // wall-clock when the command first blocked (0 = unset);
+                                    // slowlog logs the command only on unblock, with this span
 };
 
 struct WaitState {
-  std::int64_t target_offset = 0;   // master offset at WAIT issue time
-  std::int64_t deadline_ms = 0;     // absolute deadline; 0 = no timeout
-  std::int64_t min_replicas = 0;    // number of replicas to wait for
+  std::int64_t target_offset = 0;  // master offset at WAIT issue time
+  std::int64_t deadline_ms = 0;    // absolute deadline; 0 = no timeout
+  std::int64_t min_replicas = 0;   // number of replicas to wait for
 };
 
 enum class ReplicaSyncState { Online, WaitSnapshot, SaveSnapshot, SendSnapshot };
@@ -99,14 +99,14 @@ struct SessionState {
   // time (except an explicit TOUCH), so OBJECT IDLETIME/FREQ stay stable for observation.
   bool no_touch = false;
   // ── Introspection (CLIENT LIST / MONITOR / CLIENT KILL) ──
-  std::string addr;                       // peer "ip:port", set at accept
+  std::string addr;  // peer "ip:port", set at accept
   // A unix-socket or loopback (127.x, ::1) client: Redis's connIsLocal(), which decides what a
   // "local" value of enable-protected-configs allows. Set at accept.
   bool is_local = false;
-  std::int64_t created_ms = 0;            // connection creation time
-  std::int64_t last_interaction_ms = 0;   // last command time (for idle)
-  std::string last_cmd;                   // last command name (lowercased)
-  bool is_monitor = false;                // client issued MONITOR
+  std::int64_t created_ms = 0;           // connection creation time
+  std::int64_t last_interaction_ms = 0;  // last command time (for idle)
+  std::string last_cmd;                  // last command name (lowercased)
+  bool is_monitor = false;               // client issued MONITOR
   // Set by the event loop before each command: earlier replies to this client are not sent yet
   // (Redis's clientHasPendingReplies(), which SCRIPT DEBUG checks).
   bool has_pending_replies = false;
@@ -122,7 +122,8 @@ struct SessionState {
   bool blocked_on_shutdown = false;
 };
 
-std::string handle_command(const std::vector<std::string>& args, SessionState& session, bool& should_close);
+std::string handle_command(const std::vector<std::string>& args, SessionState& session,
+                           bool& should_close);
 // Redis's command flags (kRedisCmd* in command_metadata.generated.hpp) of the command or
 // subcommand that `args` runs (also under a name given by rename-command), from the pinned Redis
 // command JSON; 0 for a name that runs no command.
@@ -154,14 +155,15 @@ int configured_max_clients();  // read live by the accept loop, so CONFIG SET ma
 // Raises the open-files soft limit so `max_clients` clients fit (Redis's adjustOpenFilesLimit())
 // and returns how many clients the limit allows, which may be fewer. Defined in server.cpp.
 int adjust_open_files_limit(int max_clients);
-std::int64_t proto_max_bulk_len();          // proto-max-bulk-len, for the RESP parser
-std::int64_t client_query_buffer_limit();   // client-query-buffer-limit
-int tcp_keepalive_seconds();                 // tcp-keepalive (0 = off), for new connections
-int replication_timeout_seconds();           // repl-timeout, also bounds replica ACK silence
+std::int64_t proto_max_bulk_len();         // proto-max-bulk-len, for the RESP parser
+std::int64_t client_query_buffer_limit();  // client-query-buffer-limit
+int tcp_keepalive_seconds();               // tcp-keepalive (0 = off), for new connections
+int replication_timeout_seconds();         // repl-timeout, also bounds replica ACK silence
 // ── Cluster configuration (wired from main.cpp at startup; startup-only, like Redis's
 // IMMUTABLE_CONFIG for cluster-enabled) ──
-void configure_cluster(bool enabled, const std::string& bind, int port, const std::string& announce_ip,
-                       const std::string& announce_port, const std::string& announce_bus_port);
+void configure_cluster(bool enabled, const std::string& bind, int port,
+                       const std::string& announce_ip, const std::string& announce_port,
+                       const std::string& announce_bus_port);
 // What this node tells other nodes and clients to reach it on. `announce_ip` empty falls back
 // to the bound address — a documented simplification of Redis's live-connection auto-detection
 // (see docs/decisions/p5-cluster-addressing-and-version-provenance.md); `announce_port`/`-bus-port`
@@ -186,15 +188,16 @@ std::string validate_command_renames(std::vector<std::string>& warnings);
 // Sets the log level from a Redis loglevel name (debug, verbose, notice, warning, nothing),
 // as reported by CONFIG GET loglevel.
 void configure_log_level(const std::string& name);
-bool protected_mode_enabled();   // read by the server accept loop
-bool requirepass_is_set();       // read by the server accept loop (protected-mode bypass)
-void configure_maxmemory(const std::string& spec);   // "100mb"/bytes; "" = unlimited
+bool protected_mode_enabled();  // read by the server accept loop
+bool requirepass_is_set();      // read by the server accept loop (protected-mode bypass)
+void configure_maxmemory(const std::string& spec);          // "100mb"/bytes; "" = unlimited
 void configure_maxmemory_policy(const std::string& spec);   // e.g. "allkeys-lru"; "" = noeviction
 void configure_maxmemory_samples(const std::string& spec);  // eviction sample size; "" = 5
-void init_replication_id();   // randomize the replication id at startup (call once in main)
-void functions_register_rdb_hooks();   // wire RDB save/load to the function-library registry (call once in main)
-void configure_timeout(const std::string& spec);   // idle-client timeout (seconds); "" = keep 0
-void configure_tcp_backlog(int backlog);            // listen(2) backlog, for CONFIG GET reporting
+void init_replication_id();           // randomize the replication id at startup (call once in main)
+void functions_register_rdb_hooks();  // wire RDB save/load to the function-library registry (call
+                                      // once in main)
+void configure_timeout(const std::string& spec);  // idle-client timeout (seconds); "" = keep 0
+void configure_tcp_backlog(int backlog);          // listen(2) backlog, for CONFIG GET reporting
 // Apply *-max-listpack-*/set-max-intset-entries thresholds from the checked config settings
 // (ServerConfig::raw, canonical names) — the upstream harness passes per-test overrides this way.
 void configure_encoding_limits(const std::unordered_map<std::string, std::string>& raw);
@@ -208,17 +211,22 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // ("" for none), for CONFIG REWRITE.
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
                                 const std::string& config_file);
-void script_set_repl_flags(int flags);              // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
-int client_timeout_seconds();                       // current idle timeout (0 = disabled)
-bool client_has_subscriptions(int fd);              // exempt pub/sub clients from idle reaping
+void script_set_repl_flags(int flags);  // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
+int client_timeout_seconds();           // current idle timeout (0 = disabled)
+bool client_has_subscriptions(int fd);  // exempt pub/sub clients from idle reaping
 
 // client-output-buffer-limit: per-class output buffer caps. hard=0 / soft=0 means no limit.
 enum CoblClass { kCoblNormal = 0, kCoblReplica = 1, kCoblPubsub = 2 };
-struct CoblLimit { std::int64_t hard; std::int64_t soft; int soft_seconds; };
-void configure_client_output_buffer_limit(const std::string& spec);  // "normal H S Sec slave ... pubsub ..."
-CoblLimit cobl_for(int cls);                          // limits for a CoblClass
-std::string client_output_buffer_limit_str();         // current config as a CONFIG GET string
-void configure_save(const std::string& spec);        // "sec changes [sec changes ...]"
+struct CoblLimit {
+  std::int64_t hard;
+  std::int64_t soft;
+  int soft_seconds;
+};
+void configure_client_output_buffer_limit(
+    const std::string& spec);                               // "normal H S Sec slave ... pubsub ..."
+CoblLimit cobl_for(int cls);                                // limits for a CoblClass
+std::string client_output_buffer_limit_str();               // current config as a CONFIG GET string
+void configure_save(const std::string& spec);               // "sec changes [sec changes ...]"
 void configure_repl_backlog_size(const std::string& spec);  // e.g. "256mb"
 void configure_notify_keyspace_events(const std::string& spec);  // e.g. "KEA"
 // Makes a master propagate the DEL and send the `expired` event of each key DataStore deletes
@@ -393,4 +401,4 @@ void pubsub_unsubscribe_all(int fd);
 // Publish a message; returns number of receivers.
 std::int64_t pubsub_publish(const std::string& channel, const std::string& message);
 
-} // namespace peadb
+}  // namespace peadb

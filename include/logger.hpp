@@ -27,4 +27,4 @@ void log_from_signal_handler(LogLevel level, const char* message);
 void log_before_fork();
 void log_in_forked_child();
 
-} // namespace peadb
+}  // namespace peadb

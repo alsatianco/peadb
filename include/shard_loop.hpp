@@ -40,7 +40,9 @@ class ShardLoop {
   // Block until this shard's event loop exits.
   void join();
 
-  int shard_id() const { return shard_id_; }
+  int shard_id() const {
+    return shard_id_;
+  }
 
  private:
   int shard_id_;

@@ -78,7 +78,7 @@ DIFFERENTIAL_COMMANDS: set[str] = _load_differential_commands()
 def extract_commands(cpp_path: Path) -> list[str]:
     """Extract command names from t.emplace("NAME", ...) calls ('-' for RESTORE-ASKING)."""
     text = cpp_path.read_text()
-    return sorted(set(re.findall(r't\.emplace\("([A-Z0-9_-]+)"', text)))
+    return sorted(set(re.findall(r't\s*\.\s*emplace\s*\(\s*"([A-Z0-9_-]+)"', text)))
 
 def test_invocations(tests_dir: Path) -> dict[str, set[str]]:
     """

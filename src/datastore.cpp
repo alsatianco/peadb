@@ -20,8 +20,8 @@ namespace peadb {
 
 namespace {
 // The loop of Redis's scanGenericCommand() over one Dict: Dict::scan() calls from `cursor` until
-// `count` elements have been looked at, count * 10 more buckets have been visited (so a sparse table
-// cannot make one call walk it all), or the scan is over. `visit` gets every element of every
+// `count` elements have been looked at, count * 10 more buckets have been visited (so a sparse
+// table cannot make one call walk it all), or the scan is over. `visit` gets every element of every
 // visited bucket, before any MATCH filter. Returns the next cursor (0 at the end).
 template <class D, class Fn>
 std::uint64_t scan_dict(const D& d, std::uint64_t cursor, std::int64_t count, Fn&& visit) {
@@ -41,12 +41,18 @@ std::uint64_t scan_dict(const D& d, std::uint64_t cursor, std::int64_t count, Fn
 // TYPE's name for a value type.
 const char* type_name(ValueType t) {
   switch (t) {
-    case ValueType::String: return "string";
-    case ValueType::Hash: return "hash";
-    case ValueType::List: return "list";
-    case ValueType::Set: return "set";
-    case ValueType::ZSet: return "zset";
-    case ValueType::Stream: return "stream";
+    case ValueType::String:
+      return "string";
+    case ValueType::Hash:
+      return "hash";
+    case ValueType::List:
+      return "list";
+    case ValueType::Set:
+      return "set";
+    case ValueType::ZSet:
+      return "zset";
+    case ValueType::Stream:
+      return "stream";
   }
   return "none";
 }
@@ -76,13 +82,17 @@ inline bool stream_id_parse_strict(const std::string& s, StreamID& out) {
   const auto dash = s.find('-');
   auto to_u64 = [](const std::string& t, std::uint64_t& v) -> bool {
     if (t.empty()) return false;
-    for (char c : t) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    for (char c : t)
+      if (!std::isdigit(static_cast<unsigned char>(c))) return false;
     errno = 0;
     char* end = nullptr;
     v = std::strtoull(t.c_str(), &end, 10);
     return errno != ERANGE && end == t.c_str() + t.size();
   };
-  if (dash == std::string::npos) { out.seq = 0; return to_u64(s, out.ms); }
+  if (dash == std::string::npos) {
+    out.seq = 0;
+    return to_u64(s, out.ms);
+  }
   return to_u64(s.substr(0, dash), out.ms) && to_u64(s.substr(dash + 1), out.seq);
 }
 // Parse an XRANGE/XREVRANGE bound into an INCLUSIVE StreamID: "-"/"+", optional "("
@@ -93,10 +103,19 @@ inline bool stream_id_parse_strict(const std::string& s, StreamID& out) {
 inline bool stream_id_parse_bound(const std::string& in, bool is_start, StreamID& out) {
   bool exclusive = false;
   std::string s = in;
-  if (!s.empty() && s[0] == '(') { exclusive = true; s = s.substr(1); }
+  if (!s.empty() && s[0] == '(') {
+    exclusive = true;
+    s = s.substr(1);
+  }
   if (!exclusive) {
-    if (s == "-") { out = {0, 0}; return true; }
-    if (s == "+") { out = {UINT64_MAX, UINT64_MAX}; return true; }
+    if (s == "-") {
+      out = {0, 0};
+      return true;
+    }
+    if (s == "+") {
+      out = {UINT64_MAX, UINT64_MAX};
+      return true;
+    }
   } else if (s == "-" || s == "+" || s.empty()) {
     return false;  // exclusive of a special/empty bound is invalid
   }
@@ -104,7 +123,8 @@ inline bool stream_id_parse_bound(const std::string& in, bool is_start, StreamID
   if (s.find('-') == std::string::npos) {
     std::uint64_t ms = 0;
     if (s.empty()) return false;
-    for (char c : s) if (!std::isdigit(static_cast<unsigned char>(c))) return false;
+    for (char c : s)
+      if (!std::isdigit(static_cast<unsigned char>(c))) return false;
     errno = 0;
     char* end = nullptr;
     ms = std::strtoull(s.c_str(), &end, 10);
@@ -153,7 +173,7 @@ bool stream_range_has_tombstones(const Entry::StreamT& st, const StreamID& start
   StreamID first{0, 0};
   stream_id_parse_strict(st.entries.front().first, first);
   if (stream_id_cmp(first, maxdel) > 0) return false;  // tombstone is before the first entry
-  return stream_id_cmp(start, maxdel) <= 0;             // start <= maxdel <= +inf
+  return stream_id_cmp(start, maxdel) <= 0;            // start <= maxdel <= +inf
 }
 
 // Estimate a group's logical read-counter for a given id, or kInvalidEntriesRead when it
@@ -194,7 +214,8 @@ std::optional<std::int64_t> stream_cg_lag(const Entry::StreamT& st, const Entry:
 }
 }  // namespace
 
-DataStore::DataStore() : current_db_(0), dbs_(16), hidden_expired_(16), replica_hidden_(16) {}
+DataStore::DataStore() : current_db_(0), dbs_(16), hidden_expired_(16), replica_hidden_(16) {
+}
 
 bool DataStore::select_db(int db_index) {
   if (db_index < 0 || db_index >= static_cast<int>(dbs_.size())) return false;
@@ -202,7 +223,9 @@ bool DataStore::select_db(int db_index) {
   return true;
 }
 
-int DataStore::current_db() const { return current_db_; }
+int DataStore::current_db() const {
+  return current_db_;
+}
 
 std::int64_t DataStore::now_ms() {
   if (time_frozen_) return frozen_time_ms_;
@@ -297,7 +320,10 @@ bool DataStore::expire_if_needed(DB& db, const std::string& key) {
 std::optional<std::string> DataStore::get(const std::string& key) {
   auto& db = dbs_[current_db_];
   auto it = db.find(key);
-  if (it == db.end()) { record_miss(); return std::nullopt; }
+  if (it == db.end()) {
+    record_miss();
+    return std::nullopt;
+  }
   if (logically_expired(it->second)) {
     remove_expired(db, it);
     record_miss();
@@ -546,7 +572,8 @@ bool DataStore::rename(const std::string& src, const std::string& dst, bool nx_o
 }
 
 bool DataStore::swapdb(int a, int b) {
-  if (a < 0 || b < 0 || a >= static_cast<int>(dbs_.size()) || b >= static_cast<int>(dbs_.size())) return false;
+  if (a < 0 || b < 0 || a >= static_cast<int>(dbs_.size()) || b >= static_cast<int>(dbs_.size()))
+    return false;
   if (a == b) return true;
   std::swap(dbs_[a], dbs_[b]);
   std::swap(hidden_expired_[a], hidden_expired_[b]);
@@ -572,7 +599,8 @@ std::int64_t DataStore::move_key(const std::string& key, int dst_db) {
   return 1;
 }
 
-std::int64_t DataStore::copy_key(const std::string& src, const std::string& dst, int db, bool replace) {
+std::int64_t DataStore::copy_key(const std::string& src, const std::string& dst, int db,
+                                 bool replace) {
   if (db < 0 || db >= static_cast<int>(dbs_.size())) return 0;
   auto& src_db = dbs_[current_db_];
   expire_if_needed(src_db, src);
@@ -587,7 +615,8 @@ std::int64_t DataStore::copy_key(const std::string& src, const std::string& dst,
   return 1;
 }
 
-std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok, std::string& err) {
+std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok,
+                               std::string& err) {
   ok = false;
   err.clear();
 
@@ -599,8 +628,7 @@ std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok
     const std::string& s = *val;
     char* end = nullptr;
     errno = 0;
-    if (s.empty() ||
-        (!std::isdigit(static_cast<unsigned char>(s.front())) && s.front() != '-') ||
+    if (s.empty() || (!std::isdigit(static_cast<unsigned char>(s.front())) && s.front() != '-') ||
         s.find('\0') != std::string::npos ||
         (base = std::strtoll(s.c_str(), &end, 10), end != s.c_str() + s.size()) ||
         errno == ERANGE) {
@@ -622,7 +650,8 @@ std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok
   return out;
 }
 
-std::string DataStore::incrbyfloat(const std::string& key, long double by, bool& ok, std::string& err) {
+std::string DataStore::incrbyfloat(const std::string& key, long double by, bool& ok,
+                                   std::string& err) {
   ok = false;
   err.clear();
 
@@ -656,7 +685,7 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
   if (s.find('.') != std::string::npos) {
     auto pos = s.find_last_not_of('0');
     if (pos != std::string::npos && s[pos] == '.') {
-      s = s.substr(0, pos); // Remove the trailing dot too
+      s = s.substr(0, pos);  // Remove the trailing dot too
     } else if (pos != std::string::npos) {
       s = s.substr(0, pos + 1);
     }
@@ -691,7 +720,8 @@ std::size_t DataStore::strlen(const std::string& key) {
   return v.has_value() ? v->size() : 0;
 }
 
-int DataStore::setbit(const std::string& key, std::uint64_t bit_offset, int bit, bool& ok, std::string& err) {
+int DataStore::setbit(const std::string& key, std::uint64_t bit_offset, int bit, bool& ok,
+                      std::string& err) {
   ok = false;
   err.clear();
   if (bit_offset > 0xffffffffULL) {
@@ -724,15 +754,18 @@ int DataStore::setbit(const std::string& key, std::uint64_t bit_offset, int bit,
   unsigned char c = static_cast<unsigned char>(s[byte_index]);
   const unsigned char mask = static_cast<unsigned char>(1u << (7u - bit_index));
   const int prev = (c & mask) ? 1 : 0;
-  if (bit == 1) c = static_cast<unsigned char>(c | mask);
-  else c = static_cast<unsigned char>(c & static_cast<unsigned char>(~mask));
+  if (bit == 1)
+    c = static_cast<unsigned char>(c | mask);
+  else
+    c = static_cast<unsigned char>(c & static_cast<unsigned char>(~mask));
   s[byte_index] = static_cast<char>(c);
   it->second.string_force_raw = true;
   ok = true;
   return prev;
 }
 
-int DataStore::getbit(const std::string& key, std::uint64_t bit_offset, bool& ok, std::string& err) {
+int DataStore::getbit(const std::string& key, std::uint64_t bit_offset, bool& ok,
+                      std::string& err) {
   ok = false;
   err.clear();
   if (bit_offset > 0xffffffffULL) {
@@ -766,7 +799,8 @@ int DataStore::getbit(const std::string& key, std::uint64_t bit_offset, bool& ok
   return (c & mask) ? 1 : 0;
 }
 
-std::size_t DataStore::setrange(const std::string& key, std::size_t offset, const std::string& value, bool& ok, std::string& err) {
+std::size_t DataStore::setrange(const std::string& key, std::size_t offset,
+                                const std::string& value, bool& ok, std::string& err) {
   ok = false;
   err.clear();
   constexpr std::size_t kMaxStringLen = 512ULL * 1024ULL * 1024ULL;
@@ -814,7 +848,8 @@ std::size_t DataStore::setrange(const std::string& key, std::size_t offset, cons
   return s.size();
 }
 
-std::string DataStore::getrange(const std::string& key, std::int64_t start, std::int64_t stop, bool& ok, std::string& err) {
+std::string DataStore::getrange(const std::string& key, std::int64_t start, std::int64_t stop,
+                                bool& ok, std::string& err) {
   ok = false;
   err.clear();
 
@@ -854,7 +889,9 @@ std::string DataStore::getrange(const std::string& key, std::int64_t start, std:
   return s.substr(from, n);
 }
 
-std::int64_t DataStore::hset(const std::string& key, const std::vector<std::pair<std::string, std::string>>& fields, bool& wrongtype) {
+std::int64_t DataStore::hset(const std::string& key,
+                             const std::vector<std::pair<std::string, std::string>>& fields,
+                             bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -878,7 +915,8 @@ std::int64_t DataStore::hset(const std::string& key, const std::vector<std::pair
   return added;
 }
 
-std::optional<std::string> DataStore::hget(const std::string& key, const std::string& field, bool& wrongtype) {
+std::optional<std::string> DataStore::hget(const std::string& key, const std::string& field,
+                                           bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -893,7 +931,8 @@ std::optional<std::string> DataStore::hget(const std::string& key, const std::st
   return fit->second;
 }
 
-std::int64_t DataStore::hdel(const std::string& key, const std::vector<std::string>& fields, bool& wrongtype) {
+std::int64_t DataStore::hdel(const std::string& key, const std::vector<std::string>& fields,
+                             bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -940,7 +979,8 @@ bool DataStore::hexists(const std::string& key, const std::string& field, bool& 
   return it->second.hash().find(field) != it->second.hash().end();
 }
 
-std::vector<std::pair<std::string, std::string>> DataStore::hgetall(const std::string& key, bool& wrongtype) {
+std::vector<std::pair<std::string, std::string>> DataStore::hgetall(const std::string& key,
+                                                                    bool& wrongtype) {
   wrongtype = false;
   std::vector<std::pair<std::string, std::string>> out;
   auto& db = dbs_[current_db_];
@@ -981,7 +1021,8 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, std::string>>> DataS
   return {next, out};
 }
 
-std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype) {
+std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::string>& values,
+                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -999,7 +1040,8 @@ std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::str
   return static_cast<std::int64_t>(it->second.list().size());
 }
 
-std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::string>& values, bool& wrongtype) {
+std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::string>& values,
+                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1064,7 +1106,8 @@ std::int64_t DataStore::llen(const std::string& key, bool& wrongtype) {
   return static_cast<std::int64_t>(it->second.list().size());
 }
 
-std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t start, std::int64_t stop, bool& wrongtype) {
+std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t start,
+                                           std::int64_t stop, bool& wrongtype) {
   wrongtype = false;
   std::vector<std::string> out;
   auto& db = dbs_[current_db_];
@@ -1085,7 +1128,8 @@ std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t 
   if (stop >= n) stop = n - 1;
   if (start > stop || start >= n) return out;
 
-  for (std::int64_t i = start; i <= stop; ++i) out.push_back(it->second.list()[static_cast<std::size_t>(i)]);
+  for (std::int64_t i = start; i <= stop; ++i)
+    out.push_back(it->second.list()[static_cast<std::size_t>(i)]);
   return out;
 }
 
@@ -1197,7 +1241,8 @@ bool DataStore::ltrim(const std::string& key, std::int64_t start, std::int64_t s
   return true;
 }
 
-std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::string>& members, bool& wrongtype) {
+std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::string>& members,
+                             bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1227,7 +1272,8 @@ std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::stri
         if (!std::isdigit(static_cast<unsigned char>(m[j]))) is_int = false;
       }
       if (is_int && m.size() > 19) is_int = false;  // beyond int64 digits
-      if (!is_int || e.set().size() > static_cast<std::size_t>(std::max<std::int64_t>(0, encoding_limits_.set_intset))) {
+      if (!is_int || e.set().size() > static_cast<std::size_t>(
+                                          std::max<std::int64_t>(0, encoding_limits_.set_intset))) {
         e.encoding_no_intset = true;
       }
     }
@@ -1235,7 +1281,8 @@ std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::stri
   return added;
 }
 
-std::int64_t DataStore::srem(const std::string& key, const std::vector<std::string>& members, bool& wrongtype) {
+std::int64_t DataStore::srem(const std::string& key, const std::vector<std::string>& members,
+                             bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1348,8 +1395,9 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::sscan(
   return {next, out};
 }
 
-DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, const std::string& member,
-                                          bool nx, bool xx, bool gt, bool lt, bool incr) {
+DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score,
+                                          const std::string& member, bool nx, bool xx, bool gt,
+                                          bool lt, bool incr) {
   ZAddResult r;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1385,7 +1433,7 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score, 
   }
 
   if (mit->second != new_score) {
-    entry.zord().erase({mit->second, member}); // remove old position
+    entry.zord().erase({mit->second, member});  // remove old position
     mit->second = new_score;
     entry.zord()[{new_score, member}] = true;  // insert at new position
     r.changed = true;
@@ -1423,8 +1471,9 @@ std::int64_t DataStore::zrem(const std::string& key, const std::vector<std::stri
   return removed;
 }
 
-std::vector<std::pair<std::string, double>> DataStore::zrange(
-    const std::string& key, std::int64_t start, std::int64_t stop, bool withscores, bool& wrongtype) {
+std::vector<std::pair<std::string, double>> DataStore::zrange(const std::string& key,
+                                                              std::int64_t start, std::int64_t stop,
+                                                              bool withscores, bool& wrongtype) {
   wrongtype = false;
   std::vector<std::pair<std::string, double>> out;
   auto& db = dbs_[current_db_];
@@ -1449,7 +1498,7 @@ std::vector<std::pair<std::string, double>> DataStore::zrange(
   auto oit = ordered.begin();
   std::advance(oit, start);
   for (std::int64_t i = start; i <= stop; ++i, ++oit)
-    out.push_back({oit->first.second, oit->first.first}); // {member, score}
+    out.push_back({oit->first.second, oit->first.first});  // {member, score}
   (void)withscores;
   return out;
 }
@@ -1471,7 +1520,8 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
   if (scans_whole(it->second)) {
     // A listpack keeps the members in score order, so Redis returns them that way.
     for (const auto& [score_member, _] : it->second.zord())
-      if (scan_match(pattern, score_member.second)) out.emplace_back(score_member.second, score_member.first);
+      if (scan_match(pattern, score_member.second))
+        out.emplace_back(score_member.second, score_member.first);
     return {0, out};
   }
   const std::uint64_t next = scan_dict(z, cursor, count, [&](const auto& ms) {
@@ -1480,8 +1530,9 @@ std::pair<std::uint64_t, std::vector<std::pair<std::string, double>>> DataStore:
   return {next, out};
 }
 
-std::vector<std::pair<std::string, double>> DataStore::zpop(
-    const std::string& key, std::size_t count, bool max, bool& wrongtype) {
+std::vector<std::pair<std::string, double>> DataStore::zpop(const std::string& key,
+                                                            std::size_t count, bool max,
+                                                            bool& wrongtype) {
   wrongtype = false;
   std::vector<std::pair<std::string, double>> out;
   auto& db = dbs_[current_db_];
@@ -1512,8 +1563,8 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(
 
 std::optional<std::string> DataStore::xadd(
     const std::string& key, const std::string& id,
-    const std::vector<std::pair<std::string, std::string>>& fields,
-    bool& wrongtype, std::string& err) {
+    const std::vector<std::pair<std::string, std::string>>& fields, bool& wrongtype,
+    std::string& err) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1527,8 +1578,9 @@ std::optional<std::string> DataStore::xadd(
 
   // Compute the ID against the current last-id BEFORE creating anything, so an invalid
   // ID never leaves an empty stream behind (Redis: XADD with a bad ID doesn't create).
-  const StreamID last = key_exists ? StreamID{it->second.stream_last_ms(), it->second.stream_last_seq()}
-                                   : StreamID{0, 0};
+  const StreamID last = key_exists
+                            ? StreamID{it->second.stream_last_ms(), it->second.stream_last_seq()}
+                            : StreamID{0, 0};
   // last_id persists after XDEL / on an emptied stream, so new IDs must still exceed it:
   // gate the monotonicity checks on "has this stream ever assigned an id" (last != 0-0),
   // not on the current entry count.
@@ -1561,10 +1613,22 @@ std::optional<std::string> DataStore::xadd(
     if (star != std::string::npos && star == id.size() - 2) {
       std::uint64_t ms = 0;
       const std::string mspart = id.substr(0, star);
-      if (mspart.empty()) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
-      for (char c : mspart) if (!std::isdigit(static_cast<unsigned char>(c))) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
-      errno = 0; char* e2 = nullptr; ms = std::strtoull(mspart.c_str(), &e2, 10);
-      if (errno == ERANGE || e2 != mspart.c_str() + mspart.size()) { err = "Invalid stream ID specified as stream command argument"; return std::nullopt; }
+      if (mspart.empty()) {
+        err = "Invalid stream ID specified as stream command argument";
+        return std::nullopt;
+      }
+      for (char c : mspart)
+        if (!std::isdigit(static_cast<unsigned char>(c))) {
+          err = "Invalid stream ID specified as stream command argument";
+          return std::nullopt;
+        }
+      errno = 0;
+      char* e2 = nullptr;
+      ms = std::strtoull(mspart.c_str(), &e2, 10);
+      if (errno == ERANGE || e2 != mspart.c_str() + mspart.size()) {
+        err = "Invalid stream ID specified as stream command argument";
+        return std::nullopt;
+      }
       if (have_last && ms < last.ms) {
         err = "The ID specified in XADD is equal or smaller than the target stream top item";
         return std::nullopt;
@@ -1621,7 +1685,10 @@ bool DataStore::stream_info(const std::string& key, StreamInfo& out, bool& wrong
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return false;
+  }
   const auto& st = it->second.stream();
   out.length = static_cast<std::int64_t>(st.entries.size());
   out.last_id = stream_id_str({st.last_ms, st.last_seq});
@@ -1648,9 +1715,9 @@ std::int64_t DataStore::xlen(const std::string& key, bool& wrongtype) {
   return static_cast<std::int64_t>(it->second.stream_entries().size());
 }
 
-std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xrange(
-    const std::string& key, const std::string& start, const std::string& stop, bool rev, bool& wrongtype,
-    bool* invalid_id) {
+std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>
+DataStore::xrange(const std::string& key, const std::string& start, const std::string& stop,
+                  bool rev, bool& wrongtype, bool* invalid_id) {
   wrongtype = false;
   if (invalid_id) *invalid_id = false;
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
@@ -1680,9 +1747,11 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   };
 
   if (!rev) {
-    for (const auto& e : it->second.stream_entries()) if (in_range(e.first)) out.push_back(e);
+    for (const auto& e : it->second.stream_entries())
+      if (in_range(e.first)) out.push_back(e);
   } else {
-    for (auto rit = it->second.stream_entries().rbegin(); rit != it->second.stream_entries().rend(); ++rit) {
+    for (auto rit = it->second.stream_entries().rbegin(); rit != it->second.stream_entries().rend();
+         ++rit) {
       if (in_range(rit->first)) out.push_back(*rit);
     }
   }
@@ -1708,11 +1777,11 @@ bool stream_id_gt(const std::string& a, const std::string& b) {
   if (am != bm) return am > bm;
   return as > bs;
 }
-} // namespace
+}  // namespace
 
-bool DataStore::xgroup_create(const std::string& key, const std::string& group, const std::string& start_id,
-                              bool mkstream, bool& wrongtype, std::string& err,
-                              const std::int64_t* entries_read) {
+bool DataStore::xgroup_create(const std::string& key, const std::string& group,
+                              const std::string& start_id, bool mkstream, bool& wrongtype,
+                              std::string& err, const std::int64_t* entries_read) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1720,7 +1789,9 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group, 
   auto it = db.find(key);
   if (it == db.end()) {
     if (!mkstream) {
-      err = "The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to use the MKSTREAM option to create an empty stream automatically.";
+      err =
+          "The XGROUP subcommand requires the key to exist. Note that for CREATE you may want to "
+          "use the MKSTREAM option to create an empty stream automatically.";
       return false;
     }
     Entry e;
@@ -1755,8 +1826,9 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group, 
   return true;
 }
 
-bool DataStore::xgroup_setid(const std::string& key, const std::string& group, const std::string& id,
-                             bool& wrongtype, std::string& err, const std::int64_t* entries_read) {
+bool DataStore::xgroup_setid(const std::string& key, const std::string& group,
+                             const std::string& id, bool& wrongtype, std::string& err,
+                             const std::int64_t* entries_read) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1793,13 +1865,20 @@ bool DataStore::xgroup_setid(const std::string& key, const std::string& group, c
   return true;
 }
 
-std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> DataStore::xreadgroup(
-    const std::string& group, const std::string& consumer, const std::vector<std::pair<std::string, std::string>>& streams,
-    std::size_t count, bool noack, bool& wrongtype, std::string& err, bool* consumer_created) {
+std::vector<std::pair<
+    std::string,
+    std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>>
+DataStore::xreadgroup(const std::string& group, const std::string& consumer,
+                      const std::vector<std::pair<std::string, std::string>>& streams,
+                      std::size_t count, bool noack, bool& wrongtype, std::string& err,
+                      bool* consumer_created) {
   wrongtype = false;
   err.clear();
   if (consumer_created) *consumer_created = false;
-  std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>> out;
+  std::vector<std::pair<
+      std::string,
+      std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>>>
+      out;
   auto& db = dbs_[current_db_];
 
   for (const auto& [key, idreq] : streams) {
@@ -1807,7 +1886,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
     auto it = db.find(key);
     if (it == db.end()) {
       // Redis reports NOGROUP for a missing key too (the group can't exist).
-      err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "' in XREADGROUP with GROUP option";
+      err = "NOGROUP No such key '" + key + "' or consumer group '" + group +
+            "' in XREADGROUP with GROUP option";
       return {};
     }
     if (it->second.type() != ValueType::Stream) {
@@ -1816,7 +1896,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
     }
     auto git = it->second.stream_groups().find(group);
     if (git == it->second.stream_groups().end()) {
-      err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "' in XREADGROUP with GROUP option";
+      err = "NOGROUP No such key '" + key + "' or consumer group '" + group +
+            "' in XREADGROUP with GROUP option";
       return {};
     }
     auto& g = git->second;
@@ -1828,7 +1909,9 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
       g.consumers[consumer].seen_time = now_ms();
       if (consumer_created && is_new) *consumer_created = true;
     }
-    auto mark_active = [&]() { g.consumers[consumer].active_time = now_ms(); };
+    auto mark_active = [&]() {
+      g.consumers[consumer].active_time = now_ms();
+    };
 
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> rows;
     if (idreq == ">") {
@@ -1844,7 +1927,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
         }
         // Advance the read counter: increment when it's valid and no tombstone lies ahead,
         // otherwise recover it via the estimate (Redis streamReplyWithRange group logic).
-        StreamID eid; stream_id_parse_strict(e.first, eid);
+        StreamID eid;
+        stream_id_parse_strict(e.first, eid);
         auto& stt = it->second.stream();
         if (g.entries_read != -1 && !stream_range_has_tombstones(stt, eid)) {
           ++g.entries_read;
@@ -1854,7 +1938,10 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
         g.last_delivered_id = e.first;
         if (count && rows.size() >= count) break;
       }
-      if (!rows.empty()) { mark_active(); out.push_back({key, std::move(rows)}); }
+      if (!rows.empty()) {
+        mark_active();
+        out.push_back({key, std::move(rows)});
+      }
     } else {
       // History read: re-emit this consumer's own pending entries with id STRICTLY GREATER
       // than the given id (Redis increments the start id, treating it as already-delivered).
@@ -1864,10 +1951,13 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::vecto
       for (const auto& [pid, owner] : g.pending_to_consumer) {
         if (owner != consumer) continue;
         StreamID pidk;
-        if (stream_id_parse_strict(pid, pidk) && stream_id_cmp(pidk, start) > 0) pel_ids.push_back(pid);
+        if (stream_id_parse_strict(pid, pidk) && stream_id_cmp(pidk, start) > 0)
+          pel_ids.push_back(pid);
       }
       std::sort(pel_ids.begin(), pel_ids.end(), [](const std::string& a, const std::string& b) {
-        StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+        StreamID ia, ib;
+        stream_id_parse_strict(a, ia);
+        stream_id_parse_strict(b, ib);
         return stream_id_cmp(ia, ib) < 0;
       });
       const auto& entries = it->second.stream_entries();
@@ -1904,8 +1994,8 @@ bool DataStore::stream_group_ids(const std::string& key, const std::string& grou
   return true;
 }
 
-std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::string>& ids, bool& wrongtype,
-                             bool is_trim) {
+std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::string>& ids,
+                             bool& wrongtype, bool is_trim) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
@@ -1922,11 +2012,11 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
     // ms matches the stored "ms-seq" entry.
     StreamID want;
     if (!stream_id_parse_strict(id, want)) continue;
-    auto vit = std::find_if(it->second.stream_entries().begin(), it->second.stream_entries().end(),
-                            [&](const auto& e) {
-                              StreamID eid;
-                              return stream_id_parse_strict(e.first, eid) && stream_id_cmp(eid, want) == 0;
-                            });
+    auto vit = std::find_if(
+        it->second.stream_entries().begin(), it->second.stream_entries().end(), [&](const auto& e) {
+          StreamID eid;
+          return stream_id_parse_strict(e.first, eid) && stream_id_cmp(eid, want) == 0;
+        });
     if (vit == it->second.stream_entries().end()) continue;
     const std::string canon_id = vit->first;
     // Track the highest deleted id (XINFO max-deleted-entry-id) — only for explicit XDEL;
@@ -1944,8 +2034,9 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
   return removed;
 }
 
-std::int64_t DataStore::xack(const std::string& key, const std::string& group, const std::vector<std::string>& ids,
-                             bool& wrongtype, std::string& err) {
+std::int64_t DataStore::xack(const std::string& key, const std::string& group,
+                             const std::vector<std::string>& ids, bool& wrongtype,
+                             std::string& err) {
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
@@ -1983,16 +2074,20 @@ std::int64_t DataStore::xack(const std::string& key, const std::string& group, c
   return acked;
 }
 
-std::vector<std::string> DataStore::xpending_summary(const std::string& key, const std::string& group,
-                                                     std::vector<std::pair<std::string, std::int64_t>>& consumers,
-                                                     bool& wrongtype, std::string& err) {
+std::vector<std::string> DataStore::xpending_summary(
+    const std::string& key, const std::string& group,
+    std::vector<std::pair<std::string, std::int64_t>>& consumers, bool& wrongtype,
+    std::string& err) {
   wrongtype = false;
   err.clear();
   consumers.clear();
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return {}; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return {};
+  }
   if (it->second.type() != ValueType::Stream) {
     wrongtype = true;
     return {};
@@ -2008,8 +2103,10 @@ std::vector<std::string> DataStore::xpending_summary(const std::string& key, con
   bool first = true;
   std::map<std::string, std::int64_t> per_consumer;  // ordered for stable output
   for (const auto& kv : g.pending_to_consumer) {
-    if (first) { min_id = max_id = kv.first; first = false; }
-    else {
+    if (first) {
+      min_id = max_id = kv.first;
+      first = false;
+    } else {
       if (stream_id_gt(min_id, kv.first)) min_id = kv.first;
       if (stream_id_gt(kv.first, max_id)) max_id = kv.first;
     }
@@ -2020,16 +2117,23 @@ std::vector<std::string> DataStore::xpending_summary(const std::string& key, con
 }
 
 std::vector<DataStore::PendingItem> DataStore::xpending_extended(
-    const std::string& key, const std::string& group, const std::string& start, const std::string& end,
-    std::int64_t count, const std::string* consumer, std::int64_t min_idle_ms, bool& wrongtype, std::string& err) {
+    const std::string& key, const std::string& group, const std::string& start,
+    const std::string& end, std::int64_t count, const std::string* consumer,
+    std::int64_t min_idle_ms, bool& wrongtype, std::string& err) {
   wrongtype = false;
   err.clear();
   std::vector<PendingItem> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return out;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return out;
+  }
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) {
     err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
@@ -2037,8 +2141,14 @@ std::vector<DataStore::PendingItem> DataStore::xpending_extended(
   }
   const auto& g = git->second;
   StreamID lo, hi;
-  if (!stream_id_parse_bound(start, /*is_start=*/true, lo)) { err = "Invalid stream ID specified as stream command argument"; return out; }
-  if (!stream_id_parse_bound(end, /*is_start=*/false, hi)) { err = "Invalid stream ID specified as stream command argument"; return out; }
+  if (!stream_id_parse_bound(start, /*is_start=*/true, lo)) {
+    err = "Invalid stream ID specified as stream command argument";
+    return out;
+  }
+  if (!stream_id_parse_bound(end, /*is_start=*/false, hi)) {
+    err = "Invalid stream ID specified as stream command argument";
+    return out;
+  }
   const auto now = now_ms();
   for (const auto& [pid, owner] : g.pending_to_consumer) {
     if (consumer && owner != *consumer) continue;
@@ -2053,10 +2163,13 @@ std::vector<DataStore::PendingItem> DataStore::xpending_extended(
     out.push_back({pid, owner, idle, dc != g.pending_delivery_count.end() ? dc->second : 1});
   }
   std::sort(out.begin(), out.end(), [](const PendingItem& a, const PendingItem& b) {
-    StreamID ia, ib; stream_id_parse_strict(a.id, ia); stream_id_parse_strict(b.id, ib);
+    StreamID ia, ib;
+    stream_id_parse_strict(a.id, ia);
+    stream_id_parse_strict(b.id, ib);
     return stream_id_cmp(ia, ib) < 0;
   });
-  if (count >= 0 && static_cast<std::int64_t>(out.size()) > count) out.resize(static_cast<std::size_t>(count));
+  if (count >= 0 && static_cast<std::int64_t>(out.size()) > count)
+    out.resize(static_cast<std::size_t>(count));
   return out;
 }
 
@@ -2066,21 +2179,33 @@ int DataStore::xgroup_destroy(const std::string& key, const std::string& group, 
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return 0;
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return 0;
+  }
   return it->second.stream_groups().erase(group) ? 1 : 0;
 }
 
-int DataStore::xgroup_createconsumer(const std::string& key, const std::string& group, const std::string& consumer,
-                                     bool& wrongtype, std::string& err) {
-  wrongtype = false; err.clear();
+int DataStore::xgroup_createconsumer(const std::string& key, const std::string& group,
+                                     const std::string& consumer, bool& wrongtype,
+                                     std::string& err) {
+  wrongtype = false;
+  err.clear();
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return 0;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return 0;
+  }
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) {
-    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0;
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return 0;
   }
   if (git->second.consumers.count(consumer)) return 0;  // already exists
   auto& c = git->second.consumers[consumer];
@@ -2089,18 +2214,27 @@ int DataStore::xgroup_createconsumer(const std::string& key, const std::string& 
   return 1;
 }
 
-std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::string& group, const std::string& consumer,
-                                           bool& wrongtype, std::string& err, bool* existed) {
-  wrongtype = false; err.clear();
+std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::string& group,
+                                           const std::string& consumer, bool& wrongtype,
+                                           std::string& err, bool* existed) {
+  wrongtype = false;
+  err.clear();
   if (existed) *existed = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return 0; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return 0;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return 0;
+  }
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) {
-    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return 0;
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return 0;
   }
   auto& g = git->second;
   if (existed) *existed = g.consumers.count(consumer) > 0;
@@ -2120,14 +2254,22 @@ std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::st
   return removed;  // number of pending entries owned by the deleted consumer
 }
 
-std::vector<DataStore::GroupInfo> DataStore::xinfo_groups(const std::string& key, bool& wrongtype, std::string& err) {
-  wrongtype = false; err.clear();
+std::vector<DataStore::GroupInfo> DataStore::xinfo_groups(const std::string& key, bool& wrongtype,
+                                                          std::string& err) {
+  wrongtype = false;
+  err.clear();
   std::vector<GroupInfo> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "no such key"; return out; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  if (it == db.end()) {
+    err = "no such key";
+    return out;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return out;
+  }
   const auto& st = it->second.stream();
   std::vector<std::string> gnames;
   for (const auto& [name, _] : st.groups) gnames.push_back(name);
@@ -2152,24 +2294,36 @@ std::vector<DataStore::GroupInfo> DataStore::xinfo_groups(const std::string& key
   return out;
 }
 
-std::vector<DataStore::ConsumerInfo> DataStore::xinfo_consumers(const std::string& key, const std::string& group,
-                                                               bool& wrongtype, std::string& err) {
-  wrongtype = false; err.clear();
+std::vector<DataStore::ConsumerInfo> DataStore::xinfo_consumers(const std::string& key,
+                                                                const std::string& group,
+                                                                bool& wrongtype, std::string& err) {
+  wrongtype = false;
+  err.clear();
   std::vector<ConsumerInfo> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "no such key"; return out; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  if (it == db.end()) {
+    err = "no such key";
+    return out;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return out;
+  }
   auto git = it->second.stream_groups().find(group);
   if (git == it->second.stream_groups().end()) {
-    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out;
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return out;
   }
   const auto& g = git->second;
   // Union of registered consumers and PEL owners, name-ordered (Redis iterates a sorted rax).
   std::map<std::string, Entry::StreamConsumer> all(g.consumers.begin(), g.consumers.end());
   std::map<std::string, std::size_t> pend;
-  for (const auto& [_, owner] : g.pending_to_consumer) { pend[owner]++; all.emplace(owner, Entry::StreamConsumer{}); }
+  for (const auto& [_, owner] : g.pending_to_consumer) {
+    pend[owner]++;
+    all.emplace(owner, Entry::StreamConsumer{});
+  }
   const auto now = now_ms();
   for (const auto& [name, c] : all) {
     ConsumerInfo ci;
@@ -2182,13 +2336,17 @@ std::vector<DataStore::ConsumerInfo> DataStore::xinfo_consumers(const std::strin
   return out;
 }
 
-bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, StreamFullInfo& out, bool& wrongtype) {
+bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, StreamFullInfo& out,
+                                  bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
   if (it == db.end()) return false;
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return false;
+  }
   const auto& st = it->second.stream();
   out.length = static_cast<std::int64_t>(st.entries.size());
   out.last_id = stream_id_str({st.last_ms, st.last_seq});
@@ -2197,7 +2355,8 @@ bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, Str
   out.entries_added = static_cast<std::int64_t>(st.entries_added);
   out.entries.clear();
   const std::size_t lim = count == 0 ? st.entries.size() : count;
-  for (std::size_t i = 0; i < st.entries.size() && i < lim; ++i) out.entries.push_back(st.entries[i]);
+  for (std::size_t i = 0; i < st.entries.size() && i < lim; ++i)
+    out.entries.push_back(st.entries[i]);
   out.groups.clear();
   std::vector<std::string> gnames;
   for (const auto& [gname, _] : st.groups) gnames.push_back(gname);
@@ -2216,18 +2375,27 @@ bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, Str
     std::vector<std::string> ids;
     for (const auto& [pid, _] : g.pending_to_consumer) ids.push_back(pid);
     std::sort(ids.begin(), ids.end(), [](const std::string& a, const std::string& b) {
-      StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+      StreamID ia, ib;
+      stream_id_parse_strict(a, ia);
+      stream_id_parse_strict(b, ib);
       return stream_id_cmp(ia, ib) < 0;
     });
-    auto dms = [&](const std::string& id) { auto i = g.pending_delivery_ms.find(id); return i != g.pending_delivery_ms.end() ? i->second : 0; };
-    auto dcnt = [&](const std::string& id) { auto i = g.pending_delivery_count.find(id); return i != g.pending_delivery_count.end() ? i->second : 1; };
+    auto dms = [&](const std::string& id) {
+      auto i = g.pending_delivery_ms.find(id);
+      return i != g.pending_delivery_ms.end() ? i->second : 0;
+    };
+    auto dcnt = [&](const std::string& id) {
+      auto i = g.pending_delivery_count.find(id);
+      return i != g.pending_delivery_count.end() ? i->second : 1;
+    };
     for (const auto& id : ids) {
       auto owner = g.pending_to_consumer.at(id);
       fg.pending.push_back({id, owner, dms(id), dcnt(id)});
     }
     // Consumers (name-ordered), each with its own id-ordered PEL.
     std::map<std::string, Entry::StreamConsumer> all(g.consumers.begin(), g.consumers.end());
-    for (const auto& [_, owner] : g.pending_to_consumer) all.emplace(owner, Entry::StreamConsumer{});
+    for (const auto& [_, owner] : g.pending_to_consumer)
+      all.emplace(owner, Entry::StreamConsumer{});
     const auto now = now_ms();
     for (const auto& [cname, c] : all) {
       StreamFullConsumer fc;
@@ -2235,9 +2403,12 @@ bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, Str
       fc.seen_time = c.seen_time ? c.seen_time : now;
       fc.active_time = c.active_time;
       std::vector<std::string> cids;
-      for (const auto& [pid, own] : g.pending_to_consumer) if (own == cname) cids.push_back(pid);
+      for (const auto& [pid, own] : g.pending_to_consumer)
+        if (own == cname) cids.push_back(pid);
       std::sort(cids.begin(), cids.end(), [](const std::string& a, const std::string& b) {
-        StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+        StreamID ia, ib;
+        stream_id_parse_strict(a, ia);
+        stream_id_parse_strict(b, ib);
         return stream_id_cmp(ia, ib) < 0;
       });
       for (const auto& id : cids) fc.pending.push_back({id, dms(id), dcnt(id)});
@@ -2302,9 +2473,11 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   }
 }
 
-bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wrongtype, std::string& err,
-                       const std::string* entries_added, const std::string* max_deleted_id) {
-  wrongtype = false; err.clear();
+bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wrongtype,
+                       std::string& err, const std::string* entries_added,
+                       const std::string* max_deleted_id) {
+  wrongtype = false;
+  err.clear();
   StreamID nid;
   if (!stream_id_parse_strict(id, nid)) {
     err = "ERR Invalid stream ID specified as stream command argument";
@@ -2326,8 +2499,14 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "ERR no such key"; return false; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return false; }
+  if (it == db.end()) {
+    err = "ERR no such key";
+    return false;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return false;
+  }
   auto& st = it->second.stream();
   // The new last-id cannot regress below the stream's recorded max-deleted tombstone.
   StreamID cur_maxdel{0, 0};
@@ -2357,26 +2536,38 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
   st.last_ms = nid.ms;
   st.last_seq = nid.seq;
   if (entries_added) {
-    errno = 0; st.entries_added = std::strtoull(entries_added->c_str(), nullptr, 10);
+    errno = 0;
+    st.entries_added = std::strtoull(entries_added->c_str(), nullptr, 10);
   }
   if (max_deleted_id) st.max_deleted_id = stream_id_str(maxdel);
   return true;
 }
 
-std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> DataStore::xclaim(
-    const std::string& key, const std::string& group, const std::string& consumer,
-    std::int64_t min_idle_ms, const std::vector<std::string>& ids_in, bool justid, bool force,
-    bool& wrongtype, std::string& err, const std::string* last_id, bool* consumer_created) {
-  wrongtype = false; err.clear();
+std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>>
+DataStore::xclaim(const std::string& key, const std::string& group, const std::string& consumer,
+                  std::int64_t min_idle_ms, const std::vector<std::string>& ids_in, bool justid,
+                  bool force, bool& wrongtype, std::string& err, const std::string* last_id,
+                  bool* consumer_created) {
+  wrongtype = false;
+  err.clear();
   if (consumer_created) *consumer_created = false;
   std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> out;
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return out; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return out;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return out;
+  }
   auto git = it->second.stream_groups().find(group);
-  if (git == it->second.stream_groups().end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return out; }
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return out;
+  }
   auto& g = git->second;
   // XCLAIM creates the target consumer as a side effect (needed so a replayed XCLAIM restores
   // the consumer even when the read that produced it was propagated as bare XCLAIMs).
@@ -2405,11 +2596,13 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
     auto pit = g.pending_to_consumer.find(id);
     const bool in_pel = pit != g.pending_to_consumer.end();
     if (!in_pel && !force) continue;
-    auto eit = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+    auto eit =
+        std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
     if (eit == entries.end()) {  // entry was deleted from the stream — drop the dangling PEL entry
       if (in_pel) {
         auto cit = g.pending_per_consumer.find(pit->second);
-        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
+          g.pending_per_consumer.erase(cit);
         g.pending_to_consumer.erase(pit);
         g.pending_delivery_ms.erase(id);
         g.pending_delivery_count.erase(id);
@@ -2422,7 +2615,8 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
       if (idle < min_idle_ms) continue;
       if (pit->second != consumer) {
         auto cit = g.pending_per_consumer.find(pit->second);
-        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+        if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
+          g.pending_per_consumer.erase(cit);
         pit->second = consumer;
         g.pending_per_consumer[consumer] += 1;
       }
@@ -2440,27 +2634,41 @@ std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::strin
   return out;
 }
 
-DataStore::AutoClaimResult DataStore::xautoclaim(
-    const std::string& key, const std::string& group, const std::string& consumer,
-    std::int64_t min_idle_ms, const std::string& start, std::int64_t count, bool justid,
-    bool& wrongtype, std::string& err, bool* consumer_created) {
-  wrongtype = false; err.clear();
+DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const std::string& group,
+                                                 const std::string& consumer,
+                                                 std::int64_t min_idle_ms, const std::string& start,
+                                                 std::int64_t count, bool justid, bool& wrongtype,
+                                                 std::string& err, bool* consumer_created) {
+  wrongtype = false;
+  err.clear();
   if (consumer_created) *consumer_created = false;
   AutoClaimResult res;
   res.next_cursor = "0-0";
   auto& db = dbs_[current_db_];
   expire_if_needed(db, key);
   auto it = db.find(key);
-  if (it == db.end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
-  if (it->second.type() != ValueType::Stream) { wrongtype = true; return res; }
+  if (it == db.end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return res;
+  }
+  if (it->second.type() != ValueType::Stream) {
+    wrongtype = true;
+    return res;
+  }
   auto git = it->second.stream_groups().find(group);
-  if (git == it->second.stream_groups().end()) { err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'"; return res; }
+  if (git == it->second.stream_groups().end()) {
+    err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
+    return res;
+  }
   auto& g = git->second;
   const std::int64_t now = now_ms();
   if (count <= 0) count = 100;
   // Ensure the target consumer exists (XAUTOCLAIM creates it as a side effect).
   if (consumer_created && g.consumers.find(consumer) == g.consumers.end()) *consumer_created = true;
-  { auto& c = g.consumers[consumer]; c.seen_time = now; }
+  {
+    auto& c = g.consumers[consumer];
+    c.seen_time = now;
+  }
   StreamID startk{0, 0};
   stream_id_parse_strict(start == "-" ? "0-0" : start, startk);
   // Iterate the group PEL (id-ordered) from the start cursor — this is what lets XAUTOCLAIM
@@ -2471,18 +2679,22 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
     if (stream_id_parse_strict(pid, pk) && stream_id_cmp(pk, startk) >= 0) pel.push_back(pid);
   }
   std::sort(pel.begin(), pel.end(), [](const std::string& a, const std::string& b) {
-    StreamID ia, ib; stream_id_parse_strict(a, ia); stream_id_parse_strict(b, ib);
+    StreamID ia, ib;
+    stream_id_parse_strict(a, ia);
+    stream_id_parse_strict(b, ib);
     return stream_id_cmp(ia, ib) < 0;
   });
   const auto& entries = it->second.stream_entries();
   auto exists = [&](const std::string& id) {
-    return std::any_of(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+    return std::any_of(entries.begin(), entries.end(),
+                       [&](const auto& e) { return e.first == id; });
   };
   auto remove_pel = [&](const std::string& id) {
     auto pit = g.pending_to_consumer.find(id);
     if (pit != g.pending_to_consumer.end()) {
       auto cit = g.pending_per_consumer.find(pit->second);
-      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
+        g.pending_per_consumer.erase(cit);
       g.pending_to_consumer.erase(pit);
     }
     g.pending_delivery_ms.erase(id);
@@ -2495,7 +2707,7 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
   for (; i < pel.size() && attempts > 0 && remaining > 0; --attempts) {
     const std::string id = pel[i];
     ++i;
-    if (!exists(id)) {           // entry was XDELed/trimmed away → surface as deleted, drop NACK
+    if (!exists(id)) {  // entry was XDELed/trimmed away → surface as deleted, drop NACK
       remove_pel(id);
       res.deleted.push_back(id);
       --remaining;
@@ -2507,13 +2719,15 @@ DataStore::AutoClaimResult DataStore::xautoclaim(
     auto pit = g.pending_to_consumer.find(id);
     if (pit != g.pending_to_consumer.end() && pit->second != consumer) {
       auto cit = g.pending_per_consumer.find(pit->second);
-      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0) g.pending_per_consumer.erase(cit);
+      if (cit != g.pending_per_consumer.end() && cit->second > 0 && --cit->second == 0)
+        g.pending_per_consumer.erase(cit);
       pit->second = consumer;
       g.pending_per_consumer[consumer] += 1;
     }
     g.pending_delivery_ms[id] = now;
     if (!justid) g.pending_delivery_count[id] += 1;
-    auto eit = std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
+    auto eit =
+        std::find_if(entries.begin(), entries.end(), [&](const auto& e) { return e.first == id; });
     res.claimed.push_back(*eit);
     got_data = true;
     --remaining;
@@ -2534,10 +2748,12 @@ bool DataStore::save_snapshot_file(const std::filesystem::path& path, std::strin
   out << "PEADB-SNAPSHOT-V1\n";
   for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
     for (const auto& [key, e] : dbs_[dbi]) {
-      const auto ttl = e.expire_at_ms.has_value() ? std::to_string(*e.expire_at_ms) : std::string("-1");
+      const auto ttl =
+          e.expire_at_ms.has_value() ? std::to_string(*e.expire_at_ms) : std::string("-1");
       switch (e.type()) {
         case ValueType::String:
-          out << "S " << dbi << " " << ttl << " " << std::quoted(key) << " " << std::quoted(e.str()) << "\n";
+          out << "S " << dbi << " " << ttl << " " << std::quoted(key) << " " << std::quoted(e.str())
+              << "\n";
           break;
         case ValueType::Hash:
           out << "H " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.hash().size();
@@ -2560,8 +2776,9 @@ bool DataStore::save_snapshot_file(const std::filesystem::path& path, std::strin
           out << "\n";
           break;
         case ValueType::Stream:
-          out << "X " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.stream_entries().size() << " "
-              << e.stream_last_ms() << " " << e.stream_last_seq();
+          out << "X " << dbi << " " << ttl << " " << std::quoted(key) << " "
+              << e.stream_entries().size() << " " << e.stream_last_ms() << " "
+              << e.stream_last_seq();
           for (const auto& [id, fields] : e.stream_entries()) {
             out << " " << std::quoted(id) << " " << fields.size();
             for (const auto& [f, v] : fields) out << " " << std::quoted(f) << " " << std::quoted(v);
@@ -2608,15 +2825,27 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
 
     if (typ == "S") {
       std::string value;
-      if (!(iss >> std::quoted(value))) { err = "malformed string"; current_db_ = prev_db; return false; }
+      if (!(iss >> std::quoted(value))) {
+        err = "malformed string";
+        current_db_ = prev_db;
+        return false;
+      }
       set(key, value, false, false, ttl, false);
     } else if (typ == "H") {
       std::size_t n = 0;
-      if (!(iss >> n)) { err = "malformed hash"; current_db_ = prev_db; return false; }
+      if (!(iss >> n)) {
+        err = "malformed hash";
+        current_db_ = prev_db;
+        return false;
+      }
       std::vector<std::pair<std::string, std::string>> fields;
       for (std::size_t i = 0; i < n; ++i) {
         std::string f, v;
-        if (!(iss >> std::quoted(f) >> std::quoted(v))) { err = "malformed hash field"; current_db_ = prev_db; return false; }
+        if (!(iss >> std::quoted(f) >> std::quoted(v))) {
+          err = "malformed hash field";
+          current_db_ = prev_db;
+          return false;
+        }
         fields.push_back({f, v});
       }
       bool wrong = false;
@@ -2624,11 +2853,19 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
       if (ttl.has_value()) expire(key, *ttl);
     } else if (typ == "L") {
       std::size_t n = 0;
-      if (!(iss >> n)) { err = "malformed list"; current_db_ = prev_db; return false; }
+      if (!(iss >> n)) {
+        err = "malformed list";
+        current_db_ = prev_db;
+        return false;
+      }
       std::vector<std::string> values;
       for (std::size_t i = 0; i < n; ++i) {
         std::string v;
-        if (!(iss >> std::quoted(v))) { err = "malformed list value"; current_db_ = prev_db; return false; }
+        if (!(iss >> std::quoted(v))) {
+          err = "malformed list value";
+          current_db_ = prev_db;
+          return false;
+        }
         values.push_back(v);
       }
       bool wrong = false;
@@ -2636,11 +2873,19 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
       if (ttl.has_value()) expire(key, *ttl);
     } else if (typ == "T") {
       std::size_t n = 0;
-      if (!(iss >> n)) { err = "malformed set"; current_db_ = prev_db; return false; }
+      if (!(iss >> n)) {
+        err = "malformed set";
+        current_db_ = prev_db;
+        return false;
+      }
       std::vector<std::string> members;
       for (std::size_t i = 0; i < n; ++i) {
         std::string m;
-        if (!(iss >> std::quoted(m))) { err = "malformed set member"; current_db_ = prev_db; return false; }
+        if (!(iss >> std::quoted(m))) {
+          err = "malformed set member";
+          current_db_ = prev_db;
+          return false;
+        }
         members.push_back(m);
       }
       bool wrong = false;
@@ -2648,26 +2893,46 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
       if (ttl.has_value()) expire(key, *ttl);
     } else if (typ == "Z") {
       std::size_t n = 0;
-      if (!(iss >> n)) { err = "malformed zset"; current_db_ = prev_db; return false; }
+      if (!(iss >> n)) {
+        err = "malformed zset";
+        current_db_ = prev_db;
+        return false;
+      }
       for (std::size_t i = 0; i < n; ++i) {
         std::string m;
         double sc = 0;
-        if (!(iss >> std::quoted(m) >> sc)) { err = "malformed zset member"; current_db_ = prev_db; return false; }
+        if (!(iss >> std::quoted(m) >> sc)) {
+          err = "malformed zset member";
+          current_db_ = prev_db;
+          return false;
+        }
         (void)zadd_one(key, sc, m, false, false, false, false, false);
       }
       if (ttl.has_value()) expire(key, *ttl);
     } else if (typ == "X") {
       std::size_t n = 0;
       std::uint64_t lm = 0, ls = 0;
-      if (!(iss >> n >> lm >> ls)) { err = "malformed stream"; current_db_ = prev_db; return false; }
+      if (!(iss >> n >> lm >> ls)) {
+        err = "malformed stream";
+        current_db_ = prev_db;
+        return false;
+      }
       for (std::size_t i = 0; i < n; ++i) {
         std::string id;
         std::size_t fn = 0;
-        if (!(iss >> std::quoted(id) >> fn)) { err = "malformed stream item"; current_db_ = prev_db; return false; }
+        if (!(iss >> std::quoted(id) >> fn)) {
+          err = "malformed stream item";
+          current_db_ = prev_db;
+          return false;
+        }
         std::vector<std::pair<std::string, std::string>> fields;
         for (std::size_t j = 0; j < fn; ++j) {
           std::string f, v;
-          if (!(iss >> std::quoted(f) >> std::quoted(v))) { err = "malformed stream field"; current_db_ = prev_db; return false; }
+          if (!(iss >> std::quoted(f) >> std::quoted(v))) {
+            err = "malformed stream field";
+            current_db_ = prev_db;
+            return false;
+          }
           fields.push_back({f, v});
         }
         bool wrong = false;
@@ -2682,8 +2947,12 @@ bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::strin
   return true;
 }
 
-std::uint64_t DataStore::mutation_epoch() const { return mutation_epoch_; }
-void DataStore::increment_mutation_epoch() { ++mutation_epoch_; }
+std::uint64_t DataStore::mutation_epoch() const {
+  return mutation_epoch_;
+}
+void DataStore::increment_mutation_epoch() {
+  ++mutation_epoch_;
+}
 
 // ── Eviction (maxmemory-policy) ──
 
@@ -2784,10 +3053,9 @@ bool DataStore::set_object_freq(const std::string& key, std::int64_t freq) {
 
 std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy policy, int samples) {
   if (policy == MaxmemoryPolicy::NoEviction) return std::nullopt;
-  const bool volatile_only = policy == MaxmemoryPolicy::VolatileLru ||
-                             policy == MaxmemoryPolicy::VolatileLfu ||
-                             policy == MaxmemoryPolicy::VolatileRandom ||
-                             policy == MaxmemoryPolicy::VolatileTtl;
+  const bool volatile_only =
+      policy == MaxmemoryPolicy::VolatileLru || policy == MaxmemoryPolicy::VolatileLfu ||
+      policy == MaxmemoryPolicy::VolatileRandom || policy == MaxmemoryPolicy::VolatileTtl;
   const bool lfu = policy == MaxmemoryPolicy::AllkeysLfu || policy == MaxmemoryPolicy::VolatileLfu;
   const bool lru = policy == MaxmemoryPolicy::AllkeysLru || policy == MaxmemoryPolicy::VolatileLru;
   const bool ttl = policy == MaxmemoryPolicy::VolatileTtl;
@@ -2800,14 +3068,19 @@ std::optional<DataStore::EvictVictim> DataStore::evict_one(MaxmemoryPolicy polic
   // Eligible = has a TTL for volatile-*, any key otherwise. We sample by walking from a
   // random (db,bucket) start until we've gathered `samples` candidates or exhausted the
   // keyspace — the same bucket-walk RANDOMKEY uses, generalized across databases.
-  struct Cand { int db; std::string key; std::uint32_t lru; std::int64_t expire; };
+  struct Cand {
+    int db;
+    std::string key;
+    std::uint32_t lru;
+    std::int64_t expire;
+  };
   std::optional<Cand> best;
   auto better = [&](const Cand& c) -> bool {
     if (!best) return true;
-    if (ttl)  return c.expire < best->expire;          // soonest to expire
-    if (lfu)  return (c.lru & 0xFF) < (best->lru & 0xFF); // lowest frequency
-    if (lru)  return lru_idle_seconds(c.lru) > lru_idle_seconds(best->lru);  // longest idle
-    return (rng() & 1) != 0;                            // random: keep flipping
+    if (ttl) return c.expire < best->expire;                                // soonest to expire
+    if (lfu) return (c.lru & 0xFF) < (best->lru & 0xFF);                    // lowest frequency
+    if (lru) return lru_idle_seconds(c.lru) > lru_idle_seconds(best->lru);  // longest idle
+    return (rng() & 1) != 0;                                                // random: keep flipping
   };
 
   int collected = 0;
@@ -2860,7 +3133,8 @@ std::tuple<std::size_t, std::size_t, std::int64_t> DataStore::keyspace_stats() c
       if (ttl > 0) ttl_sum += ttl;
     }
   }
-  const std::int64_t avg_ttl = with_expiry > 0 ? ttl_sum / static_cast<std::int64_t>(with_expiry) : 0;
+  const std::int64_t avg_ttl =
+      with_expiry > 0 ? ttl_sum / static_cast<std::int64_t>(with_expiry) : 0;
   return {total, with_expiry, avg_ttl};
 }
 
@@ -2876,7 +3150,10 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
           break;
         case ValueType::Hash: {
           std::vector<std::string> cmd{"HSET", key};
-          for (const auto& [f, v] : e.hash()) { cmd.push_back(f); cmd.push_back(v); }
+          for (const auto& [f, v] : e.hash()) {
+            cmd.push_back(f);
+            cmd.push_back(v);
+          }
           out.push_back(std::move(cmd));
           break;
         }
@@ -2894,7 +3171,10 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
         }
         case ValueType::ZSet: {
           std::vector<std::string> cmd{"ZADD", key};
-          for (const auto& [m, s] : e.zset()) { cmd.push_back(fmt_double(s)); cmd.push_back(m); }
+          for (const auto& [m, s] : e.zset()) {
+            cmd.push_back(fmt_double(s));
+            cmd.push_back(m);
+          }
           out.push_back(std::move(cmd));
           break;
         }
@@ -2903,7 +3183,10 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
           if (!st.entries.empty()) {
             for (const auto& [id, fields] : st.entries) {
               std::vector<std::string> cmd{"XADD", key, id};
-              for (const auto& [f, v] : fields) { cmd.push_back(f); cmd.push_back(v); }
+              for (const auto& [f, v] : fields) {
+                cmd.push_back(f);
+                cmd.push_back(v);
+              }
               out.push_back(std::move(cmd));
             }
           } else {
@@ -2912,26 +3195,28 @@ std::vector<std::vector<std::string>> DataStore::export_aof_commands() const {
             out.push_back({"XADD", key, "MAXLEN", "0", "0-1", "x", "y"});
           }
           // Restore last-id / entries-added / max-deleted-entry-id even after XDEL/trim.
-          out.push_back({"XSETID", key, stream_id_str({st.last_ms, st.last_seq}),
-                         "ENTRIESADDED", std::to_string(st.entries_added),
-                         "MAXDELETEDID", st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id});
+          out.push_back({"XSETID", key, stream_id_str({st.last_ms, st.last_seq}), "ENTRIESADDED",
+                         std::to_string(st.entries_added), "MAXDELETEDID",
+                         st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id});
           // Recreate consumer groups and their pending-entries lists. XGROUP CREATE
           // rebuilds the group (preserving its entries-read counter, including the -1
           // "invalid" sentinel); XGROUP CREATECONSUMER recreates every consumer — even
           // those with no PEL (e.g. created by NOACK reads) — and XCLAIM ... FORCE re-adds
           // each pending message to its owning consumer's PEL.
           for (const auto& [gname, grp] : st.groups) {
-            out.push_back({"XGROUP", "CREATE", key, gname, grp.last_delivered_id,
-                           "ENTRIESREAD", std::to_string(grp.entries_read)});
+            out.push_back({"XGROUP", "CREATE", key, gname, grp.last_delivered_id, "ENTRIESREAD",
+                           std::to_string(grp.entries_read)});
             for (const auto& [cname, _] : grp.consumers)
               out.push_back({"XGROUP", "CREATECONSUMER", key, gname, cname});
             for (const auto& [pid, consumer] : grp.pending_to_consumer) {
               auto ms_it = grp.pending_delivery_ms.find(pid);
               auto cnt_it = grp.pending_delivery_count.find(pid);
-              const std::string dms = ms_it != grp.pending_delivery_ms.end() ? std::to_string(ms_it->second) : "0";
-              const std::string dcnt = cnt_it != grp.pending_delivery_count.end() ? std::to_string(cnt_it->second) : "1";
-              out.push_back({"XCLAIM", key, gname, consumer, "0", pid,
-                             "TIME", dms, "RETRYCOUNT", dcnt, "JUSTID", "FORCE"});
+              const std::string dms =
+                  ms_it != grp.pending_delivery_ms.end() ? std::to_string(ms_it->second) : "0";
+              const std::string dcnt =
+                  cnt_it != grp.pending_delivery_count.end() ? std::to_string(cnt_it->second) : "1";
+              out.push_back({"XCLAIM", key, gname, consumer, "0", pid, "TIME", dms, "RETRYCOUNT",
+                             dcnt, "JUSTID", "FORCE"});
             }
           }
           break;
@@ -2953,7 +3238,8 @@ std::optional<std::string> DataStore::object_encoding(const std::string& key) {
   return std::string(encoding_of(it->second));
 }
 
-const char* DataStore::encoding_of(Entry& e) {  // non-const: seeing a big encoding sets the sticky flag
+const char* DataStore::encoding_of(
+    Entry& e) {  // non-const: seeing a big encoding sets the sticky flag
   const auto& lim = encoding_limits_;
   // Redis string2ll-style integer check for the "int" / intset encodings: digits with
   // optional '-', no leading zeros (except "0" itself), must fit in int64.
@@ -3004,13 +3290,21 @@ const char* DataStore::encoding_of(Entry& e) {  // non-const: seeing a big encod
         // A listpack element is ~1-5 bytes for a small integer, else len + a small
         // header + 1-byte backlen; approximate with size + 2 (min 3 for ints).
         bytes += (v.size() <= 2 ? 3 : v.size() + 2);
-        if (bytes > budget) { small = false; break; }
+        if (bytes > budget) {
+          small = false;
+          break;
+        }
       }
     } else {
       // 0 is treated as 1 (a single element is still listpack).
       const std::int64_t entry_limit = lim.list_size == 0 ? 1 : lim.list_size;
       small = within(e.list().size(), entry_limit);
-      if (small) for (const auto& v : e.list()) if (v.size() > 64) { small = false; break; }
+      if (small)
+        for (const auto& v : e.list())
+          if (v.size() > 64) {
+            small = false;
+            break;
+          }
     }
     return small ? "listpack" : "quicklist";
   }
@@ -3018,26 +3312,43 @@ const char* DataStore::encoding_of(Entry& e) {  // non-const: seeing a big encod
     // The member walk only for a set small enough to be an intset (SSCAN asks on every call).
     if (!e.encoding_big && !e.encoding_no_intset && within(e.set().size(), lim.set_intset)) {
       bool all_int = true;
-      for (const auto& v : e.set()) if (!is_int(v)) { all_int = false; break; }
+      for (const auto& v : e.set())
+        if (!is_int(v)) {
+          all_int = false;
+          break;
+        }
       if (all_int) return "intset";
     }
     bool small = within(e.set().size(), lim.set_entries);
-    if (small) for (const auto& v : e.set()) if (v.size() > static_cast<std::size_t>(lim.set_value)) { small = false; break; }
+    if (small)
+      for (const auto& v : e.set())
+        if (v.size() > static_cast<std::size_t>(lim.set_value)) {
+          small = false;
+          break;
+        }
     return sticky(small, "listpack", "hashtable");
   }
   if (e.type() == ValueType::Hash) {
     bool small = within(e.hash().size(), lim.hash_entries);
-    if (small) for (const auto& [f, v] : e.hash()) {
-      if (f.size() > static_cast<std::size_t>(lim.hash_value) ||
-          v.size() > static_cast<std::size_t>(lim.hash_value)) { small = false; break; }
-    }
+    if (small)
+      for (const auto& [f, v] : e.hash()) {
+        if (f.size() > static_cast<std::size_t>(lim.hash_value) ||
+            v.size() > static_cast<std::size_t>(lim.hash_value)) {
+          small = false;
+          break;
+        }
+      }
     return sticky(small, "listpack", "hashtable");
   }
   if (e.type() == ValueType::ZSet) {
     bool small = within(e.zset().size(), lim.zset_entries);
-    if (small) for (const auto& [m, _] : e.zset()) {
-      if (m.size() > static_cast<std::size_t>(lim.zset_value)) { small = false; break; }
-    }
+    if (small)
+      for (const auto& [m, _] : e.zset()) {
+        if (m.size() > static_cast<std::size_t>(lim.zset_value)) {
+          small = false;
+          break;
+        }
+      }
     return sticky(small, "listpack", "skiplist");
   }
   if (e.type() == ValueType::Stream) return "stream";
@@ -3050,8 +3361,10 @@ namespace {
 std::string entry_digest_payload(const Entry& e) {
   std::ostringstream oss;
   oss << static_cast<int>(e.type()) << "|";
-  if (e.expire_at_ms.has_value()) oss << "ttl=" << *e.expire_at_ms << "|";
-  else oss << "ttl=-1|";
+  if (e.expire_at_ms.has_value())
+    oss << "ttl=" << *e.expire_at_ms << "|";
+  else
+    oss << "ttl=-1|";
   if (e.type() == ValueType::String) {
     oss << e.str();
   } else if (e.type() == ValueType::Hash) {
@@ -3066,7 +3379,8 @@ std::string entry_digest_payload(const Entry& e) {
     for (const auto& v : items) oss << v << ";";
   } else if (e.type() == ValueType::ZSet) {
     std::vector<std::pair<std::string, double>> items(e.zset().begin(), e.zset().end());
-    std::sort(items.begin(), items.end(), [](const auto& a, const auto& b) { return a.first < b.first; });
+    std::sort(items.begin(), items.end(),
+              [](const auto& a, const auto& b) { return a.first < b.first; });
     for (const auto& [m, s] : items) oss << m << "=" << s << ";";
   } else if (e.type() == ValueType::Stream) {
     for (const auto& [id, fields] : e.stream_entries()) {
@@ -3134,7 +3448,6 @@ std::int64_t DataStore::zset_max_ziplist_entries() const {
   return encoding_limits_.zset_entries;
 }
 
-
 std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::size_t budget_per_db) {
   std::vector<std::pair<int, std::string>> expired;
   const auto now = now_ms();
@@ -3150,9 +3463,11 @@ std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::siz
     std::size_t bucket = start_bucket;
 
     do {
-      // Collect expired keys in this bucket, then erase by key (local_iterator can't be passed to erase)
+      // Collect expired keys in this bucket, then erase by key (local_iterator can't be passed to
+      // erase)
       std::vector<std::string> to_del;
-      for (auto it = db.begin(bucket); it != db.end(bucket) && scanned < budget_per_db; ++it, ++scanned) {
+      for (auto it = db.begin(bucket); it != db.end(bucket) && scanned < budget_per_db;
+           ++it, ++scanned) {
         if (logically_expired(it->second, now)) to_del.push_back(it->first);
       }
       for (const auto& k : to_del) {
@@ -3227,12 +3542,18 @@ bool DataStore::entry_is_big(const Entry& e) {
   // cheaper than the queue/thread handoff.
   constexpr std::size_t kBig = 64;
   switch (e.type()) {
-    case ValueType::String: return false;
-    case ValueType::Hash:   return e.hash().size() > kBig;
-    case ValueType::List:   return e.list().size() > kBig;
-    case ValueType::Set:    return e.set().size() > kBig;
-    case ValueType::ZSet:   return e.zset().size() > kBig;
-    case ValueType::Stream: return e.stream_entries().size() > kBig;
+    case ValueType::String:
+      return false;
+    case ValueType::Hash:
+      return e.hash().size() > kBig;
+    case ValueType::List:
+      return e.list().size() > kBig;
+    case ValueType::Set:
+      return e.set().size() > kBig;
+    case ValueType::ZSet:
+      return e.zset().size() > kBig;
+    case ValueType::Stream:
+      return e.stream_entries().size() > kBig;
   }
   return false;
 }
@@ -3244,7 +3565,7 @@ bool DataStore::unlink(const std::string& key) {
   if (it == db.end()) return false;
   if (entry_is_big(it->second)) {
     DB tmp;
-    tmp.insert(db.extract(it));   // O(1) node move out of the live map
+    tmp.insert(db.extract(it));  // O(1) node move out of the live map
     lazyfree_enqueue(std::move(tmp));
   } else {
     db.erase(it);
@@ -3254,7 +3575,7 @@ bool DataStore::unlink(const std::string& key) {
 
 void DataStore::flushdb_async() {
   DB tmp;
-  std::swap(tmp, dbs_[current_db_]);   // O(1): live db becomes empty immediately
+  std::swap(tmp, dbs_[current_db_]);  // O(1): live db becomes empty immediately
   lazyfree_enqueue(std::move(tmp));
   hidden_expired_[current_db_].clear();
   replica_hidden_[current_db_].clear();
@@ -3284,8 +3605,8 @@ std::pair<std::uint64_t, std::vector<std::string>> DataStore::scan(
     if (scan_match(pattern, kv.first)) keys.push_back(kv.first);
   });
   // Step 3 of scanGenericCommand(), after the walk (an erase never resizes the table, so the cursor
-  // stays good): with TYPE, lookupKeyReadWithFlags(LOOKUP_NOTOUCH|LOOKUP_NONOTIFY) of each key, which
-  // expires it and counts a hit or a miss; without TYPE, expireIfNeeded().
+  // stays good): with TYPE, lookupKeyReadWithFlags(LOOKUP_NOTOUCH|LOOKUP_NONOTIFY) of each key,
+  // which expires it and counts a hit or a miss; without TYPE, expireIfNeeded().
   std::vector<std::string> out;
   out.reserve(keys.size());
   for (auto& key : keys) {
@@ -3315,4 +3636,4 @@ DataStore& store() {
   return s;
 }
 
-} // namespace peadb
+}  // namespace peadb

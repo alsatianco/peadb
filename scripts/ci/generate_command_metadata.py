@@ -15,7 +15,8 @@ Output: ``include/command_metadata.generated.hpp`` — a sorted table of
 ``{full_name, acl_cats, movablekeys, flags}`` consumed by the COMMAND handler,
 CLIENT PAUSE and the read-only script check. ``flags`` holds Redis's ``CMD_*``
 bits with the values ``src/server.h`` gives them. Re-run after bumping the Redis
-pin and commit the regenerated header.
+pin and commit the regenerated header. Requires clang-format 18.1.8 (the CI pin);
+set CLANG_FORMAT to its executable when it is not on PATH.
 
 Usage:
     REDIS_DIR=~/.cache/peadb/redis-7.2.5 python3 scripts/ci/generate_command_metadata.py
@@ -26,8 +27,10 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 import pathlib
 import re
+import subprocess
 import sys
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent.parent
@@ -210,7 +213,14 @@ def main() -> int:
             ""]
 
     dest = REPO_ROOT / "include" / "command_metadata.generated.hpp"
-    dest.write_text("\n".join(out))
+    formatter = os.environ.get("CLANG_FORMAT", "clang-format")
+    version = subprocess.check_output([formatter, "--version"], text=True).strip()
+    if version != "clang-format version 18.1.8":
+        raise RuntimeError(f"Expected clang-format version 18.1.8, got {version}")
+    formatted = subprocess.check_output(
+        [formatter, f"--assume-filename={dest}"], input="\n".join(out), text=True
+    )
+    dest.write_text(formatted)
     print(f"Wrote {dest} ({len(entries)} commands+subcommands)")
     return 0
 

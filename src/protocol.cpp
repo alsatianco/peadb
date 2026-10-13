@@ -15,12 +15,12 @@ namespace {
 // enormous declared count with dribbled, never-completing elements would re-scan quadratically
 // up to the query-buffer limit. This deliberately-stricter 1M cap bounds that; no realistic
 // client or the upstream suite ever declares more.
-constexpr int kMaxMultibulk = 1024 * 1024;            // 1M elements
+constexpr int kMaxMultibulk = 1024 * 1024;  // 1M elements
 // The bulk length cap is proto-max-bulk-len, which the caller passes in (CONFIG SET changes it).
 // Tighter caps for clients that have not authenticated when a password is required
 // (Redis processMultibulkBuffer): >10 elements or >16 KB per bulk is refused up front.
 constexpr int kUnauthMaxMultibulk = 10;
-constexpr int kUnauthMaxBulkLen   = 16 * 1024;
+constexpr int kUnauthMaxBulkLen = 16 * 1024;
 // PROTO_INLINE_MAX_SIZE (server.h): a single line (inline command, multibulk count, or bulk
 // length) that reaches this size without a terminator is a desync — error out and close
 // rather than buffering unboundedly.
@@ -141,12 +141,24 @@ bool split_inline_args(const std::string& line, std::vector<std::string>& out) {
               i += 4;
             } else {
               switch (e) {
-                case 'n': cur.push_back('\n'); break;
-                case 'r': cur.push_back('\r'); break;
-                case 't': cur.push_back('\t'); break;
-                case 'b': cur.push_back('\b'); break;
-                case 'a': cur.push_back('\a'); break;
-                default:  cur.push_back(e); break;
+                case 'n':
+                  cur.push_back('\n');
+                  break;
+                case 'r':
+                  cur.push_back('\r');
+                  break;
+                case 't':
+                  cur.push_back('\t');
+                  break;
+                case 'b':
+                  cur.push_back('\b');
+                  break;
+                case 'a':
+                  cur.push_back('\a');
+                  break;
+                default:
+                  cur.push_back(e);
+                  break;
               }
               i += 2;
             }
@@ -155,18 +167,21 @@ bool split_inline_args(const std::string& line, std::vector<std::string>& out) {
           }
         }
         if (i >= n) return false;  // unterminated quote
-        ++i;  // consume closing quote
+        ++i;                       // consume closing quote
         // Redis sdssplitargs: a closing quote must be followed by whitespace or end-of-line;
         // e.g. `"""x"""` is unbalanced, not three concatenated tokens.
         if (i < n && !std::isspace(static_cast<unsigned char>(line[i]))) return false;
       } else if (line[i] == '\'') {
         ++i;
         while (i < n && line[i] != '\'') {
-          if (line[i] == '\\' && i + 1 < n && line[i + 1] == '\'') { cur.push_back('\''); i += 2; }
-          else cur.push_back(line[i++]);
+          if (line[i] == '\\' && i + 1 < n && line[i + 1] == '\'') {
+            cur.push_back('\'');
+            i += 2;
+          } else
+            cur.push_back(line[i++]);
         }
         if (i >= n) return false;  // unterminated quote
-        ++i;  // consume closing quote
+        ++i;                       // consume closing quote
         if (i < n && !std::isspace(static_cast<unsigned char>(line[i]))) return false;
       } else {
         cur.push_back(line[i++]);
@@ -193,8 +208,7 @@ std::optional<ParsedCommand> parse_inline(std::string_view buffer) {
 
   const std::string line(buffer.substr(0, line_len));
   std::vector<std::string> args;
-  if (!split_inline_args(line, args))
-    return proto_error("unbalanced quotes in request", consumed);
+  if (!split_inline_args(line, args)) return proto_error("unbalanced quotes in request", consumed);
 
   // An empty (or whitespace-only) inline line is silently ignored — no reply, no close.
   if (args.empty()) return ParsedCommand{{"__empty__"}, consumed};

@@ -60,11 +60,16 @@ thread_local bool g_lua_readonly = false;
 thread_local bool g_lua_last_error_from_redis = false;
 
 // ─── FUNCTION library engine state ───────────────────────────────────────────
-struct LoadingFn { std::string name; std::string description; int flags = 0; int ref = -1; };
-bool g_in_function_load = false;                 // true only during a FUNCTION LOAD pcall
-std::vector<LoadingFn>* g_loading_fns = nullptr; // accumulator during a load
-int g_load_redis_ref = -1;                       // registry ref: the restricted load-time `redis` table
-int g_libenv_ref = -1;                           // registry ref: the shared library environment table
+struct LoadingFn {
+  std::string name;
+  std::string description;
+  int flags = 0;
+  int ref = -1;
+};
+bool g_in_function_load = false;                  // true only during a FUNCTION LOAD pcall
+std::vector<LoadingFn>* g_loading_fns = nullptr;  // accumulator during a load
+int g_load_redis_ref = -1;  // registry ref: the restricted load-time `redis` table
+int g_libenv_ref = -1;      // registry ref: the shared library environment table
 std::chrono::steady_clock::time_point g_func_load_start;
 bool g_func_load_timed_out = false;
 
@@ -84,9 +89,9 @@ void lua_timeout_hook(lua_State* L, lua_Debug* /*ar*/) {
   // script finishes (or is killed) the BUSY flag is set for clients.
   if (g_config_lua_time_limit > 0) {
     const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - g_script_start_time).count();
-    if (elapsed_ms >= g_config_lua_time_limit &&
-        !g_script_busy.load(std::memory_order_relaxed)) {
+                                std::chrono::steady_clock::now() - g_script_start_time)
+                                .count();
+    if (elapsed_ms >= g_config_lua_time_limit && !g_script_busy.load(std::memory_order_relaxed)) {
       g_script_busy.store(true, std::memory_order_release);
       g_busy_script_session = g_lua_session;
     }
@@ -110,15 +115,27 @@ std::string lower(std::string s) {
   return s;
 }
 
-std::string enc_simple(const std::string& v) { return "+" + v + "\r\n"; }
-std::string enc_error_raw(const std::string& v) { return "-" + v + "\r\n"; }
-std::string enc_error(const std::string& v) { return "-ERR " + v + "\r\n"; }
-std::string enc_integer(long long v) { return ":" + std::to_string(v) + "\r\n"; }
+std::string enc_simple(const std::string& v) {
+  return "+" + v + "\r\n";
+}
+std::string enc_error_raw(const std::string& v) {
+  return "-" + v + "\r\n";
+}
+std::string enc_error(const std::string& v) {
+  return "-ERR " + v + "\r\n";
+}
+std::string enc_integer(long long v) {
+  return ":" + std::to_string(v) + "\r\n";
+}
 std::string enc_bulk(const std::string& v) {
   return "$" + std::to_string(v.size()) + "\r\n" + v + "\r\n";
 }
-std::string enc_null_bulk() { return "$-1\r\n"; }
-std::string enc_null_resp3() { return "_\r\n"; }
+std::string enc_null_bulk() {
+  return "$-1\r\n";
+}
+std::string enc_null_resp3() {
+  return "_\r\n";
+}
 std::string enc_null(RespVersion ver) {
   return ver == RespVersion::Resp3 ? enc_null_resp3() : enc_null_bulk();
 }
@@ -131,7 +148,20 @@ std::string enc_array(const std::vector<std::string>& items) {
 // ─── Parse RESP reply from a string (used to convert dispatch results) ───────
 
 struct RespValue {
-  enum Type { Nil, SimpleString, Error, Integer, BulkString, Array, Double, BigNumber, Bool, Verbatim, Map, Set };
+  enum Type {
+    Nil,
+    SimpleString,
+    Error,
+    Integer,
+    BulkString,
+    Array,
+    Double,
+    BigNumber,
+    Bool,
+    Verbatim,
+    Map,
+    Set
+  };
   Type type = Nil;
   std::string str;
   long long integer = 0;
@@ -173,7 +203,7 @@ bool parse_resp_value(const std::string& data, std::size_t& pos, RespValue& out)
       }
       out.type = RespValue::BulkString;
       out.str = data.substr(pos, static_cast<std::size_t>(len));
-      pos += static_cast<std::size_t>(len) + 2; // skip \r\n
+      pos += static_cast<std::size_t>(len) + 2;  // skip \r\n
       return true;
     }
     case '*': {
@@ -190,27 +220,31 @@ bool parse_resp_value(const std::string& data, std::size_t& pos, RespValue& out)
       }
       return true;
     }
-    case '_': // RESP3 null
+    case '_':  // RESP3 null
       out.type = RespValue::Nil;
       read_line();
       return true;
-    case ',': // RESP3 double
+    case ',':  // RESP3 double
       out.type = RespValue::Double;
       out.str = read_line();
-      try { out.dbl = std::stod(out.str); } catch (...) { out.dbl = 0; }
+      try {
+        out.dbl = std::stod(out.str);
+      } catch (...) {
+        out.dbl = 0;
+      }
       return true;
-    case '#': { // RESP3 bool
+    case '#': {  // RESP3 bool
       auto line = read_line();
       out.type = RespValue::Bool;
       out.boolean = (line == "t");
       out.integer = out.boolean ? 1 : 0;
       return true;
     }
-    case '(': // RESP3 big number
+    case '(':  // RESP3 big number
       out.type = RespValue::BigNumber;
       out.str = read_line();
       return true;
-    case '=': { // RESP3 verbatim
+    case '=': {  // RESP3 verbatim
       auto len_str = read_line();
       int len = std::stoi(len_str);
       out.type = RespValue::Verbatim;
@@ -218,18 +252,19 @@ bool parse_resp_value(const std::string& data, std::size_t& pos, RespValue& out)
       pos += static_cast<std::size_t>(len) + 2;
       return true;
     }
-    case '%': { // RESP3 map
+    case '%': {  // RESP3 map
       auto cnt_str = read_line();
       int cnt = std::stoi(cnt_str);
       out.type = RespValue::Map;
       out.array.resize(static_cast<std::size_t>(cnt * 2));
       for (int i = 0; i < cnt; ++i) {
         if (!parse_resp_value(data, pos, out.array[static_cast<std::size_t>(i * 2)])) return false;
-        if (!parse_resp_value(data, pos, out.array[static_cast<std::size_t>(i * 2 + 1)])) return false;
+        if (!parse_resp_value(data, pos, out.array[static_cast<std::size_t>(i * 2 + 1)]))
+          return false;
       }
       return true;
     }
-    case '~': { // RESP3 set
+    case '~': {  // RESP3 set
       auto cnt_str = read_line();
       int cnt = std::stoi(cnt_str);
       out.type = RespValue::Set;
@@ -239,7 +274,7 @@ bool parse_resp_value(const std::string& data, std::size_t& pos, RespValue& out)
       }
       return true;
     }
-    case '|': { // RESP3 attribute — read and skip, then parse the real value
+    case '|': {  // RESP3 attribute — read and skip, then parse the real value
       auto cnt_str = read_line();
       int cnt = std::stoi(cnt_str);
       for (int i = 0; i < cnt; ++i) {
@@ -261,8 +296,10 @@ void push_resp_to_lua(lua_State* L, const RespValue& val) {
   const bool resp3 = (g_lua_script_resp == RespVersion::Resp3);
   switch (val.type) {
     case RespValue::Nil:
-      if (resp3) lua_pushnil(L);
-      else lua_pushboolean(L, 0); // Redis RESP2 maps nil → Lua false
+      if (resp3)
+        lua_pushnil(L);
+      else
+        lua_pushboolean(L, 0);  // Redis RESP2 maps nil → Lua false
       break;
     case RespValue::SimpleString:
       // Redis returns status replies as tables with an "ok" field
@@ -399,7 +436,8 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
   // BOTH the script called redis.setresp(3) AND the client is on RESP3.
   const RespVersion out_resp =
       (g_lua_script_resp == RespVersion::Resp3 && g_lua_client_resp == RespVersion::Resp3)
-          ? RespVersion::Resp3 : RespVersion::Resp2;
+          ? RespVersion::Resp3
+          : RespVersion::Resp2;
 
   const int t = lua_type(L, index);
   switch (t) {
@@ -474,15 +512,14 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
         // Replace \r\n in the value with spaces
         std::string clean;
         for (std::size_t i = 0; i < bn.size(); ++i) {
-          if (bn[i] == '\r' && i + 1 < bn.size() && bn[i+1] == '\n') {
+          if (bn[i] == '\r' && i + 1 < bn.size() && bn[i + 1] == '\n') {
             clean += "  ";
             i += 1;
           } else {
             clean += bn[i];
           }
         }
-        if (out_resp == RespVersion::Resp3)
-          return "(" + clean + "\r\n";
+        if (out_resp == RespVersion::Resp3) return "(" + clean + "\r\n";
         return enc_bulk(clean);
       }
       lua_pop(L, 1);
@@ -496,7 +533,7 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
         raw_getfield(L, -1, "format");
         std::string format = lua_isstring(L, -1) ? lua_tostring(L, -1) : "txt";
         lua_pop(L, 1);
-        lua_pop(L, 1); // pop verbatim_string table
+        lua_pop(L, 1);  // pop verbatim_string table
         if (out_resp == RespVersion::Resp3) {
           std::string full = format + ":" + content;
           return "=" + std::to_string(full.size()) + "\r\n" + full + "\r\n";
@@ -524,7 +561,7 @@ std::string lua_to_resp(lua_State* L, int index, int depth = 0) {
           items.push_back(encode_map_item(-1));
           lua_pop(L, 1);
         }
-        lua_pop(L, 1); // pop map table
+        lua_pop(L, 1);  // pop map table
         if (out_resp == RespVersion::Resp3) {
           std::string out = "%" + std::to_string(items.size() / 2) + "\r\n";
           for (const auto& item : items) out += item;
@@ -587,8 +624,8 @@ std::string dispatch_from_lua(const std::vector<std::string>& args) {
 
   // Commands not allowed from scripts (CMD_NOSCRIPT in Redis)
   static const std::vector<std::string> noscript_cmds = {
-      "CLUSTER", "SUBSCRIBE", "UNSUBSCRIBE", "PSUBSCRIBE", "PUNSUBSCRIBE",
-      "SSUBSCRIBE", "SUNSUBSCRIBE",
+      "CLUSTER",      "SUBSCRIBE",  "UNSUBSCRIBE",  "PSUBSCRIBE",
+      "PUNSUBSCRIBE", "SSUBSCRIBE", "SUNSUBSCRIBE",
   };
   for (const auto& ns : noscript_cmds) {
     if (cmd_upper == ns) {
@@ -776,35 +813,50 @@ int lua_redis_sha1hex(lua_State* L) {
   for (int i = 7; i >= 0; --i)
     msg.push_back(static_cast<std::uint8_t>((bit_len >> (i * 8)) & 0xff));
 
-  std::uint32_t h0 = 0x67452301U, h1 = 0xEFCDAB89U, h2 = 0x98BADCFEU,
-                h3 = 0x10325476U, h4 = 0xC3D2E1F0U;
+  std::uint32_t h0 = 0x67452301U, h1 = 0xEFCDAB89U, h2 = 0x98BADCFEU, h3 = 0x10325476U,
+                h4 = 0xC3D2E1F0U;
   for (std::size_t chunk = 0; chunk < msg.size(); chunk += 64) {
     std::uint32_t w[80]{};
     for (int i = 0; i < 16; ++i) {
       auto off = chunk + static_cast<std::size_t>(i) * 4;
       w[i] = (static_cast<std::uint32_t>(msg[off]) << 24) |
-             (static_cast<std::uint32_t>(msg[off+1]) << 16) |
-             (static_cast<std::uint32_t>(msg[off+2]) << 8) |
-             static_cast<std::uint32_t>(msg[off+3]);
+             (static_cast<std::uint32_t>(msg[off + 1]) << 16) |
+             (static_cast<std::uint32_t>(msg[off + 2]) << 8) |
+             static_cast<std::uint32_t>(msg[off + 3]);
     }
-    for (int i = 16; i < 80; ++i)
-      w[i] = leftrotate(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
-    std::uint32_t a=h0, b=h1, c=h2, d=h3, e=h4;
+    for (int i = 16; i < 80; ++i) w[i] = leftrotate(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
+    std::uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
     for (int i = 0; i < 80; ++i) {
-      std::uint32_t f=0, k=0;
-      if (i<20) { f=(b&c)|((~b)&d); k=0x5A827999U; }
-      else if (i<40) { f=b^c^d; k=0x6ED9EBA1U; }
-      else if (i<60) { f=(b&c)|(b&d)|(c&d); k=0x8F1BBCDCU; }
-      else { f=b^c^d; k=0xCA62C1D6U; }
-      auto temp = leftrotate(a,5)+f+e+k+w[i];
-      e=d; d=c; c=leftrotate(b,30); b=a; a=temp;
+      std::uint32_t f = 0, k = 0;
+      if (i < 20) {
+        f = (b & c) | ((~b) & d);
+        k = 0x5A827999U;
+      } else if (i < 40) {
+        f = b ^ c ^ d;
+        k = 0x6ED9EBA1U;
+      } else if (i < 60) {
+        f = (b & c) | (b & d) | (c & d);
+        k = 0x8F1BBCDCU;
+      } else {
+        f = b ^ c ^ d;
+        k = 0xCA62C1D6U;
+      }
+      auto temp = leftrotate(a, 5) + f + e + k + w[i];
+      e = d;
+      d = c;
+      c = leftrotate(b, 30);
+      b = a;
+      a = temp;
     }
-    h0+=a; h1+=b; h2+=c; h3+=d; h4+=e;
+    h0 += a;
+    h1 += b;
+    h2 += c;
+    h3 += d;
+    h4 += e;
   }
   std::ostringstream oss;
-  oss << std::hex << std::setfill('0') << std::nouppercase
-      << std::setw(8) << h0 << std::setw(8) << h1 << std::setw(8) << h2
-      << std::setw(8) << h3 << std::setw(8) << h4;
+  oss << std::hex << std::setfill('0') << std::nouppercase << std::setw(8) << h0 << std::setw(8)
+      << h1 << std::setw(8) << h2 << std::setw(8) << h3 << std::setw(8) << h4;
   lua_pushstring(L, oss.str().c_str());
   return 1;
 }
@@ -832,8 +884,8 @@ int lua_redis_acl_check_cmd(lua_State* L) {
   std::string cmd_upper = upper(cmd);
 
   static const std::vector<std::string> known = {
-      "SET", "GET", "DEL", "HSET", "HGET", "LPUSH", "RPUSH", "SADD",
-      "ZADD", "INCR", "DECR", "EXPIRE", "PING", "ECHO",
+      "SET",  "GET",  "DEL",  "HSET", "HGET",   "LPUSH", "RPUSH",
+      "SADD", "ZADD", "INCR", "DECR", "EXPIRE", "PING",  "ECHO",
   };
   bool is_known = false;
   for (const auto& k : known) {
@@ -843,7 +895,7 @@ int lua_redis_acl_check_cmd(lua_State* L) {
     }
   }
   if (!is_known) {
-  return luaL_error(L, "Invalid command passed to redis.acl_check_cmd()");
+    return luaL_error(L, "Invalid command passed to redis.acl_check_cmd()");
   }
 
   if (cmd_upper == "HSET") {
@@ -1068,17 +1120,23 @@ void register_redis_lib(lua_State* L) {
   lua_pushcfunction(L, [](lua_State* S) -> int {
     const lua_Integer flags = luaL_checkinteger(S, 1);
     if (flags < 0 || flags > 3) {
-      return luaL_error(S, "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_SLAVE or REPL_ALL");
+      return luaL_error(
+          S, "Invalid replication flags. Use REPL_AOF, REPL_REPLICA, REPL_SLAVE or REPL_ALL");
     }
     peadb::script_set_repl_flags(static_cast<int>(flags));
     return 0;
   });
   lua_setfield(L, -2, "set_repl");
-  lua_pushinteger(L, 0); lua_setfield(L, -2, "REPL_NONE");
-  lua_pushinteger(L, 1); lua_setfield(L, -2, "REPL_AOF");
-  lua_pushinteger(L, 2); lua_setfield(L, -2, "REPL_SLAVE");
-  lua_pushinteger(L, 2); lua_setfield(L, -2, "REPL_REPLICA");
-  lua_pushinteger(L, 3); lua_setfield(L, -2, "REPL_ALL");
+  lua_pushinteger(L, 0);
+  lua_setfield(L, -2, "REPL_NONE");
+  lua_pushinteger(L, 1);
+  lua_setfield(L, -2, "REPL_AOF");
+  lua_pushinteger(L, 2);
+  lua_setfield(L, -2, "REPL_SLAVE");
+  lua_pushinteger(L, 2);
+  lua_setfield(L, -2, "REPL_REPLICA");
+  lua_pushinteger(L, 3);
+  lua_setfield(L, -2, "REPL_ALL");
 
   lua_pushcfunction(L, lua_redis_log);
   lua_setfield(L, -2, "log");
@@ -1100,8 +1158,10 @@ void register_redis_lib(lua_State* L) {
   lua_setfield(L, -2, "LOG_WARNING");
 
   // Server version, exposed at script runtime the same as on the FUNCTION LOAD table.
-  lua_pushstring(L, "7.2.5"); lua_setfield(L, -2, "REDIS_VERSION");
-  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5); lua_setfield(L, -2, "REDIS_VERSION_NUM");
+  lua_pushstring(L, "7.2.5");
+  lua_setfield(L, -2, "REDIS_VERSION");
+  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5);
+  lua_setfield(L, -2, "REDIS_VERSION_NUM");
 
   lua_setglobal(L, "redis");
 }
@@ -1121,16 +1181,28 @@ bool read_function_flags(lua_State* L, int idx, int& flags) {
   int i = 1;
   while (true) {
     lua_rawgeti(L, idx, i++);
-    if (lua_isnil(L, -1)) { lua_pop(L, 1); break; }
-    if (!lua_isstring(L, -1)) { lua_pop(L, 1); return false; }
+    if (lua_isnil(L, -1)) {
+      lua_pop(L, 1);
+      break;
+    }
+    if (!lua_isstring(L, -1)) {
+      lua_pop(L, 1);
+      return false;
+    }
     std::string f = lower(lua_tostring(L, -1));
     lua_pop(L, 1);
-    if (f == "no-writes") flags |= kFuncNoWrites;
-    else if (f == "allow-oom") flags |= kFuncAllowOom;
-    else if (f == "allow-stale") flags |= kFuncAllowStale;
-    else if (f == "no-cluster") flags |= kFuncNoCluster;
-    else if (f == "allow-cross-slot-keys") flags |= kFuncAllowCrossSlot;
-    else return false;
+    if (f == "no-writes")
+      flags |= kFuncNoWrites;
+    else if (f == "allow-oom")
+      flags |= kFuncAllowOom;
+    else if (f == "allow-stale")
+      flags |= kFuncAllowStale;
+    else if (f == "no-cluster")
+      flags |= kFuncNoCluster;
+    else if (f == "allow-cross-slot-keys")
+      flags |= kFuncAllowCrossSlot;
+    else
+      return false;
   }
   return true;
 }
@@ -1149,8 +1221,9 @@ int lua_func_register(lua_State* L) {
 
   if (nargs == 1) {
     if (!lua_istable(L, 1))
-      return luaL_error(L, "calling redis.register_function with a single argument is only "
-                           "applicable to Lua table (representing named arguments).");
+      return luaL_error(L,
+                        "calling redis.register_function with a single argument is only "
+                        "applicable to Lua table (representing named arguments).");
     bool have_name = false, have_cb = false;
     lua_pushnil(L);
     while (lua_next(L, 1) != 0) {
@@ -1161,49 +1234,74 @@ int lua_func_register(lua_State* L) {
       }
       const std::string key = lower(lua_tostring(L, -2));
       if (key == "function_name") {
-        if (!lua_isstring(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-          return luaL_error(L, "function_name argument given to redis.register_function must be a string"); }
-        { std::size_t nl = 0; const char* np = lua_tolstring(L, -1, &nl); name.assign(np, nl); }
+        if (!lua_isstring(L, -1)) {
+          if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(
+              L, "function_name argument given to redis.register_function must be a string");
+        }
+        {
+          std::size_t nl = 0;
+          const char* np = lua_tolstring(L, -1, &nl);
+          name.assign(np, nl);
+        }
         have_name = true;
       } else if (key == "description") {
-        if (!lua_isstring(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-          return luaL_error(L, "description argument given to redis.register_function must be a string"); }
+        if (!lua_isstring(L, -1)) {
+          if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(
+              L, "description argument given to redis.register_function must be a string");
+        }
         desc = lua_tostring(L, -1);
       } else if (key == "callback") {
-        if (!lua_isfunction(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-          return luaL_error(L, "callback argument given to redis.register_function must be a function"); }
+        if (!lua_isfunction(L, -1)) {
+          if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(
+              L, "callback argument given to redis.register_function must be a function");
+        }
         lua_pushvalue(L, -1);
         cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
         have_cb = true;
       } else if (key == "flags") {
-        if (!lua_istable(L, -1)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-          return luaL_error(L, "flags argument to redis.register_function must be a table representing function flags"); }
-        if (!read_function_flags(L, lua_gettop(L), flags)) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-          return luaL_error(L, "unknown flag given"); }
+        if (!lua_istable(L, -1)) {
+          if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L,
+                            "flags argument to redis.register_function must be a table "
+                            "representing function flags");
+        }
+        if (!read_function_flags(L, lua_gettop(L), flags)) {
+          if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+          return luaL_error(L, "unknown flag given");
+        }
       } else {
         if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
         return luaL_error(L, "unknown argument given to redis.register_function");
       }
       lua_pop(L, 1);  // pop value, keep key for lua_next
     }
-    if (!have_name) { if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-      return luaL_error(L, "redis.register_function must get a function name argument"); }
-    if (!have_cb)
-      return luaL_error(L, "redis.register_function must get a callback argument");
+    if (!have_name) {
+      if (cb_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
+      return luaL_error(L, "redis.register_function must get a function name argument");
+    }
+    if (!have_cb) return luaL_error(L, "redis.register_function must get a callback argument");
   } else {
     if (!lua_isstring(L, 1))
       return luaL_error(L, "first argument to redis.register_function must be a string");
     if (!lua_isfunction(L, 2))
       return luaL_error(L, "second argument to redis.register_function must be a function");
-    { std::size_t nl = 0; const char* np = lua_tolstring(L, 1, &nl); name.assign(np, nl); }
+    {
+      std::size_t nl = 0;
+      const char* np = lua_tolstring(L, 1, &nl);
+      name.assign(np, nl);
+    }
     lua_pushvalue(L, 2);
     cb_ref = luaL_ref(L, LUA_REGISTRYINDEX);
   }
 
   if (!valid_func_name(name)) {
     luaL_unref(L, LUA_REGISTRYINDEX, cb_ref);
-    return luaL_error(L, "Library names can only contain letters, numbers, or underscores(_) "
-                         "and must be at least one character long");
+    return luaL_error(L,
+                      "Library names can only contain letters, numbers, or underscores(_) "
+                      "and must be at least one character long");
   }
   for (const auto& f : *g_loading_fns) {
     if (lower(f.name) == lower(name)) {
@@ -1221,10 +1319,17 @@ int libenv_index(lua_State* L) {
   const char* kc = lua_tostring(L, 2);
   const std::string key = kc ? kc : "";
   if (g_in_function_load) {
-    if (key == "redis" || key == "server") { lua_rawgeti(L, LUA_REGISTRYINDEX, g_load_redis_ref); return 1; }
-    return luaL_error(L, "Script attempted to access nonexistent global variable '%s'", key.c_str());
+    if (key == "redis" || key == "server") {
+      lua_rawgeti(L, LUA_REGISTRYINDEX, g_load_redis_ref);
+      return 1;
+    }
+    return luaL_error(L, "Script attempted to access nonexistent global variable '%s'",
+                      key.c_str());
   }
-  if (key == "redis" || key == "server") { lua_getglobal(L, "redis"); return 1; }
+  if (key == "redis" || key == "server") {
+    lua_getglobal(L, "redis");
+    return 1;
+  }
   lua_getglobal(L, key.c_str());  // full sandboxed globals (string/table/math/cjson/…)
   if (!lua_isnil(L, -1)) return 1;
   lua_pop(L, 1);
@@ -1237,7 +1342,8 @@ int libenv_newindex(lua_State* L) {
 // FUNCTION LOAD instruction hook: enforce a 500 ms compile/run timeout.
 void lua_func_load_hook(lua_State* L, lua_Debug* /*ar*/) {
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-      std::chrono::steady_clock::now() - g_func_load_start).count();
+                           std::chrono::steady_clock::now() - g_func_load_start)
+                           .count();
   if (elapsed > 500) {
     g_func_load_timed_out = true;
     luaL_error(L, "FUNCTION LOAD timeout");
@@ -1249,35 +1355,47 @@ void lua_func_load_hook(lua_State* L, lua_Debug* /*ar*/) {
 void setup_function_infra(lua_State* L) {
   // load-time redis table
   lua_newtable(L);
-  lua_pushcfunction(L, lua_func_register); lua_setfield(L, -2, "register_function");
-  lua_pushcfunction(L, lua_redis_log); lua_setfield(L, -2, "log");
-  lua_pushnumber(L, 0); lua_setfield(L, -2, "LOG_DEBUG");
-  lua_pushnumber(L, 1); lua_setfield(L, -2, "LOG_VERBOSE");
-  lua_pushnumber(L, 2); lua_setfield(L, -2, "LOG_NOTICE");
-  lua_pushnumber(L, 3); lua_setfield(L, -2, "LOG_WARNING");
-  lua_pushstring(L, "7.2.5"); lua_setfield(L, -2, "REDIS_VERSION");
-  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5); lua_setfield(L, -2, "REDIS_VERSION_NUM");
+  lua_pushcfunction(L, lua_func_register);
+  lua_setfield(L, -2, "register_function");
+  lua_pushcfunction(L, lua_redis_log);
+  lua_setfield(L, -2, "log");
+  lua_pushnumber(L, 0);
+  lua_setfield(L, -2, "LOG_DEBUG");
+  lua_pushnumber(L, 1);
+  lua_setfield(L, -2, "LOG_VERBOSE");
+  lua_pushnumber(L, 2);
+  lua_setfield(L, -2, "LOG_NOTICE");
+  lua_pushnumber(L, 3);
+  lua_setfield(L, -2, "LOG_WARNING");
+  lua_pushstring(L, "7.2.5");
+  lua_setfield(L, -2, "REDIS_VERSION");
+  lua_pushinteger(L, (7 << 16) | (2 << 8) | 5);
+  lua_setfield(L, -2, "REDIS_VERSION_NUM");
   // error-on-missing metatable so redis.call/setresp/etc during load raise the right error
   lua_newtable(L);
   lua_pushcfunction(L, [](lua_State* S) -> int {
     const char* kc = lua_tostring(S, 2);
-    return luaL_error(S, "Script attempted to access nonexistent global variable '%s'", kc ? kc : "");
+    return luaL_error(S, "Script attempted to access nonexistent global variable '%s'",
+                      kc ? kc : "");
   });
   lua_setfield(L, -2, "__index");
-  lua_pushcfunction(L, libenv_newindex); lua_setfield(L, -2, "__newindex");
+  lua_pushcfunction(L, libenv_newindex);
+  lua_setfield(L, -2, "__newindex");
   lua_setmetatable(L, -2);
   g_load_redis_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
   // shared library environment table (fenv for every library body + callback)
   lua_newtable(L);
   lua_newtable(L);  // metatable
-  lua_pushcfunction(L, libenv_index); lua_setfield(L, -2, "__index");
-  lua_pushcfunction(L, libenv_newindex); lua_setfield(L, -2, "__newindex");
+  lua_pushcfunction(L, libenv_index);
+  lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, libenv_newindex);
+  lua_setfield(L, -2, "__newindex");
   lua_setmetatable(L, -2);
   g_libenv_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 }
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
@@ -1293,7 +1411,7 @@ void lua_engine_init() {
   lua_getglobal(g_L, "table");
   lua_getfield(g_L, -1, "unpack");
   lua_setglobal(g_L, "unpack");
-  lua_pop(g_L, 1); // pop table
+  lua_pop(g_L, 1);  // pop table
 
   // loadstring → load  (loadstring was removed in 5.2)
   lua_getglobal(g_L, "load");
@@ -1377,10 +1495,8 @@ void lua_engine_set_dispatch(CommandDispatchFn fn) {
   g_lua_dispatch = std::move(fn);
 }
 
-std::string lua_engine_eval(const std::string& script,
-                            const std::vector<std::string>& keys,
-                            const std::vector<std::string>& argv,
-                            SessionState& session) {
+std::string lua_engine_eval(const std::string& script, const std::vector<std::string>& keys,
+                            const std::vector<std::string>& argv, SessionState& session) {
   if (!g_L) return enc_error("Lua engine not initialized");
 
   // Save/restore thread-local state
@@ -1440,10 +1556,10 @@ std::string lua_engine_eval(const std::string& script,
   // The fenv is an empty table whose __index reads from real _G and
   // __newindex always errors, preventing scripts from modifying globals.
   if (g_create_fenv_ref != LUA_NOREF) {
-    lua_rawgeti(g_L, LUA_REGISTRYINDEX, g_create_fenv_ref); // push create_fenv
+    lua_rawgeti(g_L, LUA_REGISTRYINDEX, g_create_fenv_ref);  // push create_fenv
     if (lua_pcall(g_L, 0, 1, 0) == 0) {
       // Stack: [function, fenv]
-      lua_setfenv(g_L, -2); // setfenv(compiled_function, fenv)
+      lua_setfenv(g_L, -2);  // setfenv(compiled_function, fenv)
     } else {
       // create_fenv failed — pop the error and continue without fenv
       lua_pop(g_L, 1);
@@ -1489,8 +1605,7 @@ std::string lua_engine_eval(const std::string& script,
         // Check if the error starts with a dash (raw error)
         if (err_msg.rfind("-", 0) == 0) {
           result = err_msg;
-          if (result.size() < 2 || result.substr(result.size()-2) != "\r\n")
-            result += "\r\n";
+          if (result.size() < 2 || result.substr(result.size() - 2) != "\r\n") result += "\r\n";
         } else {
           result = enc_error_raw("ERR " + err_msg);
         }
@@ -1525,10 +1640,12 @@ bool lua_engine_consume_last_error_from_redis() {
   return v;
 }
 
-bool lua_engine_load_library(const std::string& body,
-                             std::vector<LuaRegisteredFunction>& out,
+bool lua_engine_load_library(const std::string& body, std::vector<LuaRegisteredFunction>& out,
                              std::string& err) {
-  if (!g_L) { err = "Lua engine not initialized"; return false; }
+  if (!g_L) {
+    err = "Lua engine not initialized";
+    return false;
+  }
   // Compile the body under the "@user_function" chunk name.
   if (luaL_loadbuffer(g_L, body.data(), body.size(), "@user_function") != 0) {
     err = "Error compiling function: " + std::string(lua_tostring(g_L, -1));
@@ -1570,16 +1687,16 @@ bool lua_engine_load_library(const std::string& body,
     }
     return false;
   }
-  if (fns.empty()) { err = "No functions registered"; return false; }
-  for (const auto& f : fns)
-    out.push_back({f.name, f.description, f.flags, f.ref});
+  if (fns.empty()) {
+    err = "No functions registered";
+    return false;
+  }
+  for (const auto& f : fns) out.push_back({f.name, f.description, f.flags, f.ref});
   return true;
 }
 
-std::string lua_engine_fcall(int callback_ref,
-                             const std::vector<std::string>& keys,
-                             const std::vector<std::string>& argv,
-                             SessionState& session,
+std::string lua_engine_fcall(int callback_ref, const std::vector<std::string>& keys,
+                             const std::vector<std::string>& argv, SessionState& session,
                              bool no_writes) {
   if (!g_L) return enc_error("Lua engine not initialized");
   auto* prev_session = g_lua_session;
@@ -1629,15 +1746,21 @@ std::string lua_engine_fcall(int callback_ref,
       result = m;
       if (result.size() < 2 || result.substr(result.size() - 2) != "\r\n") result += "\r\n";
     } else {
-      static const char* kPfx[] = {"ERR ", "WRONGTYPE", "OOM ", "NOSCRIPT", "BUSY ",
-                                    "NOREPLICAS", "READONLY", "MASTERDOWN", "NOPERM", "MISCONF "};
+      static const char* kPfx[] = {"ERR ",       "WRONGTYPE", "OOM ",       "NOSCRIPT", "BUSY ",
+                                   "NOREPLICAS", "READONLY",  "MASTERDOWN", "NOPERM",   "MISCONF "};
       bool known = false;
-      for (auto* p : kPfx) if (m.rfind(p, 0) == 0) { known = true; break; }
+      for (auto* p : kPfx)
+        if (m.rfind(p, 0) == 0) {
+          known = true;
+          break;
+        }
       result = enc_error_raw(known ? m : ("ERR " + m));
     }
   } else {
-    if (lua_gettop(g_L) == 0 || lua_isnil(g_L, -1)) result = enc_null(g_lua_client_resp);
-    else result = lua_to_resp(g_L, -1);
+    if (lua_gettop(g_L) == 0 || lua_isnil(g_L, -1))
+      result = enc_null(g_lua_client_resp);
+    else
+      result = lua_to_resp(g_L, -1);
     if (lua_gettop(g_L) > 0) lua_pop(g_L, 1);
   }
 
@@ -1653,4 +1776,4 @@ void lua_engine_unref_function(int callback_ref) {
     luaL_unref(g_L, LUA_REGISTRYINDEX, callback_ref);
 }
 
-} // namespace peadb
+}  // namespace peadb

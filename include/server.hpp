@@ -6,4 +6,4 @@ namespace peadb {
 
 int run_server(const ServerConfig& config);
 
-} // namespace peadb
+}  // namespace peadb
