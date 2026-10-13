@@ -46,7 +46,9 @@ FunctionDumpFn g_function_dump_hook;      // returns every function library's so
 FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
 }  // namespace
 
-void rdb_set_skip_checksum_validation(bool skip) { g_skip_checksum_validation = skip; }
+void rdb_set_skip_checksum_validation(bool skip) {
+  g_skip_checksum_validation = skip;
+}
 void rdb_set_checksum(bool enabled) {
   g_rdb_checksum = enabled;
 }
@@ -95,41 +97,41 @@ bool fsync_parent_dir(const std::filesystem::path& path) {
 // ── RDB constants ──────────────────────────────────────────────────────
 
 constexpr uint8_t RDB_OPCODE_EXPIRETIME_MS = 252;
-constexpr uint8_t RDB_OPCODE_EXPIRETIME    = 253;
-constexpr uint8_t RDB_OPCODE_SELECTDB      = 254;
-constexpr uint8_t RDB_OPCODE_EOF           = 255;
-constexpr uint8_t RDB_OPCODE_RESIZEDB      = 251;
-constexpr uint8_t RDB_OPCODE_AUX           = 250;
-constexpr uint8_t RDB_OPCODE_FUNCTION2     = 245;  // one string payload = one library's source
+constexpr uint8_t RDB_OPCODE_EXPIRETIME = 253;
+constexpr uint8_t RDB_OPCODE_SELECTDB = 254;
+constexpr uint8_t RDB_OPCODE_EOF = 255;
+constexpr uint8_t RDB_OPCODE_RESIZEDB = 251;
+constexpr uint8_t RDB_OPCODE_AUX = 250;
+constexpr uint8_t RDB_OPCODE_FUNCTION2 = 245;        // one string payload = one library's source
 constexpr uint8_t RDB_OPCODE_FUNCTION_PRE_GA = 246;  // Redis 7.0 release-candidate format
-constexpr uint8_t RDB_OPCODE_IDLE          = 248;  // LRU idle seconds of the next key
-constexpr uint8_t RDB_OPCODE_FREQ          = 249;  // LFU counter of the next key
+constexpr uint8_t RDB_OPCODE_IDLE = 248;             // LRU idle seconds of the next key
+constexpr uint8_t RDB_OPCODE_FREQ = 249;             // LFU counter of the next key
 
-constexpr uint8_t RDB_TYPE_STRING   = 0;
-constexpr uint8_t RDB_TYPE_LIST     = 1;
-constexpr uint8_t RDB_TYPE_SET      = 2;
-constexpr uint8_t RDB_TYPE_ZSET     = 3;
-constexpr uint8_t RDB_TYPE_HASH     = 4;
-constexpr uint8_t RDB_TYPE_ZSET_2   = 5;
-constexpr uint8_t RDB_TYPE_HASH_ZIPMAP     = 9;
-constexpr uint8_t RDB_TYPE_LIST_ZIPLIST    = 10;
-constexpr uint8_t RDB_TYPE_SET_INTSET      = 11;
-constexpr uint8_t RDB_TYPE_ZSET_ZIPLIST    = 12;
-constexpr uint8_t RDB_TYPE_HASH_ZIPLIST    = 13;
+constexpr uint8_t RDB_TYPE_STRING = 0;
+constexpr uint8_t RDB_TYPE_LIST = 1;
+constexpr uint8_t RDB_TYPE_SET = 2;
+constexpr uint8_t RDB_TYPE_ZSET = 3;
+constexpr uint8_t RDB_TYPE_HASH = 4;
+constexpr uint8_t RDB_TYPE_ZSET_2 = 5;
+constexpr uint8_t RDB_TYPE_HASH_ZIPMAP = 9;
+constexpr uint8_t RDB_TYPE_LIST_ZIPLIST = 10;
+constexpr uint8_t RDB_TYPE_SET_INTSET = 11;
+constexpr uint8_t RDB_TYPE_ZSET_ZIPLIST = 12;
+constexpr uint8_t RDB_TYPE_HASH_ZIPLIST = 13;
 constexpr uint8_t RDB_TYPE_LIST_QUICKLIST = 14;  // nodes are ziplists (Redis 3.2 to 6.2)
-constexpr uint8_t RDB_TYPE_HASH_LISTPACK   = 16;
-constexpr uint8_t RDB_TYPE_ZSET_LISTPACK   = 17;
-constexpr uint8_t RDB_TYPE_LIST_QUICKLIST_2= 18;
-constexpr uint8_t RDB_TYPE_SET_LISTPACK    = 20;
+constexpr uint8_t RDB_TYPE_HASH_LISTPACK = 16;
+constexpr uint8_t RDB_TYPE_ZSET_LISTPACK = 17;
+constexpr uint8_t RDB_TYPE_LIST_QUICKLIST_2 = 18;
+constexpr uint8_t RDB_TYPE_SET_LISTPACK = 20;
 // PeaDB-specific stream encoding (NOT Redis byte-compatible — Redis can't load an RDB
 // containing this type; cross-engine stream migration still uses the AOF/bridge path).
 // Chosen outside Redis's type range so non-stream RDBs stay fully Redis-compatible.
-constexpr uint8_t RDB_TYPE_PEADB_STREAM       = 200;
+constexpr uint8_t RDB_TYPE_PEADB_STREAM = 200;
 
-constexpr uint8_t RDB_ENC_INT8  = 0;
+constexpr uint8_t RDB_ENC_INT8 = 0;
 constexpr uint8_t RDB_ENC_INT16 = 1;
 constexpr uint8_t RDB_ENC_INT32 = 2;
-constexpr uint8_t RDB_ENC_LZF   = 3;
+constexpr uint8_t RDB_ENC_LZF = 3;
 
 constexpr int RDB_VERSION = 10;
 // The newest RDB version Redis 7.2.5 reads (its rdb.h RDB_VERSION): a file or a DUMP payload with
@@ -190,14 +192,18 @@ namespace {
 
 class RdbWriter {
  public:
-  void write_u8(uint8_t v) { buf_.push_back(static_cast<char>(v)); }
+  void write_u8(uint8_t v) {
+    buf_.push_back(static_cast<char>(v));
+  }
   void write_u16_le(uint16_t v) {
     write_u8(v & 0xff);
     write_u8((v >> 8) & 0xff);
   }
   void write_u32_le(uint32_t v) {
-    write_u8(v & 0xff); write_u8((v >> 8) & 0xff);
-    write_u8((v >> 16) & 0xff); write_u8((v >> 24) & 0xff);
+    write_u8(v & 0xff);
+    write_u8((v >> 8) & 0xff);
+    write_u8((v >> 16) & 0xff);
+    write_u8((v >> 24) & 0xff);
   }
   void write_u64_le(uint64_t v) {
     write_u32_le(static_cast<uint32_t>(v));
@@ -206,21 +212,23 @@ class RdbWriter {
   void write_raw(const void* p, size_t n) {
     buf_.append(reinterpret_cast<const char*>(p), n);
   }
-  void write_raw(const std::string& s) { buf_ += s; }
+  void write_raw(const std::string& s) {
+    buf_ += s;
+  }
 
   // Redis "length" encoding
   void write_length(uint64_t len) {
     if (len < 64) {
-      write_u8(static_cast<uint8_t>(len)); // 00xxxxxx
+      write_u8(static_cast<uint8_t>(len));  // 00xxxxxx
     } else if (len < 16384) {
-      write_u8(static_cast<uint8_t>(0x40 | (len >> 8))); // 01xxxxxx
+      write_u8(static_cast<uint8_t>(0x40 | (len >> 8)));  // 01xxxxxx
       write_u8(static_cast<uint8_t>(len & 0xff));
     } else if (len <= 0xFFFFFFFF) {
-      write_u8(0x80); // 10000000
+      write_u8(0x80);  // 10000000
       uint32_t be = htonl(static_cast<uint32_t>(len));
       write_raw(&be, 4);
     } else {
-      write_u8(0x81); // 10000001
+      write_u8(0x81);  // 10000001
       uint64_t v = len;
       // network byte order (big-endian)
       for (int i = 7; i >= 0; --i) write_u8(static_cast<uint8_t>((v >> (i * 8)) & 0xff));
@@ -236,7 +244,7 @@ class RdbWriter {
         // Verify it's exact (no leading zeros, etc.)
         if (std::to_string(val) == s) {
           if (val >= -128 && val <= 127) {
-            write_u8(0xC0 | RDB_ENC_INT8); // 11 000000
+            write_u8(0xC0 | RDB_ENC_INT8);  // 11 000000
             write_u8(static_cast<uint8_t>(static_cast<int8_t>(val)));
             return;
           }
@@ -251,7 +259,8 @@ class RdbWriter {
             return;
           }
         }
-      } catch (...) {}
+      } catch (...) {
+      }
     }
     // Raw string
     write_length(s.size());
@@ -265,8 +274,12 @@ class RdbWriter {
     write_u64_le(bits);
   }
 
-  const std::string& data() const { return buf_; }
-  void clear() { buf_.clear(); }
+  const std::string& data() const {
+    return buf_;
+  }
+  void clear() {
+    buf_.clear();
+  }
 
  private:
   std::string buf_;
@@ -276,13 +289,23 @@ class RdbWriter {
 
 class RdbReader {
  public:
-  RdbReader(const std::string& data) : data_(data), pos_(0) {}
-  RdbReader(const char* p, size_t n) : data_(p, n), pos_(0) {}
+  RdbReader(const std::string& data) : data_(data), pos_(0) {
+  }
+  RdbReader(const char* p, size_t n) : data_(p, n), pos_(0) {
+  }
 
-  bool ok() const { return pos_ <= data_.size(); }
-  bool eof() const { return pos_ >= data_.size(); }
-  size_t pos() const { return pos_; }
-  size_t remaining() const { return data_.size() - pos_; }
+  bool ok() const {
+    return pos_ <= data_.size();
+  }
+  bool eof() const {
+    return pos_ >= data_.size();
+  }
+  size_t pos() const {
+    return pos_;
+  }
+  size_t remaining() const {
+    return data_.size() - pos_;
+  }
 
   bool read_u8(uint8_t& v) {
     if (pos_ >= data_.size()) return false;
@@ -356,16 +379,16 @@ class RdbReader {
     if (!read_u8(byte)) return false;
     uint8_t type = (byte >> 6) & 0x03;
     switch (type) {
-      case 0: // 00xxxxxx
+      case 0:  // 00xxxxxx
         len = byte & 0x3f;
         return true;
-      case 1: { // 01xxxxxx
+      case 1: {  // 01xxxxxx
         uint8_t next;
         if (!read_u8(next)) return false;
         len = ((static_cast<uint64_t>(byte) & 0x3f) << 8) | next;
         return true;
       }
-      case 2: { // 10xxxxxx
+      case 2: {  // 10xxxxxx
         if ((byte & 0x3f) == 0) {
           // 10000000 — 4-byte big-endian
           uint32_t v;
@@ -379,7 +402,7 @@ class RdbReader {
         }
         return false;
       }
-      case 3: // 11xxxxxx — special encoding
+      case 3:  // 11xxxxxx — special encoding
         is_encoded = true;
         len = byte & 0x3f;
         return true;
@@ -448,12 +471,25 @@ class RdbReader {
   bool read_double_old(double& v) {
     uint8_t len;
     if (!read_u8(len)) return false;
-    if (len == 255) { v = -std::numeric_limits<double>::infinity(); return true; }
-    if (len == 254) { v = std::numeric_limits<double>::infinity(); return true; }
-    if (len == 253) { v = std::numeric_limits<double>::quiet_NaN(); return true; }
+    if (len == 255) {
+      v = -std::numeric_limits<double>::infinity();
+      return true;
+    }
+    if (len == 254) {
+      v = std::numeric_limits<double>::infinity();
+      return true;
+    }
+    if (len == 253) {
+      v = std::numeric_limits<double>::quiet_NaN();
+      return true;
+    }
     std::string s;
     if (!read_bytes(s, len)) return false;
-    try { v = std::stod(s); } catch (...) { return false; }
+    try {
+      v = std::stod(s);
+    } catch (...) {
+      return false;
+    }
     return true;
   }
 
@@ -472,7 +508,7 @@ class RdbReader {
       } else {
         // Back-reference
         size_t len = (ctrl >> 5) + 2;
-        if (len == 9) { // 7 + 2
+        if (len == 9) {  // 7 + 2
           if (ip >= in_len) return false;
           len += static_cast<uint8_t>(in[ip++]);
         }
@@ -622,7 +658,8 @@ class ListpackWriter {
 // Simple listpack reader
 class ListpackReader {
  public:
-  ListpackReader(const std::string& data) : data_(data), pos_(0) {}
+  ListpackReader(const std::string& data) : data_(data), pos_(0) {
+  }
 
   // Reads every entry, with the checks of Redis's lpValidateIntegrity() in its deep mode: the
   // total-bytes field is the blob's size, every entry and its backlen lie inside the blob and the
@@ -668,31 +705,33 @@ class ListpackReader {
     // encoding header + data (excluding the trailing backlen), which then determines how many
     // backlen bytes to skip to reach the next element.
     size_t entry_len;
-    auto need = [&](size_t nbytes) { return pos_ + nbytes <= data_.size(); };
+    auto need = [&](size_t nbytes) {
+      return pos_ + nbytes <= data_.size();
+    };
 
-    if ((enc & 0x80) == 0) {                       // 0xxxxxxx : 7-bit unsigned int
+    if ((enc & 0x80) == 0) {  // 0xxxxxxx : 7-bit unsigned int
       val = std::to_string(enc & 0x7f);
       entry_len = 1;
-    } else if ((enc & 0xC0) == 0x80) {             // 10xxxxxx : 6-bit string
+    } else if ((enc & 0xC0) == 0x80) {  // 10xxxxxx : 6-bit string
       uint32_t slen = enc & 0x3f;
       if (!need(1 + slen)) return false;
       val.assign(data_, pos_ + 1, slen);
       entry_len = 1 + slen;
-    } else if ((enc & 0xE0) == 0xC0) {             // 110xxxxx xxxxxxxx : 13-bit signed int
+    } else if ((enc & 0xE0) == 0xC0) {  // 110xxxxx xxxxxxxx : 13-bit signed int
       if (!need(2)) return false;
       int16_t v = static_cast<int16_t>(((static_cast<uint16_t>(enc & 0x1f)) << 8) |
                                        static_cast<uint8_t>(data_[pos_ + 1]));
       if (v & 0x1000) v |= static_cast<int16_t>(0xE000);  // sign-extend from 13 bits
       val = std::to_string(v);
       entry_len = 2;
-    } else if ((enc & 0xF0) == 0xE0) {             // 1110xxxx xxxxxxxx : 12-bit string
+    } else if ((enc & 0xF0) == 0xE0) {  // 1110xxxx xxxxxxxx : 12-bit string
       if (!need(2)) return false;
-      uint32_t slen = ((static_cast<uint32_t>(enc & 0x0f)) << 8) |
-                      static_cast<uint8_t>(data_[pos_ + 1]);
+      uint32_t slen =
+          ((static_cast<uint32_t>(enc & 0x0f)) << 8) | static_cast<uint8_t>(data_[pos_ + 1]);
       if (!need(2 + slen)) return false;
       val.assign(data_, pos_ + 2, slen);
       entry_len = 2 + slen;
-    } else if (enc == 0xF0) {                      // 11110000 : 32-bit LE length string
+    } else if (enc == 0xF0) {  // 11110000 : 32-bit LE length string
       if (!need(5)) return false;
       uint32_t slen = static_cast<uint8_t>(data_[pos_ + 1]) |
                       (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
@@ -701,13 +740,14 @@ class ListpackReader {
       if (!need(static_cast<size_t>(5) + slen)) return false;
       val.assign(data_, pos_ + 5, slen);
       entry_len = 5 + slen;
-    } else if (enc == 0xF1) {                      // 16-bit signed int (LE)
+    } else if (enc == 0xF1) {  // 16-bit signed int (LE)
       if (!need(3)) return false;
-      int16_t v = static_cast<int16_t>(static_cast<uint8_t>(data_[pos_ + 1]) |
-                                       (static_cast<uint16_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8));
+      int16_t v =
+          static_cast<int16_t>(static_cast<uint8_t>(data_[pos_ + 1]) |
+                               (static_cast<uint16_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8));
       val = std::to_string(v);
       entry_len = 3;
-    } else if (enc == 0xF2) {                      // 24-bit signed int (LE)
+    } else if (enc == 0xF2) {  // 24-bit signed int (LE)
       if (!need(4)) return false;
       int32_t v = static_cast<uint8_t>(data_[pos_ + 1]) |
                   (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
@@ -715,18 +755,20 @@ class ListpackReader {
       if (v & 0x800000) v |= static_cast<int32_t>(0xFF000000u);  // sign-extend from 24 bits
       val = std::to_string(v);
       entry_len = 4;
-    } else if (enc == 0xF3) {                      // 32-bit signed int (LE)
+    } else if (enc == 0xF3) {  // 32-bit signed int (LE)
       if (!need(5)) return false;
-      int32_t v = static_cast<int32_t>(static_cast<uint8_t>(data_[pos_ + 1]) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 16) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 4])) << 24));
+      int32_t v = static_cast<int32_t>(
+          static_cast<uint8_t>(data_[pos_ + 1]) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 16) |
+          (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 4])) << 24));
       val = std::to_string(v);
       entry_len = 5;
-    } else if (enc == 0xF4) {                      // 64-bit signed int (LE)
+    } else if (enc == 0xF4) {  // 64-bit signed int (LE)
       if (!need(9)) return false;
       uint64_t u = 0;
-      for (int i = 0; i < 8; ++i) u |= static_cast<uint64_t>(static_cast<uint8_t>(data_[pos_ + 1 + i])) << (8 * i);
+      for (int i = 0; i < 8; ++i)
+        u |= static_cast<uint64_t>(static_cast<uint8_t>(data_[pos_ + 1 + i])) << (8 * i);
       val = std::to_string(static_cast<int64_t>(u));
       entry_len = 9;
     } else {
@@ -755,7 +797,7 @@ class ListpackReader {
   size_t pos_;
 };
 
-} // anonymous namespace
+}  // anonymous namespace
 
 // ── RDB Save ───────────────────────────────────────────────────────────
 
@@ -970,7 +1012,10 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
         for (const auto& [id, fields] : d.entries) {
           w.write_string(id);
           w.write_length(fields.size());
-          for (const auto& [f, v] : fields) { w.write_string(f); w.write_string(v); }
+          for (const auto& [f, v] : fields) {
+            w.write_string(f);
+            w.write_string(v);
+          }
         }
         w.write_length(d.last_ms);
         w.write_length(d.last_seq);
@@ -1000,10 +1045,9 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
 
   return w.data();
 }
-} // end anonymous namespace
+}  // end anonymous namespace
 
-bool rdb_save(const std::filesystem::path& path, std::string& err,
-              const RdbReplicationInfo* repl) {
+bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbReplicationInfo* repl) {
   err.clear();
   auto cwd = [] {
     std::error_code ec;
@@ -1107,7 +1151,9 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   }
 
   int rdb_ver = 0;
-  try { rdb_ver = std::stoi(filedata.substr(5, 4)); } catch (...) {
+  try {
+    rdb_ver = std::stoi(filedata.substr(5, 4));
+  } catch (...) {
     err = "invalid RDB version";
     return false;
   }
@@ -1123,7 +1169,8 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   // never replaces the dataset in memory.
   if (rdb_ver >= 5 && g_rdb_checksum && !g_skip_checksum_validation) {
     uint64_t stored = 0;
-    const auto* tail = reinterpret_cast<const unsigned char*>(filedata.data() + filedata.size() - 8);
+    const auto* tail =
+        reinterpret_cast<const unsigned char*>(filedata.data() + filedata.size() - 8);
     for (int i = 0; i < 8; ++i) stored |= static_cast<uint64_t>(tail[i]) << (8 * i);
     if (stored == 0) {
       log(LogLevel::Info, "RDB file was saved with checksum disabled: no check performed.");
@@ -1234,8 +1281,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     if (type == RDB_OPCODE_RESIZEDB) {
       uint64_t db_size, exp_size;
       bool enc1, enc2;
-      if (!r.read_length(db_size, enc1) || enc1 ||
-          !r.read_length(exp_size, enc2) || enc2) {
+      if (!r.read_length(db_size, enc1) || enc1 || !r.read_length(exp_size, enc2) || enc2) {
         err = "malformed RESIZEDB";
         ds.select_db(prev_db);
         return false;
@@ -1289,11 +1335,19 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       // Encoded list (linked list of strings)
       uint64_t len;
       bool enc;
-      if (!r.read_length(len, enc) || enc) { err = "malformed list"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(len, enc) || enc) {
+        err = "malformed list";
+        ds.select_db(prev_db);
+        return false;
+      }
       std::vector<std::string> items;
       for (uint64_t i = 0; i < len; ++i) {
         std::string val;
-        if (!r.read_string(val)) { err = "malformed list item"; ds.select_db(prev_db); return false; }
+        if (!r.read_string(val)) {
+          err = "malformed list item";
+          ds.select_db(prev_db);
+          return false;
+        }
         items.push_back(std::move(val));
       }
       bool wt = false;
@@ -1307,7 +1361,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       // Empty listpacks are skipped, and a list with no element is not loaded, as in Redis.
       uint64_t node_count;
       bool enc;
-      if (!r.read_length(node_count, enc) || enc) { err = "malformed quicklist"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(node_count, enc) || enc) {
+        err = "malformed quicklist";
+        ds.select_db(prev_db);
+        return false;
+      }
       std::vector<std::string> all_items;
       for (uint64_t n = 0; n < node_count; ++n) {
         uint64_t container;
@@ -1362,11 +1420,19 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     } else if (type == RDB_TYPE_SET) {
       uint64_t len;
       bool enc;
-      if (!r.read_length(len, enc) || enc) { err = "malformed set"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(len, enc) || enc) {
+        err = "malformed set";
+        ds.select_db(prev_db);
+        return false;
+      }
       std::vector<std::string> members;
       for (uint64_t i = 0; i < len; ++i) {
         std::string m;
-        if (!r.read_string(m)) { err = "malformed set member"; ds.select_db(prev_db); return false; }
+        if (!r.read_string(m)) {
+          err = "malformed set member";
+          ds.select_db(prev_db);
+          return false;
+        }
         members.push_back(std::move(m));
       }
       bool wt = false;
@@ -1375,17 +1441,21 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
 
     } else if (type == RDB_TYPE_SET_INTSET) {
       std::string blob;
-      if (!r.read_string(blob)) { err = "malformed intset"; ds.select_db(prev_db); return false; }
+      if (!r.read_string(blob)) {
+        err = "malformed intset";
+        ds.select_db(prev_db);
+        return false;
+      }
       // Intset format: encoding(u32) length(u32) entries...
       if (blob.size() >= 8) {
         uint32_t encoding = static_cast<uint32_t>(static_cast<uint8_t>(blob[0])) |
-                           (static_cast<uint32_t>(static_cast<uint8_t>(blob[1])) << 8) |
-                           (static_cast<uint32_t>(static_cast<uint8_t>(blob[2])) << 16) |
-                           (static_cast<uint32_t>(static_cast<uint8_t>(blob[3])) << 24);
+                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[1])) << 8) |
+                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[2])) << 16) |
+                            (static_cast<uint32_t>(static_cast<uint8_t>(blob[3])) << 24);
         uint32_t num = static_cast<uint32_t>(static_cast<uint8_t>(blob[4])) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(blob[5])) << 8) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(blob[6])) << 16) |
-                      (static_cast<uint32_t>(static_cast<uint8_t>(blob[7])) << 24);
+                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[5])) << 8) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[6])) << 16) |
+                       (static_cast<uint32_t>(static_cast<uint8_t>(blob[7])) << 24);
         std::vector<std::string> members;
         size_t entry_size = (encoding == 2) ? 2 : (encoding == 4) ? 4 : 8;
         for (uint32_t i = 0; i < num; ++i) {
@@ -1393,16 +1463,19 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
           if (off + entry_size > blob.size()) break;
           int64_t val = 0;
           if (entry_size == 2) {
-            val = static_cast<int16_t>(static_cast<uint16_t>(static_cast<uint8_t>(blob[off])) |
-                  (static_cast<uint16_t>(static_cast<uint8_t>(blob[off + 1])) << 8));
+            val = static_cast<int16_t>(
+                static_cast<uint16_t>(static_cast<uint8_t>(blob[off])) |
+                (static_cast<uint16_t>(static_cast<uint8_t>(blob[off + 1])) << 8));
           } else if (entry_size == 4) {
-            val = static_cast<int32_t>(static_cast<uint32_t>(static_cast<uint8_t>(blob[off])) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 1])) << 8) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 2])) << 16) |
-                  (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 3])) << 24));
+            val = static_cast<int32_t>(
+                static_cast<uint32_t>(static_cast<uint8_t>(blob[off])) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 1])) << 8) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 2])) << 16) |
+                (static_cast<uint32_t>(static_cast<uint8_t>(blob[off + 3])) << 24));
           } else {
             uint64_t uv = 0;
-            for (int b = 0; b < 8; ++b) uv |= static_cast<uint64_t>(static_cast<uint8_t>(blob[off + b])) << (b * 8);
+            for (int b = 0; b < 8; ++b)
+              uv |= static_cast<uint64_t>(static_cast<uint8_t>(blob[off + b])) << (b * 8);
             val = static_cast<int64_t>(uv);
           }
           members.push_back(std::to_string(val));
@@ -1414,7 +1487,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
 
     } else if (type == RDB_TYPE_SET_LISTPACK) {
       std::string blob;
-      if (!r.read_string(blob)) { err = "malformed set listpack"; ds.select_db(prev_db); return false; }
+      if (!r.read_string(blob)) {
+        err = "malformed set listpack";
+        ds.select_db(prev_db);
+        return false;
+      }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
       if (!lpr.parse(entries)) {
@@ -1422,17 +1499,28 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         ds.select_db(prev_db);
         return false;
       }
-      if (!entries.empty()) { bool wt = false; ds.sadd(key, entries, wt); }
+      if (!entries.empty()) {
+        bool wt = false;
+        ds.sadd(key, entries, wt);
+      }
       if (expire_at) ds.expire(key, *expire_at);
 
     } else if (type == RDB_TYPE_HASH) {
       uint64_t len;
       bool enc;
-      if (!r.read_length(len, enc) || enc) { err = "malformed hash"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(len, enc) || enc) {
+        err = "malformed hash";
+        ds.select_db(prev_db);
+        return false;
+      }
       std::vector<std::pair<std::string, std::string>> fields;
       for (uint64_t i = 0; i < len; ++i) {
         std::string f, v;
-        if (!r.read_string(f) || !r.read_string(v)) { err = "malformed hash field"; ds.select_db(prev_db); return false; }
+        if (!r.read_string(f) || !r.read_string(v)) {
+          err = "malformed hash field";
+          ds.select_db(prev_db);
+          return false;
+        }
         fields.push_back({std::move(f), std::move(v)});
       }
       bool wt = false;
@@ -1441,7 +1529,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
 
     } else if (type == RDB_TYPE_HASH_LISTPACK) {
       std::string blob;
-      if (!r.read_string(blob)) { err = "malformed hash listpack"; ds.select_db(prev_db); return false; }
+      if (!r.read_string(blob)) {
+        err = "malformed hash listpack";
+        ds.select_db(prev_db);
+        return false;
+      }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
       if (!lpr.parse(entries) || entries.size() % 2 != 0) {
@@ -1453,21 +1545,40 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       for (size_t i = 0; i + 1 < entries.size(); i += 2) {
         fields.push_back({entries[i], entries[i + 1]});
       }
-      if (!fields.empty()) { bool wt = false; ds.hset(key, fields, wt); }
+      if (!fields.empty()) {
+        bool wt = false;
+        ds.hset(key, fields, wt);
+      }
       if (expire_at) ds.expire(key, *expire_at);
 
     } else if (type == RDB_TYPE_ZSET || type == RDB_TYPE_ZSET_2) {
       uint64_t len;
       bool enc;
-      if (!r.read_length(len, enc) || enc) { err = "malformed zset"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(len, enc) || enc) {
+        err = "malformed zset";
+        ds.select_db(prev_db);
+        return false;
+      }
       for (uint64_t i = 0; i < len; ++i) {
         std::string member;
-        if (!r.read_string(member)) { err = "malformed zset member"; ds.select_db(prev_db); return false; }
+        if (!r.read_string(member)) {
+          err = "malformed zset member";
+          ds.select_db(prev_db);
+          return false;
+        }
         double score;
         if (type == RDB_TYPE_ZSET_2) {
-          if (!r.read_double_binary(score)) { err = "malformed zset score"; ds.select_db(prev_db); return false; }
+          if (!r.read_double_binary(score)) {
+            err = "malformed zset score";
+            ds.select_db(prev_db);
+            return false;
+          }
         } else {
-          if (!r.read_double_old(score)) { err = "malformed zset score"; ds.select_db(prev_db); return false; }
+          if (!r.read_double_old(score)) {
+            err = "malformed zset score";
+            ds.select_db(prev_db);
+            return false;
+          }
         }
         ds.zadd_one(key, score, member, false, false, false, false, false);
       }
@@ -1475,7 +1586,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
 
     } else if (type == RDB_TYPE_ZSET_LISTPACK) {
       std::string blob;
-      if (!r.read_string(blob)) { err = "malformed zset listpack"; ds.select_db(prev_db); return false; }
+      if (!r.read_string(blob)) {
+        err = "malformed zset listpack";
+        ds.select_db(prev_db);
+        return false;
+      }
       ListpackReader lpr(blob);
       std::vector<std::string> entries;
       if (!lpr.parse(entries) || entries.size() % 2 != 0) {
@@ -1485,42 +1600,83 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
       for (size_t i = 0; i + 1 < entries.size(); i += 2) {
         double score = 0;
-        try { score = std::stod(entries[i + 1]); } catch (...) {}
+        try {
+          score = std::stod(entries[i + 1]);
+        } catch (...) {
+        }
         ds.zadd_one(key, score, entries[i], false, false, false, false, false);
       }
       if (expire_at) ds.expire(key, *expire_at);
 
     } else if (type == RDB_TYPE_PEADB_STREAM) {
       DataStore::StreamDump d;
-      uint64_t nentries = 0; bool enc = false;
-      if (!r.read_length(nentries, enc) || enc) { err = "malformed stream"; ds.select_db(prev_db); return false; }
+      uint64_t nentries = 0;
+      bool enc = false;
+      if (!r.read_length(nentries, enc) || enc) {
+        err = "malformed stream";
+        ds.select_db(prev_db);
+        return false;
+      }
       for (uint64_t i = 0; i < nentries; ++i) {
-        std::string id; if (!r.read_string(id)) { err = "malformed stream entry id"; ds.select_db(prev_db); return false; }
-        uint64_t nf = 0; if (!r.read_length(nf, enc) || enc) { err = "malformed stream entry"; ds.select_db(prev_db); return false; }
+        std::string id;
+        if (!r.read_string(id)) {
+          err = "malformed stream entry id";
+          ds.select_db(prev_db);
+          return false;
+        }
+        uint64_t nf = 0;
+        if (!r.read_length(nf, enc) || enc) {
+          err = "malformed stream entry";
+          ds.select_db(prev_db);
+          return false;
+        }
         std::vector<std::pair<std::string, std::string>> fields;
         for (uint64_t j = 0; j < nf; ++j) {
           std::string f, v;
-          if (!r.read_string(f) || !r.read_string(v)) { err = "malformed stream field"; ds.select_db(prev_db); return false; }
+          if (!r.read_string(f) || !r.read_string(v)) {
+            err = "malformed stream field";
+            ds.select_db(prev_db);
+            return false;
+          }
           fields.emplace_back(std::move(f), std::move(v));
         }
         d.entries.emplace_back(std::move(id), std::move(fields));
       }
       uint64_t lms = 0, lseq = 0;
-      if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) { err = "malformed stream last-id"; ds.select_db(prev_db); return false; }
-      d.last_ms = lms; d.last_seq = lseq;
+      if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) {
+        err = "malformed stream last-id";
+        ds.select_db(prev_db);
+        return false;
+      }
+      d.last_ms = lms;
+      d.last_seq = lseq;
       uint64_t ngroups = 0;
-      if (!r.read_length(ngroups, enc) || enc) { err = "malformed stream groups"; ds.select_db(prev_db); return false; }
+      if (!r.read_length(ngroups, enc) || enc) {
+        err = "malformed stream groups";
+        ds.select_db(prev_db);
+        return false;
+      }
       for (uint64_t gi = 0; gi < ngroups; ++gi) {
         DataStore::StreamGroupDump gd;
-        if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) { err = "malformed stream group"; ds.select_db(prev_db); return false; }
+        if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) {
+          err = "malformed stream group";
+          ds.select_db(prev_db);
+          return false;
+        }
         uint64_t npel = 0;
-        if (!r.read_length(npel, enc) || enc) { err = "malformed stream pel"; ds.select_db(prev_db); return false; }
+        if (!r.read_length(npel, enc) || enc) {
+          err = "malformed stream pel";
+          ds.select_db(prev_db);
+          return false;
+        }
         for (uint64_t pi = 0; pi < npel; ++pi) {
           DataStore::StreamPel p;
           uint64_t dms = 0, dcnt = 0;
-          if (!r.read_string(p.id) || !r.read_string(p.consumer) ||
-              !r.read_length(dms, enc) || enc || !r.read_length(dcnt, enc) || enc) {
-            err = "malformed stream pel entry"; ds.select_db(prev_db); return false;
+          if (!r.read_string(p.id) || !r.read_string(p.consumer) || !r.read_length(dms, enc) ||
+              enc || !r.read_length(dcnt, enc) || enc) {
+            err = "malformed stream pel entry";
+            ds.select_db(prev_db);
+            return false;
           }
           p.delivery_ms = static_cast<std::int64_t>(dms);
           p.delivery_count = static_cast<std::int64_t>(dcnt);
@@ -1778,4 +1934,4 @@ void rdb_store_dump_value(const std::string& key, DumpValue&& value,
   if (expire_at_ms) ds.expire(key, *expire_at_ms);
 }
 
-} // namespace peadb
+}  // namespace peadb

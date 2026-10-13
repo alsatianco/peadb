@@ -61,8 +61,7 @@ std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl 
 // checks pass, right before rdb_load() flushes the keyspace. A file cut short fails after that.
 // `repl_stream_db`, when given, receives the file's repl-stream-db aux field (-1 without one).
 bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace = nullptr,
-              int* repl_stream_db = nullptr);
+              const std::function<void()>& before_replace = nullptr, int* repl_stream_db = nullptr);
 
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);
@@ -107,4 +106,4 @@ bool rdb_checksum();
 // crc64(crc64(0, a), b) == crc64(0, a + b).
 std::uint64_t crc64(std::uint64_t crc, const void* data, std::size_t len);
 
-} // namespace peadb
+}  // namespace peadb

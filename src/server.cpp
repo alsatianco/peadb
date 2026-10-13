@@ -49,8 +49,8 @@ void set_cloexec(int fd) {
 // Top-level exception boundary: a single bad command (bad_alloc, length_error, …)
 // must degrade to a RESP error for that client, never terminate the single event
 // loop and take down every connection.
-std::string safe_handle_command(const std::vector<std::string>& args,
-                                SessionState& session, bool& should_close) {
+std::string safe_handle_command(const std::vector<std::string>& args, SessionState& session,
+                                bool& should_close) {
   std::string reply;
   try {
     reply = handle_command(args, session, should_close);
@@ -64,7 +64,10 @@ std::string safe_handle_command(const std::vector<std::string>& args,
   // CLIENT REPLY OFF/SKIP: suppress normal command replies. Pub/sub (un)subscribe
   // confirmations are push-like and must always reach the client, so they bypass this.
   std::string cmd0;
-  if (!args.empty()) { cmd0 = args[0]; for (auto& c : cmd0) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c))); }
+  if (!args.empty()) {
+    cmd0 = args[0];
+    for (auto& c : cmd0) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  }
   const bool subscribe_family = cmd0 == "SUBSCRIBE" || cmd0 == "UNSUBSCRIBE" ||
                                 cmd0 == "PSUBSCRIBE" || cmd0 == "PUNSUBSCRIBE" ||
                                 cmd0 == "SSUBSCRIBE" || cmd0 == "SUNSUBSCRIBE";
@@ -72,7 +75,10 @@ std::string safe_handle_command(const std::vector<std::string>& args,
   // Advance the skip state: consume the armed skip for this command, then arm it for the
   // next command if a CLIENT REPLY SKIP just ran.
   session.reply_skip = false;
-  if (session.reply_skip_next) { session.reply_skip = true; session.reply_skip_next = false; }
+  if (session.reply_skip_next) {
+    session.reply_skip = true;
+    session.reply_skip_next = false;
+  }
   if (suppress) return std::string();
   return reply;
 }
@@ -104,7 +110,10 @@ int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
   return accept4(listen_fd, addr, addrlen, SOCK_NONBLOCK | SOCK_CLOEXEC);
 #else
   int fd = ::accept(listen_fd, addr, addrlen);
-  if (fd >= 0) { set_nonblocking(fd); set_cloexec(fd); }
+  if (fd >= 0) {
+    set_nonblocking(fd);
+    set_cloexec(fd);
+  }
   return fd;
 #endif
 }
@@ -113,13 +122,24 @@ int accept_nonblock(int listen_fd, sockaddr* addr, socklen_t* addrlen) {
 struct WriteBuf {
   std::string data;
   std::size_t offset = 0;
-  std::int64_t soft_since_ms = 0;  // when this buffer first exceeded its class soft limit (0 = not over)
+  std::int64_t soft_since_ms =
+      0;  // when this buffer first exceeded its class soft limit (0 = not over)
 
-  bool empty() const { return offset >= data.size(); }
-  std::size_t remaining() const { return data.size() - offset; }
-  const char* ptr() const { return data.data() + offset; }
-  void append(const std::string& s) { data.append(s); }
-  void advance(std::size_t n) { offset += n; }
+  bool empty() const {
+    return offset >= data.size();
+  }
+  std::size_t remaining() const {
+    return data.size() - offset;
+  }
+  const char* ptr() const {
+    return data.data() + offset;
+  }
+  void append(const std::string& s) {
+    data.append(s);
+  }
+  void advance(std::size_t n) {
+    offset += n;
+  }
   void compact() {
     // Only compact when we've consumed more than half the buffer to avoid O(n) erase on every tick
     if (offset > data.size() / 2) {
@@ -140,7 +160,9 @@ struct SnapshotTransfer {
   std::string chunk;
   std::size_t offset = 0;
 
-  ~SnapshotTransfer() { if (file_fd >= 0) ::close(file_fd); }
+  ~SnapshotTransfer() {
+    if (file_fd >= 0) ::close(file_fd);
+  }
 };
 
 // Empties a client buffer that has been used up. Redis gives such memory back (a reply block is
@@ -155,7 +177,7 @@ void release_drained(std::string& buf) {
   }
 }
 
-} // namespace
+}  // namespace
 
 int adjust_open_files_limit(int max_clients) {
   // PeaDB's own descriptors (listeners, AOF, RDB, replication, poller) beside the clients.
@@ -164,7 +186,7 @@ int adjust_open_files_limit(int max_clients) {
     if (value == RLIM_INFINITY) return std::numeric_limits<unsigned long long>::max();
     return static_cast<unsigned long long>(value);
   };
-  rlimit nofile {};
+  rlimit nofile{};
   if (::getrlimit(RLIMIT_NOFILE, &nofile) != 0) {
     log(LogLevel::Warn, "getrlimit(RLIMIT_NOFILE) failed: " + std::string(std::strerror(errno)));
     return max_clients;
@@ -216,7 +238,7 @@ int run_server(const ServerConfig& config) {
     setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
     set_nonblocking(listen_fd);
 
-    sockaddr_in addr {};
+    sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(config.port));
     if (inet_pton(AF_INET, config.bind.c_str(), &addr.sin_addr) != 1) {
@@ -229,14 +251,16 @@ int run_server(const ServerConfig& config) {
       // "Failed listening on port" is grepped by the upstream Redis test harness to
       // detect port-in-use and retry with a different port — keep the phrase intact.
       log(LogLevel::Error, "bind() failed: " + std::string(std::strerror(errno)) +
-                               " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
+                               " — Failed listening on port " + std::to_string(config.port) +
+                               " (tcp)");
       close(listen_fd);
       return 1;
     }
 
     if (listen(listen_fd, config.tcp_backlog) != 0) {
       log(LogLevel::Error, "listen() failed: " + std::string(std::strerror(errno)) +
-                               " — Failed listening on port " + std::to_string(config.port) + " (tcp)");
+                               " — Failed listening on port " + std::to_string(config.port) +
+                               " (tcp)");
       close(listen_fd);
       return 1;
     }
@@ -247,10 +271,11 @@ int run_server(const ServerConfig& config) {
   int unix_fd = -1;
   if (!config.unixsocket.empty()) {
     unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    sockaddr_un uaddr {};
+    sockaddr_un uaddr{};
     uaddr.sun_family = AF_UNIX;
     if (unix_fd < 0 || config.unixsocket.size() >= sizeof(uaddr.sun_path)) {
-      log(LogLevel::Error, "unixsocket setup failed (path too long or socket() error): " + config.unixsocket);
+      log(LogLevel::Error,
+          "unixsocket setup failed (path too long or socket() error): " + config.unixsocket);
       if (unix_fd >= 0) close(unix_fd);
       if (listen_fd >= 0) close(listen_fd);
       return 1;
@@ -284,11 +309,13 @@ int run_server(const ServerConfig& config) {
 
   int reserved_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
   if (reserved_fd < 0) {
-    log(LogLevel::Warn, "failed to open reserved fd for EMFILE handling: " + std::string(std::strerror(errno)));
+    log(LogLevel::Warn,
+        "failed to open reserved fd for EMFILE handling: " + std::string(std::strerror(errno)));
   }
 
   if (listen_fd >= 0) {
-    log(LogLevel::Info, "peadb-server listening on " + config.bind + ":" + std::to_string(config.port));
+    log(LogLevel::Info,
+        "peadb-server listening on " + config.bind + ":" + std::to_string(config.port));
   }
 
   // Loud warning when reachable from the network without authentication. protected-mode
@@ -296,12 +323,14 @@ int run_server(const ServerConfig& config) {
   // disable it must know they are exposing an unauthenticated server.
   if (!requirepass_is_set() && config.bind != "127.0.0.1" && config.bind != "::1") {
     if (protected_mode_enabled()) {
-      log(LogLevel::Warn, "no requirepass set and bound to " + config.bind +
-          " — protected-mode is ON, so only loopback clients are accepted. Set 'requirepass' "
-          "to allow remote clients, or 'protected-mode no' to accept them unauthenticated.");
+      log(LogLevel::Warn,
+          "no requirepass set and bound to " + config.bind +
+              " — protected-mode is ON, so only loopback clients are accepted. Set 'requirepass' "
+              "to allow remote clients, or 'protected-mode no' to accept them unauthenticated.");
     } else {
-      log(LogLevel::Warn, "SECURITY: protected-mode is OFF, no requirepass set, and bound to " +
-          config.bind + " — this server accepts UNAUTHENTICATED connections from the network.");
+      log(LogLevel::Warn,
+          "SECURITY: protected-mode is OFF, no requirepass set, and bound to " + config.bind +
+              " — this server accepts UNAUTHENTICATED connections from the network.");
     }
   }
 
@@ -316,7 +345,7 @@ int run_server(const ServerConfig& config) {
       int one_c = 1;
       setsockopt(cbus_fd, SOL_SOCKET, SO_REUSEADDR, &one_c, sizeof(one_c));
       set_nonblocking(cbus_fd);
-      sockaddr_in cbus_addr {};
+      sockaddr_in cbus_addr{};
       cbus_addr.sin_family = AF_INET;
       cbus_addr.sin_port = htons(static_cast<uint16_t>(cluster_bus_port));
       inet_pton(AF_INET, config.bind.c_str(), &cbus_addr.sin_addr);
@@ -324,7 +353,8 @@ int run_server(const ServerConfig& config) {
           listen(cbus_fd, 16) == 0) {
         log(LogLevel::Info, "cluster bus listening on port " + std::to_string(cluster_bus_port));
       } else {
-        log(LogLevel::Warn, "cluster bus bind/listen failed on port " + std::to_string(cluster_bus_port));
+        log(LogLevel::Warn,
+            "cluster bus bind/listen failed on port " + std::to_string(cluster_bus_port));
         close(cbus_fd);
         cbus_fd = -1;
       }
@@ -391,7 +421,8 @@ int run_server(const ServerConfig& config) {
     int count = 0;
     for (auto& [fd, sess] : sessions) {
       if (sess.replica_stream && sess.repl_sync_state == ReplicaSyncState::Online &&
-          sess.repl_ack_offset >= target_offset) ++count;
+          sess.repl_ack_offset >= target_offset)
+        ++count;
     }
     return count;
   };
@@ -449,7 +480,8 @@ int run_server(const ServerConfig& config) {
     const auto now = DataStore::now_ms();
     for (auto& [fd, sess] : sessions) {
       const std::int64_t age = sess.created_ms ? (now - sess.created_ms) / 1000 : 0;
-      const std::int64_t idle = sess.last_interaction_ms ? (now - sess.last_interaction_ms) / 1000 : 0;
+      const std::int64_t idle =
+          sess.last_interaction_ms ? (now - sess.last_interaction_ms) / 1000 : 0;
       auto qit = buffers.find(fd);
       const std::size_t qbuf = (qit != buffers.end()) ? qit->second.size() : 0;
       out += "id=" + std::to_string(sess.client_id);
@@ -460,9 +492,12 @@ int run_server(const ServerConfig& config) {
       out += " lib-ver=" + sess.lib_ver;
       out += " db=" + std::to_string(sess.db_index);
       out += " sub=0 psub=0 ssub=0";
-      out += " multi=" + std::string(sess.in_multi ? std::to_string(static_cast<int>(sess.queued.size())) : "-1");
+      out +=
+          " multi=" +
+          std::string(sess.in_multi ? std::to_string(static_cast<int>(sess.queued.size())) : "-1");
       out += " watch=" + std::to_string(sess.watched_digests.size());
-      out += " qbuf=" + std::to_string(qbuf) + " qbuf-free=0 argv-mem=0 multi-mem=0 tot-mem=" + std::to_string(qbuf + 16384);
+      out += " qbuf=" + std::to_string(qbuf) +
+             " qbuf-free=0 argv-mem=0 multi-mem=0 tot-mem=" + std::to_string(qbuf + 16384);
       out += " net-i=0 net-o=0";
       out += " age=" + std::to_string(age) + " idle=" + std::to_string(idle);
       std::string flags;
@@ -506,7 +541,7 @@ int run_server(const ServerConfig& config) {
     wbuf.append(data);
     const auto sit = sessions.find(fd);
     const bool snapshot_pending = sit != sessions.end() && sit->second.replica_stream &&
-        sit->second.repl_sync_state != ReplicaSyncState::Online;
+                                  sit->second.repl_sync_state != ReplicaSyncState::Online;
     while (!snapshot_pending && !wbuf.empty()) {
       const ssize_t n = ::write(fd, wbuf.ptr(), wbuf.remaining());
       if (n < 0) {
@@ -526,14 +561,20 @@ int run_server(const ServerConfig& config) {
     bool overflow = false;
     if (lim.hard > 0 && remaining > static_cast<std::size_t>(lim.hard)) {
       overflow = true;
-    } else if (lim.soft > 0 && lim.soft_seconds > 0 && remaining > static_cast<std::size_t>(lim.soft)) {
+    } else if (lim.soft > 0 && lim.soft_seconds > 0 &&
+               remaining > static_cast<std::size_t>(lim.soft)) {
       const std::int64_t now = DataStore::now_ms();
-      if (wbuf.soft_since_ms == 0) wbuf.soft_since_ms = now;
-      else if (now - wbuf.soft_since_ms >= static_cast<std::int64_t>(lim.soft_seconds) * 1000) overflow = true;
+      if (wbuf.soft_since_ms == 0)
+        wbuf.soft_since_ms = now;
+      else if (now - wbuf.soft_since_ms >= static_cast<std::int64_t>(lim.soft_seconds) * 1000)
+        overflow = true;
     } else {
       wbuf.soft_since_ms = 0;  // back under the soft limit — reset the timer
     }
-    if (overflow) { obuf_overflow_fds.push_back(fd); return false; }
+    if (overflow) {
+      obuf_overflow_fds.push_back(fd);
+      return false;
+    }
     if (wbuf.empty()) {
       release_drained(wbuf.data);
       wbuf.offset = 0;
@@ -567,14 +608,15 @@ int run_server(const ServerConfig& config) {
           // Disk-based Redis replicas read the command stream as soon as the RDB ends.
           return true;
         }
-        transfer.chunk.resize(static_cast<std::size_t>(
-            std::min<std::int64_t>(transfer.bytes_left, 16 * 1024)));
+        transfer.chunk.resize(
+            static_cast<std::size_t>(std::min<std::int64_t>(transfer.bytes_left, 16 * 1024)));
         ssize_t n;
-        do { n = ::read(transfer.file_fd, transfer.chunk.data(), transfer.chunk.size()); }
-        while (n < 0 && errno == EINTR);
+        do {
+          n = ::read(transfer.file_fd, transfer.chunk.data(), transfer.chunk.size());
+        } while (n < 0 && errno == EINTR);
         if (n <= 0) {
           log(LogLevel::Warn, "Read error sending DB to replica: " +
-                                 std::string(n == 0 ? "premature EOF" : std::strerror(errno)));
+                                  std::string(n == 0 ? "premature EOF" : std::strerror(errno)));
           return false;
         }
         transfer.chunk.resize(static_cast<std::size_t>(n));
@@ -638,7 +680,10 @@ int run_server(const ServerConfig& config) {
 
   // Wire up the pub/sub send callback (must be after enqueue_output is defined)
   g_pubsub_send = [&](int fd, const std::string& data) -> bool {
-    if (fd == self_dispatch_fd) { self_pubsub_pending += data; return true; }
+    if (fd == self_dispatch_fd) {
+      self_pubsub_pending += data;
+      return true;
+    }
     if (!sessions.count(fd)) return false;
     return enqueue_output(fd, data);
   };
@@ -733,12 +778,11 @@ int run_server(const ServerConfig& config) {
   };
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
-    if (!session.replica_stream ||
-        session.repl_sync_state == ReplicaSyncState::WaitSnapshot) return true;
+    if (!session.replica_stream || session.repl_sync_state == ReplicaSyncState::WaitSnapshot)
+      return true;
     // Over its output-buffer limit already: it is closed at the end of the pass.
-    if (!obuf_overflow_fds.empty() &&
-        std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(), fd) !=
-            obuf_overflow_fds.end())
+    if (!obuf_overflow_fds.empty() && std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(),
+                                                fd) != obuf_overflow_fds.end())
       return false;
     const std::size_t current_total = replication_event_count();
     if (session.repl_index < current_total) {
@@ -789,14 +833,18 @@ int run_server(const ServerConfig& config) {
     for (int fd : replica_fds) {
       auto& session = sessions.at(fd);
       if (session.repl_sync_state != ReplicaSyncState::SaveSnapshot) continue;
-      if (!success) { failed.push_back(fd); continue; }
+      if (!success) {
+        failed.push_back(fd);
+        continue;
+      }
       auto& transfer = snapshot_transfers.at(fd);
       transfer.file_fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
       struct stat st {};
       if (transfer.file_fd < 0 || ::fstat(transfer.file_fd, &st) != 0 || st.st_size <= 0) {
-        log(LogLevel::Warn, "Failed opening the RDB file for SYNC: " +
-                               std::string(transfer.file_fd < 0 || st.st_size < 0
-                                               ? std::strerror(errno) : "invalid snapshot"));
+        log(LogLevel::Warn,
+            "Failed opening the RDB file for SYNC: " +
+                std::string(transfer.file_fd < 0 || st.st_size < 0 ? std::strerror(errno)
+                                                                   : "invalid snapshot"));
         failed.push_back(fd);
         continue;
       }
@@ -823,14 +871,17 @@ int run_server(const ServerConfig& config) {
       for (int fd : replica_fds) {
         auto& session = sessions.at(fd);
         if (session.repl_sync_state != ReplicaSyncState::WaitSnapshot) continue;
-        if (result < 0) { failed.push_back(fd); continue; }
+        if (result < 0) {
+          failed.push_back(fd);
+          continue;
+        }
         if (result == 0) continue;
         session.repl_sync_state = ReplicaSyncState::SaveSnapshot;
         session.repl_index = static_cast<std::size_t>(info.offset);
         auto& transfer = snapshot_transfers[fd];
         if (!session.repl_legacy_sync)
-          transfer.chunk = "+FULLRESYNC " + info.replid + " " +
-                           std::to_string(info.offset) + "\r\n";
+          transfer.chunk =
+              "+FULLRESYNC " + info.replid + " " + std::to_string(info.offset) + "\r\n";
         poller.set_readwrite(fd);
       }
       for (int fd : failed) close_client(fd);
@@ -853,8 +904,7 @@ int run_server(const ServerConfig& config) {
       if (ti != snapshot_transfers.end() && ti->second.offset != ti->second.chunk.size())
         continue;  // never insert a newline in a partially sent FULLRESYNC header
       const ssize_t n = ::write(fd, "\n", 1);
-      if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)
-        failed.push_back(fd);
+      if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) failed.push_back(fd);
     }
     for (int fd : failed) close_client(fd);
   };
@@ -862,9 +912,8 @@ int run_server(const ServerConfig& config) {
   // Drain any pipelined commands sitting in buffers[fd] after a BLPOP/WAIT
   // wakeup. Without this, those commands stall until the client sends more data.
   // Returns fds that should be closed (connection error or close-on-command).
-  auto drain_pipelined = [&](const std::vector<int>& fds,
-                              int& blocked_count_ref, int& wait_count_ref,
-                              std::vector<int>& to_close_out) {
+  auto drain_pipelined = [&](const std::vector<int>& fds, int& blocked_count_ref,
+                             int& wait_count_ref, std::vector<int>& to_close_out) {
     for (int fd : fds) {
       if (shutdown_requested()) return;  // a SHUTDOWN ran: no command may run after it
       if (!sessions.count(fd)) continue;
@@ -905,10 +954,13 @@ int run_server(const ServerConfig& config) {
       if (consumed > 0) {
         if (consumed == input.size())
           release_drained(input);
-        else input.erase(0, consumed);
+        else
+          input.erase(0, consumed);
       }
-      if (!batch.empty() && !enqueue_output(fd, batch)) to_close_out.push_back(fd);
-      else if (sc) to_close_out.push_back(fd);
+      if (!batch.empty() && !enqueue_output(fd, batch))
+        to_close_out.push_back(fd);
+      else if (sc)
+        to_close_out.push_back(fd);
       if (session.blocked.type != BlockType::None) {
         ++blocked_count_ref;
         session.blocked.seq = ++block_seq;  // FIFO serving order, as on the main read path
@@ -933,8 +985,10 @@ int run_server(const ServerConfig& config) {
         const std::int64_t target = sess.wait_state->target_offset;
         const std::string reply =
             error ? "-UNBLOCKED client unblocked via CLIENT UNBLOCK\r\n"
-                  : ":" + std::to_string(g_count_synced_replicas ? g_count_synced_replicas(target)
-                                                                 : 0) + "\r\n";
+                  : ":" +
+                        std::to_string(g_count_synced_replicas ? g_count_synced_replicas(target)
+                                                               : 0) +
+                        "\r\n";
         sess.wait_state.reset();
         --wait_count;
         (enqueue_output(fd, reply) ? released_fds : release_close).push_back(fd);
@@ -1033,8 +1087,10 @@ int run_server(const ServerConfig& config) {
       const std::string reply = try_unblock_client(session);
       if (!reply.empty()) {
         --blocked_count;
-        if (!enqueue_output(bfd, reply)) to_close.push_back(bfd);
-        else to_drain.push_back(bfd);
+        if (!enqueue_output(bfd, reply))
+          to_close.push_back(bfd);
+        else
+          to_drain.push_back(bfd);
       }
     }
     for (int cfd : to_close) close_client(cfd);
@@ -1056,8 +1112,10 @@ int run_server(const ServerConfig& config) {
         session.wait_state.reset();
         --wait_count;
         const std::string reply = ":" + std::to_string(synced) + "\r\n";
-        if (!enqueue_output(wfd, reply)) to_close.push_back(wfd);
-        else to_drain.push_back(wfd);
+        if (!enqueue_output(wfd, reply))
+          to_close.push_back(wfd);
+        else
+          to_drain.push_back(wfd);
       }
     }
     for (int cfd : to_close) close_client(cfd);
@@ -1100,7 +1158,8 @@ int run_server(const ServerConfig& config) {
     }
     reserved_fd = ::open("/dev/null", O_RDONLY | O_CLOEXEC);
     if (reserved_fd < 0) {
-      log(LogLevel::Warn, "failed to re-open reserved fd after EMFILE handling: " + std::string(std::strerror(errno)));
+      log(LogLevel::Warn, "failed to re-open reserved fd after EMFILE handling: " +
+                              std::string(std::strerror(errno)));
     }
   };
 
@@ -1162,8 +1221,8 @@ int run_server(const ServerConfig& config) {
     // Close normal clients idle longer than `timeout` seconds. Replicas, blocked/waiting
     // clients, in-MULTI clients, and pub/sub subscribers are exempt (they legitimately sit
     // quiet). Swept at most ~once/sec to keep it cheap. timeout=0 disables it.
-    if (const int idle_to = client_timeout_seconds(); idle_to > 0 &&
-        loop_now_ms - last_idle_reap_ms >= 1000) {
+    if (const int idle_to = client_timeout_seconds();
+        idle_to > 0 && loop_now_ms - last_idle_reap_ms >= 1000) {
       last_idle_reap_ms = loop_now_ms;
       const std::int64_t cutoff = static_cast<std::int64_t>(idle_to) * 1000;
       std::vector<int> idle_fds;
@@ -1198,8 +1257,8 @@ int run_server(const ServerConfig& config) {
       const int fd = ep_events[i].fd;
 
       // Skip fds already closed (e.g. by blocked-client cleanup above).
-      if (fd != listen_fd && fd != cbus_fd && fd != unix_fd &&
-          !sessions.count(fd) && !cbus_buffers.count(fd)) {
+      if (fd != listen_fd && fd != cbus_fd && fd != unix_fd && !sessions.count(fd) &&
+          !cbus_buffers.count(fd)) {
         continue;
       }
 
@@ -1229,10 +1288,10 @@ int run_server(const ServerConfig& config) {
         const bool is_unix = (unix_fd >= 0 && fd == unix_fd);
         // Accept all pending connections (non-blocking accept loop)
         while (true) {
-          sockaddr_storage client_addr {};
+          sockaddr_storage client_addr{};
           socklen_t len = sizeof(client_addr);
-          const int client_fd = accept_nonblock(fd,
-                                        reinterpret_cast<sockaddr*>(&client_addr), &len);
+          const int client_fd =
+              accept_nonblock(fd, reinterpret_cast<sockaddr*>(&client_addr), &len);
           if (client_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -1258,8 +1317,7 @@ int run_server(const ServerConfig& config) {
           // (127.0.0.0/8) and unix-socket clients are always allowed (like Redis).
           if (!is_unix && protected_mode_enabled() && !requirepass_is_set()) {
             const auto* in4 = reinterpret_cast<const sockaddr_in*>(&client_addr);
-            const bool is_loopback =
-                (ntohl(in4->sin_addr.s_addr) >> 24) == 127;
+            const bool is_loopback = (ntohl(in4->sin_addr.s_addr) >> 24) == 127;
             if (!is_loopback) {
               static constexpr const char kDenied[] =
                   "-DENIED PeaDB is running in protected mode because protected mode is enabled, "
@@ -1280,7 +1338,7 @@ int run_server(const ServerConfig& config) {
 
           if (!poller.add_read(client_fd)) {
             log(LogLevel::Warn, "poller add failed for client fd=" + std::to_string(client_fd) +
-                                  ": " + std::string(std::strerror(errno)));
+                                    ": " + std::string(std::strerror(errno)));
             ::close(client_fd);
             continue;
           }
@@ -1321,10 +1379,10 @@ int run_server(const ServerConfig& config) {
       // Handle cluster bus listener
       if (fd == cbus_fd) {
         while (true) {
-          sockaddr_in cbus_client_addr {};
+          sockaddr_in cbus_client_addr{};
           socklen_t clen = sizeof(cbus_client_addr);
-          const int cbus_client_fd = accept_nonblock(cbus_fd,
-                                             reinterpret_cast<sockaddr*>(&cbus_client_addr), &clen);
+          const int cbus_client_fd =
+              accept_nonblock(cbus_fd, reinterpret_cast<sockaddr*>(&cbus_client_addr), &clen);
           if (cbus_client_fd < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) break;
@@ -1332,7 +1390,8 @@ int run_server(const ServerConfig& config) {
               handle_accept_fd_exhaustion(cbus_fd, "cluster bus listener");
               break;
             }
-            log(LogLevel::Warn, "cluster bus accept() failed: " + std::string(std::strerror(errno)));
+            log(LogLevel::Warn,
+                "cluster bus accept() failed: " + std::string(std::strerror(errno)));
             break;
           }
 
@@ -1380,8 +1439,8 @@ int run_server(const ServerConfig& config) {
       // client-query-buffer-limit: a slow/never-completing command (or a flood that never
       // forms a full frame) cannot grow input without bound and OOM the single-process server.
       if (static_cast<std::int64_t>(input.size()) > client_query_buffer_limit()) {
-        log(LogLevel::Warn, "client fd=" + std::to_string(fd) +
-            " exceeded query buffer limit (" + std::to_string(input.size()) + " bytes); closing");
+        log(LogLevel::Warn, "client fd=" + std::to_string(fd) + " exceeded query buffer limit (" +
+                                std::to_string(input.size()) + " bytes); closing");
         close_client(fd);
         continue;
       }
@@ -1400,7 +1459,8 @@ int run_server(const ServerConfig& config) {
       std::size_t consumed_total = 0;
       const bool output_pending = !write_buffers[fd].empty();
       while (true) {
-        const std::string_view remaining(input.data() + consumed_total, input.size() - consumed_total);
+        const std::string_view remaining(input.data() + consumed_total,
+                                         input.size() - consumed_total);
         auto parsed = parse_one_command(remaining, requirepass_is_set() && !session.authenticated,
                                         proto_max_bulk_len());
         if (!parsed.has_value()) break;
@@ -1518,8 +1578,8 @@ int run_server(const ServerConfig& config) {
     // Close clients whose output buffer overflowed its class limit during an async send.
     if (!obuf_overflow_fds.empty()) {
       for (int cfd : obuf_overflow_fds) {
-        log(LogLevel::Warn, "closing client fd=" + std::to_string(cfd) +
-                            " (client-output-buffer-limit exceeded)");
+        log(LogLevel::Warn,
+            "closing client fd=" + std::to_string(cfd) + " (client-output-buffer-limit exceeded)");
         close_client(cfd);
       }
       obuf_overflow_fds.clear();

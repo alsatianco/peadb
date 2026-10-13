@@ -2,24 +2,24 @@
 
 // A chained hash table with a power-of-two number of buckets, like Redis's dict.c. The bucket of an
 // element is `hash & (bucket_count - 1)`, so scan() can give Redis's SCAN guarantee across resizes:
-// every element that is in the table for the whole of a scan is returned at least once, however much
-// the table grows or shrinks between calls (std::unordered_map uses prime bucket counts, which cannot
-// keep it; compat/delta.md item 32). The interface is the part of std::unordered_map /
+// every element that is in the table for the whole of a scan is returned at least once, however
+// much the table grows or shrinks between calls (std::unordered_map uses prime bucket counts, which
+// cannot keep it; compat/delta.md item 32). The interface is the part of std::unordered_map /
 // std::unordered_set that PeaDB uses, with the same rule for references (valid until the element is
 // erased, also across a rehash). Differences from the std containers: an iterator is invalidated by
 // a rehash (which only an insert, reserve() or shrink_if_sparse() can start) and also by swap(), a
 // move or clear() of its table; erase(iterator) returns nothing, because finding the next element
-// can mean walking many empty buckets (use `auto next = std::next(it); d.erase(it); it = next;` in a
-// loop); clear() frees the bucket array (as Redis's dictEmpty() does). A rehash is done at once, not
-// in steps (compat/delta.md item 13).
+// can mean walking many empty buckets (use `auto next = std::next(it); d.erase(it); it = next;` in
+// a loop); clear() frees the bucket array (as Redis's dictEmpty() does). A rehash is done at once,
+// not in steps (compat/delta.md item 13).
 //
 // Dict<Key, Mapped> is a map whose value_type is std::pair<const Key, Mapped>; Dict<Key, void> is a
 // set whose value_type is Key (its iterators are read-only, like std::unordered_set's).
 //
 // DictStringHash is the hash for string keys: SipHash-1-2 with a key drawn at random when the
 // process first hashes, like Redis's dictGenHashFunction() with the seed it sets at startup, so a
-// client cannot choose keys that all land in one bucket (with a power-of-two table, keys whose hashes
-// share their low bits collide at every table size).
+// client cannot choose keys that all land in one bucket (with a power-of-two table, keys whose
+// hashes share their low bits collide at every table size).
 
 #include <cstddef>
 #include <cstdint>
@@ -42,13 +42,17 @@ namespace dict_detail {
 template <class Key, class Mapped>
 struct Traits {
   using value_type = std::pair<const Key, Mapped>;
-  static const Key& key_of(const value_type& v) { return v.first; }
+  static const Key& key_of(const value_type& v) {
+    return v.first;
+  }
 };
 
 template <class Key>
 struct Traits<Key, void> {
   using value_type = Key;
-  static const Key& key_of(const value_type& v) { return v; }
+  static const Key& key_of(const value_type& v) {
+    return v;
+  }
 };
 
 // Reverses the 64 bits of `v` (Redis's rev() in dict.c).
@@ -68,7 +72,9 @@ inline std::size_t next_power_of_two(std::size_t n) {
   return p;
 }
 
-inline std::uint64_t rotl64(std::uint64_t x, int b) { return (x << b) | (x >> (64 - b)); }
+inline std::uint64_t rotl64(std::uint64_t x, int b) {
+  return (x << b) | (x >> (64 - b));
+}
 
 // Reads 8 bytes as a little-endian number, as SipHash defines its input words.
 inline std::uint64_t load_le64(const unsigned char* p) {
@@ -79,9 +85,9 @@ inline std::uint64_t load_le64(const unsigned char* p) {
 
 }  // namespace dict_detail
 
-// SipHash-C-D (Aumasson and Bernstein) of `data` under the 128-bit key (k0, k1): C rounds per 8-byte
-// word and D final rounds. Redis hashes keys with SipHash-1-2; SipHash-2-4 is the paper's standard
-// form, with published test vectors (tests/unit/dict_test.cpp checks one).
+// SipHash-C-D (Aumasson and Bernstein) of `data` under the 128-bit key (k0, k1): C rounds per
+// 8-byte word and D final rounds. Redis hashes keys with SipHash-1-2; SipHash-2-4 is the paper's
+// standard form, with published test vectors (tests/unit/dict_test.cpp checks one).
 template <int C, int D>
 std::uint64_t siphash(const void* data, std::size_t len, std::uint64_t k0, std::uint64_t k1) {
   using dict_detail::rotl64;
@@ -114,7 +120,8 @@ std::uint64_t siphash(const void* data, std::size_t len, std::uint64_t k0, std::
     v0 ^= m;
   }
   std::uint64_t b = static_cast<std::uint64_t>(len) << 56;
-  for (std::size_t i = whole; i < len; ++i) b |= static_cast<std::uint64_t>(p[i]) << (8 * (i - whole));
+  for (std::size_t i = whole; i < len; ++i)
+    b |= static_cast<std::uint64_t>(p[i]) << (8 * (i - whole));
   v3 ^= b;
   for (int r = 0; r < C; ++r) round();
   v0 ^= b;
@@ -131,7 +138,9 @@ struct DictHashKey {
 inline const DictHashKey& dict_hash_key() {
   static const DictHashKey key = [] {
     std::random_device rd;
-    auto draw = [&rd] { return (static_cast<std::uint64_t>(rd()) << 32) | rd(); };
+    auto draw = [&rd] {
+      return (static_cast<std::uint64_t>(rd()) << 32) | rd();
+    };
     const std::uint64_t k0 = draw();
     return DictHashKey{k0, draw()};
   }();
@@ -191,7 +200,8 @@ class Dict {
     value_type value;
 
     template <class... Args>
-    explicit Node(std::size_t h, Args&&... args) : hash(h), value(std::forward<Args>(args)...) {}
+    explicit Node(std::size_t h, Args&&... args) : hash(h), value(std::forward<Args>(args)...) {
+    }
   };
 
   template <bool Const>
@@ -205,10 +215,15 @@ class Dict {
 
     Iter() = default;
     template <bool C = Const, std::enable_if_t<C, int> = 0>
-    Iter(const Iter<false>& o) : d_(o.d_), n_(o.n_) {}  // iterator -> const_iterator
+    Iter(const Iter<false>& o) : d_(o.d_), n_(o.n_) {
+    }  // iterator -> const_iterator
 
-    reference operator*() const { return n_->value; }
-    pointer operator->() const { return &n_->value; }
+    reference operator*() const {
+      return n_->value;
+    }
+    pointer operator->() const {
+      return &n_->value;
+    }
     Iter& operator++() {
       n_ = d_->next_node(n_);
       return *this;
@@ -218,13 +233,16 @@ class Dict {
       ++*this;
       return t;
     }
-    friend bool operator==(const Iter& a, const Iter& b) { return a.n_ == b.n_; }
+    friend bool operator==(const Iter& a, const Iter& b) {
+      return a.n_ == b.n_;
+    }
 
    private:
     friend class Dict;
     template <bool>
     friend class Iter;
-    Iter(const Dict* d, Node* n) : d_(d), n_(n) {}
+    Iter(const Dict* d, Node* n) : d_(d), n_(n) {
+    }
     const Dict* d_ = nullptr;
     Node* n_ = nullptr;
   };
@@ -240,8 +258,12 @@ class Dict {
     using pointer = std::conditional_t<Const || !kIsMap, const value_type*, value_type*>;
 
     LocalIter() = default;
-    reference operator*() const { return n_->value; }
-    pointer operator->() const { return &n_->value; }
+    reference operator*() const {
+      return n_->value;
+    }
+    pointer operator->() const {
+      return &n_->value;
+    }
     LocalIter& operator++() {
       n_ = n_->next;
       return *this;
@@ -251,11 +273,14 @@ class Dict {
       n_ = n_->next;
       return t;
     }
-    friend bool operator==(const LocalIter& a, const LocalIter& b) { return a.n_ == b.n_; }
+    friend bool operator==(const LocalIter& a, const LocalIter& b) {
+      return a.n_ == b.n_;
+    }
 
    private:
     friend class Dict;
-    explicit LocalIter(Node* n) : n_(n) {}
+    explicit LocalIter(Node* n) : n_(n) {
+    }
     Node* n_ = nullptr;
   };
 
@@ -269,7 +294,9 @@ class Dict {
   class node_type {
    public:
     node_type() = default;
-    node_type(node_type&& o) noexcept : n_(o.n_) { o.n_ = nullptr; }
+    node_type(node_type&& o) noexcept : n_(o.n_) {
+      o.n_ = nullptr;
+    }
     node_type& operator=(node_type&& o) noexcept {
       if (this != &o) {
         delete n_;
@@ -280,11 +307,19 @@ class Dict {
     }
     node_type(const node_type&) = delete;
     node_type& operator=(const node_type&) = delete;
-    ~node_type() { delete n_; }
+    ~node_type() {
+      delete n_;
+    }
 
-    bool empty() const { return n_ == nullptr; }
-    explicit operator bool() const { return n_ != nullptr; }
-    const key_type& key() const { return Tr::key_of(n_->value); }
+    bool empty() const {
+      return n_ == nullptr;
+    }
+    explicit operator bool() const {
+      return n_ != nullptr;
+    }
+    const key_type& key() const {
+      return Tr::key_of(n_->value);
+    }
     template <bool M = kIsMap, std::enable_if_t<M, int> = 0>
     auto& mapped() const {
       return n_->value.second;
@@ -296,7 +331,8 @@ class Dict {
 
    private:
     friend class Dict;
-    explicit node_type(Node* n) : n_(n) {}
+    explicit node_type(Node* n) : n_(n) {
+    }
     Node* release() {
       Node* n = n_;
       n_ = nullptr;
@@ -312,16 +348,24 @@ class Dict {
   };
 
   Dict() = default;
-  Dict(std::initializer_list<value_type> init) { insert(init.begin(), init.end()); }
+  Dict(std::initializer_list<value_type> init) {
+    insert(init.begin(), init.end());
+  }
   template <class InputIt>
   Dict(InputIt first, InputIt last) {
     insert(first, last);
   }
 
-  Dict(const Dict& o) : hash_(o.hash_), eq_(o.eq_) { copy_from(o); }
+  Dict(const Dict& o) : hash_(o.hash_), eq_(o.eq_) {
+    copy_from(o);
+  }
   Dict(Dict&& o) noexcept
-      : buckets_(std::move(o.buckets_)), nbuckets_(o.nbuckets_), size_(o.size_), first_(o.first_),
-        hash_(std::move(o.hash_)), eq_(std::move(o.eq_)) {
+      : buckets_(std::move(o.buckets_)),
+        nbuckets_(o.nbuckets_),
+        size_(o.size_),
+        first_(o.first_),
+        hash_(std::move(o.hash_)),
+        eq_(std::move(o.eq_)) {
     o.reset_empty();
   }
   Dict& operator=(const Dict& o) {
@@ -344,7 +388,9 @@ class Dict {
     }
     return *this;
   }
-  ~Dict() { free_nodes(); }
+  ~Dict() {
+    free_nodes();
+  }
 
   void swap(Dict& o) noexcept {
     using std::swap;
@@ -355,25 +401,51 @@ class Dict {
     swap(hash_, o.hash_);
     swap(eq_, o.eq_);
   }
-  friend void swap(Dict& a, Dict& b) noexcept { a.swap(b); }
+  friend void swap(Dict& a, Dict& b) noexcept {
+    a.swap(b);
+  }
 
   // ── Iteration ──
-  iterator begin() { return iterator(this, first_node()); }
-  const_iterator begin() const { return const_iterator(this, first_node()); }
-  const_iterator cbegin() const { return begin(); }
-  iterator end() { return iterator(this, nullptr); }
-  const_iterator end() const { return const_iterator(this, nullptr); }
-  const_iterator cend() const { return end(); }
+  iterator begin() {
+    return iterator(this, first_node());
+  }
+  const_iterator begin() const {
+    return const_iterator(this, first_node());
+  }
+  const_iterator cbegin() const {
+    return begin();
+  }
+  iterator end() {
+    return iterator(this, nullptr);
+  }
+  const_iterator end() const {
+    return const_iterator(this, nullptr);
+  }
+  const_iterator cend() const {
+    return end();
+  }
 
   // ── Size ──
-  bool empty() const { return size_ == 0; }
-  size_type size() const { return size_; }
+  bool empty() const {
+    return size_ == 0;
+  }
+  size_type size() const {
+    return size_;
+  }
 
   // ── Lookup ──
-  iterator find(const key_type& k) { return iterator(this, find_node(k, hash_(k))); }
-  const_iterator find(const key_type& k) const { return const_iterator(this, find_node(k, hash_(k))); }
-  size_type count(const key_type& k) const { return find_node(k, hash_(k)) ? 1 : 0; }
-  bool contains(const key_type& k) const { return find_node(k, hash_(k)) != nullptr; }
+  iterator find(const key_type& k) {
+    return iterator(this, find_node(k, hash_(k)));
+  }
+  const_iterator find(const key_type& k) const {
+    return const_iterator(this, find_node(k, hash_(k)));
+  }
+  size_type count(const key_type& k) const {
+    return find_node(k, hash_(k)) ? 1 : 0;
+  }
+  bool contains(const key_type& k) const {
+    return find_node(k, hash_(k)) != nullptr;
+  }
 
   template <bool M = kIsMap, std::enable_if_t<M, int> = 0>
   auto& at(const key_type& k) {
@@ -423,7 +495,9 @@ class Dict {
   void insert(InputIt first, InputIt last) {
     for (; first != last; ++first) emplace(*first);
   }
-  void insert(std::initializer_list<value_type> init) { insert(init.begin(), init.end()); }
+  void insert(std::initializer_list<value_type> init) {
+    insert(init.begin(), init.end());
+  }
   insert_return_type insert(node_type&& nh) {
     if (nh.empty()) return {end(), false, node_type()};
     const key_type& k = nh.key();
@@ -490,28 +564,43 @@ class Dict {
   }
 
   // ── Buckets ──
-  size_type bucket_count() const { return nbuckets_; }
+  size_type bucket_count() const {
+    return nbuckets_;
+  }
   size_type bucket_size(size_type b) const {
     size_type n = 0;
     for (const Node* p = buckets_[b]; p; p = p->next) ++n;
     return n;
   }
-  size_type bucket(const key_type& k) const { return hash_(k) & mask(); }
-  local_iterator begin(size_type b) { return local_iterator(buckets_[b]); }
-  const_local_iterator begin(size_type b) const { return const_local_iterator(buckets_[b]); }
-  local_iterator end(size_type) { return local_iterator(nullptr); }
-  const_local_iterator end(size_type) const { return const_local_iterator(nullptr); }
+  size_type bucket(const key_type& k) const {
+    return hash_(k) & mask();
+  }
+  local_iterator begin(size_type b) {
+    return local_iterator(buckets_[b]);
+  }
+  const_local_iterator begin(size_type b) const {
+    return const_local_iterator(buckets_[b]);
+  }
+  local_iterator end(size_type) {
+    return local_iterator(nullptr);
+  }
+  const_local_iterator end(size_type) const {
+    return const_local_iterator(nullptr);
+  }
   float load_factor() const {
     return nbuckets_ == 0 ? 0.0f : static_cast<float>(size_) / static_cast<float>(nbuckets_);
   }
-  float max_load_factor() const { return 1.0f; }
+  float max_load_factor() const {
+    return 1.0f;
+  }
   // Makes room for `n` elements without a rehash (never shrinks).
   void reserve(size_type n) {
-    if (n > nbuckets_) rehash_to(dict_detail::next_power_of_two(n < kInitialBuckets ? kInitialBuckets : n));
+    if (n > nbuckets_)
+      rehash_to(dict_detail::next_power_of_two(n < kInitialBuckets ? kInitialBuckets : n));
   }
-  // Redis's htNeedsResize() and dictResize(): when less than 10% of the buckets are used, shrink the
-  // table to the smallest power of two that holds every element (at least 4 buckets). Returns true
-  // when it resized, which invalidates iterators like any rehash.
+  // Redis's htNeedsResize() and dictResize(): when less than 10% of the buckets are used, shrink
+  // the table to the smallest power of two that holds every element (at least 4 buckets). Returns
+  // true when it resized, which invalidates iterators like any rehash.
   bool shrink_if_sparse() {
     if (nbuckets_ <= kInitialBuckets || size_ * 100 / nbuckets_ >= 10) return false;
     rehash_to(dict_detail::next_power_of_two(size_ < kInitialBuckets ? kInitialBuckets : size_));
@@ -519,10 +608,10 @@ class Dict {
   }
 
   // Redis's dictScan() for a table that is not rehashing: calls fn(element) for each element of the
-  // bucket that `cursor` names (cursor & (bucket_count - 1)) and returns the next cursor, 0 when the
-  // scan is over. The cursor counts with its bits reversed, so a scan that started before the table
-  // grew or shrank still returns every element that was present for the whole scan (some may come
-  // twice). fn must not change the table.
+  // bucket that `cursor` names (cursor & (bucket_count - 1)) and returns the next cursor, 0 when
+  // the scan is over. The cursor counts with its bits reversed, so a scan that started before the
+  // table grew or shrank still returns every element that was present for the whole scan (some may
+  // come twice). fn must not change the table.
   template <class Fn>
   std::uint64_t scan(std::uint64_t cursor, Fn&& fn) const {
     if (size_ == 0) return 0;
@@ -539,9 +628,12 @@ class Dict {
   }
 
  private:
-  static_assert(sizeof(std::size_t) == sizeof(std::uint64_t), "Dict's scan cursor needs a 64-bit size_t");
+  static_assert(sizeof(std::size_t) == sizeof(std::uint64_t),
+                "Dict's scan cursor needs a 64-bit size_t");
 
-  std::size_t mask() const { return nbuckets_ - 1; }
+  std::size_t mask() const {
+    return nbuckets_ - 1;
+  }
 
   Node* find_node(const key_type& k, std::size_t h) const {
     if (size_ == 0) return nullptr;
@@ -560,7 +652,8 @@ class Dict {
     return buckets_[b];
   }
 
-  // The element after `n` in iteration order: the rest of its chain, then the next non-empty bucket.
+  // The element after `n` in iteration order: the rest of its chain, then the next non-empty
+  // bucket.
   Node* next_node(const Node* n) const {
     if (n->next) return n->next;
     for (std::size_t b = (n->hash & mask()) + 1; b < nbuckets_; ++b) {
@@ -662,7 +755,8 @@ class Dict {
   std::unique_ptr<Node*[]> buckets_;
   std::size_t nbuckets_ = 0;
   std::size_t size_ = 0;
-  mutable std::size_t first_ = 0;  // no bucket before this one holds an element (a hint for begin())
+  mutable std::size_t first_ =
+      0;  // no bucket before this one holds an element (a hint for begin())
   [[no_unique_address]] Hash hash_;
   [[no_unique_address]] KeyEqual eq_;
 };

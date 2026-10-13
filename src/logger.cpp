@@ -80,18 +80,27 @@ void log_before_fork() {
   g_utc_offset_seconds = tm_buf.tm_gmtoff;
 }
 
-void log_in_forked_child() { g_forked_child = true; }
+void log_in_forked_child() {
+  g_forked_child = true;
+}
 
-void set_log_level(LogLevel level) { g_level = level; }
+void set_log_level(LogLevel level) {
+  g_level = level;
+}
 
 bool parse_redis_log_level(const std::string& name, LogLevel& level) {
   // Redis logs accepted connections at "verbose", and PeaDB logs them at Debug, so verbose
   // shares Debug with debug.
-  if (name == "debug" || name == "verbose") level = LogLevel::Debug;
-  else if (name == "notice") level = LogLevel::Info;
-  else if (name == "warning") level = LogLevel::Warn;
-  else if (name == "nothing") level = LogLevel::Nothing;
-  else return false;
+  if (name == "debug" || name == "verbose")
+    level = LogLevel::Debug;
+  else if (name == "notice")
+    level = LogLevel::Info;
+  else if (name == "warning")
+    level = LogLevel::Warn;
+  else if (name == "nothing")
+    level = LogLevel::Nothing;
+  else
+    return false;
   return true;
 }
 
@@ -106,7 +115,7 @@ void log(LogLevel level, const std::string& message) {
 
   const auto now = std::chrono::system_clock::now();
   const auto now_time = std::chrono::system_clock::to_time_t(now);
-  std::tm tm_buf {};
+  std::tm tm_buf{};
   localtime_r(&now_time, &tm_buf);
 
   std::ostringstream ts;

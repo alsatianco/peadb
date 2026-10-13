@@ -14,6 +14,8 @@ Feature status labels:
 
 ## Verification (the parity ratchet)
 
+The PR workflow checks every C/C++ file in `src/` and `include/` with pinned clang-format 18.1.8 before building. The source baseline and generated command metadata follow that version; command discovery accepts whitespace and line breaks in registrations and is checked against the running command table; formatting changes do not change Redis compatibility status. Skipped build/test steps after a formatting failure provide no test evidence.
+
 Parity is measured by two monotonically-improving numbers. They are not CI-gated yet: `parse_tcl_results.py` and `check_suite_ratchet.py` are run by hand, and neither `scripts/run_all_tests.sh` nor any CI workflow runs them.
 
 - **Upstream TCL pass-rate** — the official Redis 7.2.5 test suite runs in *native

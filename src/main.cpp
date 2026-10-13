@@ -27,10 +27,13 @@
 // produces a core dump as usual.
 static void crash_handler(int sig, siginfo_t* info, void*) {
   char hdr[160];
-  const int n = std::snprintf(hdr, sizeof(hdr),
-      "\n=== PeaDB crashed: signal %d (%s), fault addr %p ===\n",
-      sig, strsignal(sig), info ? info->si_addr : nullptr);
-  if (n > 0) { ssize_t w = ::write(STDERR_FILENO, hdr, static_cast<size_t>(n)); (void)w; }
+  const int n =
+      std::snprintf(hdr, sizeof(hdr), "\n=== PeaDB crashed: signal %d (%s), fault addr %p ===\n",
+                    sig, strsignal(sig), info ? info->si_addr : nullptr);
+  if (n > 0) {
+    ssize_t w = ::write(STDERR_FILENO, hdr, static_cast<size_t>(n));
+    (void)w;
+  }
   void* frames[64];
   const int nframes = backtrace(frames, 64);
   backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
@@ -38,7 +41,7 @@ static void crash_handler(int sig, siginfo_t* info, void*) {
 }
 
 static void install_crash_handlers() {
-  struct sigaction sa{};
+  struct sigaction sa {};
   sa.sa_sigaction = crash_handler;
   sigemptyset(&sa.sa_mask);
   sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
@@ -47,7 +50,8 @@ static void install_crash_handlers() {
   }
   std::set_terminate([]() {
     const char msg[] = "\n=== PeaDB std::terminate (unhandled exception) ===\n";
-    ssize_t w = ::write(STDERR_FILENO, msg, sizeof(msg) - 1); (void)w;
+    ssize_t w = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    (void)w;
     std::abort();  // → SIGABRT → crash_handler dumps the backtrace
   });
 }
@@ -59,7 +63,7 @@ int main(int argc, char** argv) {
     // SIGTERM and SIGINT shut down like the SHUTDOWN command, from the event loop (Redis's
     // setupSignalHandlers()). SA_RESTART, unlike Redis, so a signal does not make a blocking call
     // in another thread fail with EINTR; the event loop wakes at least every 100 ms anyway.
-    struct sigaction sa{};
+    struct sigaction sa {};
     sa.sa_handler = peadb::shutdown_signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
@@ -140,9 +144,9 @@ int main(int argc, char** argv) {
   // Startup log contract (relied on by the upstream Redis test harness): a line
   // containing " PID: <pid>", then "Server initialized", then "Ready to accept"
   // once the listeners are up (logged in run_server).
-  peadb::log(peadb::LogLevel::Info,
-             "PeaDB " PEADB_VERSION " starting, version 7.2.5-compat, PID: " +
-                 std::to_string(getpid()));
+  peadb::log(peadb::LogLevel::Info, "PeaDB " PEADB_VERSION
+                                    " starting, version 7.2.5-compat, PID: " +
+                                        std::to_string(getpid()));
   for (const auto& w : config.warnings) peadb::log(peadb::LogLevel::Warn, w);
   peadb::g_server_start_time.store(peadb::DataStore::now_ms());
   peadb::configure_runtime_port(config.port);
@@ -159,7 +163,7 @@ int main(int argc, char** argv) {
   // rename-command directives take effect on the live table.
   peadb::configure_security(config.requirepass, config.masterauth, config.protected_mode,
                             config.enable_module_command, config.rename_commands);
-  peadb::init_replication_id();   // unique per-process replid (PSYNC2 safety)
+  peadb::init_replication_id();  // unique per-process replid (PSYNC2 safety)
   peadb::configure_maxmemory(config.maxmemory);
   peadb::configure_maxmemory_policy(config.maxmemory_policy);
   peadb::configure_maxmemory_samples(config.maxmemory_samples);
@@ -173,8 +177,9 @@ int main(int argc, char** argv) {
   peadb::configure_repl_backlog_size(config.repl_backlog_size);
   peadb::configure_notify_keyspace_events(config.notify_keyspace_events);
   peadb::configure_lazy_expire();
-  peadb::configure_cluster(config.cluster_enabled, config.bind, config.port, config.cluster_announce_ip,
-                           config.cluster_announce_port, config.cluster_announce_bus_port);
+  peadb::configure_cluster(config.cluster_enabled, config.bind, config.port,
+                           config.cluster_announce_ip, config.cluster_announce_port,
+                           config.cluster_announce_bus_port);
   // Builds the command table, so every configure_* call that it depends on must come first.
   {
     std::vector<std::string> rename_warnings;
@@ -203,13 +208,15 @@ int main(int argc, char** argv) {
   if (config.cluster_enabled) {
     const std::string announced_host = peadb::cluster_announced_host();
     if (peadb::is_wildcard_announce_host(announced_host)) {
-      const std::string source = config.cluster_announce_ip.empty()
-          ? "'bind' ('" + config.bind + "')"
-          : "the explicit 'cluster-announce-ip' ('" + config.cluster_announce_ip + "')";
+      const std::string source =
+          config.cluster_announce_ip.empty()
+              ? "'bind' ('" + config.bind + "')"
+              : "the explicit 'cluster-announce-ip' ('" + config.cluster_announce_ip + "')";
       peadb::log(peadb::LogLevel::Error,
-          "FATAL: cluster-enabled is yes but " + source + " resolves to a wildcard address "
-          "that no peer can dial — refusing to start. Set 'cluster-announce-ip' "
-          "(--cluster-announce-ip) to a real, peer-reachable address.");
+                 "FATAL: cluster-enabled is yes but " + source +
+                     " resolves to a wildcard address "
+                     "that no peer can dial — refusing to start. Set 'cluster-announce-ip' "
+                     "(--cluster-announce-ip) to a real, peer-reachable address.");
       return 1;
     }
   }
@@ -217,9 +224,8 @@ int main(int argc, char** argv) {
   // Initialize the Lua scripting engine and wire the command dispatcher.
   peadb::lua_engine_init();
   peadb::lua_engine_set_dispatch(
-      [](const std::vector<std::string>& args, peadb::SessionState& session, bool& close) -> std::string {
-        return peadb::handle_command(args, session, close);
-      });
+      [](const std::vector<std::string>& args, peadb::SessionState& session,
+         bool& close) -> std::string { return peadb::handle_command(args, session, close); });
   // Wire RDB save/load to the function-library registry (must precede the RDB load below).
   peadb::functions_register_rdb_hooks();
 
@@ -252,7 +258,7 @@ int main(int argc, char** argv) {
         // serving partial data.
         peadb::log(peadb::LogLevel::Error,
                    "FATAL: AOF load failed: " + err +
-                   " — refusing to start. Restore from backup or repair the AOF.");
+                       " — refusing to start. Restore from backup or repair the AOF.");
         return 1;
       }
     }
@@ -272,7 +278,7 @@ int main(int argc, char** argv) {
       if (is_native_rdb) {
         peadb::log(peadb::LogLevel::Error,
                    "FATAL: RDB load failed: " + err +
-                   " — refusing to start. Restore from backup or repair the dump.");
+                       " — refusing to start. Restore from backup or repair the dump.");
         return 1;
       }
       peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");

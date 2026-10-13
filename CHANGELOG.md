@@ -13,6 +13,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ### Changed
 
+- Repair the PR formatting gate with a clang-format 18.1.8 source baseline, pin the formatter in CI, format generated command metadata with the same version, and keep coverage/scoreboard command discovery complete across formatter line breaks.
+
 - Resume replica links from cached applied history with PSYNC, handle changed CONTINUE ids and downstream reconnects, and fall back to a full sync for blocked clients or backlog misses. Apply live replication timeouts, master PINGs, replica TCP keepalive and ACK-silence disconnects; discard old history before replacing a snapshot so failed loads cannot resume into another dataset (delta 47).
 
 - Persist replica full-sync snapshots and replicated AOF effects, including transaction/script effects, so promotion and restart retain received data; replace the old AOF after full sync and stop old persistence children. Apply `replicaof`/`slaveof` from config/CLI before loading persistence, including when REPLICAOF is renamed or disabled. Infer a valid minimum entries-added counter when loading a private stream RDB so its next AOF rewrite can restart; historical stream metadata remains delta items 5/17. Runtime role changes still require editing startup configuration; see delta item 45.

@@ -41,7 +41,9 @@ std::string to_lower(std::string s) {
   return s;
 }
 
-bool iequals(const std::string& a, const char* b) { return strcasecmp(a.c_str(), b) == 0; }
+bool iequals(const std::string& a, const char* b) {
+  return strcasecmp(a.c_str(), b) == 0;
+}
 
 // sdstrim(line, " \t\r\n")
 std::string trim_line(const std::string& s) {
@@ -67,13 +69,27 @@ std::string quote_arg(const std::string& s) {
   for (const char ch : s) {
     const auto c = static_cast<unsigned char>(ch);
     switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      case '\a': out += "\\a"; break;
-      case '\b': out += "\\b"; break;
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      case '\a':
+        out += "\\a";
+        break;
+      case '\b':
+        out += "\\b";
+        break;
       default:
         if (std::isprint(c)) {
           out.push_back(ch);
@@ -129,14 +145,22 @@ bool memtoull(const std::string& s, unsigned long long& value) {
   const char* u = p;
   while (*u && std::isdigit(static_cast<unsigned char>(*u))) ++u;
   unsigned long long mul;
-  if (*u == '\0' || !strcasecmp(u, "b")) mul = 1;
-  else if (!strcasecmp(u, "k")) mul = 1000;
-  else if (!strcasecmp(u, "kb")) mul = 1024;
-  else if (!strcasecmp(u, "m")) mul = 1000 * 1000;
-  else if (!strcasecmp(u, "mb")) mul = 1024 * 1024;
-  else if (!strcasecmp(u, "g")) mul = 1000ULL * 1000 * 1000;
-  else if (!strcasecmp(u, "gb")) mul = 1024ULL * 1024 * 1024;
-  else return false;
+  if (*u == '\0' || !strcasecmp(u, "b"))
+    mul = 1;
+  else if (!strcasecmp(u, "k"))
+    mul = 1000;
+  else if (!strcasecmp(u, "kb"))
+    mul = 1024;
+  else if (!strcasecmp(u, "m"))
+    mul = 1000 * 1000;
+  else if (!strcasecmp(u, "mb"))
+    mul = 1024 * 1024;
+  else if (!strcasecmp(u, "g"))
+    mul = 1000ULL * 1000 * 1000;
+  else if (!strcasecmp(u, "gb"))
+    mul = 1024ULL * 1024 * 1024;
+  else
+    return false;
   const std::size_t digits = static_cast<std::size_t>(u - p);
   if (digits >= 128) return false;
   const std::string buf(p, digits);
@@ -180,8 +204,10 @@ std::string join(const std::vector<std::string>& args) {
 
 bool check_bool(const RedisConfigSpec& spec, const std::string& v, std::string& canonical,
                 std::string& err) {
-  if (iequals(v, "yes")) canonical = "yes";
-  else if (iequals(v, "no")) canonical = "no";
+  if (iequals(v, "yes"))
+    canonical = "yes";
+  else if (iequals(v, "no"))
+    canonical = "no";
   else {
     err = "argument must be 'yes' or 'no'";
     return false;
@@ -190,8 +216,9 @@ bool check_bool(const RedisConfigSpec& spec, const std::string& v, std::string& 
   // (the pinned Redis 7.2.5 built with libc malloc gives the same answer).
   if (canonical == "yes" && spec.is_valid != nullptr &&
       std::strcmp(spec.is_valid, "isValidActiveDefrag") == 0) {
-    err = "Active defragmentation cannot be enabled: it requires a Redis server compiled with a "
-          "modified Jemalloc like the one shipped by default with the Redis source distribution";
+    err =
+        "Active defragmentation cannot be enabled: it requires a Redis server compiled with a "
+        "modified Jemalloc like the one shipped by default with the Redis source distribution";
     return false;
   }
   return true;
@@ -207,8 +234,10 @@ bool check_enum(const RedisConfigSpec& spec, const std::vector<std::string>& arg
     for (auto e = spec.enum_names; *e != nullptr; ++e) {
       if (iequals(args[i], *e)) match = *e;
     }
-    if (match == nullptr) ok = false;
-    else names.emplace_back(match);
+    if (match == nullptr)
+      ok = false;
+    else
+      names.emplace_back(match);
   }
   if (!ok) {
     err = "argument(s) must be one of the following: ";
@@ -300,8 +329,8 @@ bool check_numeric(const RedisConfigSpec& spec, const std::string& v, long long&
       return false;
     }
   } else if (ll > spec.upper || ll < spec.lower) {
-    std::snprintf(buf, sizeof(buf), "argument must be between %lld and %lld inclusive",
-                  spec.lower, spec.upper);
+    std::snprintf(buf, sizeof(buf), "argument must be between %lld and %lld inclusive", spec.lower,
+                  spec.upper);
     err = buf;
     return false;
   }
@@ -386,7 +415,8 @@ bool check_special(const std::string& name, const std::vector<std::string>& in,
       ok = eptr[0] == '\0' && !((j & 1) == 0 && val < 1) && !((j & 1) == 1 && val < 0);
       // Redis stores the change count in an int, so a larger value wraps the same way.
       if (ok) {
-        args[j] = std::to_string((j & 1) == 1 ? static_cast<long long>(static_cast<int>(val)) : val);
+        args[j] =
+            std::to_string((j & 1) == 1 ? static_cast<long long>(static_cast<int>(val)) : val);
       }
     }
     if (!ok) {
@@ -404,9 +434,12 @@ bool check_special(const std::string& name, const std::vector<std::string>& in,
     std::vector<std::string> out;
     for (std::size_t j = 0; j < in.size(); j += 4) {
       std::string cls;
-      if (iequals(in[j], "normal")) cls = "normal";
-      else if (iequals(in[j], "slave") || iequals(in[j], "replica")) cls = "replica";
-      else if (iequals(in[j], "pubsub")) cls = "pubsub";
+      if (iequals(in[j], "normal"))
+        cls = "normal";
+      else if (iequals(in[j], "slave") || iequals(in[j], "replica"))
+        cls = "replica";
+      else if (iequals(in[j], "pubsub"))
+        cls = "pubsub";
       else {
         err = "Invalid client class specified in buffer limit configuration.";
         return false;
@@ -508,19 +541,37 @@ bool check_special(const std::string& name, const std::vector<std::string>& in,
 // Settings that configure_encoding_limits() and configure_runtime_settings() (command.cpp) read
 // from ServerConfig::raw at startup.
 const std::unordered_set<std::string>& raw_applied_settings() {
-  static const std::unordered_set<std::string> kSet = {
-      "hash-max-listpack-entries", "hash-max-listpack-value", "list-max-listpack-size",
-      "set-max-intset-entries", "set-max-listpack-entries", "set-max-listpack-value",
-      "zset-max-listpack-entries", "zset-max-listpack-value",
-      "min-replicas-to-write", "replica-serve-stale-data", "busy-reply-threshold",
-      "replica-ignore-disk-write-errors",
-      "repl-timeout", "repl-ping-replica-period",
-      "lazyfree-lazy-server-del", "stop-writes-on-bgsave-error", "aof-load-truncated",
-      "slowlog-log-slower-than", "slowlog-max-len", "latency-monitor-threshold",
-      "proto-max-bulk-len", "client-query-buffer-limit", "tcp-keepalive", "lfu-log-factor",
-      "maxmemory-eviction-tenacity",
-      "enable-protected-configs", "rdbchecksum", "rdb-key-save-delay", "shutdown-on-sigterm",
-      "shutdown-on-sigint", "shutdown-timeout"};
+  static const std::unordered_set<std::string> kSet = {"hash-max-listpack-entries",
+                                                       "hash-max-listpack-value",
+                                                       "list-max-listpack-size",
+                                                       "set-max-intset-entries",
+                                                       "set-max-listpack-entries",
+                                                       "set-max-listpack-value",
+                                                       "zset-max-listpack-entries",
+                                                       "zset-max-listpack-value",
+                                                       "min-replicas-to-write",
+                                                       "replica-serve-stale-data",
+                                                       "busy-reply-threshold",
+                                                       "replica-ignore-disk-write-errors",
+                                                       "repl-timeout",
+                                                       "repl-ping-replica-period",
+                                                       "lazyfree-lazy-server-del",
+                                                       "stop-writes-on-bgsave-error",
+                                                       "aof-load-truncated",
+                                                       "slowlog-log-slower-than",
+                                                       "slowlog-max-len",
+                                                       "latency-monitor-threshold",
+                                                       "proto-max-bulk-len",
+                                                       "client-query-buffer-limit",
+                                                       "tcp-keepalive",
+                                                       "lfu-log-factor",
+                                                       "maxmemory-eviction-tenacity",
+                                                       "enable-protected-configs",
+                                                       "rdbchecksum",
+                                                       "rdb-key-save-delay",
+                                                       "shutdown-on-sigterm",
+                                                       "shutdown-on-sigint",
+                                                       "shutdown-timeout"};
   return kSet;
 }
 
@@ -549,13 +600,19 @@ const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
       {"tls-port", {"0", kTlsRefusal}},
       {"tls-replication", {"no", kTlsRefusal}},
       {"tls-cluster", {"no", kTlsRefusal}},
-      {"aclfile", {"", "PeaDB has no ACL users and cannot load an ACL file (compat/delta.md item "
-                       "24): set the default user's password with requirepass instead"}},
-      {"masteruser", {"", "PeaDB replicas cannot authenticate to their master as a named ACL "
-                          "user (compat/delta.md item 50)"}},
-      {"enable-debug-command", {"yes", "PeaDB cannot restrict the DEBUG command yet "
-                                       "(compat/delta.md item 61): remove this setting and "
-                                       "disable DEBUG with: rename-command DEBUG \"\""}},
+      {"aclfile",
+       {"",
+        "PeaDB has no ACL users and cannot load an ACL file (compat/delta.md item "
+        "24): set the default user's password with requirepass instead"}},
+      {"masteruser",
+       {"",
+        "PeaDB replicas cannot authenticate to their master as a named ACL "
+        "user (compat/delta.md item 50)"}},
+      {"enable-debug-command",
+       {"yes",
+        "PeaDB cannot restrict the DEBUG command yet "
+        "(compat/delta.md item 61): remove this setting and "
+        "disable DEBUG with: rename-command DEBUG \"\""}},
   };
   return kMap;
 }
@@ -572,7 +629,8 @@ struct NotAppliedLine {
 };
 
 struct LoadState {
-  explicit LoadState(ServerConfig& c) : cfg(c) {}
+  explicit LoadState(ServerConfig& c) : cfg(c) {
+  }
   ServerConfig& cfg;
   // Redis's reading_config_file flag: set while a config text is parsed and cleared when that
   // parse ends, which includes the parse of an included file. So after an include, each later
@@ -596,8 +654,8 @@ std::string to_upper(std::string s) {
 }
 
 std::string line_origin(int linenum, const std::string& line) {
-  return "Reading the configuration file, at line " + std::to_string(linenum) + "\n>>> '" +
-         line + "'";
+  return "Reading the configuration file, at line " + std::to_string(linenum) + "\n>>> '" + line +
+         "'";
 }
 
 bool read_config_source(const std::string& path, std::string& text, std::string& error);
@@ -621,35 +679,58 @@ bool apply_setting(LoadState& st, const RedisConfigSpec& spec, const std::vector
   }
   cfg.raw[name] = value;
   if (raw_applied_settings().count(name) != 0) return true;
-  if (name == "port") cfg.port = std::stoi(value);
+  if (name == "port")
+    cfg.port = std::stoi(value);
   else if (name == "maxclients")
     cfg.maxclients = static_cast<int>(std::min<long long>(std::stoll(value), INT_MAX));
-  else if (name == "tcp-backlog") cfg.tcp_backlog = std::stoi(value);
-  else if (name == "timeout") cfg.timeout = value;
-  else if (name == "unixsocket") cfg.unixsocket = value;
-  else if (name == "unixsocketperm") cfg.unixsocketperm = std::stoi(value, nullptr, 8);
-  else if (name == "loglevel") cfg.log_level = value;
-  else if (name == "dbfilename") cfg.dbfilename = value;
-  else if (name == "appendonly") cfg.appendonly = value == "yes";
-  else if (name == "appendfilename") cfg.appendfilename = value;
-  else if (name == "appendfsync") cfg.appendfsync = value;
-  else if (name == "requirepass") cfg.requirepass = value;
-  else if (name == "masterauth") cfg.masterauth = value;
+  else if (name == "tcp-backlog")
+    cfg.tcp_backlog = std::stoi(value);
+  else if (name == "timeout")
+    cfg.timeout = value;
+  else if (name == "unixsocket")
+    cfg.unixsocket = value;
+  else if (name == "unixsocketperm")
+    cfg.unixsocketperm = std::stoi(value, nullptr, 8);
+  else if (name == "loglevel")
+    cfg.log_level = value;
+  else if (name == "dbfilename")
+    cfg.dbfilename = value;
+  else if (name == "appendonly")
+    cfg.appendonly = value == "yes";
+  else if (name == "appendfilename")
+    cfg.appendfilename = value;
+  else if (name == "appendfsync")
+    cfg.appendfsync = value;
+  else if (name == "requirepass")
+    cfg.requirepass = value;
+  else if (name == "masterauth")
+    cfg.masterauth = value;
   else if (name == "replicaof") {
     cfg.replica = value != "no one";
     cfg.master_host = cfg.replica ? args[0] : std::string();
     cfg.master_port = cfg.replica ? static_cast<int>(std::strtol(args[1].c_str(), nullptr, 10)) : 0;
-  } else if (name == "protected-mode") cfg.protected_mode = value == "yes";
-  else if (name == "enable-module-command") cfg.enable_module_command = value;
-  else if (name == "maxmemory") cfg.maxmemory = value;
-  else if (name == "maxmemory-policy") cfg.maxmemory_policy = value;
-  else if (name == "maxmemory-samples") cfg.maxmemory_samples = value;
-  else if (name == "repl-backlog-size") cfg.repl_backlog_size = value;
-  else if (name == "notify-keyspace-events") cfg.notify_keyspace_events = value;
-  else if (name == "cluster-enabled") cfg.cluster_enabled = value == "yes";
-  else if (name == "cluster-announce-ip") cfg.cluster_announce_ip = value;
-  else if (name == "cluster-announce-port") cfg.cluster_announce_port = value;
-  else if (name == "cluster-announce-bus-port") cfg.cluster_announce_bus_port = value;
+  } else if (name == "protected-mode")
+    cfg.protected_mode = value == "yes";
+  else if (name == "enable-module-command")
+    cfg.enable_module_command = value;
+  else if (name == "maxmemory")
+    cfg.maxmemory = value;
+  else if (name == "maxmemory-policy")
+    cfg.maxmemory_policy = value;
+  else if (name == "maxmemory-samples")
+    cfg.maxmemory_samples = value;
+  else if (name == "repl-backlog-size")
+    cfg.repl_backlog_size = value;
+  else if (name == "notify-keyspace-events")
+    cfg.notify_keyspace_events = value;
+  else if (name == "cluster-enabled")
+    cfg.cluster_enabled = value == "yes";
+  else if (name == "cluster-announce-ip")
+    cfg.cluster_announce_ip = value;
+  else if (name == "cluster-announce-port")
+    cfg.cluster_announce_port = value;
+  else if (name == "cluster-announce-bus-port")
+    cfg.cluster_announce_bus_port = value;
   else if (name == "bind") {
     if (args.size() != 1 || value.empty()) {
       st.bad_bind = {value, linenum, origin, st.seq++};
@@ -762,7 +843,8 @@ bool parse_config_text(LoadState& st, const std::string& text, std::string& erro
       if (const RedisConfigSpec* spec = find_redis_config(name)) {
         handle_standard(st, *spec, argv, linenum, origin, err);
       } else if ((name == "list-max-ziplist-entries" || name == "list-max-ziplist-value" ||
-                  name == "lua-replicate-commands") && argc == 2) {
+                  name == "lua-replicate-commands") &&
+                 argc == 2) {
         // Deprecated settings that Redis still accepts and ignores (deprecated_configs[]).
       } else if (name == "include" && argc == 2) {
         if (st.include_depth >= kMaxIncludeDepth) {
@@ -779,8 +861,9 @@ bool parse_config_text(LoadState& st, const std::string& text, std::string& erro
       } else if (name == "rename-command" && argc == 3) {
         handle_rename(st, argv, linenum, origin, err);
       } else if (name == "user" && argc >= 2) {
-        err = "PeaDB has no ACL users (compat/delta.md item 24): set the default user's "
-              "password with requirepass instead of a user line";
+        err =
+            "PeaDB has no ACL users (compat/delta.md item 24): set the default user's "
+            "password with requirepass instead of a user line";
       } else if (name == "loadmodule" && argc >= 2) {
         err = "PeaDB cannot load Redis modules";
       } else if (name.find('.') != std::string::npos) {
@@ -832,8 +915,8 @@ bool finish_load(LoadState& st, std::string& error) {
   if (logfile != st.cfg.raw.end() && !logfile->second.empty()) {
     FILE* fp = std::fopen(logfile->second.c_str(), "a");
     if (fp == nullptr) {
-      error = format_config_error("", std::string("Can't open the log file: ") +
-                                          std::strerror(errno));
+      error =
+          format_config_error("", std::string("Can't open the log file: ") + std::strerror(errno));
       return false;
     }
     std::fclose(fp);
@@ -996,18 +1079,30 @@ bool split_config_args(const std::string& line, std::vector<std::string>& out) {
     while (!done) {
       if (inq) {
         if (*p == '\\' && *(p + 1) == 'x' && is_hex_digit(*(p + 2)) && is_hex_digit(*(p + 3))) {
-          current.push_back(static_cast<char>(hex_digit_to_int(*(p + 2)) * 16 +
-                                              hex_digit_to_int(*(p + 3))));
+          current.push_back(
+              static_cast<char>(hex_digit_to_int(*(p + 2)) * 16 + hex_digit_to_int(*(p + 3))));
           p += 3;
         } else if (*p == '\\' && *(p + 1)) {
           ++p;
           switch (*p) {
-            case 'n': current.push_back('\n'); break;
-            case 'r': current.push_back('\r'); break;
-            case 't': current.push_back('\t'); break;
-            case 'b': current.push_back('\b'); break;
-            case 'a': current.push_back('\a'); break;
-            default: current.push_back(*p); break;
+            case 'n':
+              current.push_back('\n');
+              break;
+            case 'r':
+              current.push_back('\r');
+              break;
+            case 't':
+              current.push_back('\t');
+              break;
+            case 'b':
+              current.push_back('\b');
+              break;
+            case 'a':
+              current.push_back('\a');
+              break;
+            default:
+              current.push_back(*p);
+              break;
           }
         } else if (*p == '"') {
           // A closing quote must be followed by a space or nothing at all.
@@ -1040,10 +1135,22 @@ bool split_config_args(const std::string& line, std::vector<std::string>& out) {
         }
       } else {
         switch (*p) {
-          case ' ': case '\n': case '\r': case '\t': case '\0': done = true; break;
-          case '"': inq = true; break;
-          case '\'': insq = true; break;
-          default: current.push_back(*p); break;
+          case ' ':
+          case '\n':
+          case '\r':
+          case '\t':
+          case '\0':
+            done = true;
+            break;
+          case '"':
+            inq = true;
+            break;
+          case '\'':
+            insq = true;
+            break;
+          default:
+            current.push_back(*p);
+            break;
         }
       }
       if (*p) ++p;

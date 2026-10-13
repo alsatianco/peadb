@@ -24,35 +24,36 @@ struct ServerConfig {
   std::string bind = "127.0.0.1";
   std::string unixsocket;  // AF_UNIX listener path; empty = disabled
   int unixsocketperm = 0;  // mode for the unix socket file; 0 = leave the mode bind(2) gave it
-  std::string log_level = "notice";  // a Redis loglevel name
+  std::string log_level = "notice";     // a Redis loglevel name
   std::string dbfilename = "dump.rdb";  // relative to `dir`, which the loader chdir()s into
   bool appendonly = false;
   std::string appendfilename = "appendonly.aof";
   std::string appendfsync = "everysec";
-  std::string maxmemory;                    // bytes, decimal; empty = unlimited
-  std::string maxmemory_policy;             // e.g. "allkeys-lru"; empty = noeviction
-  std::string maxmemory_samples;            // eviction sample size; empty = 5
-  std::string timeout;                       // idle-client timeout (seconds); empty = 0 (off)
-  std::string client_output_buffer_limit;    // accumulated "class hard soft sec" groups
-  std::string save;                         // "sec changes [sec changes ...]"; empty = none
-  std::string repl_backlog_size;            // bytes, decimal; empty = default 1mb
-  std::string notify_keyspace_events;       // e.g. "KEA"; empty = disabled
+  std::string maxmemory;                   // bytes, decimal; empty = unlimited
+  std::string maxmemory_policy;            // e.g. "allkeys-lru"; empty = noeviction
+  std::string maxmemory_samples;           // eviction sample size; empty = 5
+  std::string timeout;                     // idle-client timeout (seconds); empty = 0 (off)
+  std::string client_output_buffer_limit;  // accumulated "class hard soft sec" groups
+  std::string save;                        // "sec changes [sec changes ...]"; empty = none
+  std::string repl_backlog_size;           // bytes, decimal; empty = default 1mb
+  std::string notify_keyspace_events;      // e.g. "KEA"; empty = disabled
   // ── Security ──
-  std::string requirepass;                 // empty = no auth required (Redis default)
-  std::string masterauth;                  // password the replica sends to its master
-  bool replica = false;                   // replicaof/slaveof; independent of the host text
+  std::string requirepass;  // empty = no auth required (Redis default)
+  std::string masterauth;   // password the replica sends to its master
+  bool replica = false;     // replicaof/slaveof; independent of the host text
   std::string master_host;
   int master_port = 0;
-  bool protected_mode = true;              // refuse non-loopback clients when no auth set
-  std::string enable_module_command = "no"; // "yes" | "no" | "local" — gates MODULE LOAD
+  bool protected_mode = true;                // refuse non-loopback clients when no auth set
+  std::string enable_module_command = "no";  // "yes" | "no" | "local" — gates MODULE LOAD
   std::vector<RenameCommandDirective> rename_commands;  // in config order
   // ── Cluster ──
-  bool cluster_enabled = false;             // startup-only, like Redis's IMMUTABLE_CONFIG
-  std::string cluster_announce_ip;          // empty = use `bind` (a documented simplification —
-                                             // Redis instead auto-detects from a live connection;
-                                             // see docs/decisions/p5-cluster-addressing-and-version-provenance.md)
-  std::string cluster_announce_port;        // empty = use `port`
-  std::string cluster_announce_bus_port;    // empty = announced port + 10000
+  bool cluster_enabled = false;  // startup-only, like Redis's IMMUTABLE_CONFIG
+  std::string
+      cluster_announce_ip;  // empty = use `bind` (a documented simplification —
+                            // Redis instead auto-detects from a live connection;
+                            // see docs/decisions/p5-cluster-addressing-and-version-provenance.md)
+  std::string cluster_announce_port;      // empty = use `port`
+  std::string cluster_announce_bus_port;  // empty = announced port + 10000
   // Every standard Redis setting the config named, by canonical name (aliases are folded into
   // it and the last value wins, as in Redis), holding the checked value: "yes"/"no", a decimal
   // number, a lower-case enum name, or the string. configure_encoding_limits() and

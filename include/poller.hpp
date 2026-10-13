@@ -140,13 +140,12 @@ struct Poller {
   }
 };
 
-
 #ifdef PEADB_HAVE_IO_URING
 // io_uring-based poller for Linux. Uses IORING_OP_POLL_ADD for readiness
 // (same semantic as epoll) so the existing read/write paths are unchanged.
 // Per-fd recv buffers for zero-copy path are a future optimisation (P4-6b).
 struct IoUringPoller {
-  struct io_uring ring{};
+  struct io_uring ring {};
   bool created = false;
 
   bool create() {
@@ -180,7 +179,9 @@ struct IoUringPoller {
     return true;
   }
 
-  bool set_read_only(int fd) { return add_read(fd); }
+  bool set_read_only(int fd) {
+    return add_read(fd);
+  }
 
   void remove(int fd) {
     // Cancel the outstanding poll for fd using IORING_OP_POLL_REMOVE.
@@ -192,7 +193,9 @@ struct IoUringPoller {
   }
 
   int wait(std::vector<PollEvent>& out, int timeout_ms) {
-    struct __kernel_timespec ts{timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L};
+    struct __kernel_timespec ts {
+      timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L
+    };
     struct io_uring_cqe* cqe = nullptr;
     int ret = io_uring_wait_cqe_timeout(&ring, &cqe, timeout_ms >= 0 ? &ts : nullptr);
     if (ret < 0) return (ret == -ETIME) ? 0 : ret;

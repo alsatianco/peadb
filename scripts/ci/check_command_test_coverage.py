@@ -59,10 +59,15 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 
+def extract_commands(text: str) -> list[str]:
+    """Recognize registrations across formatter-inserted line breaks."""
+    return sorted(set(re.findall(r't\s*\.\s*emplace\s*\(\s*"([A-Z0-9_-]+)"', text)))
+
+
 def main() -> int:
     cmd_src = (ROOT / 'src/command.cpp').read_text(encoding='utf-8', errors='ignore')
     # '-' for RESTORE-ASKING, Redis's only command name with one.
-    commands = sorted(set(re.findall(r't\.emplace\("([A-Z0-9_-]+)"', cmd_src)))
+    commands = extract_commands(cmd_src)
 
     texts = []
     for p in ROOT.joinpath('tests').rglob('*'):
