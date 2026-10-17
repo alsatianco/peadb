@@ -114,12 +114,20 @@ def start(binary, port, workdir, extra=()):
         if proc.poll() is not None:
             raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
         try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
+            c = Conn(port)
+            try:
+                reply = c('PING')
+                # These fixtures also start authenticated and stale replicas. LOADING is retried.
+                if reply == '+PONG' or reply.startswith(('-NOAUTH', '-MASTERDOWN')):
+                    return proc
+            finally:
+                c.close()
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(0.05)
     proc.kill()
-    raise RuntimeError(f'{binary} did not start on port {port}')
+    proc.wait()
+    raise RuntimeError(f'{binary} did not start on port {port}: {open(log_path).read()}')
 
 
 def stop(proc):

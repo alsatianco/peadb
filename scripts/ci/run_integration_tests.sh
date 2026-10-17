@@ -12,7 +12,7 @@
 #      repo root.
 #   2. Runs each test file via `python3 <file>`, optionally wrapped in a
 #      per-test `timeout` to prevent hangs.
-#   3. On failure, captures the last 3 lines of stdout/stderr for quick
+#   3. On failure, captures the last 80 lines of stdout/stderr for quick
 #      triage and marks the test as FAIL (distinguishing timeouts from
 #      other errors).
 #   4. After each test file (pass, fail, or timeout), reaps any peadb-server
@@ -91,7 +91,7 @@
 # Interpreting the output
 #   Each failing test produces a block like:
 #       FAIL: test_foo (exit 1)
-#       <last 3 lines of test output>
+#       <last 80 lines of test output>
 #       ---
 #   Followed by the aggregated counts:
 #       PASSED: 12
@@ -166,13 +166,14 @@ fi
 # is left over. Only polls/sleeps when there is actually a straggler to wait
 # for, and only for up to ~2s before escalating to SIGKILL.
 reap_stragglers() {
-  [[ "$have_pgrep" -eq 1 ]] || return
+  [[ "$have_pgrep" -eq 1 ]] || return 0
   local pid pgid
   local -a strays=()
   for pid in $(pgrep -x peadb-server 2>/dev/null || true); do
     [[ "$protected_server_pids" == *" $pid "* ]] && continue
-    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ')"
-    [[ -n "$pgid" && "$pgid" != "$own_pgid" ]] && continue
+    # A process can exit between pgrep and ps; that is successful cleanup.
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [[ "$pgid" == "$own_pgid" ]] || continue
     strays+=("$pid")
   done
   [[ ${#strays[@]} -eq 0 ]] && return
@@ -222,7 +223,7 @@ for t in "${tests[@]}"; do
     else
       code=$?
       failed=$((failed + 1))
-      msg=$(tail -3 "$out_file" || true)
+      msg=$(tail -80 "$out_file" || true)
       if [[ "$code" -eq 124 ]]; then
         fail_list="${fail_list}FAIL: ${name} (timeout after ${TIMEOUT_SECS}s)\n${msg}\n---\n"
       else
@@ -235,7 +236,7 @@ for t in "${tests[@]}"; do
     else
       code=$?
       failed=$((failed + 1))
-      msg=$(tail -3 "$out_file" || true)
+      msg=$(tail -80 "$out_file" || true)
       fail_list="${fail_list}FAIL: ${name} (exit ${code})\n${msg}\n---\n"
     fi
   fi

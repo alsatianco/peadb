@@ -14,20 +14,26 @@
 #include <memory>
 #include <new>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace {
 int failures = 0;
-void check(bool ok, const std::string& what) {
+// Literal diagnostics must not allocate while another argument samples the counter.
+// For constructed diagnostics, take the measurement before building the message: C++ does not
+// specify which function argument is evaluated first (GCC and Clang choose differently).
+void check(bool ok, std::string_view what) {
   if (!ok) {
     std::cerr << "FAIL: " << what << "\n";
     ++failures;
   }
 }
 
-std::int64_t used() { return static_cast<std::int64_t>(peadb::zmalloc_used_memory()); }
+std::int64_t used() {
+  return static_cast<std::int64_t>(peadb::zmalloc_used_memory());
+}
 
 struct alignas(64) Aligned {
   char bytes[200];
@@ -56,7 +62,8 @@ std::int64_t churn(bool alone) {
       lst.push_back(i);
       dict.emplace(key, key);
     }
-    for (int i = 0; i < 1000; ++i) dict.erase(dict.find("key:" + std::to_string(i) + std::string(30, 'k')));
+    for (int i = 0; i < 1000; ++i)
+      dict.erase(dict.find("key:" + std::to_string(i) + std::string(30, 'k')));
     dict.shrink_if_sparse();
     auto* array = new int[1000];
     auto* aligned = new Aligned;
@@ -73,8 +80,9 @@ std::int64_t churn(bool alone) {
     delete[] nothrow;
   }
   if (alone) {
-    check(used() == before, "the count is back where it started after a mixed churn (" +
-                                std::to_string(used() - before) + " bytes off)");
+    const std::int64_t after = used();
+    check(after == before, "the count is back where it started after a mixed churn (" +
+                               std::to_string(after - before) + " bytes off)");
   }
   return grown;
 }
@@ -98,9 +106,9 @@ int main() {
     check(used() == before, "freeing the 10 MB string gives it back");
   }
 
-  // zmalloc_string_bytes() is what freeing a string gives back, also for a buffer the allocator made
-  // bigger than asked (macOS can hand back a larger freed region as a string doubles), and 0 for
-  // text kept inside the object.
+  // zmalloc_string_bytes() is what freeing a string gives back, also for a buffer the allocator
+  // made bigger than asked (macOS can hand back a larger freed region as a string doubles), and 0
+  // for text kept inside the object.
   {
     std::string small = "short";
     check(peadb::zmalloc_string_bytes(small) == 0, "a short string holds no heap buffer");
@@ -108,13 +116,14 @@ int main() {
       std::string s;
       while (s.size() < target) s.append(std::string(57, 'a'));
       const std::int64_t bytes = static_cast<std::int64_t>(peadb::zmalloc_string_bytes(s));
-      check(bytes >= static_cast<std::int64_t>(s.capacity()), "a string holds at least its capacity");
+      check(bytes >= static_cast<std::int64_t>(s.capacity()),
+            "a string holds at least its capacity");
       const std::int64_t before = used();
       std::string().swap(s);
-      check(before - used() == bytes, "freeing a string of " + std::to_string(target) +
-                                          " bytes gives back zmalloc_string_bytes() (" +
-                                          std::to_string(before - used()) + " vs " +
-                                          std::to_string(bytes) + ")");
+      const std::int64_t freed = before - used();
+      check(freed == bytes, "freeing a string of " + std::to_string(target) +
+                                " bytes gives back zmalloc_string_bytes() (" +
+                                std::to_string(freed) + " vs " + std::to_string(bytes) + ")");
     }
   }
 
@@ -148,8 +157,9 @@ int main() {
     for (auto& th : threads) th.join();
     threads.clear();
     threads.shrink_to_fit();
-    check(used() == before, "the count is back after five threads churned at once (" +
-                                std::to_string(used() - before) + " bytes off)");
+    const std::int64_t after = used();
+    check(after == before, "the count is back after five threads churned at once (" +
+                               std::to_string(after - before) + " bytes off)");
   }
 
   if (failures == 0) std::cout << "zmalloc_test: all checks passed\n";

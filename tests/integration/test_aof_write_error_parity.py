@@ -225,10 +225,16 @@ def start(binary, port, workdir, *extra, env=None):
         if proc.poll() is not None:
             raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
         try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
+            c = Conn(port)
+            try:
+                # Redis listens while loading its AOF; wait until commands can run.
+                if c('PING') == '+PONG':
+                    return proc
+            finally:
+                c.close()
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(0.05)
     proc.kill()
     raise RuntimeError(f'{binary} did not start on port {port}')
 

@@ -40,7 +40,9 @@ PEADB_FIXED = {
 
 class Conn:
     def __init__(self, port):
-        self.sock = socket.create_connection(('127.0.0.1', port), timeout=5)
+        # DEBUG LOADAOF replays 300,000 keys; sanitizer instrumentation needs a larger I/O budget.
+        timeout = 30 if os.environ.get('PEADB_TEST_SANITIZED') == '1' else 5
+        self.sock = socket.create_connection(('127.0.0.1', port), timeout=timeout)
         self.f = self.sock.makefile('rb')
 
     def close(self):

@@ -168,10 +168,16 @@ def start(binary, port, workdir, *extra):
         if proc.poll() is not None:
             raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
         try:
-            socket.create_connection((HOST, port), timeout=0.2).close()
-            return proc
+            c = Conn(port)
+            try:
+                # A connected socket can still receive LOADING while Redis replays its AOF.
+                if c('PING') == '+PONG':
+                    return proc
+            finally:
+                c.close()
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(0.05)
     proc.kill()
     raise RuntimeError(f'{binary} did not start on port {port}')
 
@@ -308,9 +314,19 @@ def check_replies(name, src, sport, tgt, tport, closed_port, seen):
         (('MIGRATE', HOST, tport, 'r', 0, 'abc'), NOT_INT),
         (('MIGRATE', HOST, tport, 'r', 'x', 5000), NOT_INT),
         (('MIGRATE', HOST, tport, 'r', '01', 5000), NOT_INT),
-        (('MIGRATE', HOST, 'abc', 'r', 0, 5000), '-IOERR error or timeout connecting to the client'),
     ]:
-        assert src(*args) == reply, (name, args, src(*args))
+        actual = src(*args)
+        assert actual == reply, (name, args, actual)
+    # Redis converts a nonnumeric port to 0 using atoi(). The failure can surface in connect()
+    # or in the first write depending on the platform; retain the exact Redis reply as the oracle.
+    io_errors = {'-IOERR error or timeout connecting to the client',
+                 '-IOERR error or timeout writing to target instance'}
+    reply = src('MIGRATE', HOST, 'abc', 'r', 0, 500)
+    assert reply in io_errors, (name, reply)
+    if 'nonnumeric_port' in seen:
+        assert reply == seen['nonnumeric_port'], (name, reply, seen['nonnumeric_port'])
+    seen['nonnumeric_port'] = reply
+    assert src('GET', 'r') == 'v', name
     # A database the target does not have: its SELECT error. Redis sends the RESTOREs in the same
     # write, so its target restores the key into the connection's database anyway (here 0); PeaDB
     # sends them only after a good SELECT (and AUTH), with the same reply.

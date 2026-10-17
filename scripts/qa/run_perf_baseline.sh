@@ -137,10 +137,11 @@ PY
 if command -v redis-benchmark >/dev/null 2>&1; then
   echo "=== Using redis-benchmark ==="
   for CMD in SET GET LPUSH LPOP INCR SADD; do
-    RPS=$(redis-benchmark -h 127.0.0.1 -p "$PORT" -t "$(echo "$CMD" | tr '[:upper:]' '[:lower:]')" \
+    metric_key=$(printf '%s' "$CMD" | tr '[:upper:]' '[:lower:]')
+    RPS=$(redis-benchmark -h 127.0.0.1 -p "$PORT" -t "$metric_key" \
       -n 10000 -c 10 -q 2>/dev/null | tr '\r' '\n' | grep 'requests per second' | awk '{print $2}' | tail -n1 || true)
     RPS="${RPS:-0}"
-    echo "${CMD,,}_ops_per_sec,${RPS}" >> "$OUT"
+    echo "${metric_key}_ops_per_sec,${RPS}" >> "$OUT"
     echo "  $CMD: $RPS ops/sec"
   done
 else

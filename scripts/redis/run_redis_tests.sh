@@ -260,10 +260,6 @@ trap cleanup EXIT
 
 mkdir -p "$OUT_DIR"
 
-# Kill stale peadb-server processes from previous test stages.
-pkill -9 -f "peadb-server" 2>/dev/null || true
-sleep 1
-
 if [[ "$SUITE_MODE" == "native" ]]; then
   if [[ ! -x "$PEADB_BIN" ]]; then
     echo "Missing PeaDB binary at $PEADB_BIN" >&2

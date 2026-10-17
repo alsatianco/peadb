@@ -10457,6 +10457,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           if (pos != std::string::npos && val[pos] == '.') pos--;
                           val = val.substr(0, pos + 1);
                         }
+                        if (val == "-0") val = "0";  // Redis's LD_STR_HUMAN normalizes zero.
                         std::vector<std::pair<std::string, std::string>> fields{{args[2], val}};
                         store().hset(args[1], fields, wrongtype);
                         return encode_bulk(val);

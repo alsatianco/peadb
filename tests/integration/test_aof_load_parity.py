@@ -67,10 +67,16 @@ def start(binary, port, workdir, *extra):
         if proc.poll() is not None:
             raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
         try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
+            c = Conn(port)
+            try:
+                # Redis accepts connections during AOF loading and can reply LOADING.
+                if c('PING') == '+PONG':
+                    return proc
+            finally:
+                c.close()
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(0.05)
     proc.kill()
     raise RuntimeError(f'{binary} did not start on port {port}')
 
@@ -320,7 +326,8 @@ def check_torn_tail(name, binary, work):
     proc = start(binary, port, workdir, *aof_args)
     try:
         c = Conn(port)
-        assert c('GET', 'm') is None, name
+        actual = c('GET', 'm')
+        assert actual is None, (name, actual)
         assert c('DBSIZE') == 148, name
         assert c('SET', 'after', '1') == '+OK'
         c.close()

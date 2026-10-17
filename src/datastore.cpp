@@ -691,6 +691,9 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
     }
   }
 
+  // Redis's LD_STR_HUMAN also normalizes values that round to negative zero.
+  if (s == "-0") s = "0";
+
   // Keep the TTL, like Redis's dbReplaceValue(); it is propagated as SET ... KEEPTTL.
   set(key, s, false, false, std::nullopt, /*keep_ttl=*/true);
   ok = true;

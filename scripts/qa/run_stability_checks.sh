@@ -13,6 +13,7 @@
 #      ``build-asan/`` directory.
 #   2. Starts the sanitised peadb-server on port 6450 with
 #      ``ASAN_OPTIONS=detect_leaks=1:halt_on_error=1``.
+#      Waits for a PONG before starting the stress loop.
 #   3. Enters a timed loop (default 15 seconds) where each iteration
 #      spawns a Python snippet that opens a TCP connection and sends a
 #      broad mix of commands: strings, lists, hashes, sets, sorted sets,
@@ -124,7 +125,14 @@ ASAN_OPTIONS="$ASAN_OPTS" \
   "$ROOT_DIR/build-asan/peadb-server" --port "$PORT" --bind 127.0.0.1 --loglevel warning >/tmp/peadb-asan.log 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID:-0} >/dev/null 2>&1 || true; wait ${SERVER_PID:-0} 2>/dev/null || true' EXIT
-sleep 1
+python3 - "$PORT" <<'PY'
+import sys
+
+sys.path.insert(0, "tests/integration")
+from _readiness import wait_until_ready
+
+wait_until_ready(int(sys.argv[1]), timeout=10)
+PY
 
 echo "=== Running stress loop for ${SECONDS_TO_RUN}s ==="
 end=$(( $(date +%s) + SECONDS_TO_RUN ))

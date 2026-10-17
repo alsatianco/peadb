@@ -46,6 +46,8 @@ class Conn:
     def __init__(self, port):
         self.sock = socket.create_connection(('127.0.0.1', port), timeout=10)
         self.f = self.sock.makefile('rb')
+        # Complete a command before another connection filters or kills this client.
+        assert self('PING') == '+PONG'
 
     def close(self):
         self.f.close()

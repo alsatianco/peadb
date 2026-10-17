@@ -37,6 +37,8 @@ def run(binary, rdb):
             wait_link(r)
             check(r('GET', 'kept') == 'value', 'cached data after timeout')
             r('REPLICAOF', 'NO', 'ONE')
+            wait_for(lambda: info(m, 'connected_slaves', 'replication') == '0',
+                     'previous replica disconnect')
 
             # A live socket alone is not a live replica: it must periodically ACK.
             m('CONFIG', 'SET', 'repl-timeout', '1')

@@ -53,7 +53,8 @@ def seed(c, streams=False):
 
 
 def verify(c, streamed=False, streams=False):
-    assert c('GET', 'initial') == 'snapshot'
+    actual = c('GET', 'initial')
+    assert actual == 'snapshot', actual
     assert c('GET', 'obsolete') is None
     assert c('GET', 'ttl') == 'kept'
     assert 0 < c('PTTL', 'ttl') < 60000

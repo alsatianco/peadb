@@ -42,14 +42,17 @@ scripts/dev/install_deps_ubuntu.sh
 # Build + start server (one command)
 scripts/dev/quick_start.sh
 
-# Run integration tests (requires a running server)
+# Run integration tests (each test starts its own servers)
 scripts/ci/run_integration_tests.sh
+
+# Run integration tests after building peadb-server with ASAN/UBSAN
+PEADB_TEST_SANITIZED=1 TIMEOUT_SECS=90 scripts/ci/run_integration_tests.sh
 
 # Run ASAN/UBSAN stability checks
 scripts/qa/run_stability_checks.sh --seconds 30
 
-# Run upstream Redis Tcl tests against PeaDB
-scripts/redis/run_redis_tests.sh
+# Run the adopted upstream Redis Tcl suites, as in nightly CI
+SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
 
 # Check that every command has test coverage
 python3 scripts/ci/check_command_test_coverage.py
@@ -77,6 +80,7 @@ Depending on the script, you may need:
 These are not exhaustive; each script documents its own configuration.
 
 - `TIMEOUT_SECS`: per-test timeout for `scripts/ci/run_integration_tests.sh`.
+- `PEADB_TEST_SANITIZED`: set to `1` for sanitizer builds to extend heavy fixture I/O budgets and leave the process RSS bound to Release tests; allocator accounting and eviction assertions still run.
 - `PEADB_BIN`: path to the `peadb-server` binary for scripts that need to start the server.
 - `START_PEADB`: for `scripts/redis/run_redis_tests.sh`, set to `0` to test against an already-running server.
 - `REDIS_VERSION`: Redis version to fetch/build for running upstream Redis Tcl tests.

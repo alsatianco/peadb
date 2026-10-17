@@ -22,7 +22,7 @@ jobs:
       - name: Configure (ASAN+UBSAN)
         run: |
           cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
-            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+            -DCMAKE_CXX_FLAGS="-O1 -fsanitize=address,undefined -fno-omit-frame-pointer"
 
       - name: Build
         run: cmake --build build-asan -j$(nproc)
@@ -31,6 +31,9 @@ jobs:
         run: cd build-asan && ctest --output-on-failure
 
       - name: Integration smoke (ASAN)
+        env:
+          PEADB_TEST_SANITIZED: "1"
+          TIMEOUT_SECS: "90"
         run: cd build-asan && ../scripts/ci/run_integration_tests.sh
 
   stability:
@@ -55,15 +58,13 @@ jobs:
       - name: Full integration suite
         run: cd build && ../scripts/ci/run_integration_tests.sh
 
-      - name: Compat scoreboard
-        run: python3 scripts/ci/generate_compat_scoreboard.py
-
       - name: Redis upstream compatibility tests
-        # Invokes scripts/redis/run_redis_tests.sh which runs the Redis Tcl suite
-        # (tests/test_helper.tcl) against PeaDB. Failure is blocking: the curated
-        # SUITES list in run_redis_tests.sh names only suites that must pass on
-        # PeaDB. To explicitly waive a regression, remove or comment out the
-        # offending suite there (and track it in compat/delta.md).
+        env:
+          SUITE_MODE: native
+          OUT_DIR: artifacts/redis-native
+        # Run tests/test_helper.tcl with the native harness and the adopted
+        # suites/skipfiles tracked in compat/redis_suite_ledger.json. Native mode
+        # lets each test configure and restart its own PeaDB server.
         #
         # `set -o pipefail` is required: the GitHub Actions default shell uses
         # `bash -e {0}`, which does NOT enable pipefail. Without it, a failing
@@ -73,6 +74,15 @@ jobs:
           set -o pipefail
           mkdir -p artifacts
           bash scripts/redis/run_redis_tests.sh 2>&1 | tee artifacts/redis-compat.log
+
+      - name: Upstream suite ratchet
+        run: |
+          python3 scripts/redis/parse_tcl_results.py artifacts/redis-native \
+            --out-json artifacts/redis-native/pass_rate.json
+          python3 scripts/ci/check_suite_ratchet.py --results artifacts/redis-native/pass_rate.json
+
+      - name: Compat scoreboard
+        run: python3 scripts/ci/generate_compat_scoreboard.py
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

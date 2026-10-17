@@ -182,12 +182,18 @@ def start(binary, port, workdir, *extra):
         if proc.poll() is not None:
             raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
         try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
+            c = Conn(port)
+            try:
+                if c('PING') == '+PONG':
+                    return proc
+            finally:
+                c.close()
         except OSError:
-            time.sleep(0.05)
+            pass
+        time.sleep(0.05)
     proc.kill()
-    raise RuntimeError(f'{binary} did not start on port {port}')
+    proc.wait()
+    raise RuntimeError(f'{binary} did not start on port {port}: {open(log_path).read()}')
 
 
 def stop(proc):
@@ -305,14 +311,17 @@ LAZY_PATHS = [
 LAZY_KEYS = ['e1', 'h1', 't1', 'y1', 'g1', 'm1', 'm2', 'i1', 'a1', 'd1', 's1']
 
 
+LAZY_TTL_MS = 250
+
+
 def expire_soon(c, *keys):
-    """Keys that expire 1 ms after they are written (h1 is a hash)."""
+    """Arm expiry after setup finishes, including the two-command hash setup under ASAN."""
     for k in keys:
         if k == 'h1':
             assert c('HSET', k, 'f', 'v') == 1
-            assert c('PEXPIRE', k, 1) == 1
+            assert c('PEXPIRE', k, LAZY_TTL_MS) == 1
         else:
-            assert c('SET', k, 'v', 'PX', 1) == '+OK'
+            assert c('SET', k, 'v', 'PX', LAZY_TTL_MS) == '+OK'
 
 
 def check_lazy(name, binary, work):
@@ -339,7 +348,7 @@ def check_lazy(name, binary, work):
         expire_soon(c, *LAZY_KEYS)
         assert c('SET', 'end1', '1') == '+OK'
         replica.commands_until(['SET', 'end1', '1'])
-        time.sleep(0.02)
+        time.sleep(LAZY_TTL_MS / 1000 + 0.02)
         expected = []
         for cmd, reply, sent in LAZY_PATHS:
             assert c(*cmd) == reply, (name, cmd)
@@ -382,10 +391,10 @@ def check_lazy(name, binary, work):
         assert c('SELECT', 0) == '+OK'
         assert c('SET', 'mv', 'live') == '+OK'
         assert c('RPUSH', 'dst9', 'old') == 1
-        assert c('PEXPIRE', 'dst9', 1) == 1
+        assert c('PEXPIRE', 'dst9', LAZY_TTL_MS) == 1
         assert c('SET', 'end2c', '1') == '+OK'
         upto(['SET', 'end2c', '1'])
-        time.sleep(0.02)
+        time.sleep(LAZY_TTL_MS / 1000 + 0.02)
         assert c('EXPIRE', 'u1', 100) == 0
         assert c('GETEX', 'u2', 'PX', 100) is None
         assert isinstance(c('MEMORY', 'USAGE', 'u3'), int), name
@@ -417,7 +426,7 @@ def check_lazy(name, binary, work):
         # KEYS, SAVE, a full sync and WATCH/EXEC leave expired keys in place.
         expire_soon(c, 'k1', 'k2', 'k3', 'w1')
         assert c('SET', 'end3', '1') == '+OK'
-        time.sleep(0.02)
+        time.sleep(LAZY_TTL_MS / 1000 + 0.02)
         live = ['a1', 'end1', 'end2', 'end2b', 'end2c', 'end2d', 'end2e', 'end2f', 'end3', 'i1']
         assert sorted(c('KEYS', '*')) == live, name
         assert c('DBSIZE') == len(live) + 4, name
@@ -467,7 +476,7 @@ def check_lazy(name, binary, work):
         assert c('SELECT', 0) == '+OK'
         assert c('SET', 'end6', '1') == '+OK'
         upto(['SET', 'end6', '1'])
-        time.sleep(0.02)
+        time.sleep(LAZY_TTL_MS / 1000 + 0.02)
         assert c('SELECT', 5) == '+OK'
         assert c('RANDOMKEY') is None, name
         assert c('SELECT', 0) == '+OK'
@@ -744,8 +753,8 @@ def check_events(name, binary, work):
         sub.sock.sendall(encode('PSUBSCRIBE', '__keyevent@*__:*'))
         assert sub.read() == ['psubscribe', '__keyevent@*__:*', 1]
         assert c('HSET', 'h', 'f', 'v') == 1
-        assert c('PEXPIRE', 'h', 1) == 1
-        time.sleep(0.02)
+        assert c('PEXPIRE', 'h', LAZY_TTL_MS) == 1
+        time.sleep(LAZY_TTL_MS / 1000 + 0.02)
         assert c('GET', 'h') is None, name
         assert c('EXPIRE', 'missing', 10) == 0
         assert c('SET', 'k', 'v') == '+OK'
