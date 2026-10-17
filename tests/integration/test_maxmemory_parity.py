@@ -197,8 +197,12 @@ def check_accounting(name, binary, work):
         rss = rss_bytes(proc.pid)
         assert evicted > 0, (name, 'no key evicted', used, rss)
         assert used <= limit + 1024 * 1024, (name, used)
-        # Allow for allocator fragmentation, but not for an RSS that grows to many times the limit.
-        assert rss - start_rss < 2 * limit, (name, 'rss', rss, 'start rss', start_rss, 'used', used, 'evicted', evicted)
+        # ASAN's quarantine and shadow memory live outside the counted C++ allocations. Keep the
+        # accounting/eviction/FLUSHALL assertions in both jobs; Release CI checks the RSS bound.
+        if name != 'peadb' or os.environ.get('PEADB_TEST_SANITIZED') != '1':
+            assert rss - start_rss < 2 * limit, (name, 'rss', rss, 'start rss', start_rss, 'used', used, 'evicted', evicted)
+        else:
+            print('ASAN: RSS bound is checked in Release; allocator and eviction checks remain active', flush=True)
         assert c('CONFIG', 'SET', 'maxmemory', 0) == '+OK'
         assert c('FLUSHALL') == '+OK'
         after = int(info(c, 'used_memory', 'memory'))

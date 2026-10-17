@@ -56,6 +56,8 @@ Tests that do not exercise persistence/restart use `tests/integration/_isolated_
 
 Provision the exact reference with `bash scripts/ci/ensure_redis_reference.sh` (PR/nightly do this before integration tests); the native DUMP interoperability test fails if Redis 7.2.5 is unavailable. Check persistence and replication changes against the pinned real Redis (`~/.cache/peadb/redis-7.2.5/src/redis-server`, `redis-check-rdb`): load each other's `dump.rdb` and replicate in both directions. PeaDB-only round trips cannot catch format bugs; they hid the wrong RDB CRC64.
 
+Sanitizer build and integration settings live in the [nightly workflow](.github/workflows/nightly.yml). Its `PEADB_TEST_SANITIZED` mode retains functional allocator/eviction checks, leaves the RSS ceiling to Release CI, and gives bulk AOF replay a longer socket timeout.
+
 **The parity ratchet**: adopted upstream suites must stay at 0 `[err]`; growing a skipfile (`scripts/redis/skipfiles/`) or lowering a ledger count requires updating `compat/delta.md` in the same change. See the "Verification" section of `compat/delta.md`.
 
 ### Adopting an upstream TCL suite

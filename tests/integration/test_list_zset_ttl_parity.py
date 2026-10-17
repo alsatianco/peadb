@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LSET, LREM, LINSERT, LTRIM, ZREM, ZREMRANGEBYSCORE/RANK/LEX and INCRBYFLOAT keep the key's TTL (compat/delta.md item 31).
+"""LSET, LREM, LINSERT, LTRIM, ZREM, ZREMRANGEBYSCORE/RANK/LEX and floating-point increments keep the key's TTL (compat/delta.md item 31).
 
 Each command runs on a key with a TTL on peadb-server and on the pinned redis-server 7.2.x, and both must give the expected reply and contents and keep the TTL; a command that empties the key deletes it. The same runs check the keyspace events (Redis's order, with "del" when the key becomes empty), the order in which these commands and the shared sorted-set range parser check their arguments, a key whose TTL has passed while active expiry is off, a replica of each engine and across the engines both ways (the replicated key keeps its TTL, an emptied key stays deleted) and a restart from the AOF. PeaDB alone: the edits change large collections in place, so 300 ZREM, LSET and LTRIM calls on 200,000 items take well under the bound (the old copy-and-rebuild took seconds). Without a pinned Redis 7.2.x, only the PeaDB side runs.
 """
@@ -61,6 +61,16 @@ TTL_CASES = [
     (LEX, ('ZREMRANGEBYLEX', 'k', '[b', '(d'), 2, ZRANGE, ['a', '0', 'd', '0']),
     (('SET', 'k', '1.5'), ('INCRBYFLOAT', 'k', '1'), '2.5', ('GET', 'k'), '2.5'),
 ]
+
+# Redis's human-readable long-double formatter normalizes a rounded negative zero.
+# Keep genuinely negative values at the last printed decimal place unchanged.
+for initial, expected in [('-0', '0'), ('-0.000000000000000001', '0'),
+                          ('-0.00000000000000001', '-0.00000000000000001')]:
+    TTL_CASES.extend([
+        (('SET', 'k', initial), ('INCRBYFLOAT', 'k', '0'), expected, ('GET', 'k'), expected),
+        (('HSET', 'k', 'f', initial), ('HINCRBYFLOAT', 'k', 'f', '0'), expected,
+         ('HGET', 'k', 'f'), expected),
+    ])
 
 # (setup, command, reply) — the command empties the key, so the key is deleted.
 EMPTY_CASES = [
