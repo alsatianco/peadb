@@ -7,7 +7,7 @@
 //   - Hashes (RDB_TYPE_HASH = 4, RDB_TYPE_HASH_LISTPACK = 16)
 //   - Sorted sets (RDB_TYPE_ZSET_2 = 5, RDB_TYPE_ZSET_LISTPACK = 17)
 //   - Streams (Redis listpack types 15/19/21; writes type 21, reads old private type 200)
-// The zipmap and ziplist encodings of Redis before 7.0 (types 9, 10, 12, 13, 14) are refused.
+// Reads pre-7.0 zipmap/ziplist/quicklist-of-ziplists encodings (types 9/10/12/13/14).
 //
 // References: Redis src/rdb.h, src/rdb.c
 
@@ -822,6 +822,113 @@ class ListpackReader {
 // ── RDB Save ───────────────────────────────────────────────────────────
 
 namespace {
+// Pre-7.0 containers are converted on load, like Redis's rdbLoadObject(). Lengths are
+// checked against the actual blob before reading or allocating; headers never size reserves.
+class LegacyReader {
+ public:
+  explicit LegacyReader(std::string_view blob) : blob_(blob) {
+  }
+  bool number(std::size_t bytes, uint64_t& n, bool big_endian = false) {
+    if (bytes > remaining()) return false;
+    n = 0;
+    for (std::size_t i = 0; i < bytes; ++i) {
+      const auto shift = 8 * (big_endian ? bytes - i - 1 : i);
+      n |= static_cast<uint64_t>(static_cast<uint8_t>(blob_[pos_++])) << shift;
+    }
+    return true;
+  }
+  bool text(std::size_t bytes, std::string& value) {
+    if (bytes > remaining()) return false;
+    value.assign(blob_.data() + pos_, bytes);
+    pos_ += bytes;
+    return true;
+  }
+  bool skip(std::size_t bytes) {
+    if (bytes > remaining()) return false;
+    pos_ += bytes;
+    return true;
+  }
+  std::size_t position() const {
+    return pos_;
+  }
+  std::size_t remaining() const {
+    return blob_.size() - pos_;
+  }
+
+ private:
+  std::string_view blob_;
+  std::size_t pos_ = 0;
+};
+
+bool read_ziplist(const std::string& blob, std::vector<std::string>& items) {
+  if (blob.size() < 11 || static_cast<uint8_t>(blob.back()) != 255) return false;
+  // Exclude ZIP_END from the entry reader, so no entry can consume the terminator.
+  LegacyReader r(std::string_view(blob).substr(0, blob.size() - 1));
+  uint64_t bytes, tail, count;
+  if (!r.number(4, bytes) || bytes != blob.size() || !r.number(4, tail) || tail > blob.size() - 1 ||
+      !r.number(2, count))
+    return false;
+  std::size_t previous = 0, last = 10;
+  while (r.remaining()) {
+    const auto start = r.position();
+    uint64_t prev, encoding;
+    if (!r.number(1, prev) || prev == 255) return false;
+    if (prev == 254 && !r.number(4, prev)) return false;
+    if (prev != previous || !r.number(1, encoding)) return false;
+    std::string item;
+    if (encoding < 0xc0) {
+      uint64_t len = encoding & 0x3f;
+      if (encoding >= 0x80) {
+        if (!r.number(4, len, true)) return false;
+      } else if (encoding >= 0x40) {
+        uint64_t low;
+        if (!r.number(1, low)) return false;
+        len = (len << 8) | low;
+      }
+      if (!r.text(len, item)) return false;
+    } else if (encoding >= 0xf1 && encoding <= 0xfd) {
+      item = std::to_string((encoding & 15) - 1);
+    } else {
+      const std::size_t width = encoding == 0xfe   ? 1
+                                : encoding == 0xc0 ? 2
+                                : encoding == 0xf0 ? 3
+                                : encoding == 0xd0 ? 4
+                                : encoding == 0xe0 ? 8
+                                                   : 0;
+      uint64_t bits;
+      if (width == 0 || !r.number(width, bits)) return false;
+      if (width < 8 && (bits & (uint64_t{1} << (width * 8 - 1))))
+        bits |= (~uint64_t{0}) << (width * 8);
+      item = std::to_string(std::bit_cast<int64_t>(bits));
+    }
+    items.push_back(std::move(item));
+    previous = r.position() - start;
+    last = start;
+  }
+  // Redis ignores the tail for an empty ziplist and treats UINT16_MAX as unknown count.
+  return (items.empty() || tail == last) && (count == 65535 || count == items.size());
+}
+
+bool read_zipmap(const std::string& blob,
+                 std::vector<std::pair<std::string, std::string>>& fields) {
+  if (blob.size() < 2 || static_cast<uint8_t>(blob.back()) != 255) return false;
+  LegacyReader r(std::string_view(blob).substr(0, blob.size() - 1));
+  uint64_t count;
+  if (!r.number(1, count)) return false;
+  auto text = [&](std::string& value, bool has_free) {
+    uint64_t len, free = 0;
+    if (!r.number(1, len) || len == 255) return false;
+    if (len == 254 && !r.number(4, len)) return false;
+    return (!has_free || r.number(1, free)) && r.text(len, value) && r.skip(free);
+  };
+  while (r.remaining()) {
+    std::string field, value;
+    if (!text(field, false) || !text(value, true)) return false;
+    fields.emplace_back(std::move(field), std::move(value));
+  }
+  return !fields.empty() && (count == 254 || count == fields.size());
+}
+
 // Redis's quicklist node containers (quicklist.h).
 constexpr uint64_t kQuicklistNodePlain = 1;   // one element, stored as it is
 constexpr uint64_t kQuicklistNodePacked = 2;  // a listpack of elements
@@ -1199,19 +1306,60 @@ bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empt
       if (!r.read_string(item)) return false;
       out.items.push_back(std::move(item));
     }
-  } else if (type == RDB_TYPE_LIST_QUICKLIST_2) {
+  } else if (type == RDB_TYPE_HASH_ZIPMAP) {
+    std::string blob;
+    if (!r.read_string(blob) || !read_zipmap(blob, out.fields))
+      return corrupt("Zipmap integrity check failed.");
+    out.type = RDB_TYPE_HASH;
+  } else if (type == RDB_TYPE_LIST_ZIPLIST || type == RDB_TYPE_HASH_ZIPLIST ||
+             type == RDB_TYPE_ZSET_ZIPLIST) {
+    std::string blob;
+    std::vector<std::string> items;
+    const char* integrity = type == RDB_TYPE_LIST_ZIPLIST ? "List ziplist integrity check failed."
+                            : type == RDB_TYPE_HASH_ZIPLIST
+                                ? "Hash ziplist integrity check failed."
+                                : "Zset ziplist integrity check failed.";
+    if (!r.read_string(blob) || !read_ziplist(blob, items)) return corrupt(integrity);
+    if (type == RDB_TYPE_LIST_ZIPLIST) {
+      out.items = std::move(items);
+      out.type = RDB_TYPE_LIST;
+    } else {
+      if (items.size() % 2 != 0) return corrupt(integrity);
+      if (type == RDB_TYPE_HASH_ZIPLIST) {
+        for (std::size_t i = 0; i < items.size(); i += 2)
+          out.fields.emplace_back(std::move(items[i]), std::move(items[i + 1]));
+        out.type = RDB_TYPE_HASH;
+      } else {
+        for (std::size_t i = 0; i < items.size(); i += 2) {
+          const auto& text = items[i + 1];
+          char* end = nullptr;
+          const double score = std::strtod(text.c_str(), &end);
+          if (text.empty() || end != text.c_str() + text.size() || std::isnan(score))
+            return corrupt(integrity);
+          out.scored.emplace_back(std::move(items[i]), score);
+        }
+        out.type = RDB_TYPE_ZSET_2;
+      }
+    }
+  } else if (type == RDB_TYPE_LIST_QUICKLIST || type == RDB_TYPE_LIST_QUICKLIST_2) {
     if (!count(len)) return false;
     while (len--) {
       uint64_t container;
       std::string blob;
-      if (!read_plain_length(r, container) || !r.read_string(blob) || blob.empty()) return false;
+      container = kQuicklistNodePacked;
+      if ((type == RDB_TYPE_LIST_QUICKLIST_2 && !read_plain_length(r, container)) ||
+          !r.read_string(blob) || blob.empty())
+        return false;
       if (container != kQuicklistNodePlain && container != kQuicklistNodePacked)
         return corrupt("Quicklist integrity check failed.");
       if (container == kQuicklistNodePlain)
         out.items.push_back(std::move(blob));
       else {
         std::vector<std::string> node;
-        if (!ListpackReader(blob).parse(node)) return corrupt("Listpack integrity check failed.");
+        if (type == RDB_TYPE_LIST_QUICKLIST) {
+          if (!read_ziplist(blob, node)) return corrupt("Ziplist integrity check failed.");
+        } else if (!ListpackReader(blob).parse(node))
+          return corrupt("Listpack integrity check failed.");
         for (auto& item : node) out.items.push_back(std::move(item));
       }
     }
@@ -1608,246 +1756,258 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     }
   }
 
-  RdbReader r(filedata.data() + 9, filedata.size() - 9);
   auto& ds = store();
-  if (before_replace) before_replace();
-  ds.flushall();
-  // No key expires while the file loads (Redis's keyIsExpired() while loading); a master leaves out
-  // the keys that have expired already, a replica keeps them until its master's DEL (below).
-  const DataStore::LazyExpireDisabled no_lazy_expire(ds);
-  const std::int64_t load_now = DataStore::now_ms();
-  const int prev_db = ds.current_db();
-  ds.select_db(0);
-
-  std::optional<int64_t> pending_expire;
-  // Like Redis, a file must end with the EOF opcode (and, from version 5, the 8-byte checksum
-  // after it): a file cut at a key boundary is an error even when the checksum is not checked.
-  bool saw_eof = false;
-
-  while (!r.eof()) {
-    uint8_t type;
-    if (!r.read_u8(type)) break;
-
-    if (type == RDB_OPCODE_EOF) {
-      saw_eof = true;
-      break;
+  auto load = [&](bool apply) {
+    RdbReader r(filedata.data() + 9, filedata.size() - 9);
+    if (apply) {
+      if (before_replace) before_replace();
+      ds.flushall();
     }
+    // No key expires while the file loads (Redis's keyIsExpired() while loading); a master leaves
+    // out the keys that have expired already, a replica keeps them until its master's DEL (below).
+    std::optional<DataStore::LazyExpireDisabled> no_lazy_expire;
+    if (apply) no_lazy_expire.emplace(ds);
+    const std::int64_t load_now = DataStore::now_ms();
+    const int prev_db = ds.current_db();
+    if (apply) ds.select_db(0);
 
-    // Written by a Redis with an LRU or LFU maxmemory-policy, before each key. Read and
-    // dropped: a loaded key starts with fresh eviction data, and eviction is approximate in
-    // PeaDB anyway (compat/delta.md item 12).
-    if (type == RDB_OPCODE_IDLE) {
-      uint64_t idle_seconds;
-      bool enc;
-      if (!r.read_length(idle_seconds, enc) || enc) {
-        err = "malformed IDLE";
-        ds.select_db(prev_db);
+    std::optional<int64_t> pending_expire;
+    // Like Redis, a file must end with the EOF opcode (and, from version 5, the 8-byte checksum
+    // after it): a file cut at a key boundary is an error even when the checksum is not checked.
+    bool saw_eof = false;
+
+    while (!r.eof()) {
+      uint8_t type;
+      if (!r.read_u8(type)) break;
+
+      if (type == RDB_OPCODE_EOF) {
+        saw_eof = true;
+        break;
+      }
+
+      // Written by a Redis with an LRU or LFU maxmemory-policy, before each key. Read and
+      // dropped: a loaded key starts with fresh eviction data, and eviction is approximate in
+      // PeaDB anyway (compat/delta.md item 12).
+      if (type == RDB_OPCODE_IDLE) {
+        uint64_t idle_seconds;
+        bool enc;
+        if (!r.read_length(idle_seconds, enc) || enc) {
+          err = "malformed IDLE";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        continue;
+      }
+      if (type == RDB_OPCODE_FREQ) {
+        uint8_t freq;
+        if (!r.read_u8(freq)) {
+          err = "malformed FREQ";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        continue;
+      }
+
+      if (type == RDB_OPCODE_AUX) {
+        std::string aux_key, aux_val;
+        if (!r.read_string(aux_key) || !r.read_string(aux_val)) {
+          err = "malformed AUX field";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        // rdbLoadRio(): the database the master's stream has selected, for a replica's full sync.
+        if (apply && repl_stream_db != nullptr && aux_key == "repl-stream-db") {
+          char* end = nullptr;
+          const long db = std::strtol(aux_val.c_str(), &end, 10);
+          if (end != aux_val.c_str() && *end == '\0' && db >= 0 && db < 16)
+            *repl_stream_db = static_cast<int>(db);
+        }
+        continue;
+      }
+
+      if (type == RDB_OPCODE_FUNCTION2) {
+        std::string code;
+        if (!r.read_string(code)) {
+          err = "malformed FUNCTION payload";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        if (apply && g_function_load_hook && !g_function_load_hook(code, err)) {
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        continue;
+      }
+
+      if (type == RDB_OPCODE_SELECTDB) {
+        uint64_t dbnum;
+        bool enc;
+        if (!r.read_length(dbnum, enc) || enc) {
+          err = "malformed SELECTDB";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        if (dbnum >= ds.database_count()) {
+          err = "FATAL: Data file was created with a Redis server configured to handle more than " +
+                std::to_string(ds.database_count()) + " databases. Exiting";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        if (apply) ds.select_db(static_cast<int>(dbnum));
+        continue;
+      }
+
+      if (type == RDB_OPCODE_RESIZEDB) {
+        uint64_t db_size, exp_size;
+        bool enc1, enc2;
+        if (!r.read_length(db_size, enc1) || enc1 || !r.read_length(exp_size, enc2) || enc2) {
+          err = "malformed RESIZEDB";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        continue;
+      }
+
+      if (type == RDB_OPCODE_EXPIRETIME_MS) {
+        uint64_t ms;
+        if (!r.read_u64_le(ms)) {
+          err = "malformed EXPIRETIME_MS";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        pending_expire = static_cast<int64_t>(ms);
+        continue;
+      }
+
+      if (type == RDB_OPCODE_EXPIRETIME) {
+        uint32_t sec;
+        if (!r.read_u32_le(sec)) {
+          err = "malformed EXPIRETIME";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        pending_expire = static_cast<int64_t>(sec) * 1000;
+        continue;
+      }
+
+      // It's a value type — read key
+      std::string key;
+      if (!r.read_string(key)) {
+        err = "malformed key";
+        if (apply) ds.select_db(prev_db);
         return false;
       }
-      continue;
-    }
-    if (type == RDB_OPCODE_FREQ) {
-      uint8_t freq;
-      if (!r.read_u8(freq)) {
-        err = "malformed FREQ";
-        ds.select_db(prev_db);
-        return false;
+
+      std::optional<int64_t> expire_at = pending_expire;
+      pending_expire.reset();
+
+      if (type != RDB_TYPE_PEADB_STREAM) {
+        DumpValue value;
+        std::string load_error;
+        if (!read_dump_value(r, type, value, true, &load_error)) {
+          err = load_error.empty() ? "Bad data format (RDB type " + std::to_string(type) + ")"
+                                   : load_error;
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        if (apply) rdb_store_dump_value(key, std::move(value), expire_at);
+      } else {
+        DataStore::StreamDump d;
+        uint64_t nentries = 0;
+        bool enc = false;
+        if (!r.read_length(nentries, enc) || enc) {
+          err = "malformed stream";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        for (uint64_t i = 0; i < nentries; ++i) {
+          std::string id;
+          if (!r.read_string(id)) {
+            err = "malformed stream entry id";
+            if (apply) ds.select_db(prev_db);
+            return false;
+          }
+          uint64_t nf = 0;
+          if (!r.read_length(nf, enc) || enc) {
+            err = "malformed stream entry";
+            if (apply) ds.select_db(prev_db);
+            return false;
+          }
+          std::vector<std::pair<std::string, std::string>> fields;
+          for (uint64_t j = 0; j < nf; ++j) {
+            std::string f, v;
+            if (!r.read_string(f) || !r.read_string(v)) {
+              err = "malformed stream field";
+              if (apply) ds.select_db(prev_db);
+              return false;
+            }
+            fields.emplace_back(std::move(f), std::move(v));
+          }
+          d.entries.emplace_back(std::move(id), std::move(fields));
+        }
+        uint64_t lms = 0, lseq = 0;
+        if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) {
+          err = "malformed stream last-id";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        d.last_ms = lms;
+        d.last_seq = lseq;
+        uint64_t ngroups = 0;
+        if (!r.read_length(ngroups, enc) || enc) {
+          err = "malformed stream groups";
+          if (apply) ds.select_db(prev_db);
+          return false;
+        }
+        for (uint64_t gi = 0; gi < ngroups; ++gi) {
+          DataStore::StreamGroupDump gd;
+          if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) {
+            err = "malformed stream group";
+            if (apply) ds.select_db(prev_db);
+            return false;
+          }
+          uint64_t npel = 0;
+          if (!r.read_length(npel, enc) || enc) {
+            err = "malformed stream pel";
+            if (apply) ds.select_db(prev_db);
+            return false;
+          }
+          for (uint64_t pi = 0; pi < npel; ++pi) {
+            DataStore::StreamPel p;
+            uint64_t dms = 0, dcnt = 0;
+            if (!r.read_string(p.id) || !r.read_string(p.consumer) || !r.read_length(dms, enc) ||
+                enc || !r.read_length(dcnt, enc) || enc) {
+              err = "malformed stream pel entry";
+              if (apply) ds.select_db(prev_db);
+              return false;
+            }
+            p.delivery_ms = static_cast<std::int64_t>(dms);
+            p.delivery_count = static_cast<std::int64_t>(dcnt);
+            gd.pending.push_back(std::move(p));
+          }
+          d.groups.push_back(std::move(gd));
+        }
+        if (apply) {
+          ds.restore_stream(key, d);
+          if (expire_at) ds.expire(key, *expire_at);
+        }
       }
-      continue;
+      // Redis's rdbLoadRio(): a master does not load a key that has already expired.
+      if (apply && expire_at && *expire_at < load_now && !ds.replica_expiry()) ds.del(key);
     }
 
-    if (type == RDB_OPCODE_AUX) {
-      std::string aux_key, aux_val;
-      if (!r.read_string(aux_key) || !r.read_string(aux_val)) {
-        err = "malformed AUX field";
-        ds.select_db(prev_db);
-        return false;
-      }
-      // rdbLoadRio(): the database the master's stream has selected, for a replica's full sync.
-      if (repl_stream_db != nullptr && aux_key == "repl-stream-db") {
-        char* end = nullptr;
-        const long db = std::strtol(aux_val.c_str(), &end, 10);
-        if (end != aux_val.c_str() && *end == '\0' && db >= 0 && db < 16)
-          *repl_stream_db = static_cast<int>(db);
-      }
-      continue;
-    }
-
-    if (type == RDB_OPCODE_FUNCTION2) {
-      std::string code;
-      if (!r.read_string(code)) {
-        err = "malformed FUNCTION payload";
-        ds.select_db(prev_db);
-        return false;
-      }
-      if (g_function_load_hook && !g_function_load_hook(code, err)) {
-        ds.select_db(prev_db);
-        return false;
-      }
-      continue;
-    }
-
-    if (type == RDB_OPCODE_SELECTDB) {
-      uint64_t dbnum;
-      bool enc;
-      if (!r.read_length(dbnum, enc) || enc) {
-        err = "malformed SELECTDB";
-        ds.select_db(prev_db);
-        return false;
-      }
-      ds.select_db(static_cast<int>(dbnum));
-      continue;
-    }
-
-    if (type == RDB_OPCODE_RESIZEDB) {
-      uint64_t db_size, exp_size;
-      bool enc1, enc2;
-      if (!r.read_length(db_size, enc1) || enc1 || !r.read_length(exp_size, enc2) || enc2) {
-        err = "malformed RESIZEDB";
-        ds.select_db(prev_db);
-        return false;
-      }
-      continue;
-    }
-
-    if (type == RDB_OPCODE_EXPIRETIME_MS) {
-      uint64_t ms;
-      if (!r.read_u64_le(ms)) {
-        err = "malformed EXPIRETIME_MS";
-        ds.select_db(prev_db);
-        return false;
-      }
-      pending_expire = static_cast<int64_t>(ms);
-      continue;
-    }
-
-    if (type == RDB_OPCODE_EXPIRETIME) {
-      uint32_t sec;
-      if (!r.read_u32_le(sec)) {
-        err = "malformed EXPIRETIME";
-        ds.select_db(prev_db);
-        return false;
-      }
-      pending_expire = static_cast<int64_t>(sec) * 1000;
-      continue;
-    }
-
-    // It's a value type — read key
-    std::string key;
-    if (!r.read_string(key)) {
-      err = "malformed key";
-      ds.select_db(prev_db);
+    if (apply) ds.select_db(prev_db);
+    if (!saw_eof || (rdb_ver >= 5 && r.remaining() < 8)) {
+      err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
       return false;
     }
-
-    std::optional<int64_t> expire_at = pending_expire;
-    pending_expire.reset();
-
-    if (type != RDB_TYPE_PEADB_STREAM) {
-      DumpValue value;
-      std::string load_error;
-      if (!read_dump_value(r, type, value, true, &load_error)) {
-        err = load_error.empty() ? "Bad data format (RDB type " + std::to_string(type) + ")"
-                                 : load_error;
-        if (type == RDB_TYPE_HASH_ZIPMAP || type == RDB_TYPE_LIST_ZIPLIST ||
-            type == RDB_TYPE_ZSET_ZIPLIST || type == RDB_TYPE_HASH_ZIPLIST ||
-            type == RDB_TYPE_LIST_QUICKLIST)
-          err = "unsupported RDB type " + std::to_string(type) +
-                " (an encoding written by Redis before 7.0: load the file in Redis 7 and save it "
-                "again)";
-        ds.select_db(prev_db);
-        return false;
-      }
-      rdb_store_dump_value(key, std::move(value), expire_at);
-    } else {
-      DataStore::StreamDump d;
-      uint64_t nentries = 0;
-      bool enc = false;
-      if (!r.read_length(nentries, enc) || enc) {
-        err = "malformed stream";
-        ds.select_db(prev_db);
-        return false;
-      }
-      for (uint64_t i = 0; i < nentries; ++i) {
-        std::string id;
-        if (!r.read_string(id)) {
-          err = "malformed stream entry id";
-          ds.select_db(prev_db);
-          return false;
-        }
-        uint64_t nf = 0;
-        if (!r.read_length(nf, enc) || enc) {
-          err = "malformed stream entry";
-          ds.select_db(prev_db);
-          return false;
-        }
-        std::vector<std::pair<std::string, std::string>> fields;
-        for (uint64_t j = 0; j < nf; ++j) {
-          std::string f, v;
-          if (!r.read_string(f) || !r.read_string(v)) {
-            err = "malformed stream field";
-            ds.select_db(prev_db);
-            return false;
-          }
-          fields.emplace_back(std::move(f), std::move(v));
-        }
-        d.entries.emplace_back(std::move(id), std::move(fields));
-      }
-      uint64_t lms = 0, lseq = 0;
-      if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) {
-        err = "malformed stream last-id";
-        ds.select_db(prev_db);
-        return false;
-      }
-      d.last_ms = lms;
-      d.last_seq = lseq;
-      uint64_t ngroups = 0;
-      if (!r.read_length(ngroups, enc) || enc) {
-        err = "malformed stream groups";
-        ds.select_db(prev_db);
-        return false;
-      }
-      for (uint64_t gi = 0; gi < ngroups; ++gi) {
-        DataStore::StreamGroupDump gd;
-        if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) {
-          err = "malformed stream group";
-          ds.select_db(prev_db);
-          return false;
-        }
-        uint64_t npel = 0;
-        if (!r.read_length(npel, enc) || enc) {
-          err = "malformed stream pel";
-          ds.select_db(prev_db);
-          return false;
-        }
-        for (uint64_t pi = 0; pi < npel; ++pi) {
-          DataStore::StreamPel p;
-          uint64_t dms = 0, dcnt = 0;
-          if (!r.read_string(p.id) || !r.read_string(p.consumer) || !r.read_length(dms, enc) ||
-              enc || !r.read_length(dcnt, enc) || enc) {
-            err = "malformed stream pel entry";
-            ds.select_db(prev_db);
-            return false;
-          }
-          p.delivery_ms = static_cast<std::int64_t>(dms);
-          p.delivery_count = static_cast<std::int64_t>(dcnt);
-          gd.pending.push_back(std::move(p));
-        }
-        d.groups.push_back(std::move(gd));
-      }
-      ds.restore_stream(key, d);
-      if (expire_at) ds.expire(key, *expire_at);
-    }
-    // Redis's rdbLoadRio(): a master does not load a key that has already expired.
-    if (expire_at && *expire_at < load_now && !ds.replica_expiry()) ds.del(key);
-  }
-
-  ds.select_db(prev_db);
-  if (!saw_eof || (rdb_ver >= 5 && r.remaining() < 8)) {
-    err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
-    return false;
-  }
-  return true;
+    return true;
+  };
+  // A full sync must refuse an out-of-range SELECTDB before its callback publishes the
+  // snapshot or clears libraries/persistence/history. Decode one value at a time, discarding
+  // it, then re-read the same immutable bytes to apply; no second whole dataset is retained.
+  if (before_replace && !load(false)) return false;
+  return load(true);
 }
 
 // ── DUMP / RESTORE ─────────────────────────────────────────────────────

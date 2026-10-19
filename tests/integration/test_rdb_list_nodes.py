@@ -557,13 +557,17 @@ def check_hand_built_files(name, binary, work):
             write(rdb_file(type_byte, b'k', enc_str(listpack([b'a', b'1', b'b']))))
             log = expect_start_fails(f'peadb: odd entries, type {type_byte}', binary, port, workdir)
             assert text in log, (type_byte, log[-1500:])
-        # Encodings of Redis before 7.0: refused until PeaDB can read them (item 53).
-        for type_byte in (9, 10, 12, 13, 14):
-            value = enc_len(1) + enc_str(b'\x00' * 12) if type_byte == 14 else enc_str(b'\x00' * 12)
-            write(rdb_file(type_byte, b'k', value))
-            log = expect_start_fails(f'peadb: type {type_byte}', binary, port, workdir)
-            assert f'unsupported RDB type {type_byte} (an encoding written by Redis before 7.0' in log, \
-                (type_byte, log[-1500:])
+    # Malformed legacy containers are rejected with Redis's integrity errors. Valid
+    # pre-7.0 values are covered by test_rdb_legacy_interop.py (item 53).
+    for type_byte, text in ((9, 'Zipmap integrity check failed.'),
+                            (10, 'List ziplist integrity check failed.'),
+                            (12, 'Zset ziplist integrity check failed.'),
+                            (13, 'Hash ziplist integrity check failed.'),
+                            (14, 'Ziplist integrity check failed.')):
+        value = enc_len(1) + enc_str(b'\x00' * 12) if type_byte == 14 else enc_str(b'\x00' * 12)
+        write(rdb_file(type_byte, b'k', value))
+        log = expect_start_fails(f'{name}: malformed type {type_byte}', binary, port, workdir)
+        assert text in log, (name, type_byte, log[-1500:])
     print(f'{name}: hand-built list files ok')
 
 

@@ -162,13 +162,36 @@ def run(binary, rdb, invalid_rdb=None):
             check(int(info(r, 'slave_repl_offset', 'replication')) == len(replacement),
                   'applied stream offset')
             if invalid_rdb is not None:
-                # A snapshot whose checksum is valid but whose object type is invalid must
-                # discard cached history, even after its valid prefix has replaced keys.
+                # Structural validation refuses the snapshot before replacement: the old
+                # keys, selected stream DB and cached history must remain usable.
+                wait_for(lambda: child('GET', 'counter') == '3', 'downstream before rejection')
+                retained_full = int(info(r, 'sync_full', 'stats'))
                 link.shutdown(socket.SHUT_RDWR); link.close()
                 link, args = fake.accept()
                 check(args[1] == NEXT_ID, 'cached master before rejected snapshot')
                 link.sendall(f'+FULLRESYNC {REPLID} 0\r\n${len(invalid_rdb)}\r\n'.encode() +
                              invalid_rdb)
+                link, args = fake.accept()
+                check(args == ['PSYNC', NEXT_ID, str(len(replacement) + 1)],
+                      f'preflight failure keeps applied history: {args}')
+                check(r('GET', 'counter') == '3', 'preflight failure keeps old dataset')
+                command = encode('INCR', 'counter')
+                link.sendall(b'+CONTINUE\r\n' + command)
+                wait_link(r)
+                wait_for(lambda: r('GET', 'counter') == '4', 'resume after rejected snapshot')
+                wait_for(lambda: child('GET', 'counter') == '4', 'retained downstream history')
+                check(int(info(r, 'sync_full', 'stats')) == retained_full,
+                      'structural rejection does not force a downstream full resync')
+
+                # A function compilation error is outside structural preflight. Once apply
+                # begins, the old dataset/history are discarded, so reconnect and promotion
+                # must require a fresh full sync rather than resume the replaced history.
+                broken = apply_failure_rdb()
+                link.shutdown(socket.SHUT_RDWR); link.close()
+                link, args = fake.accept()
+                check(args == ['PSYNC', NEXT_ID, str(len(replacement) + len(command) + 1)],
+                      'cached history before apply-time error')
+                link.sendall(f'+FULLRESYNC {REPLID} 0\r\n${len(broken)}\r\n'.encode() + broken)
                 link, args = fake.accept()
                 check(args == ['PSYNC', '?', '-1'], f'failed load cannot resume: {args}')
                 check(r('GET', 'counter') == 'untrusted', 'valid prefix was decoded before failure')
@@ -205,10 +228,18 @@ def empty_rdb():
 
 def malformed_rdb():
     # Ordinary RDB corruption fixture: one readable DB-5 string before an unknown type.
-    # Unlike a checksum failure, this reaches the dataset/history replacement boundary.
+    # Structural preflight must refuse it before the dataset/history replacement boundary.
     from test_rdb_redis_interop import with_checksum
     body = b'REDIS0011\xfe\x05\x00\x07counter\x09untrusted\x63\x06broken\xff'
     return with_checksum(body)
+
+
+def apply_failure_rdb():
+    # Structurally valid FUNCTION2, with a Lua compilation error after a valid DB-5 key.
+    from test_rdb_redis_interop import with_checksum
+    code = b'#!lua name=broken\nthis is not valid Lua'
+    return with_checksum(b'REDIS0011\xfe\x05\x00\x07counter\x09untrusted' +
+                         b'\xf5' + bytes([len(code)]) + code + b'\xff')
 
 
 if __name__ == '__main__':

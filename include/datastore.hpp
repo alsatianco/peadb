@@ -245,6 +245,9 @@ class DataStore {
 
   bool select_db(int db_index);
   int current_db() const;
+  std::size_t database_count() const {
+    return dbs_.size();
+  }
 
   std::optional<std::string> get(const std::string& key);
   // GET: one lookup that also reports a key of another type (counted as a hit, as Redis's

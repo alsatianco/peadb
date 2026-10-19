@@ -59,8 +59,11 @@ std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl 
 // Load a Redis-compatible RDB file into the datastore (startup, DEBUG RELOAD, a replica's full
 // sync). The header and the trailing CRC64 are checked first (the CRC64 unless rdbchecksum is no
 // or DEBUG SET-SKIP-CHECKSUM-VALIDATION is on); a file that fails them leaves the dataset as it
-// is (DEBUG RELOAD flushes it before the call, as Redis does). `before_replace` runs once those
-// checks pass, right before rdb_load() flushes the keyspace. A file cut short fails after that.
+// is (DEBUG RELOAD flushes it before the call, as Redis does). When `before_replace` is
+// given (full sync), a structural decoding pass also checks all database IDs and values before
+// the callback publishes the snapshot and the loader flushes the keyspace. It discards one value
+// at a time, then re-decodes the same bytes to apply. Function-library Lua compilation/collisions
+// and apply-time allocation failures are not staged and can still fail after replacement.
 // `repl_stream_db`, when given, receives the file's repl-stream-db aux field (-1 without one).
 bool rdb_load(const std::filesystem::path& path, std::string& err,
               const std::function<void()>& before_replace = nullptr, int* repl_stream_db = nullptr);

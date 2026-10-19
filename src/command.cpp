@@ -17817,10 +17817,10 @@ void drain_replica_cmd_queue() {
         ok = rdb_load(
             path, err,
             [&] {
-              // replicationAttachToNewMaster(): only after header/checksum validation discard the
-              // old cached master and backlog. A decoding failure after this boundary may have
-              // replaced part of the dataset; neither reconnect nor promotion can reuse its
-              // history.
+              // replicationAttachToNewMaster(): only after header/checksum and structural
+              // validation discard the old cached master and backlog. An apply failure (e.g.
+              // function loading) may have replaced part of the dataset; neither reconnect nor
+              // promotion can reuse its history.
               g_cached_master = false;
               g_master_stream_session = SessionState{};
               g_master_stream_multi.clear();
@@ -17829,7 +17829,8 @@ void drain_replica_cmd_queue() {
               g_replicas_taken_to = g_master_repl_offset;
               g_backlog_has_replica = false;
               // readSyncBulkPayload(): an old save/rewrite must never overwrite the new dataset.
-              // Do this after checksum validation, so a corrupt transfer keeps the old disk files.
+              // Do this after structural validation, so a refused transfer keeps the old disk
+              // files.
               kill_rdb_child();
               if (g_appendonly && !g_aof_sync_suspended) {
                 stop_append_only();
