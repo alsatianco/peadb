@@ -58,7 +58,7 @@ Limits of this signal (found by the 2026-10 review): of the 26 upstream `integra
 - Target milestone: P3
 - Implemented:
   - Native in-process RDB reader/writer for common Redis data types (see `rdb_load()` / `rdb_save()` usage at startup and in `SAVE`/`BGSAVE`). Its files load in real Redis 7.2.5 and real Redis files load in PeaDB (the checksum was fixed 2026-10-06, item 27; lists of any length since item 29 was fixed), except streams (item 5) and the encodings of Redis before 7.0 (item 53).
-  - RDB import/export via Redis bridge scripts (`scripts/redis/import_rdb_via_redis.py`, `scripts/redis/export_rdb_via_redis.py`). They have no password option and do not check errors (item 52).
+  - RDB import/export via Redis bridge scripts (`scripts/redis/import_rdb_via_redis.py`, `scripts/redis/export_rdb_via_redis.py`). Authentication, checked replies and native all-database/type/function transfer are implemented (item 52); operational limits are in the migration guide.
   - Legacy PeaDB snapshot format as a fallback for local persistence.
   - Save points: `save <sec> <changes>` (config/`CONFIG SET`, repeatable; `save ""` disables)
     trigger a background BGSAVE via the event-loop cron; `SHUTDOWN [SAVE|NOSAVE]` saves on a
@@ -664,7 +664,7 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Severity: critical
 - Target milestone: R3
 - Implemented: replication, RDB files and DUMP/RESTORE work between PeaDB servers; replica persistence and large full syncs are fixed in items 45 and 46. Since the checksum was fixed (2026-10-06, item 27), RDB files load in both directions, a real Redis replica of a PeaDB master syncs, `FUNCTION DUMP`/`RESTORE` work both ways, and `DUMP`/`RESTORE` and `MIGRATE` work from PeaDB into Redis, for data without streams (checked by `tests/integration/test_rdb_redis_interop.py`; lists of 65,536 or more items, fixed in item 29, by `tests/integration/test_rdb_list_nodes.py`). The AOF is plain RESP commands (loading a PeaDB AOF into Redis was not tested).
-- Missing: no path between Redis and PeaDB works for every dataset yet. Stream RDB files and full syncs are fixed in item 5. Native DUMP/RESTORE/MIGRATE and stream snapshots are fixed in items 51/5. The bridge scripts: item 52. RDB files from a Redis with more than 16 databases: item 53.
+- Missing: no path between Redis and PeaDB works for every dataset yet. Stream RDB files and full syncs are fixed in item 5. Native DUMP/RESTORE/MIGRATE and stream snapshots are fixed in items 51/5. Authenticated, checked offline bridge transfers are fixed in item 52. Pre-7.0 RDB encodings and native files from a Redis with more than 16 databases remain item 53; release-scale acceptance is still unverified.
 - Tracking: close the items above, then add one end-to-end acceptance test in both directions as a release gate, with `requirepass`, several databases, more than 2M keys, streams with consumer groups, and functions.
 
 50. PeaDB as a replica of a real Redis master
@@ -683,16 +683,16 @@ Target milestone for items 24–71 names the planned fix order: R0 stop false cl
 - Target milestone: R3
 - Implemented: one validated value reader for RDB load and RESTORE accepts plain collections, Redis quicklist-v2 (PACKED and PLAIN nodes), intset widths 16/32/64, hash/zset/set listpacks and native stream types 15/19/21. Subnormal zset scores are preserved. RESTORE holds the decoded value outside the keyspace before REPLACE, preserving an old key on any decode failure (original boundary fixed with item 42). DUMP writes native type-21 streams instead of returning nil; MIGRATE transfers stream keys alongside other types with existing TTL, authentication, COPY/REPLACE and deterministic DEL propagation. Cross-engine tests compare logical values, stream history/groups/consumers/PELs, absolute RESTORE TTLs, bounded relative MIGRATE TTL drift, snapshots checked/loaded by real Redis, AOF RESTORE replay and all four full-sync pairings. The upstream legacy stream-payload and consumer timestamp tests run without skips.
 - Missing: none for the formats Redis 7.2.5 writes. Pre-7.0 zipmap/ziplist/quicklist-of-ziplists values still fail loudly (item 53); streams are native (item 5). As with item 42, duplicate hash fields/set/zset members and structurally inconsistent compact/stream payloads fail with Bad data format even when Redis's default shallow validation accepts an unusable structure.
-- Tracking: complete; bridge reliability and full migration acceptance remain items 52 and 49.
+- Tracking: complete; bridge reliability is fixed in item 52, and full migration acceptance remains item 49.
 
-52. The RDB bridge scripts fail silently
-- Status: open defect. Evidence: seen in code.
+52. Reliable authenticated RDB bridge scripts
+- Status: full (fixed 2026-10-19).
 - Owner: persistence-compat
 - Severity: critical
 - Target milestone: R3
-- Implemented: against a server with no password, `scripts/redis/import_rdb_via_redis.py` and `export_rdb_via_redis.py` copy database 0's strings, lists, sets, hashes, zsets and stream entries through a temporary Redis.
-- Missing: neither script has a password option or sends AUTH, and neither checks replies, so against a server with `requirepass` the export writes an empty RDB and the import copies nothing, and both print "complete" and exit 0. They copy only database 0 (no SELECT), copy stream entries without consumer groups, skip functions, and a second import appends list items again (RPUSH).
-- Tracking: add authentication, check every reply and exit non-zero on error, cover all databases, consumer groups and functions, and test with `requirepass`.
+- Implemented: shared checked RESP2 transport for `scripts/redis/{import,export}_rdb_via_redis.py`; password environment/option and named-user AUTH; all configured databases, binary values and keys, stream history/groups/consumers/PEL and functions via native DUMP/RESTORE and FUNCTION DUMP/RESTORE. Each source key's payload and exact 64-bit absolute expiry are read in one pipelined MULTI/EXEC transaction (avoiding Lua number rounding above 2^53); RESTORE REPLACE ABSTTL replaces old collections/types/TTLs without extending deadlines. Temporary Redis is pinned to 7.2.5, uses private scratch storage, ephemeral ports and random authentication, and is always reaped. Readiness checks authenticated PING and child status. Exports publish atomically only after checked SAVE; failures exit nonzero without success text or credential contents. Database-count preflight prevents out-of-range imports and authenticates before optional FLUSHALL/FUNCTION FLUSH. Real Redis-first regressions cover requirepass/missing/wrong credentials, named ACLs and denied SCAN/RESTORE, all types and stream metadata, databases 0/1/15, absolute TTLs, function calls, repeated imports over stale/wrong-type values, READONLY targets, invalid snapshots, occupied ports, malformed RESP, denied SAVE, failed publication, explicitly empty exports and preservation of an existing backup on failure.
+- Missing: none for this defect. Offline use requires quiesced writers and verification; later errors can leave a partial import, and without --flush-target unrelated target keys/libraries remain. A configured source with more databases than the target is refused even when those databases are empty. Imports require --databases for input snapshots configured differently from 16; sequential transfer and per-key payload memory remain operational limits, with release-scale acceptance in item 49. See `docs/compatibility.md` for the procedure.
+- Tracking: complete; native pre-7.0/database-range loading and release-scale acceptance remain items 53 and 49.
 
 53. RDB load edge cases with real Redis files
 - Status: open defect. Evidence: reproduced by one reviewer for the database index and subnormal scores; seen in code for type 14.

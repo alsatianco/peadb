@@ -17,6 +17,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 - Run the adopted upstream Redis suites in native mode with the suite ratchet in nightly CI. Optimize sanitizer builds and allow heavy fixture I/O more time; keep allocator and eviction checks active, with production RSS limits checked by Release CI.
 
+- Repair the RDB bridge scripts: authenticate live endpoints, check all replies and fail loudly, preserve all databases, binary values, stream metadata, absolute TTLs and functions with native transfers, replace existing collections safely and publish exports atomically after SAVE. See the migration guide for offline use and partial-import limits (delta item 52).
+
 - Support Redis 7.2.5 compact DUMP/RESTORE/MIGRATE payloads and native stream RDB v11 snapshots, retaining stream history, groups, consumer activity and pending entries across Redis/PeaDB round trips, full sync and RESTORE AOF replay. Share validated decoding before replacement, preserve subnormal scores and run the formerly skipped stream timestamp/legacy-format tests (delta items 5/51).
 
 - Full sync forks a disk-backed BGSAVE and streams bounded chunks without charging RDB bytes to the replica output-buffer limit; the master keeps serving clients and retains all post-fork writes. SYNC shares the full-state path, failed/cancelled saves close recipients, syncing replicas do not satisfy WAIT, and PeaDB accepts repeated snapshot keep-alives. Redis parity and a >256 MiB transfer/load regression cover the change (delta 46; newline half of delta 50).
