@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Enforce `min-replicas-max-lag` for write admission: count only online replicas with fresh ACKs, honor startup/runtime settings and aliases, and disable the gate when either setting is zero. Adopt the native Redis `integration/replication-2` suite with no skips.
+
 - Enforce the upstream suite ratchet in the local full test gate, generating JSON/Markdown parity reports from fresh, complete native sweep logs. Sweep, parser and ratchet failures fail the gate; isolated regressions cover stale/partial results, dropped counts and grown skipfiles.
 
 - Adopt the native Redis RDB integration suite, explicitly tracking startup-loading and Linux child-metric limits. Refuse unreadable or invalid snapshots instead of serving an empty database, report fatal/CRC load diagnostics and expose Redis-compatible loaded/expired key counters across startup, reload and full sync.

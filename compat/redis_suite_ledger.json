@@ -10,6 +10,15 @@
       "mode": "native",
       "skipfile_lines": 2
     },
+    "integration/replication-2": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 2,
+        "ok": 7
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "integration/shutdown": {
       "last_counts": {
         "err": 0,

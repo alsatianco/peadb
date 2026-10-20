@@ -143,7 +143,8 @@ The settings PeaDB applies (each works as a config-file line and as a `--name` o
 | `repl-backlog-size` | `1mb` | Replication backlog size for partial resync |
 | `repl-timeout` | `60` | Seconds of inactivity before a replica reconnects during connect/handshake/transfer/streaming, or a master disconnects a replica whose ACKs stop |
 | `repl-ping-replica-period` (`repl-ping-slave-period`) | `10` | Seconds between top-level master PINGs in the replication stream |
-| `min-replicas-to-write` | `0` | Refuse writes unless this many replicas are connected (`min-replicas-max-lag` is not applied) |
+| `min-replicas-to-write` | `0` | Require healthy replicas for writes; see [replication admission](compat/delta.md) (item 8) |
+| `min-replicas-max-lag` | `10` | Maximum ACK age in seconds for replica write admission |
 | `replica-serve-stale-data` | `yes` | Whether a replica answers reads while its master link is down (with `no`, only the commands Redis allows on a stale replica run) |
 | `busy-reply-threshold` (`lua-time-limit`) | `5000` | Milliseconds a script may run before other clients get `-BUSY` |
 | `lazyfree-lazy-server-del` | `no` | Propagate server-side deletes as `UNLINK` |

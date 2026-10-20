@@ -550,6 +550,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "zset-max-listpack-entries",
                                                        "zset-max-listpack-value",
                                                        "min-replicas-to-write",
+                                                       "min-replicas-max-lag",
                                                        "replica-serve-stale-data",
                                                        "busy-reply-threshold",
                                                        "replica-ignore-disk-write-errors",

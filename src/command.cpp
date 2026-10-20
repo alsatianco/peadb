@@ -372,6 +372,7 @@ CoblLimit g_cobl[3] = {
     {32LL * 1024 * 1024, 8LL * 1024 * 1024, 60},
 };
 std::int64_t g_config_min_replicas_to_write = 0;
+std::int64_t g_config_min_replicas_max_lag = 10;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
 // ── Security ──
@@ -1010,16 +1011,26 @@ void unpause_clients() {
 // scripts (Redis's server.pre_command_oom_state): a script's denyoom write is refused only when
 // memory was already over the limit when the command started (scriptVerifyOOM()).
 bool g_pre_command_oom_state = false;
-// min-replicas-to-write: reject writes only when FEWER than the required number of
-// replicas are actually connected (the previous code rejected whenever the knob was
-// set at all, blocking writes even with healthy replicas — a footgun).
-// Never for the AOF or the master stream, and never on a replica (Redis's mustObeyClient() and
-// checkGoodReplicasStatus()).
+// refreshGoodSlavesCount(): a connected socket alone is not a healthy replica. Count only
+// online replicas whose ACK arrived within the configured number of whole seconds.
+bool replica_has_fresh_ack(const SessionState& replica, std::int64_t now_s) {
+  return replica.repl_sync_state == ReplicaSyncState::Online &&
+         now_s - replica.repl_ack_time_ms / 1000 <= g_config_min_replicas_max_lag;
+}
+
+// checkGoodReplicasStatus(): either zero setting disables write admission. Never gate
+// the AOF or master stream, or writes on a writable replica (mustObeyClient()).
 inline bool noreplicas_should_reject() {
-  if (g_config_min_replicas_to_write <= 0) return false;
+  if (g_config_min_replicas_to_write == 0 || g_config_min_replicas_max_lag == 0) return false;
   if (must_obey_client() || g_replication_role == "slave") return false;
-  const int connected = g_count_connected_replicas ? g_count_connected_replicas() : 0;
-  return connected < g_config_min_replicas_to_write;
+  int good = 0;
+  if (g_for_each_replica_cb) {
+    const auto now_s = now_ms() / 1000;
+    g_for_each_replica_cb([&](const SessionState& replica) {
+      if (replica_has_fresh_ack(replica, now_s)) ++good;
+    });
+  }
+  return good < g_config_min_replicas_to_write;
 }
 // Redis's writeCommandsDeniedByDiskError() and writeCommandsGetDiskErrorMessage(): the -MISCONF
 // reply that refuses writes (and PING) while persistence is failing, so the server does not keep
@@ -5548,6 +5559,7 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             return true;
           }}},
         {"min-replicas-to-write", live_number(g_config_min_replicas_to_write)},
+        {"min-replicas-max-lag", live_number(g_config_min_replicas_max_lag)},
         {"replica-serve-stale-data", live_bool(g_config_replica_serve_stale_data)},
         {"replica-ignore-disk-write-errors", live_bool(g_replica_ignore_disk_write_errors)},
         {"busy-reply-threshold", live_number(g_config_lua_time_limit)},
@@ -5700,15 +5712,13 @@ std::string info_replication_section() {
            std::string(setting("replica-announced") == "yes" ? "1" : "0") + "\r\n";
   }
   // As in Redis, syncing replicas appear in INFO but only online ones count as good.
-  std::int64_t max_lag = 0;
-  parse_i64(setting("min-replicas-max-lag"), max_lag);
   int count = 0;
   int good = 0;
   std::string lines;
   if (g_for_each_replica_cb) {
     g_for_each_replica_cb([&](const SessionState& r) {
       const std::int64_t lag = now_s - r.repl_ack_time_ms / 1000;
-      if (r.repl_sync_state == ReplicaSyncState::Online && lag <= max_lag) ++good;
+      if (replica_has_fresh_ack(r, now_s)) ++good;
       lines += "slave" + std::to_string(count++) + ":ip=" + replica_ip(r) +
                ",port=" + std::to_string(r.repl_listening_port) + ",state=" +
                std::string(r.repl_sync_state == ReplicaSyncState::Online         ? "online"
@@ -5719,7 +5729,7 @@ std::string info_replication_section() {
     });
   }
   out += "connected_slaves:" + std::to_string(count) + "\r\n";
-  if (g_config_min_replicas_to_write != 0 && max_lag != 0)
+  if (g_config_min_replicas_to_write != 0 && g_config_min_replicas_max_lag != 0)
     out += "min_slaves_good_slaves:" + std::to_string(good) + "\r\n";
   out += lines;
   const bool backlog = g_backlog_has_replica;
@@ -16588,6 +16598,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
     if (it != raw.end()) slot = it->second == "yes";
   };
   num("min-replicas-to-write", g_config_min_replicas_to_write);
+  num("min-replicas-max-lag", g_config_min_replicas_max_lag);
   yes("replica-serve-stale-data", g_config_replica_serve_stale_data);
   yes("replica-ignore-disk-write-errors", g_replica_ignore_disk_write_errors);
   num("busy-reply-threshold", g_config_lua_time_limit);
