@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current work
 
-The active plan and the verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read its Part 0 first). A verified review on 2026-10-03 found silent data-loss defects; they are registered as `compat/delta.md` items 24–71 (items 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 51 and 52 are fixed, items 24, 25 and 55 are fixed in part; the others are not fixed yet; items 72–79 were found later, and item 78 of them is fixed), and the statements below marked "not yet fixed" come from that review and name their item.
+The active plan and verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read Part 0 first). Completed fixes, remaining defects and compatibility limits are recorded in [compat/delta.md](compat/delta.md), the canonical status registry. Consult it before acting on an older backlog item or a historical defect description.
 
 ## Build
 
@@ -86,6 +86,8 @@ bash scripts/dev/redis_vs_peadb_benchmark.sh
 Do not skip either check. Do not commit if either fails.
 
 `run_all_tests.sh` runs 11 stages and takes about 40 minutes: start it in the background and wait for it, because a tool timeout (about 10 minutes) stops it early and looks like a failure. `redis_vs_peadb_benchmark.sh` needs Docker host networking, so it only works on Linux; on macOS, report it as not run (a PeaDB-only `redis-benchmark` run is a smoke check, not the comparison).
+
+Release image publication additionally requires the [migration acceptance gate](docs/compatibility.md#migration-acceptance-gate), using more than two million keys in both directions. The normal integration test is explicitly a small smoke, not release-scale evidence.
 
 ## Keep docs in sync
 
