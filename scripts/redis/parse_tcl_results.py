@@ -14,10 +14,12 @@ Outputs (both optional, see flags):
   * a Markdown summary table.
 
 Usage:
-    parse_tcl_results.py LOG_DIR [--skipfiles-dir DIR]
+    parse_tcl_results.py LOG_DIR [--skipfiles-dir DIR] [--require-complete]
                          [--out-json PATH] [--out-md PATH]
 
-Exit code 0 unless no logs were found (2).
+Exit code 0 on success, 2 when no logs were found, or 1 when
+--require-complete finds an unfinished, failing or exceptional suite. Without
+that flag, partial/failing logs can still be parsed for diagnostics.
 """
 import argparse
 import json
@@ -33,8 +35,13 @@ def suite_from_log_name(name: str) -> str:
     return name[: -len(".log")].replace("_", "/")
 
 
-def count_results(log_path: pathlib.Path) -> dict:
+def count_results(log_path: pathlib.Path, require_complete: bool = False) -> dict:
     text = ANSI_RE.sub("", log_path.read_text(errors="replace"))
+    if require_complete and (
+        "All tests passed without errors!" not in text
+        or re.search(r"^\[(err|exception)\]:", text, re.MULTILINE)
+    ):
+        raise ValueError(f"incomplete or failed runtest log: {log_path}")
     counts = {"ok": 0, "err": 0, "ignored": 0}
     for m in RESULT_RE.finditer(text):
         kind = m.group(1)
@@ -63,6 +70,8 @@ def main() -> int:
                     default=pathlib.Path(__file__).resolve().parent / "skipfiles")
     ap.add_argument("--out-json", type=pathlib.Path)
     ap.add_argument("--out-md", type=pathlib.Path)
+    ap.add_argument("--require-complete", action="store_true",
+                    help="refuse logs without a successful harness completion or with errors")
     args = ap.parse_args()
 
     logs = sorted(p for p in args.log_dir.glob("*.log")
@@ -74,7 +83,11 @@ def main() -> int:
     suites = {}
     for log in logs:
         suite = suite_from_log_name(log.name)
-        counts = count_results(log)
+        try:
+            counts = count_results(log, args.require_complete)
+        except ValueError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         counts["skipfile_lines"] = skipfile_lines(args.skipfiles_dir, suite)
         suites[suite] = counts
 

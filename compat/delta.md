@@ -16,7 +16,7 @@ Feature status labels:
 
 The PR workflow checks every C/C++ file in `src/` and `include/` with pinned clang-format 18.1.8 before building. The source baseline and generated command metadata follow that version; command discovery accepts whitespace and line breaks in registrations and is checked against the running command table; formatting changes do not change Redis compatibility status. Skipped build/test steps after a formatting failure provide no test evidence.
 
-Parity is measured by two monotonically-improving numbers. Nightly CI runs the adopted suites natively, parses their results and enforces `check_suite_ratchet.py`. The local `scripts/run_all_tests.sh` sweep still requires manual parsing and ratchet validation.
+Parity is measured by two monotonically-improving numbers. Nightly CI and the local `scripts/run_all_tests.sh` both run the adopted suites natively, parse their results and enforce `check_suite_ratchet.py`. The local runner requires fresh, complete sweep logs and generates JSON/Markdown reports before checking the ratchet; [runner artifact and skip behavior](../scripts/README.md#running-scripts) is documented with the test workflow.
 
 - **Upstream TCL pass-rate** — the official Redis 7.2.5 test suite runs in *native
   mode* (the harness spawns `peadb-server` as a redis-server stand-in via

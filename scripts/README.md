@@ -54,7 +54,10 @@ PEADB_TEST_SANITIZED=1 TIMEOUT_SECS=90 scripts/ci/run_integration_tests.sh
 # Run ASAN/UBSAN stability checks
 scripts/qa/run_stability_checks.sh --seconds 30
 
-# Run the adopted upstream Redis Tcl suites, as in nightly CI
+# Run the full gate, including native Tcl reports and the suite ratchet
+bash scripts/run_all_tests.sh
+
+# Run only the adopted upstream Redis Tcl sweep, as in nightly CI
 SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
 
 # Check that every command has test coverage
@@ -67,6 +70,8 @@ Exit codes:
 Artifacts and logs:
 - Several QA/Redis-harness scripts write logs and repro commands under `artifacts/`.
 - If you want to change output locations, check the script header for supported flags/env vars.
+
+The full runner's `redis` stage clears previous `artifacts/redis-native/*.log`, command-coverage files and failure/reproduction lists, then runs the native sweep. Only a successful sweep whose logs contain the harness completion message and no errors/exceptions produces `artifacts/redis-parity/pass_rate.json` and `pass_rate.md`; the stage then enforces the ledger with an explicit results path. Sweep, parsing or ratchet failures fail the overall gate while later stages still run. Failed-sweep logs remain available for diagnosis; previous parity reports are removed before the sweep. `SKIP=redis` skips this entire stage, leaves existing artifacts untouched and provides no fresh parity evidence. The runner starts its own test servers; it does not require a server already listening on port 6379. See [the ratchet rules](../compat/delta.md#verification-the-parity-ratchet).
 
 ## Common prerequisites
 

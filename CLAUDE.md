@@ -40,11 +40,12 @@ cd build && ../scripts/ci/run_integration_tests.sh
 # Single integration test
 python3 tests/integration/test_m2_strings_expire.py
 
-# Upstream Redis 7.2.5 TCL suite in native mode (the harness spawns peadb-server as a
-# redis-server stand-in). Adopted suites + ratchet baselines: compat/redis_suite_ledger.json.
-SUITE_MODE=native scripts/redis/run_redis_tests.sh
-python3 scripts/redis/parse_tcl_results.py artifacts/redis-native   # per-suite pass counts
-python3 scripts/ci/check_suite_ratchet.py                           # monotonic ratchet gate
+# Standalone upstream Redis 7.2.5 native sweep and ratchet (the full local gate
+# already includes these). Adopted baselines: compat/redis_suite_ledger.json.
+SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
+python3 scripts/redis/parse_tcl_results.py artifacts/redis-native --require-complete \
+  --out-json artifacts/redis-parity/pass_rate.json --out-md artifacts/redis-parity/pass_rate.md
+python3 scripts/ci/check_suite_ratchet.py --results artifacts/redis-parity/pass_rate.json
 
 # Most integration tests use fixed ports; new tests need an unused one
 python3 scripts/ci/check_port_collisions.py   # stage `portcheck`: fails on new port collisions

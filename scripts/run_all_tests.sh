@@ -18,10 +18,11 @@
 #   7. Stability checks        — scripts/qa/run_stability_checks.sh
 #   8. Perf baseline           — scripts/qa/run_perf_baseline.sh
 #   9. Sentinel validation     — scripts/qa/run_sentinel_validation.sh
-#  10. Redis Tcl tests         — scripts/redis/run_redis_tests.sh
+#  10. Redis Tcl tests         — native sweep, complete-result reports, suite ratchet
+#  11. Differential tests      — tests/diff/run_diff_tests.py
 #
 # How to run
-#   From the repo root, with a peadb-server already running on port 6379:
+#   From the repo root, after building peadb-server:
 #
 #       scripts/run_all_tests.sh
 #
@@ -30,7 +31,7 @@
 #       SKIP=perf,redis scripts/run_all_tests.sh
 #
 # Prerequisites
-#   - A running peadb-server instance (for integration / Redis tests).
+#   - A built peadb-server binary (tests start their own servers).
 #   - A successful build in build/ (for unit tests).
 #   - python3, cmake, redis-cli in PATH.
 #   - See individual scripts for their own prerequisites.
@@ -43,6 +44,13 @@
 # Exit codes
 #   0   All executed stages passed.
 #   1   One or more stages failed.
+#
+# Redis artifacts
+#   The redis stage clears previous sweep logs/coverage and parity reports,
+#   runs the native sweep, then requires complete logs before generating
+#   artifacts/redis-parity/pass_rate.{json,md} and checking the ledger ratchet.
+#   Sweep, parsing and ratchet failures all fail that stage. SKIP=redis skips
+#   the whole stage and provides no fresh parity validation.
 #
 set -uo pipefail
 
@@ -194,6 +202,27 @@ run_ctest_stage() {
     (cd "$CTEST_DIR" && ctest --output-on-failure --no-tests=error)
 }
 
+run_redis_stage() {
+    local log_dir="$ROOT_DIR/artifacts/redis-native"
+    local report_dir="$ROOT_DIR/artifacts/redis-parity"
+
+    # A previous sweep must not fill gaps in this run, and a failed sweep must
+    # not leave an old green report or old command coverage looking current.
+    mkdir -p "$log_dir" "$report_dir" || return $?
+    rm -f "$log_dir/"*.log "$log_dir/"coverage_*.txt \
+        "$log_dir/failed_suites.txt" "$log_dir/repro_commands.txt" \
+        "$report_dir/pass_rate.json" "$report_dir/pass_rate.md" || return $?
+
+    # run_stage invokes us in an if condition, so every failure needs an
+    # explicit return (even set -e would be disabled here by Bash).
+    env SUITE_MODE=native OUT_DIR="$log_dir" \
+        scripts/redis/run_redis_tests.sh || return $?
+    python3 scripts/redis/parse_tcl_results.py "$log_dir" --require-complete \
+        --out-json "$report_dir/pass_rate.json" \
+        --out-md "$report_dir/pass_rate.md" || return $?
+    python3 scripts/ci/check_suite_ratchet.py --results "$report_dir/pass_rate.json"
+}
+
 # ── 1. C++ unit tests (CTest) ──────────────────────────────────────────
 run_stage unit "C++ unit tests (ctest)" \
     run_ctest_stage
@@ -245,8 +274,8 @@ run_stage sentinel "Sentinel / replication validation" \
     scripts/qa/run_sentinel_validation.sh
 
 # ── 10. Upstream Redis Tcl tests (native mode: the harness spawns peadb-server) ──
-run_stage redis "Upstream Redis Tcl tests" \
-    env SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
+run_stage redis "Upstream Redis Tcl tests and suite ratchet" \
+    run_redis_stage
 
 # ── 11. Differential tests (PeaDB vs real Redis) ────────────────────────
 run_stage diff "Differential tests (PeaDB vs Redis)" \

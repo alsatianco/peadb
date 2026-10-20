@@ -203,11 +203,11 @@ PeaDB has a comprehensive suite spanning unit, integration, fuzz, and differenti
 Parity against real Redis is measured by the **upstream Redis 7.2.5 TCL suite running in native mode** (the official harness spawns `peadb-server` as a redis-server stand-in). Adopted suites, per-suite baselines, and the monotonic no-regression ratchet live in [`compat/redis_suite_ledger.json`](compat/redis_suite_ledger.json); every skipped upstream test is a tracked debt in `scripts/redis/skipfiles/` tied to a [`compat/delta.md`](compat/delta.md) entry.
 
 ```bash
-# Run all tests (11 stages: unit, integration, coverage, portcheck, compat, fuzz, stability, perf, sentinel, redis, diff)
+# Run all tests, including native Redis reports and the suite ratchet
 scripts/run_all_tests.sh
 
-# Upstream Redis TCL suite, native mode + pass-rate report
-SUITE_MODE=native scripts/redis/run_redis_tests.sh
+# Standalone upstream Redis TCL sweep and diagnostic pass-rate summary
+SUITE_MODE=native OUT_DIR=artifacts/redis-native scripts/redis/run_redis_tests.sh
 python3 scripts/redis/parse_tcl_results.py artifacts/redis-native
 
 # Unit tests only (via CTest)
