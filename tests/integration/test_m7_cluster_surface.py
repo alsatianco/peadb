@@ -76,8 +76,8 @@ def main():
  p_standalone=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6428','--bind','127.0.0.1',
    '--loglevel','warning'])
  try:
-  wait_until_ready(6427)
-  wait_until_ready(6428)
+  wait_until_ready(6427, process=p)
+  wait_until_ready(6428, process=p_standalone)
   check_cluster_surface(6427)
   check_standalone_disabled(6428)
   print('M7 cluster surface tests passed')

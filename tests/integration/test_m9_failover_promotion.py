@@ -60,8 +60,8 @@ def main():
     m = IsolatedServer([str(ROOT / "peadb-server"), "--port", "6436", "--bind", "127.0.0.1", "--loglevel", "warning"])
     r = IsolatedServer([str(ROOT / "peadb-server"), "--port", "6437", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(6436)
-        wait_until_ready(6437)
+        wait_until_ready(6436, process=m)
+        wait_until_ready(6437, process=r)
         with socket.create_connection(("127.0.0.1", 6436), timeout=2) as master, socket.create_connection(("127.0.0.1", 6437), timeout=2) as replica:
             assert cmd(master, "FLUSHALL") == "OK"
             assert cmd(master, "SET", "promote:key", "v1") == "OK"

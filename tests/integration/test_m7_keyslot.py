@@ -38,7 +38,7 @@ def main():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6426','--bind','127.0.0.1',
    '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6426)
+  wait_until_ready(6426, process=p)
   with socket.create_connection(('127.0.0.1',6426),timeout=2) as s:
    a=cmd(s,'CLUSTER','KEYSLOT','foo{bar}x')
    b=cmd(s,'CLUSTER','KEYSLOT','zap{bar}y')

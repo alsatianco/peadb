@@ -165,7 +165,7 @@ def lifecycle(binary):
                                     stdout=log, stderr=subprocess.STDOUT)
         m = None
         try:
-            wait_until_ready(port, timeout=10)
+            wait_until_ready(port, timeout=10, process=proc)
             m = Conn(port)
             for i in range(20):
                 m('SET', f'k:{i}', 'v')

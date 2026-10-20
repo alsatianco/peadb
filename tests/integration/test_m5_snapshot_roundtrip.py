@@ -57,7 +57,7 @@ def cmd(s, *a):
 
 def start(cfg_path, port):
     p = subprocess.Popen([str(ROOT / 'peadb-server'), '--config', str(cfg_path)])
-    wait_until_ready(port)
+    wait_until_ready(port, process=p)
     return p
 
 

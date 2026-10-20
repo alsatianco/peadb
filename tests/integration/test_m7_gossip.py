@@ -46,8 +46,8 @@ def main():
  p2=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port_b),'--bind','127.0.0.1',
    '--cluster-enabled','yes','--cluster-announce-ip',announce_b,'--loglevel','warning'])
  try:
-  wait_until_ready(port_a)
-  wait_until_ready(port_b)
+  wait_until_ready(port_a, process=p1)
+  wait_until_ready(port_b, process=p2)
   with socket.create_connection(('127.0.0.1',port_a),timeout=2) as a, \
        socket.create_connection(('127.0.0.1',port_b),timeout=2) as b:
    assert cmd(a,'CLUSTER','MEET',announce_b,str(port_b))=='OK'

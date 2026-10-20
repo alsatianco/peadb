@@ -54,7 +54,7 @@ def repl_cmd(s):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6502","--bind","127.0.0.1","--loglevel","warning"])
     try:
-        wait_until_ready(6502)
+        wait_until_ready(6502, process=p)
         with socket.create_connection(("127.0.0.1",6502),timeout=2) as c, socket.create_connection(("127.0.0.1",6502),timeout=2) as r:
             assert cmd(c,"FLUSHALL")=="OK"
             assert isinstance(cmd(c,"XADD","mystream","*","f","1"),str)

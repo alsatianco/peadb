@@ -93,7 +93,7 @@ def main() -> int:
     port = 6547
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(port)
+        wait_until_ready(port, process=p)
         with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             assert cmd(s, "DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1") == "OK"
 

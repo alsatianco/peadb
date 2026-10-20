@@ -55,7 +55,7 @@ def main():
   ])+'\n',encoding='utf-8')
   p=subprocess.Popen([str(ROOT/'peadb-server'),'--config',str(cfg)])
   try:
-   wait_until_ready(6410)
+   wait_until_ready(6410, process=p)
    with socket.create_connection(('127.0.0.1',6410),timeout=2) as s:
     assert cmd(s,'SET','a','1')=='OK'
     assert cmd(s,'SAVE')=='OK'

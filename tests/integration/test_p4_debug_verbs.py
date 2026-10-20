@@ -68,7 +68,7 @@ def main():
                           "--bind", "127.0.0.1", "--loglevel", "warning",
                           "--dir", workdir, "--appendonly", "yes"])
     try:
-        wait_until_ready(PORT)
+        wait_until_ready(PORT, process=p)
         with socket.create_connection(("127.0.0.1", PORT), timeout=5) as s:
             assert cmd(s, "FLUSHALL") == "OK"
 

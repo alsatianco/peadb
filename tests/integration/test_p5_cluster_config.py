@@ -49,7 +49,7 @@ def case_config_surface():
                      '--cluster-announce-port','7100','--cluster-announce-bus-port','17100',
                      '--loglevel','warning'])
  try:
-  wait_until_ready(6305)
+  wait_until_ready(6305, process=p)
   with socket.create_connection(('127.0.0.1',6305),timeout=5) as s:
    def cget(k):
     r=cmd(s,'CONFIG','GET',k); return dict(zip(r[0::2],r[1::2])).get(k)
@@ -80,7 +80,7 @@ def case_standalone_redis_mode():
  # matching pre-existing standalone behaviour (they must not drift apart from each other).
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6306','--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6306)
+  wait_until_ready(6306, process=p)
   with socket.create_connection(('127.0.0.1',6306),timeout=5) as s:
    info_server = cmd(s,'INFO','server')
    assert 'redis_mode:standalone\r\n' in info_server, info_server
@@ -140,7 +140,7 @@ def case_config_set_announce_ip_rejects_wildcard():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6309','--bind','127.0.0.1',
                      '--cluster-enabled','yes','--loglevel','warning'])
  try:
-  wait_until_ready(6309)
+  wait_until_ready(6309, process=p)
   with socket.create_connection(('127.0.0.1',6309),timeout=5) as s:
    for wildcard in ('0.0.0.0', '::', '*'):
     r = cmd(s,'CONFIG','SET','cluster-announce-ip',wildcard)
@@ -168,7 +168,7 @@ def case_announce_port_zero_accepted_without_warning():
                      '--cluster-announce-port','0','--loglevel','warning'],
                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
  try:
-  wait_until_ready(6310)
+  wait_until_ready(6310, process=p)
   with socket.create_connection(('127.0.0.1',6310),timeout=5) as s:
    # CONFIG GET reports the configured 0, as Redis does; the fallback shows where the port is
    # announced.
@@ -191,7 +191,7 @@ def case_config_set_announce_ip_empty_rejected_when_bind_is_wildcard():
                      '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
                      '--loglevel','warning'])
  try:
-  wait_until_ready(6311)
+  wait_until_ready(6311, process=p)
   with socket.create_connection(('127.0.0.1',6311),timeout=5) as s:
    r = cmd(s,'CONFIG','SET','cluster-announce-ip','')
    assert isinstance(r,tuple) and r[0]=='ERR', r
@@ -209,7 +209,7 @@ def case_wildcard_bind_with_explicit_announce_ip_starts():
                      '--cluster-enabled','yes','--cluster-announce-ip','203.0.113.5',
                      '--loglevel','warning'])
  try:
-  wait_until_ready(6312)
+  wait_until_ready(6312, process=p)
   with socket.create_connection(('127.0.0.1',6312),timeout=5) as s:
    assert cmd(s,'PING')=='PONG'
    r=cmd(s,'CONFIG','GET','bind'); d=dict(zip(r[0::2],r[1::2]))
@@ -236,7 +236,7 @@ def case_announce_reregisters_after_cluster_touch():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6313','--bind','127.0.0.1',
                      '--cluster-enabled','yes','--loglevel','warning'])
  try:
-  wait_until_ready(6313)
+  wait_until_ready(6313, process=p)
   with socket.create_connection(('127.0.0.1',6313),timeout=5) as s:
    old_id = cmd(s,'CLUSTER','MYID')  # forces the node-table snapshot
    assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
@@ -260,7 +260,7 @@ def case_announce_reregisters_before_cluster_touch():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6314','--bind','127.0.0.1',
                      '--cluster-enabled','yes','--loglevel','warning'])
  try:
-  wait_until_ready(6314)
+  wait_until_ready(6314, process=p)
   with socket.create_connection(('127.0.0.1',6314),timeout=5) as s:
    assert cmd(s,'CONFIG','SET','cluster-announce-ip','203.0.113.9')=='OK'
    assert cmd(s,'CONFIG','SET','cluster-announce-port','7100')=='OK'

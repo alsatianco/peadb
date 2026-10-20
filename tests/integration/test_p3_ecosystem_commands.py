@@ -72,7 +72,7 @@ def main():
     p = subprocess.Popen([str(binary), "--port", str(PORT), "--bind", "127.0.0.1", "--loglevel", "warning"])
     passed = failed = 0
     try:
-        wait_until_ready(PORT)
+        wait_until_ready(PORT, process=p)
         s = socket.create_connection(("127.0.0.1", PORT), timeout=3)
         cmd(s, "FLUSHALL")
 

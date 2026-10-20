@@ -65,7 +65,7 @@ def main() -> int:
     proc = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6522",
                              "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(6522)
+        wait_until_ready(6522, process=proc)
         with socket.create_connection(("127.0.0.1", 6522), timeout=2) as s:
             # ── REPLCONF ─────────────────────────────────────────
             # REPLCONF listening-port

@@ -46,13 +46,15 @@ SUITE_MODE=native scripts/redis/run_redis_tests.sh
 python3 scripts/redis/parse_tcl_results.py artifacts/redis-native   # per-suite pass counts
 python3 scripts/ci/check_suite_ratchet.py                           # monotonic ratchet gate
 
-# Each integration test starts its own server on a fixed port; new tests need an unused one
+# Most integration tests use fixed ports; new tests need an unused one
 python3 scripts/ci/check_port_collisions.py   # stage `portcheck`: fails on new port collisions
 ```
 
 Tests find `redis-server` through `tests/integration/_redis_path.py` (the pinned 7.2.5 build first, `PATH` last), so a newer Redis on `PATH` (for example Homebrew 8.x) is only a fallback. For ad-hoc experiments, start servers on an unused `--port` with a scratch `--dir` outside the repo, and stop only the PIDs you started: `pkill -f peadb-server` also kills servers that a running test suite owns.
 
 Tests that do not exercise persistence/restart use `tests/integration/_isolated_server.py` (`IsolatedServer`) for a scratch data directory cleaned after the child is reaped. Replication writes its received RDB even with save points off, so replicas must never share the repository data directory. The replication/promotion QA smoke likewise owns separate temporary data directories; restart tests own explicit `--dir` fixtures instead.
+
+Use `wait_until_ready(port, process=proc, password=...)` from `tests/integration/_readiness.py` after starting a child: it requires authenticated PONG when configured, a matching INFO `process_id`, and child liveness. Callers own startup logs and must stop/wait the child on failure. The integration supervisor's timeout, process-group cleanup and log controls are documented in [scripts/README.md](scripts/README.md).
 
 Provision the exact reference with `bash scripts/ci/ensure_redis_reference.sh` (PR/nightly do this before integration tests); the native DUMP interoperability test fails if Redis 7.2.5 is unavailable. Check persistence and replication changes against the pinned real Redis (`~/.cache/peadb/redis-7.2.5/src/redis-server`, `redis-check-rdb`): load each other's `dump.rdb` and replicate in both directions. PeaDB-only round trips cannot catch format bugs; they hid the wrong RDB CRC64.
 

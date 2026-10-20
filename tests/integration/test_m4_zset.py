@@ -41,7 +41,7 @@ def cmd(s,*a):
 def main():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6403','--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6403)
+  wait_until_ready(6403, process=p)
   with socket.create_connection(('127.0.0.1',6403),timeout=2) as s:
    assert cmd(s,'FLUSHALL')=='OK'
    assert cmd(s,'ZADD','z','1','a','2','b')==2

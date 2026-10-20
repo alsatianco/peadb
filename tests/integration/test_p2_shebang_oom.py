@@ -50,7 +50,7 @@ def is_err_with(v,needle):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6513","--bind","127.0.0.1","--loglevel","warning"])
     try:
-        wait_until_ready(6513)
+        wait_until_ready(6513, process=p)
         with socket.create_connection(("127.0.0.1",6513),timeout=2) as s:
             assert is_err_with(cmd(s,"EVAL","#!not-lua\nreturn 1","0"),"Unexpected engine in script shebang")
             assert cmd(s,"EVAL","#!lua\nreturn 1","0")==1

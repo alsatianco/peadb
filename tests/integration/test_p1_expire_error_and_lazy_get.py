@@ -80,7 +80,7 @@ def parse_repl_cmd(s):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6483", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(6483)
+        wait_until_ready(6483, process=p)
         with socket.create_connection(("127.0.0.1", 6483), timeout=2) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             assert cmd(s, "SET", "foo", "bar") == "OK"

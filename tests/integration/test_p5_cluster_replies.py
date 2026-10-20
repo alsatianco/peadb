@@ -70,7 +70,7 @@ def main():
                           '--cluster-enabled', 'yes', '--cluster-announce-ip', '10.9.8.7',
                           '--cluster-announce-port', '7100', '--loglevel', 'warning'])
     try:
-        wait_until_ready(6317)
+        wait_until_ready(6317, process=p)
         with socket.create_connection(('127.0.0.1', 6317), timeout=5) as s:
             myid = cmd(s, 'CLUSTER', 'MYID')
             assert cmd(s, 'CLUSTER', 'ADDSLOTSRANGE', '0', '16383') == 'OK'

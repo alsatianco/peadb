@@ -138,7 +138,7 @@ def main():
         "--cluster-enabled", "yes", "--loglevel", "warning",
     ])
     try:
-        wait_until_ready(PORT)
+        wait_until_ready(PORT, process=p)
         with socket.create_connection(("127.0.0.1", PORT), timeout=5) as s:
             # LATENCY GRAPH replies with a plain, empty bulk string (not verbatim) when there
             # is no recorded history for the event yet (command.cpp) -- seed one "command"

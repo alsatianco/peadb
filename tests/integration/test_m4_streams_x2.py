@@ -45,7 +45,7 @@ def isid(x): return isinstance(x,str) and re.match(r'^\d+-\d+$',x)
 def main():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6408','--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6408)
+  wait_until_ready(6408, process=p)
   with socket.create_connection(('127.0.0.1',6408),timeout=2) as s:
    assert cmd(s,'FLUSHALL')=='OK'
    id1=cmd(s,'XADD','st','*','f','v1'); assert isid(id1)

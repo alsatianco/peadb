@@ -30,7 +30,7 @@ def rc(port, *args):
 def start(port, *extra):
     p = IsolatedServer([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
                           "--loglevel", "warning", *extra])
-    wait_until_ready(port)
+    wait_until_ready(port, process=p)
     return p
 
 

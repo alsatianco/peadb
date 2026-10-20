@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Integration tests now run in owned process groups with bounded timeout cleanup and per-test scratch directories, preserving unrelated servers and complete failure logs. Shared readiness checks require a live child, authenticated PONG when configured, and a matching server process ID, preventing occupied ports from hiding startup failures.
+
 - Load pre-7.0 zipmap/ziplist/quicklist RDB values and refuse out-of-range database IDs before full-sync replacement (delta 53).
 
 - Normalize rounded negative zero in INCRBYFLOAT and HINCRBYFLOAT like Redis 7.2.5, fixing the upstream increment suite on Linux. Regression cases cover replies, stored values, TTLs, replicas and AOF reloads.

@@ -44,7 +44,7 @@ def cmd(s,*a):
 def main():
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6301','--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6301)
+  wait_until_ready(6301, process=p)
   with socket.create_connection(('127.0.0.1',6301),timeout=5) as s:
    # Redis emits a real "# Cluster" section; PeaDB is standalone here so cluster_enabled:0.
    c=cmd(s,'INFO','cluster')

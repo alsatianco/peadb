@@ -67,8 +67,8 @@ def main():
                           "--cluster-enabled", "yes", "--cluster-announce-ip", "127.0.0.1",
                           "--loglevel", "warning"])
     try:
-        wait_until_ready(6315)
-        wait_until_ready(6316)
+        wait_until_ready(6315, process=a)
+        wait_until_ready(6316, process=b)
         with socket.create_connection(("127.0.0.1", 6315), timeout=5) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             myid = cmd(s, "CLUSTER", "MYID")

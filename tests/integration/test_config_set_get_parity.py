@@ -22,6 +22,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _redis_path import redis_server_path  # noqa: E402
+from _readiness import wait_until_ready  # noqa: E402
 
 PEADB = str(ROOT / 'peadb-server')
 REDIS = redis_server_path()
@@ -77,22 +78,20 @@ class Conn:
 
 
 def start(binary, port, workdir, *extra):
-    log = open(os.path.join(workdir, 'server.log'), 'ab')
+    log_path = os.path.join(workdir, 'server.log')
     # Started from / with --dir: CONFIG GET dir must name the data directory, not the cwd.
-    proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--save', '',
-                             '--dir', workdir, '--loglevel', 'warning', *extra],
-                            cwd='/', stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f'{binary} exited: {open(os.path.join(workdir, "server.log")).read()}')
-        try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
-        except OSError:
-            time.sleep(0.05)
-    proc.kill()
-    raise RuntimeError(f'{binary} did not start on port {port}')
+    with open(log_path, 'ab') as log:
+        proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--save', '',
+                                 '--dir', workdir, '--loglevel', 'warning', *extra],
+                                cwd='/', stdout=log, stderr=subprocess.STDOUT)
+    try:
+        wait_until_ready(port, process=proc, timeout=10)
+        return proc
+    except BaseException:
+        stop(proc)
+        with open(log_path, errors='replace') as log:
+            print(f'{binary} startup failed; log {log_path}:\n{log.read()}', file=sys.stderr)
+        raise
 
 
 def stop(proc):

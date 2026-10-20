@@ -44,7 +44,7 @@ def main():
  want=(ROOT/'VERSION').read_text().strip()
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6300','--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6300)
+  wait_until_ready(6300, process=p)
   with socket.create_connection(('127.0.0.1',6300),timeout=5) as s:
    blob=cmd(s,'INFO','server')
    assert f"peadb_version:{want}\r\n" in blob, f"INFO peadb_version does not match VERSION ({want!r}): {blob!r}"

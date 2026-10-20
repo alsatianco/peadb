@@ -65,7 +65,7 @@ def main() -> int:
     proc = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6523",
                              "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(6523)
+        wait_until_ready(6523, process=proc)
         with socket.create_connection(("127.0.0.1", 6523), timeout=2) as s:
             assert cmd(s, "FLUSHALL") == "OK"
 

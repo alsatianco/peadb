@@ -74,7 +74,7 @@ def main():
 
         p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6433", "--bind", "127.0.0.1", "--loglevel", "warning", "--enable-module-command", "yes"])
         try:
-            wait_until_ready(6433)
+            wait_until_ready(6433, process=p)
             with socket.create_connection(("127.0.0.1", 6433), timeout=2) as s:
                 assert cmd(s, "MODULE", "LOAD", str(mod_so)) == "OK"
                 listed = cmd(s, "MODULE", "LIST")

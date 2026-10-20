@@ -66,7 +66,7 @@ def parse_repl_cmd(s):
 def main():
     p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6468", "--bind", "127.0.0.1", "--loglevel", "warning"])
     try:
-        wait_until_ready(6468)
+        wait_until_ready(6468, process=p)
         with socket.create_connection(("127.0.0.1", 6468), timeout=2) as c, socket.create_connection(("127.0.0.1", 6468), timeout=2) as r:
             send_cmd(c, "FLUSHALL")
             assert read_bulk_reply.__name__

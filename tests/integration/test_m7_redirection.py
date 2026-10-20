@@ -46,8 +46,8 @@ def main():
  peer=subprocess.Popen([str(ROOT/'peadb-server'),'--port','6567','--bind','127.0.0.1',
    '--cluster-enabled','yes','--cluster-announce-ip','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(6428)
-  wait_until_ready(6567)
+  wait_until_ready(6428, process=p)
+  wait_until_ready(6567, process=peer)
   with socket.create_connection(('127.0.0.1',6428),timeout=2) as s:
    assert cmd(s,'CLUSTER','MEET','127.0.0.1','6567')=='OK'
    slot=cmd(s,'CLUSTER','KEYSLOT','foo')

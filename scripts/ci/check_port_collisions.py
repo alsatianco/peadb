@@ -9,7 +9,7 @@ Purpose
     breaks when one file's server has not actually released the port yet when
     the next file starts (a slow shutdown, or -- the case that motivated this
     check -- a straggler process the previous test failed to reap; see that
-    script's own "Straggler reaping" header comment). That failure mode is
+    supervisor's process-group cleanup). That failure mode is
     confusing: a ``ConnectionRefusedError`` or hang on an unrelated test, not
     a clear "port already in use" message.
 

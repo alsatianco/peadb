@@ -46,7 +46,7 @@ def cmd(s,*a):
 def main():
     p=subprocess.Popen([str(ROOT/"peadb-server"),"--port","6499","--bind","127.0.0.1","--loglevel","warning"])
     try:
-        wait_until_ready(6499)
+        wait_until_ready(6499, process=p)
         with socket.create_connection(("127.0.0.1",6499),timeout=2) as s:
             assert cmd(s,"FLUSHALL")=="OK"
             # BLOCK with a short timeout and no data → null after the timeout (XREAD now really blocks).

@@ -125,13 +125,13 @@ ASAN_OPTIONS="$ASAN_OPTS" \
   "$ROOT_DIR/build-asan/peadb-server" --port "$PORT" --bind 127.0.0.1 --loglevel warning >/tmp/peadb-asan.log 2>&1 &
 SERVER_PID=$!
 trap 'kill ${SERVER_PID:-0} >/dev/null 2>&1 || true; wait ${SERVER_PID:-0} 2>/dev/null || true' EXIT
-python3 - "$PORT" <<'PY'
+python3 - "$PORT" "$SERVER_PID" <<'PY'
 import sys
 
 sys.path.insert(0, "tests/integration")
-from _readiness import wait_until_ready
+from _readiness import ObservedProcess, wait_until_ready
 
-wait_until_ready(int(sys.argv[1]), timeout=10)
+wait_until_ready(int(sys.argv[1]), process=ObservedProcess(int(sys.argv[2])), timeout=10)
 PY
 
 echo "=== Running stress loop for ${SECONDS_TO_RUN}s ==="

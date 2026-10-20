@@ -45,6 +45,9 @@ scripts/dev/quick_start.sh
 # Run integration tests (each test starts its own servers)
 scripts/ci/run_integration_tests.sh
 
+# Run selected integration files through the same supervisor
+scripts/ci/run_integration_tests.sh tests/integration/test_harness_lifecycle.py
+
 # Run integration tests after building peadb-server with ASAN/UBSAN
 PEADB_TEST_SANITIZED=1 TIMEOUT_SECS=90 scripts/ci/run_integration_tests.sh
 
@@ -72,7 +75,7 @@ Depending on the script, you may need:
 - `python3`
 - Redis CLI/tools: `redis-cli` (package: `redis-tools` on Ubuntu/Debian)
 - Redis server binary: `redis-server` (for the RDB import/export helpers)
-- `timeout` (GNU coreutils) for per-test timeouts (optional; scripts fall back when unavailable)
+- `timeout` (GNU coreutils) for QA timeouts; the integration runner also enforces a Python deadline when GNU timeout is unavailable.
 - `redis-benchmark` for performance baselines (optional; script can fall back to Python)
 
 ## Frequently used environment variables
@@ -80,6 +83,7 @@ Depending on the script, you may need:
 These are not exhaustive; each script documents its own configuration.
 
 - `TIMEOUT_SECS`: per-test timeout for `scripts/ci/run_integration_tests.sh`.
+- `INTEGRATION_LOG_DIR`: integration log root (default `artifacts/integration`); each invocation retains complete per-test logs in its own `run-*` directory and prints failing logs' last 80 lines. The supervisor gives each test an anchored process group and scratch directory, stops that group after success/failure/timeout/SIGTERM/SIGINT, reaps direct children (and adopted children on Linux), then removes its scratch data. A private liveness pipe also stops the group if the supervisor is killed; SIGKILL can leave its scratch directory behind. GNU timeout runs with `--foreground` inside that group. Children must inherit the group or explicitly own and clean their separate groups on SIGTERM. Unrelated processes are never selected by name or a system-wide PID snapshot.
 - `PEADB_TEST_SANITIZED`: set to `1` for sanitizer builds to extend heavy fixture I/O budgets and leave the process RSS bound to Release tests; allocator accounting and eviction assertions still run.
 - `PEADB_BIN`: path to the `peadb-server` binary for scripts that need to start the server.
 - `START_PEADB`: for `scripts/redis/run_redis_tests.sh`, set to `0` to test against an already-running server.

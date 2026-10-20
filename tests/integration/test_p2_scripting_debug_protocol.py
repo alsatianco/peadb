@@ -118,7 +118,7 @@ def main() -> int:
         [str(ROOT / "peadb-server"), "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning"]
     )
     try:
-        wait_until_ready(port)
+        wait_until_ready(port, process=proc)
         with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             assert cmd(s, "DEBUG", "SET-DISABLE-DENY-SCRIPTS", "1")[1] == "OK"
 

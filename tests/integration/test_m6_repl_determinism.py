@@ -49,7 +49,7 @@ def off(info):
 def run(port):
  p=subprocess.Popen([str(ROOT/'peadb-server'),'--port',str(port),'--bind','127.0.0.1','--loglevel','warning'])
  try:
-  wait_until_ready(port)
+  wait_until_ready(port, process=p)
   with socket.create_connection(('127.0.0.1',port),timeout=2) as s:
    cmd(s,'FLUSHALL')
    for c in CMDS: cmd(s,*c)

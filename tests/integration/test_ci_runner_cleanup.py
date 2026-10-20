@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The CI runner must finish when a discovered server exits before its PGID is read."""
+"""The CI runner must finish as children exit during group cleanup."""
 import os
 import pathlib
 import shlex
@@ -20,11 +20,16 @@ def main():
             directory.mkdir(parents=True)
         runner = scripts / 'run_integration_tests.sh'
         shutil.copyfile(ROOT / 'scripts/ci/run_integration_tests.sh', runner)
+        shutil.copyfile(ROOT / 'scripts/ci/run_integration_tests.py', runner.with_suffix('.py'))
         for name in ('first', 'second'):
-            (tests / f'test_{name}.py').write_text(f'print({name!r})\n')
+            (tests / f'test_{name}.py').write_text(
+                'import subprocess,sys\n'
+                'subprocess.Popen([sys.executable,"-c","pass"])\n'
+                f'print({name!r})\n')
 
-        # The initial snapshot is empty. Every later scan finds a PID that vanishes
-        # before ps inspects it, as a short-lived server in another job can do.
+        # Global name scans and per-candidate PGID reads are no longer needed.
+        # Preserve their old failure diagnostic and assert the new supervisor
+        # does not depend on them while a real child exits during cleanup.
         state = shlex.quote(str(root / 'snapshot-taken'))
         (binaries / 'pgrep').write_text(
             '#!/bin/sh\n'
@@ -42,6 +47,7 @@ def main():
         assert result.returncode == 0, (result.returncode, result.stdout, result.stderr)
         assert 'PASSED: 2' in result.stdout, result.stdout
         assert 'FAILED: 0' in result.stdout, result.stdout
+        assert not (root / 'snapshot-taken').exists(), 'runner used a global name scan'
     print('CI runner cleanup race: ok')
 
 

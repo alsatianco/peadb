@@ -63,7 +63,7 @@ def main():
         [str(ROOT / "peadb-server"), "--port", "6549", "--bind", "127.0.0.1", "--loglevel", "warning"]
     )
     try:
-        wait_until_ready(6549)
+        wait_until_ready(6549, process=p)
         with socket.create_connection(("127.0.0.1", 6549), timeout=2) as s:
             assert cmd(s, "SET", "k", "v") == "OK"
             assert cmd(s, "GET", "k") == "v"
