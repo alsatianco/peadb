@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Adopt the native Redis RDB integration suite, explicitly tracking startup-loading and Linux child-metric limits. Refuse unreadable or invalid snapshots instead of serving an empty database, report fatal/CRC load diagnostics and expose Redis-compatible loaded/expired key counters across startup, reload and full sync.
+
 - Integration tests now run in owned process groups with bounded timeout cleanup and per-test scratch directories, preserving unrelated servers and complete failure logs. Shared readiness checks require a live child, authenticated PONG when configured, and a matching server process ID, preventing occupied ports from hiding startup failures.
 
 - Load pre-7.0 zipmap/ziplist/quicklist RDB values and refuse out-of-range database IDs before full-sync replacement (delta 53).

@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **236** commands — full: 11, upstream: 215, diff: 0, tested: 8, registered: 2
+Total: **236** commands — full: 11, upstream: 216, diff: 0, tested: 8, registered: 1
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -93,7 +93,7 @@ Total: **236** commands — full: 11, upstream: 215, diff: 0, tested: 8, registe
 | `INCRBYFLOAT` | upstream | test_m2_strings_expire.py |
 | `INFO` | upstream | test_b4_observability.py, test_b7_eviction.py, test_b8_repl_safety.py, test_m1_commands.py, test_m5_persistence_commands.py, test_m5_snapshot_roundtrip.py, test_m6_repl_determinism.py, test_m6_repl_offsets.py, test_p2_script_cache_info.py, test_p5_cluster_config.py, test_p5_info_sections.py, test_p5_version_provenance.py |
 | `KEYS` | full | test_p1_keys_pattern.py, test_p5_cluster_ownership.py |
-| `LASTSAVE` | registered | — |
+| `LASTSAVE` | upstream | — |
 | `LATENCY` | upstream | test_p3_ecosystem_commands.py |
 | `LCS` | upstream | test_p1_lcs.py |
 | `LINDEX` | upstream | test_p3_ecosystem_commands.py |

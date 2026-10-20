@@ -143,6 +143,7 @@ SUITES=(
   "unit/shutdown"
   "unit/maxmemory"
   "integration/shutdown"
+  "integration/rdb"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

@@ -7344,6 +7344,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     "rdb_saves:" +
                     std::to_string(g_stat_rdb_saves) +
                     "\r\n"
+                    "rdb_last_load_keys_expired:" +
+                    std::to_string(rdb_last_load_stats().expired) +
+                    "\r\n"
+                    "rdb_last_load_keys_loaded:" +
+                    std::to_string(rdb_last_load_stats().loaded) +
+                    "\r\n"
                     "aof_enabled:" +
                     std::to_string(g_appendonly ? 1 : 0) +
                     "\r\n"

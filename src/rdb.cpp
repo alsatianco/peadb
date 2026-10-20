@@ -45,7 +45,12 @@ bool g_rdb_checksum = true;               // rdbchecksum (startup-only, as in Re
 int g_rdb_key_save_delay = 0;             // rdb-key-save-delay (hidden Redis setting, for tests)
 FunctionDumpFn g_function_dump_hook;      // returns every function library's source
 FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
+RdbLoadStats g_rdb_load_stats;
 }  // namespace
+
+const RdbLoadStats& rdb_last_load_stats() {
+  return g_rdb_load_stats;
+}
 
 void rdb_set_skip_checksum_validation(bool skip) {
   g_skip_checksum_validation = skip;
@@ -1751,6 +1756,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
             msg, sizeof(msg), "Wrong RDB checksum expected: (%llx) but got (%llx). Aborting now.",
             static_cast<unsigned long long>(computed), static_cast<unsigned long long>(stored));
         err = msg;
+        log(LogLevel::Error, "RDB CRC error");
         return false;
       }
     }
@@ -1760,6 +1766,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   auto load = [&](bool apply) {
     RdbReader r(filedata.data() + 9, filedata.size() - 9);
     if (apply) {
+      g_rdb_load_stats = {};
       if (before_replace) before_replace();
       ds.flushall();
     }
@@ -1993,7 +2000,14 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         }
       }
       // Redis's rdbLoadRio(): a master does not load a key that has already expired.
-      if (apply && expire_at && *expire_at < load_now && !ds.replica_expiry()) ds.del(key);
+      if (apply) {
+        if (expire_at && *expire_at < load_now && !ds.replica_expiry()) {
+          ds.del(key);
+          ++g_rdb_load_stats.expired;
+        } else {
+          ++g_rdb_load_stats.loaded;
+        }
+      }
     }
 
     if (apply) ds.select_db(prev_db);

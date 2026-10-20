@@ -1,0 +1,6 @@
+# Startup loading does not serve clients/INFO; the listener opens after the load.
+# compat/delta.md item 70. Keep the native test intact until that architecture changes.
+client freed during loading
+# Linux-only: live child COW/progress metrics are not implemented (compat/delta.md item 22).
+# Skip explicitly on every platform so a macOS pass cannot hide the Linux gap.
+Test child sending info

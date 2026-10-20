@@ -68,6 +68,14 @@ std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl 
 bool rdb_load(const std::filesystem::path& path, std::string& err,
               const std::function<void()>& before_replace = nullptr, int* repl_stream_db = nullptr);
 
+// INFO persistence counters for the last RDB application (startup, DEBUG RELOAD, full sync).
+// Validation passes do not change these; a replica retains expired keys as Redis does.
+struct RdbLoadStats {
+  std::uint64_t loaded = 0;
+  std::uint64_t expired = 0;
+};
+const RdbLoadStats& rdb_last_load_stats();
+
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);
 
