@@ -35,7 +35,7 @@ touches this file. Every skipfile line under `scripts/redis/skipfiles/` is a tra
 debt with a comment naming its delta item — the skipfiles themselves are the
 authoritative debt list; each item below cites its skipfile where one exists.
 
-Limits of this signal (found by the 2026-10 review): of the 26 upstream `integration/*` suites `integration/shutdown`, `integration/rdb` and `integration/replication-2` are adopted; the RDB suite explicitly skips startup client servicing (item 70) and Linux child COW/progress metrics (item 22). Replication, psync2, aof, logging, corrupt-dump and the others are not, which is why the persistence and replication defects in items 27–47 pass every gate; and some upstream passes come from code shaped to match the test rather than real behavior (item 54; item 42's RESTORE propagation, which matched its upstream test only because of the braces, is fixed), so the pass rate overstates parity there.
+Limits of this signal (found by the 2026-10 review): of the 26 upstream `integration/*` suites `integration/shutdown`, `integration/rdb`, `integration/replication-2` and `integration/block-repl` are adopted; the RDB suite explicitly skips startup client servicing (item 70) and Linux child COW/progress metrics (item 22). Replication, psync2, aof, logging, corrupt-dump and the others are not, which is why the persistence and replication defects in items 27–47 pass every gate; and some upstream passes come from code shaped to match the test rather than real behavior (item 54; item 42's RESTORE propagation, which matched its upstream test only because of the braces, is fixed), so the pass rate overstates parity there.
 
 ## Known Deltas
 
@@ -276,6 +276,7 @@ Limits of this signal (found by the 2026-10 review): of the 26 upstream `integra
   ZPOPMAX with counts), millisecond-precise timeouts, FIFO-ordered wakeups, and
   CLIENT UNBLOCK [TIMEOUT|ERROR].
 - Open propagation-shape differences (native `integration/replication` baseline, 2026-10-20): GETSET reaches the replica as GETSET instead of Redis's SET, and BRPOPLPUSH is rewritten to LMOVE instead of RPOPLPUSH, both when immediately served and when woken. Dataset checks pass, but replica commandstats expose the different stream. These cases remain unadopted; no assertion or skipfile was changed.
+- Native `integration/block-repl` is adopted without skips: three concurrent randomized writers/blocking readers exercise list pushes, single/multi-key BLPOP and BZPOPMIN/BZPOPMAX, then compare master/replica dataset digests after stopping the writers. This adds consistency coverage; the serving-order and propagation-shape gaps below remain open.
 - Missing: (each skipfile-tracked) a "ready keys" serving queue so an already-blocked
   client is served before a later same-batch pop takes the value (`Unblock fairness
   ...`, `... blocked twice`); nested-unblock propagation ordering; blocked-BLPOP-pop and

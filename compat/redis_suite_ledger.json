@@ -1,6 +1,15 @@
 {
   "comment": "Canonical upstream-TCL-suite adoption ledger. mode: native (harness spawns peadb-server), external (--host/--port, limited coverage), excluded (out of scope, reason required). last_counts/skipfile_lines are the ratchet baselines maintained by scripts/ci/check_suite_ratchet.py --update; regressions require a compat/delta.md change. The headline parity number is sum(ok)/sum(ok+err+skipfile_lines) over non-excluded suites (scripts/redis/parse_tcl_results.py).",
   "suites": {
+    "integration/block-repl": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 2,
+        "ok": 2
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "integration/rdb": {
       "last_counts": {
         "err": 0,
