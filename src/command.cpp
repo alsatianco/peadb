@@ -221,7 +221,9 @@ std::string g_master_stream_multi;
 // it publishes it after the full sync and takes it back under this mutex before it closes it.
 std::mutex g_replica_link_mu;
 int g_replica_link_fd = -1;
-std::string g_replica_ack_out;  // the unsent rest of an ACK, under g_replica_link_mu
+std::uint64_t g_replica_link_client_id = 0;  // under g_replica_link_mu; retained on CONTINUE
+bool g_replica_link_killed = false;          // makes repeated KILLs count the link only once
+std::string g_replica_ack_out;               // the unsent rest of an ACK, under g_replica_link_mu
 // What the replica has read from its master's stream (Redis's master->read_reploff), and when it
 // last read anything (master->lastinteraction); written by the streaming thread.
 std::atomic<std::int64_t> g_replica_read_offset{0};
@@ -296,7 +298,49 @@ void release_master_link(bool link_down) {
   std::lock_guard<std::mutex> lk(g_replica_link_mu);
   g_replica_link_fd = -1;
   g_replica_ack_out.clear();
+  if (!link_down) g_replica_link_client_id = 0;  // promotion discards the cached master client
   if (link_down) g_replica_stale = true;
+}
+
+// Redis's getClientPeerId()/getClientSockname(): match the actual socket endpoints, including
+// numeric addresses when REPLICAOF was given a hostname. Caller holds g_replica_link_mu.
+std::string master_socket_addr(bool local) {
+  sockaddr_storage ss{};
+  socklen_t len = sizeof(ss);
+  const int fd = g_replica_link_fd;
+  const int rc = local ? ::getsockname(fd, reinterpret_cast<sockaddr*>(&ss), &len)
+                       : ::getpeername(fd, reinterpret_cast<sockaddr*>(&ss), &len);
+  if (rc != 0) return {};
+  char host[NI_MAXHOST], port[NI_MAXSERV];
+  if (::getnameinfo(reinterpret_cast<sockaddr*>(&ss), len, host, sizeof(host), port, sizeof(port),
+                    NI_NUMERICHOST | NI_NUMERICSERV) != 0)
+    return {};
+  return (ss.ss_family == AF_INET6 ? "[" + std::string(host) + "]" : std::string(host)) + ":" +
+         port;
+}
+
+int kill_master_link_impl(const ClientKillFilter& filter) {
+  std::lock_guard<std::mutex> lk(g_replica_link_mu);
+  if (g_replica_link_fd < 0 || g_replica_link_killed || filter.default_user ||
+      (filter.type && *filter.type != ClientType::Master) ||
+      (filter.id != 0 && filter.id != g_replica_link_client_id) ||
+      (!filter.addr.empty() && filter.addr != master_socket_addr(false)) ||
+      (!filter.laddr.empty() && filter.laddr != master_socket_addr(true)))
+    return 0;
+  // Wake recv without closing or recycling the thread's fd. Its normal disconnect path caches
+  // applied history and discards unfinished input before reconnecting with PSYNC.
+  ::shutdown(g_replica_link_fd, SHUT_RDWR);
+  g_replica_link_killed = true;
+  g_replica_stale = true;
+  return 1;
+}
+
+std::string master_client_list_impl() {
+  std::lock_guard<std::mutex> lk(g_replica_link_mu);
+  if (g_replica_link_fd < 0 || g_replica_link_killed) return {};
+  return "id=" + std::to_string(g_replica_link_client_id) + " addr=" + master_socket_addr(false) +
+         " laddr=" + master_socket_addr(true) + " fd=" + std::to_string(g_replica_link_fd) +
+         " flags=M user=(superuser) cmd=NULL resp=2\n";
 }
 
 // Redis's disconnectSlaves(): this server's replicas must sync again (CLIENT KILL's server.cpp
@@ -447,6 +491,10 @@ struct ReplBacklog {
   // is held. Returns false, with the backlog unchanged, when the size cannot be allocated.
   bool resize(std::size_t newsize) {
     if (newsize == 0 || newsize == size_) return true;
+    if (!buf) {
+      size_ = newsize;
+      return true;
+    }
     const std::int64_t keep_from = std::max(base(), total - static_cast<std::int64_t>(newsize));
     std::unique_ptr<char[]> fresh;
     std::string kept;
@@ -474,8 +522,15 @@ struct ReplBacklog {
   // An empty backlog whose next byte is stream offset `offset` + 1 (Redis's
   // createReplicationBacklog(): repl_backlog->offset = master_repl_offset + 1).
   void reset_at(std::int64_t offset) {
+    if (!buf) buf.reset(new char[size_]);
     total = offset;
     start_ = offset;
+    filled_ = 0;
+  }
+
+  void discard() {
+    buf.reset();
+    start_ = total;
     filled_ = 0;
   }
 
@@ -534,6 +589,9 @@ ReplBacklog g_repl_backlog;
 // Redis creates its backlog when the first replica connects, or on a replica after its full sync;
 // PeaDB fills its own from the start, and starts it over then (start_backlog()).
 bool g_backlog_has_replica = false;
+std::int64_t g_repl_backlog_ttl = 3600;
+// Redis's repl_no_slaves_since: reset when the last replica leaves and on promotion.
+std::int64_t g_repl_no_replicas_since = 0;
 // A replica takes its bytes from the ring once per event-loop pass (server.cpp, repl_index); every
 // replica has taken the ring up to at least this offset. Before a write would overwrite bytes some
 // replica has not taken, backlog_append() hands them out at once (g_feed_replicas_cb).
@@ -551,7 +609,9 @@ std::size_t backlog_memory() {
 std::size_t used_memory() {
   const std::size_t total = zmalloc_used_memory();
   const std::size_t left_out =
-      g_backlog_has_replica ? g_repl_backlog.unused_bytes() : g_repl_backlog.size_;
+      !g_repl_backlog.buf
+          ? 0
+          : (g_backlog_has_replica ? g_repl_backlog.unused_bytes() : g_repl_backlog.size_);
   return total > left_out ? total - left_out : 0;
 }
 // Append to the replication stream: the backlog, and through it every replica, and advance the
@@ -560,6 +620,9 @@ std::size_t used_memory() {
 // written in one event-loop pass (one big value, a pipeline, a script), so then every replica gets
 // what it has not taken yet, and this write, in its output buffer first (compat/delta.md item 40).
 inline void backlog_append(const std::string& data) {
+  // Once an expired backlog has been released, local writes need no replication stream.
+  // start_backlog() recreates the ring when another replica attaches.
+  if (!g_repl_backlog.buf) return;
   if (g_backlog_has_replica && g_feed_replicas_cb &&
       g_repl_backlog.total + static_cast<std::int64_t>(data.size()) >
           g_replicas_taken_to + static_cast<std::int64_t>(g_repl_backlog.size_)) {
@@ -1699,6 +1762,14 @@ std::int64_t g_total_error_replies = 0;
 std::int64_t g_unexpected_error_replies = 0;
 
 }  // end anonymous namespace
+
+int kill_master_link(const ClientKillFilter& filter) {
+  return kill_master_link_impl(filter);
+}
+
+std::string master_client_list() {
+  return master_client_list_impl();
+}
 
 // ── Script busy / kill state (external linkage for lua_engine.cpp) ──
 std::int64_t g_config_lua_time_limit = 5000;
@@ -5558,6 +5629,7 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             }
             return true;
           }}},
+        {"repl-backlog-ttl", live_number(g_repl_backlog_ttl)},
         {"min-replicas-to-write", live_number(g_config_min_replicas_to_write)},
         {"min-replicas-max-lag", live_number(g_config_min_replicas_max_lag)},
         {"replica-serve-stale-data", live_bool(g_config_replica_serve_stale_data)},
@@ -7688,6 +7760,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 // new stream starts with a SELECT, and a transaction the old master had not
                 // finished is dropped.
                 if (was_replica) {
+                  g_repl_no_replicas_since = now_ms() / 1000;
                   g_master_replid2 = g_master_replid;
                   g_second_replid_offset = g_master_repl_offset + 1;  // shiftReplicationId()
                   g_master_replid = gen_run_id();
@@ -12671,10 +12744,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     } else if (opt == "laddr" && moreargs) {
                       filter.laddr = args[i + 1];
                     } else if (opt == "user" && moreargs) {
-                      // Every client is the default user (multi-user ACL is item 7), so USER
-                      // default matches all of them.
+                      // Normal clients use the default user (multi-user ACL is item 7);
+                      // the upstream master is a superuser without an ACL user.
                       if (args[i + 1] != "default")
                         return encode_error("No such user '" + args[i + 1] + "'");
+                      filter.default_user = true;
                     } else if (opt == "skipme" && moreargs) {
                       const auto v = lower(args[i + 1]);
                       if (v == "yes")
@@ -16618,6 +16692,7 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("repl-timeout", repl_timeout);
   g_repl_timeout = repl_timeout;
   num("repl-ping-replica-period", g_repl_ping_replica_period);
+  num("repl-backlog-ttl", g_repl_backlog_ttl);
   num("maxmemory-eviction-tenacity", g_maxmemory_eviction_tenacity);
   num("shutdown-timeout", g_shutdown_timeout);
   int lfu_log_factor = store().lfu_log_factor();
@@ -17366,7 +17441,8 @@ std::function<void(const std::string&, bool)> g_replication_snapshot_done_cb;
 
 int start_replication_snapshot(RdbReplicationInfo& info) {
   if (has_active_child_process()) return 0;
-  info.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index : 0;
+  info.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index
+                                                 : std::max(g_last_repl_db, 0);
   info.replid = g_master_replid;
   info.offset = g_master_repl_offset;
   if (!do_bgsave_fork(&info)) return -1;
@@ -17421,6 +17497,11 @@ void migrate_cron(std::int64_t now) {
   }
 }
 
+void replica_disconnected() {
+  if (g_count_connected_replicas && g_count_connected_replicas() == 0)
+    g_repl_no_replicas_since = now_ms() / 1000;
+}
+
 void replication_cron(std::int64_t now) {
   static std::int64_t last_run = 0;
   static std::uint64_t loops = 0;
@@ -17432,6 +17513,19 @@ void replication_cron(std::int64_t now) {
              g_count_connected_replicas() > 0) {
     // replicationFeedSlaves(..., -1): PING has no SELECT and never reaches the AOF.
     backlog_append("*1\r\n$4\r\nPING\r\n");
+  }
+  // replicationCron(): replicas retain their own backlog for a possible promotion. Zero TTL
+  // keeps a master's backlog forever; the age is measured from the last replica's departure.
+  if (g_replication_role != "slave" && g_backlog_has_replica && g_repl_backlog_ttl != 0 &&
+      g_count_connected_replicas && g_count_connected_replicas() == 0 &&
+      now / 1000 - g_repl_no_replicas_since > g_repl_backlog_ttl) {
+    g_master_replid = gen_run_id();
+    g_master_replid2 = std::string(40, '0');
+    g_second_replid_offset = -1;
+    g_repl_backlog.discard();
+    g_backlog_has_replica = false;
+    log(LogLevel::Info, "Replication backlog freed after " + std::to_string(g_repl_backlog_ttl) +
+                            " seconds without connected replicas.");
   }
   ++loops;
 }
@@ -18379,6 +18473,9 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
       g_replica_last_io_ms = now_ms();
       g_repl_down_since_ms = 0;
       g_replica_link_fd = fd;
+      if (!partial || g_replica_link_client_id == 0)
+        g_replica_link_client_id = g_next_client_id.fetch_add(1);
+      g_replica_link_killed = false;
       g_replica_ack_out.clear();
       g_replica_stale = false;
       g_repl_link_state = ReplLinkState::Connected;

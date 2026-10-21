@@ -270,6 +270,7 @@ void take_replica_wakeup();
 // Each event-loop pass, Redis's replicationCron() part: a replica tells its master every second
 // how much of its stream it has applied (REPLCONF ACK).
 void replication_cron(std::int64_t now_ms);
+void replica_disconnected();  // call after removing a replica session
 // Event-loop cron: closes the MIGRATE connections idle for more than 10 seconds (once a second).
 void migrate_cron(std::int64_t now_ms);
 void notify_key_written(const std::string& key, int db_index);
@@ -364,9 +365,13 @@ struct ClientKillFilter {
   std::string laddr;               // LADDR ip:port (the local end of the client's socket)
   std::uint64_t id = 0;            // ID; 0 = any
   std::optional<ClientType> type;  // TYPE
+  bool default_user = false;       // USER default (the upstream master has no ACL user)
   bool skipme = true;              // SKIPME yes: the calling client is never killed
   int self_fd = -1;                // the calling client
 };
+// The upstream link is owned by the replication thread, outside the event-loop session map.
+int kill_master_link(const ClientKillFilter& filter);
+std::string master_client_list();
 // Callback: closes the clients that match, except the caller, which is only reported in
 // kill_self (it is closed after its reply). Returns the number matched, the caller included.
 // Wired by server.cpp (owns fd lifecycle).

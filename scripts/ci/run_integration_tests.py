@@ -177,12 +177,16 @@ def main():
     passed = failed = 0
     for index, test in enumerate(tests):
         log = logs / f'{index:03d}-{test.stem}.log'
-        code = run_test(test, budget, timeout_cmd, log)
+        # This Redis-first test observes several real one-second cron/TTL boundaries on both
+        # engines. Keep its assertions active and allow for slower sanitizer/CI scheduling.
+        test_budget = (60.0 if test.name == 'test_replication_backlog_ttl_parity.py' and
+                       'TIMEOUT_SECS' not in os.environ else budget)
+        code = run_test(test, test_budget, timeout_cmd, log)
         if code == 0:
             passed += 1
         else:
             failed += 1
-            reason = f'timeout after {budget:g}s' if code == 124 else f'exit {code}'
+            reason = f'timeout after {test_budget:g}s' if code == 124 else f'exit {code}'
             print(f'FAIL: {test.stem} ({reason})\nLog: {log}', flush=True)
             print('\n'.join(log.read_text(errors='replace').splitlines()[-80:]), flush=True)
             print('---', flush=True)

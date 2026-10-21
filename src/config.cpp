@@ -556,6 +556,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "replica-ignore-disk-write-errors",
                                                        "repl-timeout",
                                                        "repl-ping-replica-period",
+                                                       "repl-backlog-ttl",
                                                        "lazyfree-lazy-server-del",
                                                        "stop-writes-on-bgsave-error",
                                                        "aof-load-truncated",

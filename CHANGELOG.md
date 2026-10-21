@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Fix upstream master connection filtering in CLIENT KILL, expire replication backlogs with Redis-compatible role and ID handling, and preserve the selected stream database in queued full-sync snapshots. Adopt native `integration/replication-psync` without skips, with Redis-first regressions for connection lifecycle, backlog lifetime and full-sync database selection.
+
 - Fix shutdown parity checks under the Linux integration supervisor: an exited Redis BGSAVE child awaiting reaping counts as stopped. Cover live, zombie and reaped children without changing cleanup ownership or persistence assertions.
 
 - Adopt the native Redis `integration/block-repl` suite without skips, checking replica consistency under concurrent blocking list and sorted-set operations in the full test gate.

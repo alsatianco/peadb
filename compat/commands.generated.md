@@ -5,7 +5,7 @@
 > coverage; `upstream` / `diff` = one of the two; `tested` = homegrown integration
 > tests only; `registered` = no test proof. See `compat/redis_suite_ledger.json`.
 
-Total: **236** commands — full: 11, upstream: 216, diff: 0, tested: 8, registered: 1
+Total: **236** commands — full: 11, upstream: 217, diff: 0, tested: 7, registered: 1
 
 | Command | Coverage | Test files |
 |---------|----------|------------|
@@ -145,7 +145,7 @@ Total: **236** commands — full: 11, upstream: 216, diff: 0, tested: 8, registe
 | `RESET` | upstream | test_p3_ecosystem_commands.py |
 | `RESTORE` | upstream | test_m2_dump_restore.py, test_p4_debug_verbs.py |
 | `RESTORE-ASKING` | registered | — |
-| `ROLE` | tested | test_p3_ecosystem_commands.py |
+| `ROLE` | upstream | test_p3_ecosystem_commands.py |
 | `RPOP` | upstream | test_m4_list.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |
 | `RPOPLPUSH` | upstream | test_p3_ecosystem_commands.py |
 | `RPUSH` | upstream | test_b13_obuf_limit.py, test_b5_commands.py, test_m4_blpop_brpop.py, test_m4_list.py, test_m4_list_moves.py, test_m5_aof.py, test_p3_ecosystem_commands.py, test_p3_sort_zmpop.py, test_p4_debug_verbs.py, test_p4_encoding_shim.py, test_p4_lpop_count_readonly.py |

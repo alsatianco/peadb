@@ -513,6 +513,7 @@ int run_server(const ServerConfig& config) {
       out += " resp=" + std::to_string(static_cast<int>(sess.resp_version));
       out += "\n";
     }
+    out += master_client_list();
     return out;
   };
 
@@ -709,9 +710,11 @@ int run_server(const ServerConfig& config) {
     buffers.erase(fd);
     write_buffers.erase(fd);
     snapshot_transfers.erase(fd);
-    if (scit != sessions.end() && scit->second.replica_stream) --replica_count;
+    const bool was_replica = scit != sessions.end() && scit->second.replica_stream;
+    if (was_replica) --replica_count;
     sessions.erase(fd);
     replica_fds.erase(fd);
+    if (was_replica) replica_disconnected();
     g_connected_clients.fetch_sub(1);
   };
 
@@ -750,8 +753,7 @@ int run_server(const ServerConfig& config) {
       inet_ntop(AF_INET, &in4->sin_addr, ipbuf, sizeof(ipbuf));
       return std::string(ipbuf) + ":" + std::to_string(ntohs(in4->sin_port));
     };
-    // getClientType(): PeaDB's link to its own master is not a client session, so no session is
-    // of the master type; a MONITOR client is a normal one.
+    // The upstream master is handled separately below; a MONITOR client is a normal one.
     auto type_of = [&](int fd, const SessionState& sess) {
       if (sess.replica_stream) return ClientType::Slave;
       if (client_has_subscriptions(fd)) return ClientType::Pubsub;
@@ -774,7 +776,7 @@ int run_server(const ServerConfig& config) {
       ++matched;
     }
     for (int fd : to_kill) close_client(fd);
-    return matched;
+    return matched + kill_master_link(filter);
   };
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {

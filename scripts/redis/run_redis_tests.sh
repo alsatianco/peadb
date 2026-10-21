@@ -146,6 +146,7 @@ SUITES=(
   "integration/rdb"
   "integration/replication-2"
   "integration/block-repl"
+  "integration/replication-psync"
 )
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"

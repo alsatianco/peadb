@@ -28,6 +28,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "integration/replication-psync": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 40,
+        "ok": 60
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "integration/shutdown": {
       "last_counts": {
         "err": 0,
