@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Fix shutdown parity checks under the Linux integration supervisor: an exited Redis BGSAVE child awaiting reaping counts as stopped. Cover live, zombie and reaped children without changing cleanup ownership or persistence assertions.
+
 - Adopt the native Redis `integration/block-repl` suite without skips, checking replica consistency under concurrent blocking list and sorted-set operations in the full test gate.
 
 - Enforce `min-replicas-max-lag` for write admission: count only online replicas with fresh ACKs, honor startup/runtime settings and aliases, and disable the gate when either setting is zero. Adopt the native Redis `integration/replication-2` suite with no skips.

@@ -16,6 +16,7 @@ from _isolated_server import IsolatedServer
 from _readiness import ObservedProcess, wait_until_ready
 from _redis_path import redis_server_path
 from test_config_set_get_parity import start as config_start
+from test_shutdown_parity import wait_child_stopped, wait_for
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / 'scripts/ci/run_integration_tests.sh'
@@ -123,6 +124,37 @@ def wait_file(path):
             return path.read_text().splitlines()
         time.sleep(0.01)
     raise AssertionError(f'fixture did not publish {path}')
+
+
+def check_child_exit():
+    # Keep a real zombie unreaped: PID existence must not be mistaken for a
+    # live BGSAVE child. This is deterministic even without Linux's subreaper.
+    child = subprocess.Popen(
+        [sys.executable, '-u', '-c',
+         'import time; print("ready", flush=True); time.sleep(60)'], stdout=subprocess.PIPE)
+    try:
+        assert child.stdout.readline() == b'ready\n'
+        try:
+            wait_child_stopped(child.pid, 'live fixture', timeout=0.05)
+        except AssertionError as error:
+            assert 'timed out waiting for live fixture' in str(error), str(error)
+        else:
+            raise AssertionError('shutdown wait accepted a live child')
+        child.terminate()
+
+        def zombie():
+            state = subprocess.check_output(
+                ['ps', '-o', 'stat=', '-p', str(child.pid)], text=True).strip()
+            return state.startswith('Z')
+
+        wait_for(zombie, 'the fixture child to become a zombie')
+        wait_child_stopped(child.pid, 'zombie fixture', timeout=0.2)
+        os.kill(child.pid, 0)  # observation must leave reaping to the owner
+    finally:
+        stop(child)
+        child.stdout.close()
+    wait_child_stopped(child.pid, 'reaped fixture', timeout=0.2)
+    print('shutdown child wait: live, zombie and reaped children passed')
 
 
 def assert_gone(pids, reap=None):
@@ -263,6 +295,7 @@ def main():
     with tempfile.TemporaryDirectory(prefix='peadb-harness-regression-') as directory:
         work = Path(directory)
         check_readiness(work)
+        check_child_exit()
         check_runner(work)
     print('integration harness lifecycle passed')
 

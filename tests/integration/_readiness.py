@@ -12,7 +12,7 @@ import time
 
 
 class ObservedProcess:
-    """Read-only child handle when the owning parent is a shell, which reaps it."""
+    """Read-only liveness handle; the process's owner remains responsible for reaping."""
 
     def __init__(self, pid: int):
         self.pid = pid

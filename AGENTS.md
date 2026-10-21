@@ -12,6 +12,7 @@
 - Server readiness means a successful protocol round trip, using authentication when required. A listening socket or fixed sleep does not prove that AOF/RDB loading has finished. Synchronize background work using observable state and bounded waits.
 - Give sanitizer builds appropriate execution budgets. Keep functional allocator, eviction and persistence assertions active; evaluate production RSS limits in Release builds because sanitizer overhead changes process memory usage. Diagnose the reason for a failure before adjusting a bound or expectation.
 - Test harnesses own their processes and temporary data. Clean up by owned PID or verified process group, tolerate children exiting during inspection, and reap children after stopping them. Avoid global process-name kills that can stop unrelated servers or development tools.
+- Distinguish process exit from PID disappearance: `kill(pid, 0)` succeeds for zombies. Observe non-child liveness with the shared zombie-aware helper and leave reaping to the owner. Changes to supervisors or orphan adoption need tests through the actual runner on Linux; a macOS pass does not exercise Linux subreaper behavior.
 - Check test prerequisites and pinned tool versions before a long run. Run adopted upstream Redis suites in native mode and check their ledger ratchet. Keep failure logs useful. For import/export tools, check server replies and report errors instead of printing success after refused operations or copying no data unexpectedly.
 
 # Room for development

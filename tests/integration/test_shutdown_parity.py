@@ -19,6 +19,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _redis_path import redis_server_path  # noqa: E402
+from _readiness import ObservedProcess  # noqa: E402
 
 PEADB = str(ROOT / 'peadb-server')
 REDIS = redis_server_path()
@@ -184,6 +185,15 @@ def wait_exit(proc, timeout=10):
         raise AssertionError('the server did not exit')
 
 
+def wait_child_stopped(pid, name, timeout=10):
+    # Redis signals its BGSAVE child without waiting for it during shutdown.
+    # Linux's runner adopts the orphan and reaps it after this test finishes.
+    # kill(pid, 0) also succeeds for that exited zombie, so observe liveness
+    # without taking reaping ownership away from the supervisor.
+    child = ObservedProcess(pid)
+    wait_for(lambda: child.poll() is not None, f'{name}: the BGSAVE child to stop', timeout)
+
+
 def info_field(c, section, field):
     info = c('INFO', section)
     return info.split(field + ':')[1].split()[0]
@@ -326,13 +336,7 @@ def check_signals(name, binary, work):
         assert not temp_rdbs(workdir), (name, temp_rdbs(workdir))
         assert 'There is a child saving an .rdb. Killing it!' in log_of(workdir), name
 
-        def child_gone():
-            try:
-                os.kill(child, 0)
-                return False
-            except ProcessLookupError:
-                return True
-        wait_for(child_gone, f'{name}: the BGSAVE child to stop')
+        wait_child_stopped(child, name)
         assert not os.path.exists(os.path.join(workdir, 'dump.rdb')), name
     finally:
         stop(proc)
@@ -355,13 +359,7 @@ def check_signals(name, binary, work):
         assert c('SHUTDOWN', 'SAVE') is None, name
         assert wait_exit(proc) == 0, name
 
-        def child_gone():
-            try:
-                os.kill(child, 0)
-                return False
-            except ProcessLookupError:
-                return True
-        wait_for(child_gone, f'{name}: the BGSAVE child to stop', timeout=15)
+        wait_child_stopped(child, name, timeout=15)
         assert not temp_rdbs(workdir), (name, temp_rdbs(workdir))
     finally:
         stop(proc)
