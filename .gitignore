@@ -1,5 +1,9 @@
 # ─ AI
 .AI-LLM/
+/.remember/
+/.superpowers/
+/auto_prompt.md
+/todo.md
 
 # ── Build directories ──────────────────────────────────────────
 build/

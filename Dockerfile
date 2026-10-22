@@ -8,7 +8,10 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
-COPY . .
+COPY CMakeLists.txt VERSION LICENSE ./
+COPY include/ include/
+COPY src/ src/
+COPY third_party/lua-5.1.5/ third_party/lua-5.1.5/
 
 # CMake places the binary at the source root (RUNTIME_OUTPUT_DIRECTORY), not build/.
 RUN cmake -S . -B build \

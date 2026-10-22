@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current work
 
-The active plan and verified next-work list live in `AI-TEMP/improve-plan.md` (local and gitignored; read Part 0 first). Completed fixes, remaining defects and compatibility limits are recorded in [compat/delta.md](compat/delta.md), the canonical status registry. Consult it before acting on an older backlog item or a historical defect description.
+Completed fixes, remaining defects and compatibility limits are recorded in [compat/delta.md](compat/delta.md), the canonical status registry. Consult it before acting on an older backlog item or a historical defect description. Use the task and any local plan supplied by the contributor for current work; local plans are optional and are not part of the published repository.
 
 ## Build
 

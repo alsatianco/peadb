@@ -1,10 +1,25 @@
-# Exclude local build artifacts that conflict with in-container builds
-build/
-build-asan/
-build.clean/
+# Only production build inputs belong in the context, including source licenses.
+# Git ignore rules do not protect local files sent to a Docker builder.
+**
+!CMakeLists.txt
+!VERSION
+!LICENSE
+!include/
+!include/**
+!src/
+!src/**
+!third_party/
+!third_party/lua-5.1.5/
+!third_party/lua-5.1.5/**
 
-# Large / irrelevant directories
-artifacts/
-.git/
-data/
-*.out.*
+# Keep generated files and editor debris out of the allowed source directories.
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+**/*.out
+**/*.exe
+**/.DS_Store
+**/*~
+**/*.swp
+**/*.swo
