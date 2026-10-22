@@ -25,8 +25,6 @@ if(APPLE AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
 endif()
 
-set(PEADB_NUM_SHARDS 1 CACHE STRING "Number of event-loop shards (1 = single-threaded, legacy behavior)")
-
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND AND NOT APPLE)
   pkg_check_modules(LIBURING QUIET liburing>=2.4)
@@ -61,7 +59,6 @@ add_library(peadb_core
     src/protocol.cpp
     src/server.cpp
     src/sha256.cpp
-    src/shard_loop.cpp
     src/lua_engine.cpp
     src/rdb.cpp
     src/zmalloc.cpp
@@ -73,7 +70,6 @@ add_library(peadb_core
 target_include_directories(peadb_core PUBLIC include)
 target_link_libraries(peadb_core PUBLIC lua_bundled m)
 target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
-target_compile_definitions(peadb_core PUBLIC PEADB_NUM_SHARDS=${PEADB_NUM_SHARDS})
 target_compile_definitions(peadb_core PUBLIC PEADB_VERSION="${PROJECT_VERSION}")
 if(LIBURING_FOUND)
   target_compile_definitions(peadb_core PUBLIC PEADB_HAVE_IO_URING)

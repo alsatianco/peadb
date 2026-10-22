@@ -8,7 +8,6 @@
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
-#include "lua_compat.h"
 
 #include <ctype.h>
 #include <math.h>

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import pathlib
 import socket
-import subprocess
 import time
 
 from _isolated_server import IsolatedServer

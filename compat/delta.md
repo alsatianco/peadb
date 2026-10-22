@@ -171,15 +171,17 @@ Limits of this signal (found by the 2026-10 review): of the 26 upstream `integra
   replica-expiry propagation + min-replicas-correctness + randomized replid/replid2 +
   WAIT GETACK done; failover + diskless sync deferred.
 
-9. Sharding (shard_loop.cpp)
-- Status: `stub` (scaffolding only, not wired)
+9. Sharding
+- Status: `deferred` (not implemented)
 - Owner: future-work
 - Severity: n/a (future work)
 - Target milestone: P5
-- Implemented: `crc16`, `key_hash_slot`, `ShardLoop`, `shard_init` defined.
-  PEADB_NUM_SHARDS CMake option defaults to 1 (single-threaded, unchanged behaviour).
+- Implemented: Single-threaded event loop; cluster slot hashing in `src/command.cpp`.
+  The unused `ShardLoop` stubs, duplicate hash implementation and ineffective
+  `PEADB_NUM_SHARDS` option were removed in the 2026-10 code audit.
 - Missing: Actual multi-shard event loops, listener distribution, cross-shard routing.
-  Prerequisites: full P3-3 ServerContext migration. (P4-1 `Entry` tagged-union variant is
+  Prerequisites: an implemented, tested migration of process-global server state into
+  per-shard ownership. (P4-1 `Entry` tagged-union variant is
   **done** — `Entry` now allocates only the active payload; see `docs/architecture.md`.)
 - Tracking: P4-7 in improvement plan.
 
@@ -203,7 +205,7 @@ Limits of this signal (found by the 2026-10 review): of the 26 upstream `integra
 - Severity: medium
 - Target milestone: P4
 - Implemented: `HELLO 2`/`3` negotiation with a dynamic reply (real proto/id/role);
-  RESP3 type encoders (`encode_map`/`encode_set`/`encode_double`/`encode_bool`, plus
+  RESP3 type encoders (`encode_map`/`encode_set`/`encode_double`, plus
   RESP3 null `_`); `HGETALL` returns a RESP3 map. The RESP2 subscribe-mode command
   gate is now enforced (only (P|S)SUBSCRIBE/(P|S)UNSUBSCRIBE/PING/QUIT/RESET while
   subscribed; PING replies as a 2-element array), closing the old unenforced-gate gap.

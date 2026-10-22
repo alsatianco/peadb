@@ -7,7 +7,6 @@ on a real full resync; and WAIT resolving quickly against a connected replica (G
 """
 import pathlib
 import socket
-import subprocess
 import time
 
 from _isolated_server import IsolatedServer
@@ -126,7 +125,7 @@ def test_promotion_rotates_replid():
                 synced = True; break
             time.sleep(0.1)
         expect(synced, "replica synced from master")
-        expect(int(info_field(m, "sync_full") if False else info_field(sm, "sync_full")) >= 1,
+        expect(int(info_field(sm, "sync_full")) >= 1,
                "master counts a full resync (sync_full>=1)")
         replid_before = info_field(sr, "master_replid")
         # promote

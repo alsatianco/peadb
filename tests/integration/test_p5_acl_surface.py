@@ -3,7 +3,7 @@
 introspection (WHOAMI/USERS/LIST/CAT/GETUSER/GENPASS/HELP) answers for real, and anything
 that would create or change a rule (SETUSER/DELUSER/LOAD/SAVE/LOG/DRYRUN) refuses and names
 the documented gap (compat/delta.md items 1 and 7), rather than affirming work it did not do."""
-import pathlib, socket, subprocess, sys, time
+import pathlib, socket, subprocess, time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 def wait_up(port, auth_required=False, timeout=5.0):

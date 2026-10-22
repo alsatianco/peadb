@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import pathlib,socket,subprocess,time,re
+import pathlib,socket,subprocess,re
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))

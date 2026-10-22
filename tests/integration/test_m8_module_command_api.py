@@ -4,7 +4,6 @@ import platform
 import socket
 import subprocess
 import tempfile
-import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys

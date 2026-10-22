@@ -6,7 +6,6 @@ Verifies that SHUTDOWN causes the server to terminate gracefully, closing the co
 import pathlib
 import socket
 import subprocess
-import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys
@@ -72,7 +71,7 @@ def main():
             assert s.recv(64) == b"", "SHUTDOWN NOSAVE should close the connection with no reply"
 
         # Server should exit within a reasonable time
-        rc = p.wait(timeout=5)
+        p.wait(timeout=5)
         p = None  # already exited
         print("P1 SHUTDOWN tests passed")
         return 0

@@ -3,7 +3,6 @@
 #include "zmalloc.hpp"
 #include "command_metadata.generated.hpp"
 #include "peadb_version.hpp"
-#include "server_context.hpp"
 
 #include "datastore.hpp"
 #include "errors.hpp"
@@ -1772,7 +1771,6 @@ bool g_rdb_load_functions_replace = true;  // RDB function-load collision policy
 bool g_script_readonly_context = false;
 RespVersion g_script_client_resp_version = RespVersion::Resp2;
 SessionState* g_script_current_session = nullptr;
-std::uint64_t g_script_prng_state = 0x12345678ULL;
 std::unordered_map<std::string, CmdStats> g_cmdstats;
 std::unordered_map<std::string, std::int64_t> g_errorstats;
 std::int64_t g_total_error_replies = 0;
@@ -1996,21 +1994,6 @@ std::string lower(std::string s) {
   std::transform(s.begin(), s.end(), s.begin(),
                  [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
   return s;
-}
-
-bool parse_eval_set_keys1_literal(const std::string& script, std::string& literal) {
-  constexpr const char* kPrefix1 = "redis.call('set', KEYS[1], '";
-  constexpr const char* kPrefix2 = "redis.call('SET', KEYS[1], '";
-  constexpr const char* kSuffix = "')";
-  auto parse_with_prefix = [&](const char* pfx) -> bool {
-    const std::string prefix(pfx);
-    if (script.rfind(prefix, 0) != 0) return false;
-    if (script.size() < prefix.size() + 2) return false;
-    if (script.substr(script.size() - 2) != kSuffix) return false;
-    literal = script.substr(prefix.size(), script.size() - prefix.size() - 2);
-    return true;
-  };
-  return parse_with_prefix(kPrefix1) || parse_with_prefix(kPrefix2);
 }
 
 bool valid_lib_name(const std::string& s) {
@@ -2304,9 +2287,6 @@ std::string encode_double(double d, RespVersion v) {
     s = format_score(d);
   return v == RespVersion::Resp3 ? ("," + s + "\r\n") : encode_bulk(s);
 }
-std::string encode_bool(bool b, RespVersion v) {
-  return v == RespVersion::Resp3 ? (b ? "#t\r\n" : "#f\r\n") : (b ? ":1\r\n" : ":0\r\n");
-}
 // RESP3 verbatim string: a human-readable multi-line blob tagged with a 3-char format (Redis
 // only ever sends "txt"). Mirrors addReplyVerbatim (networking.c): the header's length counts
 // the 4-byte "fmt:" prefix (format padded/truncated to exactly 3 chars) plus the payload; RESP2
@@ -2355,10 +2335,6 @@ void record_error_stat(const std::string& code) {
   ++g_errorstats[upper(code)];
 }
 
-void record_cmd_call(const std::string& cmd) {
-  ++g_cmdstats[lower(cmd)].calls;
-}
-
 void record_cmd_rejected(const std::string& cmd) {
   ++g_cmdstats[lower(cmd)].rejected_calls;
 }
@@ -2378,24 +2354,6 @@ std::string encode_command_resp(const std::vector<std::string>& args) {
     out += "$" + std::to_string(a.size()) + "\r\n" + a + "\r\n";
   }
   return out;
-}
-
-std::size_t encode_command_resp_size(const std::vector<std::string>& args) {
-  // *<count>\r\n + for each: $<len>\r\n<data>\r\n
-  auto digits = [](std::size_t n) -> std::size_t {
-    if (n == 0) return 1;
-    std::size_t d = 0;
-    while (n > 0) {
-      ++d;
-      n /= 10;
-    }
-    return d;
-  };
-  std::size_t total = 1 + digits(args.size()) + 2;  // *<count>\r\n
-  for (const auto& a : args) {
-    total += 1 + digits(a.size()) + 2 + a.size() + 2;  // $<len>\r\n<data>\r\n
-  }
-  return total;
 }
 
 // Rewrite a client write command into its canonical, deterministic propagation form —
@@ -4413,9 +4371,6 @@ std::optional<std::int64_t> parse_expiry(std::string mode, const std::string& va
   return std::nullopt;
 }
 
-std::string dump_prefix() {
-  return "PEADBSTR:";
-}
 std::string module_name_from_path(const std::string& p) {
   std::filesystem::path pp(p);
   return pp.stem().string();
@@ -6145,11 +6100,6 @@ std::uint64_t command_flags(const std::string& cmd, const std::vector<std::strin
 // Whether a command writes or may replicate (CLIENT PAUSE WRITE holds it).
 bool command_may_replicate(const std::string& cmd, const std::vector<std::string>& args) {
   return (command_flags(cmd, args) & (kRedisCmdWrite | kRedisCmdMayReplicate)) != 0;
-}
-
-// Whether a command writes, as processCommand() reads CMD_WRITE for the -MISCONF check.
-bool command_writes(const std::string& cmd, const std::vector<std::string>& args) {
-  return (command_flags(cmd, args) & kRedisCmdWrite) != 0;
 }
 
 // Whether CLIENT PAUSE holds this command (processCommand): everything under ALL; under WRITE
@@ -18779,14 +18729,6 @@ void reap_background_children() {
       !start_aof_rewrite()) {
     ++g_aofrw_consecutive_failures;
   }
-}
-
-// ── ServerContext accessor ────────────────────────────────────────────────
-
-static ServerContext g_server_context;
-
-ServerContext& server_ctx() {
-  return g_server_context;
 }
 
 }  // namespace peadb

@@ -24,8 +24,12 @@ Each script's header documents it exhaustively (see above), so this table maps p
 | `scripts/redis/` | Upstream Redis TCL harness (`run_redis_tests.sh`, result parser, per-suite `skipfiles/`) and RDB bridge/sync utilities |
 | `scripts/qa/` | Quality assurance: fuzz sanity, perf baseline, ASAN/UBSAN stability, sentinel/replication validation |
 | `scripts/dev/` | Local development helpers: quick start, dependency install, Redis-vs-PeaDB benchmark, memtier |
-| `scripts/debug/` | Ad-hoc developer debugging scripts |
 | `scripts/examples/` | Optional/experimental scripts (may need extra Python deps) |
+
+The former manual RESP3/Lua and replication debug drivers are covered by
+`tests/integration/test_p2_scripting_debug_protocol.py` and
+`tests/integration/test_p2_script_replication_shapes.py`. Run those through the
+integration supervisor for assertions, readiness checks and process cleanup.
 
 ## Running scripts
 

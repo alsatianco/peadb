@@ -169,15 +169,6 @@ def rss_bytes(pid):
     return int(out.strip()) * 1024
 
 
-def wait_for(cond, what, timeout=10):
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if cond():
-            return
-        time.sleep(0.01)
-    raise AssertionError(f'timed out waiting for {what}')
-
-
 def check_accounting(name, binary, work):
     """used_memory follows real memory, so maxmemory bounds the process."""
     limit = 16 * 1024 * 1024

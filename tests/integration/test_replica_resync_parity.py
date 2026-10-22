@@ -3,7 +3,6 @@
 import os
 import socket
 import tempfile
-import time
 
 from test_replica_offset_parity import (Conn, PEADB, REDIS, check, info, start, stop,
                                        wait_for, wait_link)

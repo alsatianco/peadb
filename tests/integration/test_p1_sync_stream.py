@@ -46,12 +46,6 @@ def read_bulk_reply(s):
     return d.decode()
 
 
-def read_int_reply(s):
-    p = rx(s, 1)
-    assert p == b":"
-    return int(read_line(s))
-
-
 def parse_repl_cmd(s):
     p = rx(s, 1)
     if p != b"*":

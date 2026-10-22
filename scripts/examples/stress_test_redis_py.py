@@ -70,7 +70,6 @@ Notes
 """
 import random
 import string
-import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor

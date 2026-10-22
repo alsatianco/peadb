@@ -7,7 +7,6 @@
 #include "rdb.hpp"
 #include "zmalloc.hpp"
 #include "protocol.hpp"
-#include "server_context.hpp"
 
 #include <arpa/inet.h>
 #include <cctype>
@@ -516,10 +515,6 @@ int run_server(const ServerConfig& config) {
     out += master_client_list();
     return out;
   };
-
-  // Mirror callbacks into the ServerContext struct for future callers.
-  server_ctx().callbacks.count_synced_replicas = g_count_synced_replicas;
-  server_ctx().callbacks.client_list = g_client_list_callback;
 
   // Per-class client-output-buffer-limit (normal/replica/pubsub). A slow consumer or a
   // lagging replica can no longer buffer unbounded and OOM the single process. Returning

@@ -7,7 +7,6 @@ background free must not corrupt live data — single-writer ownership transfer)
 """
 import pathlib
 import socket
-import subprocess
 import time
 
 from _isolated_server import IsolatedServer

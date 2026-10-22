@@ -6,7 +6,6 @@ connected-replica count, expiry convergence master↔replica, and automatic reco
 after the master restarts. Uses two PeaDB instances (PeaDB master + PeaDB replica).
 """
 import pathlib
-import socket
 import subprocess
 import sys
 import time

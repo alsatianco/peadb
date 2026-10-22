@@ -4,7 +4,6 @@
 Covers: real maxmemory enforcement + unit parsing, save points (BGSAVE cron),
 SHUTDOWN SAVE, and AOF truncated-tail tolerance vs mid-file-corruption refusal.
 """
-import os
 import pathlib
 import socket
 import subprocess

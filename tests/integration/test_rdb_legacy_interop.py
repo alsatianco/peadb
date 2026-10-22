@@ -14,7 +14,6 @@ import subprocess
 import sys
 import tempfile
 import threading
-import time
 
 from test_rdb_redis_interop import Conn, REDIS, with_checksum
 from test_dump_native_interop import payload, port, wait_for

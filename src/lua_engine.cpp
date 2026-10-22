@@ -9,7 +9,6 @@ extern "C" {
 #include "lua.h"
 #include "lauxlib.h"
 #include "lualib.h"
-#include "lua_compat.h"
 }
 
 // Lua extension library init functions (compiled from C source files)
@@ -919,25 +918,10 @@ int lua_redis_acl_check_cmd(lua_State* L) {
   return 1;
 }
 
-// pcall wrapper — wraps Lua's built-in pcall to match Redis behavior
-int lua_redis_pcall_wrapper(lua_State* L) {
-  // This is the Lua-level pcall(fn, ...) — leave it as standard Lua behavior
-  int nargs = lua_gettop(L) - 1;
-  int status = lua_pcall(L, nargs, LUA_MULTRET, 0);
-  lua_pushboolean(L, status == 0);
-  lua_insert(L, 1);
-  return lua_gettop(L);
-}
-
 // ─── Fenv C helper functions ─────────────────────────────────────────────────
 
 // Registry key for the "create_fenv" Lua closure
 static int g_create_fenv_ref = LUA_NOREF;
-
-// __newindex for script fenv and readonly tables: always error
-int fenv_newindex_forbidden(lua_State* L) {
-  return luaL_error(L, "Attempt to modify a readonly table");
-}
 
 // ─── Sandboxing: protect globals and library tables ──────────────────────────
 
@@ -1070,22 +1054,13 @@ end
   }
 
   // Retrieve create_fenv and store in Lua registry, then remove from _G
-#if LUA_VERSION_NUM >= 502
-  lua_getglobal(L, "__peadb_create_fenv");
-#else
   lua_pushstring(L, "__peadb_create_fenv");
   lua_rawget(L, LUA_GLOBALSINDEX);
-#endif
   g_create_fenv_ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
-#if LUA_VERSION_NUM >= 502
-  lua_pushnil(L);
-  lua_setglobal(L, "__peadb_create_fenv");
-#else
   lua_pushstring(L, "__peadb_create_fenv");
   lua_pushnil(L);
   lua_rawset(L, LUA_GLOBALSINDEX);
-#endif
 }
 
 // ─── Register the "redis" table ──────────────────────────────────────────────
@@ -1404,48 +1379,6 @@ void lua_engine_init() {
   g_L = luaL_newstate();
   luaL_openlibs(g_L);
 
-  // Lua 5.2+ removed several globals that existed in 5.1.  Redis scripts
-  // depend on them, so we restore them here for backward compatibility.
-#if LUA_VERSION_NUM >= 502
-  // unpack → table.unpack
-  lua_getglobal(g_L, "table");
-  lua_getfield(g_L, -1, "unpack");
-  lua_setglobal(g_L, "unpack");
-  lua_pop(g_L, 1);  // pop table
-
-  // loadstring → load  (loadstring was removed in 5.2)
-  lua_getglobal(g_L, "load");
-  lua_setglobal(g_L, "loadstring");
-
-  // Override LUAI_NUMFORMAT: Lua 5.3+ uses "%.14g" for number-to-string
-  // which prints 0.0 as "0.0".  But table.concat uses a different internal
-  // path.  Set LUA_NUMFORMAT env or patch the number format string in the
-  // global state so integers print like "0" in table.concat but "0.0" in
-  // tostring — matching Lua 5.1 behaviour is impossible without patching Lua.
-  //
-  // Instead, install a Lua-level workaround: cjson.decode returns numbers
-  // that, when concatenated, lose the .0 suffix.  Override table.concat to
-  // use tostring() for each element (matching Redis's Lua 5.1 behaviour).
-  luaL_dostring(g_L, R"(
-    local orig_concat = table.concat
-    table.concat = function(t, sep, i, j)
-      -- Only override for simple array-of-numbers case
-      i = i or 1
-      j = j or #t
-      local parts = {}
-      for k = i, j do
-        local v = t[k]
-        if type(v) == "number" then
-          parts[#parts + 1] = tostring(v)
-        else
-          parts[#parts + 1] = v
-        end
-      end
-      return orig_concat(parts, sep)
-    end
-  )");
-#endif
-
   // Register cjson if available (Redis vendors it)
   {
     lua_pushcfunction(g_L, luaopen_cjson);
@@ -1519,26 +1452,18 @@ std::string lua_engine_eval(const std::string& script, const std::vector<std::st
     lua_pushlstring(g_L, keys[i].c_str(), keys[i].size());
     lua_rawseti(g_L, -2, static_cast<int>(i + 1));
   }
-#if LUA_VERSION_NUM >= 502
-  lua_setglobal(g_L, "KEYS");
-#else
   lua_pushstring(g_L, "KEYS");
   lua_insert(g_L, -2);
   lua_rawset(g_L, LUA_GLOBALSINDEX);
-#endif
 
   lua_newtable(g_L);
   for (std::size_t i = 0; i < argv.size(); ++i) {
     lua_pushlstring(g_L, argv[i].c_str(), argv[i].size());
     lua_rawseti(g_L, -2, static_cast<int>(i + 1));
   }
-#if LUA_VERSION_NUM >= 502
-  lua_setglobal(g_L, "ARGV");
-#else
   lua_pushstring(g_L, "ARGV");
   lua_insert(g_L, -2);
   lua_rawset(g_L, LUA_GLOBALSINDEX);
-#endif
 
   // Compile and execute the script
   int load_status = luaL_loadstring(g_L, script.c_str());
