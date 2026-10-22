@@ -1,0 +1,4 @@
+interface:
+  display_name: "Clean Code"
+  short_description: "Remove unused code across all repository languages"
+  default_prompt: "Use $clean-code to remove all confirmed unused code in this repository, preserve used behavior, and verify the cleanup."
