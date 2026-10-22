@@ -211,7 +211,7 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // setting the config named, for CONFIG GET; `config_file` is the config file PeaDB was started with
 // ("" for none), for CONFIG REWRITE.
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
-                                const std::string& config_file);
+                                const std::string& config_file, unsigned int startup_umask = 0022);
 void script_set_repl_flags(int flags);  // redis.set_repl() from the Lua engine (1=AOF, 2=replicas)
 int client_timeout_seconds();           // current idle timeout (0 = disabled)
 bool client_has_subscriptions(int fd);  // exempt pub/sub clients from idle reaping

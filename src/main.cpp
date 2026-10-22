@@ -19,6 +19,7 @@
 #include <cstring>
 #include <exception>
 #include <execinfo.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 // Fatal-signal crash report: dump signal, faulting address, and a backtrace to
@@ -57,6 +58,10 @@ static void install_crash_handlers() {
 }
 
 int main(int argc, char** argv) {
+  // Capture before worker threads can create files; CONFIG REWRITE uses Redis's
+  // 0644 & ~startup_umask publication mode.
+  const mode_t startup_umask = ::umask(0777);
+  ::umask(startup_umask);
   std::signal(SIGPIPE, SIG_IGN);
   std::signal(SIGHUP, SIG_IGN);  // as in Redis (initServer, server.c)
   {
@@ -132,6 +137,18 @@ int main(int argc, char** argv) {
   const std::string options =
       peadb::config_options_from_argv(args, first_option, config_from_stdin);
 
+  // The loader applies dir immediately. Retain the original absolute config
+  // filename for rewriting after startup or a later CONFIG SET dir.
+  std::string absolute_config_path;
+  if (!config_path.empty()) {
+    std::error_code ec;
+    absolute_config_path = std::filesystem::absolute(config_path, ec).string();
+    if (ec) {
+      std::cerr << "Fatal error resolving config file: " << ec.message() << '\n';
+      return 1;
+    }
+  }
+
   peadb::ServerConfig config;
   std::string config_error;
   if (!peadb::load_server_config(config_path, config_from_stdin, options, config, config_error)) {
@@ -171,7 +188,7 @@ int main(int argc, char** argv) {
   peadb::configure_timeout(config.timeout);
   peadb::configure_tcp_backlog(config.tcp_backlog);
   peadb::configure_encoding_limits(config.raw);
-  peadb::configure_runtime_settings(config.raw, config_path);
+  peadb::configure_runtime_settings(config.raw, absolute_config_path, startup_umask);
   peadb::configure_replication(config.replica, config.master_host, config.master_port);
   peadb::configure_client_output_buffer_limit(config.client_output_buffer_limit);
   peadb::configure_save(config.save);

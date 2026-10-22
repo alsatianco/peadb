@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Implement `CONFIG REWRITE`: persist live settings and replication role to the startup config file, preserve comments/includes and canonicalize aliases/duplicates, escape binary values, and publish through fsynced temporary-file replacement with Redis-compatible errors. Redis-first restart and disk-fault regressions cover the change; PSYNC2 adoption still requires RDB restart history (item 47).
+
 - Record the native PSYNC2 baseline blockers: CONFIG REWRITE refusal prevents the upstream restart check, and an independent Redis comparison confirms RDB restart requires a full sync instead of resuming replication history. The suite remains unadopted; see compatibility items 25 and 47.
 
 - Fix upstream master connection filtering in CLIENT KILL, expire replication backlogs with Redis-compatible role and ID handling, and preserve the selected stream database in queued full-sync snapshots. Adopt native `integration/replication-psync` without skips, with Redis-first regressions for connection lifecycle, backlog lifetime and full-sync database selection.

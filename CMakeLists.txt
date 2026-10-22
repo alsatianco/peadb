@@ -56,6 +56,7 @@ add_library(peadb_core
     src/command.cpp
     src/datastore.cpp
     src/config.cpp
+    src/config_rewrite.cpp
     src/logger.cpp
     src/protocol.cpp
     src/server.cpp

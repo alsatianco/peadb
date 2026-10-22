@@ -186,11 +186,15 @@ def main() -> int:
         cfg_flags = [bit for f, bit in FLAG_BITS if f in flags]
         row = {"name": name, "alias": alias, "multi_arg": multi_arg, "lower": "0", "upper": "0",
                "num_flags": "0", "unsigned": False, "enum": None, "is_valid": None,
-               "flags": " | ".join(cfg_flags) if cfg_flags else "0"}
+               "flags": " | ".join(cfg_flags) if cfg_flags else "0",
+               "sds": kind == "SDS", "empty_to_null": False, "null_default": False}
         if kind == "Bool":
             row["type"] = "Bool"
         elif kind in ("String", "SDS"):
             row["type"] = "String"
+            row["empty_to_null"] = args[3] == "EMPTY_STRING_IS_NULL"
+            tok = defines.get(args[5].strip(), args[5].strip())
+            row["null_default"] = tok == "NULL"
         elif kind == "Enum":
             row["type"] = "Enum"
             row["enum"] = args[3]
@@ -267,6 +271,9 @@ def main() -> int:
         "  const char* is_valid;          // name of Redis's extra validator function, or nullptr",
         "  int flags;                     // kCfg* bits",
         "  const char* default_value;     // as CONFIG GET prints it; nullptr when there is none (dir)",
+        "  bool string_sds;              // String only: binary-safe SDS instead of a C string",
+        "  bool string_empty_to_null;    // String only: empty value removes the directive",
+        "  bool string_null_default;     // String only: NULL differs from an empty default",
         "};",
         "",
     ]
@@ -284,7 +291,8 @@ def main() -> int:
             f"{'true' if r['multi_arg'] else 'false'}, {r['num_flags']}, "
             f"{'true' if r['unsigned'] else 'false'}, static_cast<long long>({r['lower']}), "
             f"static_cast<long long>({r['upper']}), {enum_ref}, {cxx_str(r['is_valid'])}, "
-            f"{r['flags']}, {cxx_str(r['default'])}}},"
+            f"{r['flags']}, {cxx_str(r['default'])}, "
+            f"{str(r['sds']).lower()}, {str(r['empty_to_null']).lower()}, {str(r['null_default']).lower()}}},"
         )
     out += [
         "};",

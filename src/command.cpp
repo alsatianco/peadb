@@ -1,4 +1,5 @@
 #include "command.hpp"
+#include "config_rewrite.hpp"
 #include "zmalloc.hpp"
 #include "command_metadata.generated.hpp"
 #include "peadb_version.hpp"
@@ -5382,6 +5383,7 @@ std::string do_geo_search(const std::vector<std::string>& args, RespVersion resp
 // canonical name: the config file's value, then CONFIG SET's.
 std::unordered_map<std::string, std::string> g_config_values;
 std::string g_config_file;  // the config file PeaDB started with; "" when there is none
+mode_t g_startup_umask = 0022;
 
 struct LiveConfig {
   std::function<std::string()> get;
@@ -8535,8 +8537,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 if (g_config_file.empty()) {
                   return encode_error("The server is running without a config file");
                 }
-                return encode_error(
-                    "CONFIG REWRITE is not supported by PeaDB yet (compat/delta.md item 25)");
+                const bool replica = g_replication_role == "slave" && !g_cluster_enabled;
+                if (!rewrite_config_file(g_config_file, config_value, replica,
+                                         g_replication_master_host, g_replication_master_port,
+                                         g_startup_umask)) {
+                  const int error = errno;
+                  log(LogLevel::Warn,
+                      std::string("CONFIG REWRITE failed: ") + std::strerror(error));
+                  return encode_error(std::string("Rewriting config file: ") +
+                                      std::strerror(error));
+                }
+                log(LogLevel::Info, "CONFIG REWRITE executed with success.");
+                return encode_simple("OK");
               }
               if (sub == "HELP") {
                 if (args.size() != 2) return arity_error();
@@ -16655,8 +16667,9 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 }
 
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
-                                const std::string& config_file) {
+                                const std::string& config_file, unsigned int startup_umask) {
   g_config_file = config_file;
+  g_startup_umask = static_cast<mode_t>(startup_umask);
   // CONFIG GET reports every setting the config named (a live setting reads its global
   // instead, and a fixed one reports PeaDB's behaviour).
   for (const auto& [name, value] : raw) g_config_values[name] = value;
