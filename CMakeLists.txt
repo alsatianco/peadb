@@ -25,14 +25,6 @@ if(APPLE AND CMAKE_BUILD_TYPE STREQUAL "Release")
   set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG" CACHE STRING "" FORCE)
 endif()
 
-find_package(PkgConfig QUIET)
-if(PkgConfig_FOUND AND NOT APPLE)
-  pkg_check_modules(LIBURING QUIET liburing>=2.4)
-  if(LIBURING_FOUND)
-    message(STATUS "io_uring found (${LIBURING_VERSION}) — enabling PEADB_HAVE_IO_URING")
-  endif()
-endif()
-
 # Bundled Lua 5.1.5 — the exact interpreter Redis 7.2.5 embeds. Scripting parity
 # (float tostring, table hash order, cjson/cmsgpack output) depends on it, so the
 # system Lua is never used.
@@ -71,11 +63,6 @@ target_include_directories(peadb_core PUBLIC include)
 target_link_libraries(peadb_core PUBLIC lua_bundled m)
 target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
 target_compile_definitions(peadb_core PUBLIC PEADB_VERSION="${PROJECT_VERSION}")
-if(LIBURING_FOUND)
-  target_compile_definitions(peadb_core PUBLIC PEADB_HAVE_IO_URING)
-  target_include_directories(peadb_core PUBLIC ${LIBURING_INCLUDE_DIRS})
-  target_link_libraries(peadb_core PUBLIC ${LIBURING_LIBRARIES})
-endif()
 
 add_executable(peadb-server src/main.cpp)
 # Place the binary at the repo root so integration tests can find it via

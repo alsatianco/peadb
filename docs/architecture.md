@@ -4,7 +4,7 @@ How PeaDB works internally and how to develop it. For build/test commands and co
 
 ## Execution model
 
-PeaDB runs a **single-threaded event loop** (like Redis). One thread accepts connections, reads and parses requests, dispatches commands, and writes replies. The loop uses `Poller` (`include/poller.hpp`), backed by **epoll** on Linux and **kqueue** on macOS. That header also contains an **io_uring** prototype behind `PEADB_HAVE_IO_URING`; the server does not instantiate it. The poller waits with a 100 ms timeout, which also bounds background housekeeping (active expiry, child reaping, blocked-client rechecks, deferred `WAIT`).
+PeaDB runs a **single-threaded event loop** (like Redis). One thread accepts connections, reads and parses requests, dispatches commands, and writes replies. The loop uses `Poller` (`include/poller.hpp`), backed by **epoll** on Linux and **kqueue** on macOS. The poller waits with a 100 ms timeout, which also bounds background housekeeping (active expiry, child reaping, blocked-client rechecks, deferred `WAIT`).
 
 Besides the event-loop thread there are two helper threads: a detached **replica supervisor** that `REPLICAOF` starts, which runs the sync, reads the master's command stream and reconnects with backoff until a newer `REPLICAOF` replaces it (it only touches atomics and queues commands for the event loop), and a **lazyfree** worker that destructs large detached objects (`UNLINK`, `FLUSHALL`/`FLUSHDB ASYNC`) off the loop. Both preserve the single-writer invariant: command processing and `DataStore` mutation happen only on the event-loop thread, and the lazyfree worker only ever touches data that was first *moved out* of the live keyspace (exclusive ownership transferred under a mutex-guarded queue), so there is no fine-grained locking on the hot path and no race with live data.
 
@@ -21,7 +21,7 @@ Besides the event-loop thread there are two helper threads: a detached **replica
 | `src/protocol.cpp` | RESP parsing (operates on `std::string_view`; only argument values are copied) |
 | `src/config_rewrite.cpp` | Typed CONFIG REWRITE serialization of live configuration, old-file/comment preservation and durable atomic publication; role/include/default-user boundaries are in delta item 25 |
 | `src/config.cpp` | Config file + command-line loading, following Redis 7.2.5's `loadServerConfig()` (settings table, with flags and defaults, generated from Redis's `config.c` into `include/redis_config_table.generated.hpp`); its value checks are shared with `CONFIG SET` |
-| `include/poller.hpp` | Active epoll / kqueue abstraction and an unselected io_uring prototype |
+| `include/poller.hpp` | epoll / kqueue abstraction |
 
 ## Data structures
 

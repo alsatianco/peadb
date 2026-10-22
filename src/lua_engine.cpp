@@ -943,7 +943,6 @@ do
   local _type = type
   local _tostring = tostring
   local _error = error
-  local _pairs = pairs
   local _string_byte = string.byte
   local _loadstring = loadstring
   local _G_ref = _G  -- reference to the real global table

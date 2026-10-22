@@ -90,12 +90,8 @@ removed too.
    Keep explicit adapters for binary replies, RESP3 attributes/pushes,
    replication keepalives, exact RDB lengths and authentication. Lifecycle
    changes need the existing supervisor tests on Linux as well as macOS.
-2. **Decide the io_uring prototype's future.** `IoUringPoller` in
-   `include/poller.hpp` has no instantiation; `src/server.cpp` always creates
-   `Poller`. CMake's liburing detection compiles the prototype but does not
-   select it. Either wire it with Linux runtime tests or remove the prototype
-   and detection together. Architecture documentation now describes the
-   current behavior accurately; this audit does not claim Linux validation.
+2. **io_uring prototype removed in the follow-up below.** The selected epoll
+   and kqueue implementations remain; adding io_uring is future feature work.
 3. **Keep static checks inexpensive.** Ruff found only the removed unused
    imports/binding for `F401,F811,F821,F841`; those checks now pass. Vulture
    helped locate the dead ternary, but missed some uncalled helpers whose
@@ -140,3 +136,103 @@ and was stopped through its owned supervisor (exit 143). It is not a pass;
 its output remains in `AI-TEMP/code-audit-integration.log`. The corrected full
 run above passed. No fresh upstream Tcl sweep, sanitizer run or Linux run
 was performed for this cleanup.
+
+## Clean-code follow-up — 2026-10-22
+
+Baseline: `2e333b1`. Rechecked the current tracked C/C++, Python, shell,
+build targets, workflows and embedded Lua. The earlier cleanup remains in
+place. Untracked personal notes and concurrent changes to the tracked
+`AI-TEMP/auto-improve-codex.sh` and its tests are outside this cleanup.
+
+Additional confirmed removals:
+
+- `IoUringPoller`, its headers and CMake's liburing discovery, compile flag,
+  include path and link dependency. The sole server instantiation is
+  `Poller`, and neither supported platform selected the prototype. Updated
+  architecture/compatibility documentation and marked D0.3's backend policy
+  as a future target.
+- `DataStore::save_snapshot_file`, the uncalled `PEADB-SNAPSHOT-V1` writer.
+  Startup still uses `load_snapshot_file` for legacy recovery; native saves
+  and replication use `rdb_save`. The legacy reader, its dependencies and
+  its regression tests remain.
+- `rdb_save_to_string`, an uncalled internal wrapper, and the false branch
+  it alone passed to `rdb_build_string`'s delay argument. The surviving
+  caller always enabled the delay; file saves and full-sync snapshots still
+  honor `rdb-key-save-delay`. Single-key DUMP serialization is independent.
+- The uncalled `set_active_expire_enabled`, `expire_paused` and
+  `lazy_expire_disabled` accessors, and the obsolete zset ziplist threshold
+  getter/setter. DEBUG still controls active expiry directly; pause/lazy
+  expiry internals and the live `encoding_limits()` configuration remain.
+- `SessionState::repl_send_select`, which was never read or assigned;
+  the sandbox's unused `_pairs` local; and the unused `ok`/`is_nil` unit-test
+  helpers. Also removed the unused `<regex>` include from `datastore.cpp`;
+  it uses no regex symbols. No behavioral assertion was removed.
+
+These are internal server interfaces: CMake has no library/header install
+or export registration, and native module discovery uses the separate
+`RedisModule_*` ABI. Searches included source, tests, scripts, generated
+metadata and documentation, followed by reviewing the actual persistence,
+replication and configuration callers.
+
+Retained boundaries:
+
+- Dict's standard container surface (`cbegin`, `cend`, `max_load_factor` and
+  conventional type aliases) has no direct calls for some members. They
+  intentionally support generic container consumers. Removing that surface
+  requires deciding whether compatibility with those consumers is part of
+  the container contract; a name count alone does not resolve that question.
+- Exported native-module entry points and registered Lua callbacks remain.
+- The Lua development package and pkg-config still have a consumer in the
+  standalone fuzz build; they are not unused setup dependencies.
+- Shared test transport/lifecycle consolidation remains a separate live-code
+  refactor. All integration entry points and behavioral assertions remain.
+
+Follow-up verification:
+
+- Full macOS integration supervisor: **170 passed, zero failed**, exit 0
+  (`AI-TEMP/clean-code-integration.log`, per-file logs in
+  `artifacts/integration/run-vkynq3oi/`). The absent `third_party/redis`
+  checkout skipped the D0 Git SHA assertion; the cached reference was used.
+- Fresh macOS arm64 Release configure/build in `build-clean-code`, followed
+  by the final rebuild and CTest: **16/16 passed**, exit 0. Logs:
+  `AI-TEMP/clean-code-{configure,build,build-final,unit}.log`. After the
+  final redundant `<regex>` include was removed, another rebuild produced
+  byte-identical datastore object/server SHA-256 hashes, so the full suite
+  above exercised the delivered binary. CTest again passed **16/16**, exit 0
+  (`AI-TEMP/clean-code-include-build.log`, `clean-code-unit-final.log`).
+- Fresh Linux arm64 Release build from a copy of the edited sources in
+  `peadb-ci-toolchain` (GCC 13.3): **16/16 unit tests passed** and **12/12
+  focused integration files passed**, exit 0. Covered protocol/connection
+  hygiene, delayed full-sync snapshots, stream database framing, startup
+  load/BGSAVE status, encoding thresholds, paused expiry, Lua and restart
+  history. Logs: `AI-TEMP/clean-code-linux.log` and the snapshot's
+  `configure.log`, `build.log` and `artifacts/integration/run-eiysd4jt/`.
+  This initial root run skipped unreadable-file/read-only-directory checks;
+  rerunning those two files as UID 1000 executed them and passed **2/2**,
+  exit 0 (`AI-TEMP/clean-code-linux-permissions.log`). The snapshot's
+  cleanup source files were byte-compared with the final worktree.
+  A second fresh Linux build after removing `<regex>` passed **16/16**
+  unit tests and **3/3** affected integration files as UID 1000, exit 0
+  (`AI-TEMP/clean-code-linux-final.log`).
+- Both differential JSON cases passed with Redis 7.2.5, exit 0. All
+  cross-engine runs used the cached 7.2.5 reference binaries; the Linux
+  reference version was checked inside its container.
+- Command coverage (236 commands), port-collision ratchet (21 known, zero
+  new) and compatibility-delta gates passed, exit 0.
+- All 32 first-party C/C++ CMake sources passed a syntax scan with unused
+  warnings enabled: **zero failures and zero unused warnings**. The
+  unreachable-code scan also passed with no findings. Logs:
+  `AI-TEMP/clean-code-{unused-check,unreachable-check,unused-check-final}.log`.
+  The initial
+  standalone scan split compiler commands incorrectly and produced version
+  macro quoting errors; the successful rerun used `shlex.split`. The normal
+  Release builds passed independently. Existing missing-field-initializer
+  warnings in the command table remain outside this removal task.
+- Ruff (`F401,F811,F821,F841`) passed and all 193 tracked Python files
+  parsed. Vulture still exits 3 for the required `frame` signal-handler
+  parameter; it found no independently removable Python code. ShellCheck
+  0.11.0's unused-variable check (`SC2034`) passed on all tracked shell scripts.
+- clang-format 18.1.8 on changed production C/C++ files and whitespace
+  validation passed. Removed-symbol searches found no remaining consumers.
+
+No fresh upstream Tcl sweep or sanitizer run was performed for this follow-up.

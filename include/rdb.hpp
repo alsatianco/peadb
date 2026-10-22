@@ -52,11 +52,6 @@ struct RdbReplicationInfo {
   bool valid() const;
 };
 
-// Serialize all databases to an in-memory RDB blob, with the repl-stream-db,
-// repl-id and repl-offset aux fields when `repl` is given.
-// Sets err on failure (e.g. unsupported key types); returns empty string.
-std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl = nullptr);
-
 // Load a Redis-compatible RDB file into the datastore (startup, DEBUG RELOAD, a replica's full
 // sync). The header and the trailing CRC64 are checked first (the CRC64 unless rdbchecksum is no
 // or DEBUG SET-SKIP-CHECKSUM-VALIDATION is on); a file that fails them leaves the dataset as it

@@ -9,11 +9,6 @@
 #include <sys/event.h>
 #endif
 
-#ifdef PEADB_HAVE_IO_URING
-#include <liburing.h>
-#include <poll.h>
-#endif
-
 #include <unistd.h>
 
 namespace peadb {
@@ -139,78 +134,5 @@ struct Poller {
 #endif
   }
 };
-
-#ifdef PEADB_HAVE_IO_URING
-// io_uring-based poller for Linux. Uses IORING_OP_POLL_ADD for readiness
-// (same semantic as epoll) so the existing read/write paths are unchanged.
-// Per-fd recv buffers for zero-copy path are a future optimisation (P4-6b).
-struct IoUringPoller {
-  struct io_uring ring {};
-  bool created = false;
-
-  bool create() {
-    if (io_uring_queue_init(256, &ring, 0) < 0) return false;
-    created = true;
-    return true;
-  }
-
-  void destroy() {
-    if (created) {
-      io_uring_queue_exit(&ring);
-      created = false;
-    }
-  }
-
-  bool add_read(int fd) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) return false;
-    io_uring_prep_poll_add(sqe, fd, POLLIN);
-    io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(fd));
-    io_uring_submit(&ring);
-    return true;
-  }
-
-  bool set_readwrite(int fd) {
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (!sqe) return false;
-    io_uring_prep_poll_add(sqe, fd, POLLIN | POLLOUT);
-    io_uring_sqe_set_data64(sqe, static_cast<uint64_t>(fd));
-    io_uring_submit(&ring);
-    return true;
-  }
-
-  bool set_read_only(int fd) {
-    return add_read(fd);
-  }
-
-  void remove(int fd) {
-    // Cancel the outstanding poll for fd using IORING_OP_POLL_REMOVE.
-    struct io_uring_sqe* sqe = io_uring_get_sqe(&ring);
-    if (sqe) {
-      io_uring_prep_poll_remove(sqe, static_cast<uint64_t>(fd));
-      io_uring_submit(&ring);
-    }
-  }
-
-  int wait(std::vector<PollEvent>& out, int timeout_ms) {
-    struct __kernel_timespec ts {
-      timeout_ms / 1000, (long)(timeout_ms % 1000) * 1000000L
-    };
-    struct io_uring_cqe* cqe = nullptr;
-    int ret = io_uring_wait_cqe_timeout(&ring, &cqe, timeout_ms >= 0 ? &ts : nullptr);
-    if (ret < 0) return (ret == -ETIME) ? 0 : ret;
-    out.clear();
-    unsigned head;
-    io_uring_for_each_cqe(&ring, head, cqe) {
-      int fd = static_cast<int>(io_uring_cqe_get_data64(cqe) & 0xFFFFFFFFULL);
-      const int res = cqe->res;
-      const bool err = (res < 0) || (res & (POLLERR | POLLHUP));
-      out.push_back({fd, bool(res & POLLIN), bool(res & POLLOUT), err});
-    }
-    io_uring_cq_advance(&ring, static_cast<unsigned>(out.size()));
-    return static_cast<int>(out.size());
-  }
-};
-#endif  // PEADB_HAVE_IO_URING
 
 }  // namespace peadb

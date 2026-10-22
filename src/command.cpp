@@ -17144,10 +17144,6 @@ void configure_max_clients(int max_clients) {
   g_runtime_max_clients.store(max_clients, std::memory_order_relaxed);
 }
 
-void set_active_expire_enabled(bool enabled) {
-  g_active_expire = enabled;
-}
-
 bool active_expire_enabled() {
   return g_active_expire;
 }

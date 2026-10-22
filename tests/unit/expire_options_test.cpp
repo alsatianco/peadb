@@ -11,11 +11,9 @@ static std::string cmd(std::initializer_list<std::string> args) {
   return peadb::handle_command(std::vector<std::string>(args), g_session, g_close);
 }
 
-static bool ok(const std::string& r) { return r.find("+OK") != std::string::npos; }
 static bool is_int(const std::string& r, long long v) {
   return r == ":" + std::to_string(v) + "\r\n";
 }
-static bool is_nil(const std::string& r) { return r == "$-1\r\n" || r == "*-1\r\n"; }
 
 #define ASSERT(cond, msg) \
   do { if (!(cond)) { std::cerr << "FAIL: " << msg << "\n"; return 1; } } while(0)

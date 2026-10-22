@@ -1475,10 +1475,9 @@ bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empt
   return true;
 }
 
-// `key_save_delay`: wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
-// File saves and full syncs run in a fork child; in-memory DUMP payloads do not delay.
-std::string rdb_build_string(std::string& err, bool key_save_delay,
-                             const RdbReplicationInfo* repl = nullptr) {
+// Wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
+// Used by file saves, including full-sync snapshots.
+std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
   err.clear();
   auto& ds = store();
   // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
@@ -1549,7 +1548,7 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
         ~DelayAfterKey() {
           if (usec != 0) debug_delay(usec);
         }
-      } delay_after_key{key_save_delay ? g_rdb_key_save_delay : 0};
+      } delay_after_key{g_rdb_key_save_delay};
       // Expire
       auto pttl_val = ds.pexpiretime(key);
       if (pttl_val >= 0) {
@@ -1649,7 +1648,7 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
   }
   std::string data;
   try {
-    data = rdb_build_string(err, /*key_save_delay=*/true, repl);
+    data = rdb_build_string(err, repl);
   } catch (const std::exception& e) {  // e.g. out of memory: the whole file is built in memory
     err = std::string("Error saving DB: ") + e.what();
   }
@@ -1700,10 +1699,6 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
 
 void rdb_remove_temp_file(pid_t pid) {
   ::unlink(rdb_temp_file_name(std::filesystem::path(), pid).c_str());
-}
-
-std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl) {
-  return rdb_build_string(err, /*key_save_delay=*/false, repl);
 }
 
 // ── RDB Load ───────────────────────────────────────────────────────────

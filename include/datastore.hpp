@@ -620,9 +620,6 @@ class DataStore {
   // (unless a write made a new key of the same name meanwhile), so the next access or the
   // active expiry cycle expires them with their DEL then.
   void set_expire_paused(bool paused);
-  bool expire_paused() const {
-    return expire_paused_;
-  }
 
   // ── Lazy expiry (Redis's expireIfNeeded()) ──
   // What a command does with a key whose TTL has passed (strictly: now > expire time, like
@@ -642,9 +639,6 @@ class DataStore {
   void set_replica_expiry(bool replica);
   bool replica_expiry() const {
     return replica_expiry_;
-  }
-  bool lazy_expire_disabled() const {
-    return lazy_expire_disabled_ > 0;
   }
   void restore_hidden_expired() {
     if (has_replica_hidden_) restore_replica_hidden();
@@ -730,7 +724,6 @@ class DataStore {
   std::size_t lazyfree_pending_objects() const {
     return lazyfree_pending_.load(std::memory_order_relaxed);
   }
-  bool save_snapshot_file(const std::filesystem::path& path, std::string& err);
   bool load_snapshot_file(const std::filesystem::path& path, std::string& err);
   std::vector<std::vector<std::string>> export_aof_commands() const;
   std::optional<std::string> object_encoding(const std::string& key);
@@ -763,9 +756,6 @@ class DataStore {
   // RESTORE IDLETIME/FREQ: seed a key's LRU idle time (seconds) or LFU frequency counter.
   bool set_object_idle(const std::string& key, std::int64_t idle_seconds);
   bool set_object_freq(const std::string& key, std::int64_t freq);
-  // Legacy accessors kept for existing callers; they delegate to encoding_limits().
-  void set_zset_max_ziplist_entries(std::int64_t v);
-  std::int64_t zset_max_ziplist_entries() const;
   static void freeze_time();
   static void unfreeze_time();
   static std::int64_t now_ms();

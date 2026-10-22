@@ -64,7 +64,6 @@ struct SessionState {
   ReplicaSyncState repl_sync_state = ReplicaSyncState::Online;
   bool repl_legacy_sync = false;
   std::size_t repl_index = 0;
-  bool repl_send_select = false;
   std::int64_t repl_ack_offset = 0;
   // The replication offset right after this client's last command that propagated something
   // (Redis's c->woff): what WAIT waits for.
@@ -243,7 +242,6 @@ void run_active_expire_cycle();  // event-loop active expiry (master propagates 
 void run_eviction_cycle();       // every event-loop pass: used_memory peak, and the eviction timer
 bool eviction_proc_running();    // the eviction timer is on: the event loop must not sleep
 void databases_cron();           // event-loop shrink of sparse keyspace tables (no fork child)
-void set_active_expire_enabled(bool enabled);
 bool active_expire_enabled();
 std::size_t replication_event_count();
 // The replication stream from offset `from` (counted from 0) to its end, for a replica. False when

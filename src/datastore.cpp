@@ -8,7 +8,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <sstream>
-#include <regex>
 #include <fstream>
 #include <iomanip>
 #include <random>
@@ -2837,59 +2836,6 @@ DataStore::AutoClaimResult DataStore::xautoclaim(const std::string& key, const s
   return res;
 }
 
-bool DataStore::save_snapshot_file(const std::filesystem::path& path, std::string& err) {
-  err.clear();
-  std::ofstream out(path);
-  if (!out.is_open()) {
-    err = "cannot open snapshot for write";
-    return false;
-  }
-  out << "PEADB-SNAPSHOT-V1\n";
-  for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
-    for (const auto& [key, e] : dbs_[dbi]) {
-      const auto ttl =
-          e.expire_at_ms.has_value() ? std::to_string(*e.expire_at_ms) : std::string("-1");
-      switch (e.type()) {
-        case ValueType::String:
-          out << "S " << dbi << " " << ttl << " " << std::quoted(key) << " " << std::quoted(e.str())
-              << "\n";
-          break;
-        case ValueType::Hash:
-          out << "H " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.hash().size();
-          for (const auto& [f, v] : e.hash()) out << " " << std::quoted(f) << " " << std::quoted(v);
-          out << "\n";
-          break;
-        case ValueType::List:
-          out << "L " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.list().size();
-          for (const auto& v : e.list()) out << " " << std::quoted(v);
-          out << "\n";
-          break;
-        case ValueType::Set:
-          out << "T " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.set().size();
-          for (const auto& m : e.set()) out << " " << std::quoted(m);
-          out << "\n";
-          break;
-        case ValueType::ZSet:
-          out << "Z " << dbi << " " << ttl << " " << std::quoted(key) << " " << e.zset().size();
-          for (const auto& [m, s] : e.zset()) out << " " << std::quoted(m) << " " << s;
-          out << "\n";
-          break;
-        case ValueType::Stream:
-          out << "X " << dbi << " " << ttl << " " << std::quoted(key) << " "
-              << e.stream_entries().size() << " " << e.stream_last_ms() << " "
-              << e.stream_last_seq();
-          for (const auto& [id, fields] : e.stream_entries()) {
-            out << " " << std::quoted(id) << " " << fields.size();
-            for (const auto& [f, v] : fields) out << " " << std::quoted(f) << " " << std::quoted(v);
-          }
-          out << "\n";
-          break;
-      }
-    }
-  }
-  return true;
-}
-
 bool DataStore::load_snapshot_file(const std::filesystem::path& path, std::string& err) {
   err.clear();
   std::ifstream in(path);
@@ -3537,14 +3483,6 @@ std::string DataStore::debug_digest() {
   char buf[17];
   std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(acc));
   return std::string(24, '0') + buf;
-}
-
-void DataStore::set_zset_max_ziplist_entries(std::int64_t v) {
-  encoding_limits_.zset_entries = v;
-}
-
-std::int64_t DataStore::zset_max_ziplist_entries() const {
-  return encoding_limits_.zset_entries;
 }
 
 std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::size_t budget_per_db) {

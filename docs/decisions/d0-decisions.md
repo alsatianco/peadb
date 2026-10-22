@@ -33,7 +33,7 @@ Quality bar:
 - Minimum kernel target: Linux `5.15+`
 - `liburing` target: `2.4+`
 
-Policy:
+Target policy (future work; the current Linux event loop uses epoll, with no io_uring backend):
 - Runtime backend is pluggable.
 - `epoll` fallback is required for environments without usable io_uring.
 - Semantics must be backend-independent.
