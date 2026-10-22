@@ -291,7 +291,8 @@ int main(int argc, char** argv) {
       if (probe.read(header, sizeof(header)))
         is_legacy_snapshot = std::string(header, sizeof(header)) == "PEADB-SNAPSHOT-V1\n";
     }
-    bool loaded = peadb::rdb_load(snap, err);
+    peadb::RdbReplicationInfo repl;
+    bool loaded = peadb::rdb_load(snap, err, nullptr, &repl, peadb::feed_rdb_startup_expiry);
     if (!loaded && is_legacy_snapshot) {
       peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");
       loaded = peadb::store().load_snapshot_file(snap, err);
@@ -301,6 +302,7 @@ int main(int argc, char** argv) {
       peadb::log(peadb::LogLevel::Error, "Fatal error loading the DB, check server logs. Exiting.");
       return 1;
     }
+    peadb::restore_rdb_replication(repl);
   }
 
   peadb::set_loading(false);

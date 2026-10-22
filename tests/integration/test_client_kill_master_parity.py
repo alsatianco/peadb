@@ -2,6 +2,8 @@
 """CLIENT KILL reaches the upstream master and resumes applied history, as Redis does."""
 import os
 import subprocess
+import sys
+from pathlib import Path
 import tempfile
 
 from _isolated_server import IsolatedServer
@@ -36,7 +38,8 @@ def run(binary):
             m, r = conns
             m('SELECT', 5)
             m('SET', 'counter', 0)
-            check(r('REPLICAOF', 'localhost', p[0]) == '+OK', 'follow hostname master')
+            # Match the IPv4-only listener: localhost can resolve to ::1 first on Linux.
+            check(r('REPLICAOF', '127.0.0.1', p[0]) == '+OK', 'follow IPv4 master')
             wait_link(r)
             r('SELECT', 5)
             check(m('INCR', 'counter') == 1 and m('WAIT', 1, 3000) == 1, 'initial data')
@@ -109,6 +112,9 @@ def run(binary):
             print('PASS upstream CLIENT KILL filters, repeated kill and cached PSYNC:', binary,
                   flush=True)
         finally:
+            if sys.exc_info()[0] is not None:
+                for path in sorted(Path(td).glob('*.log')):
+                    print(f'{path}:\n{path.read_text(errors="replace")[-12000:]}', file=sys.stderr)
             for c in conns:
                 c.close()
             for proc in reversed(procs):

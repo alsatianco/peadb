@@ -48,6 +48,14 @@ FunctionLoadFn g_function_load_hook;      // loads one library's source (idempot
 RdbLoadStats g_rdb_load_stats;
 }  // namespace
 
+bool RdbReplicationInfo::valid() const {
+  return stream_db >= 0 && static_cast<std::size_t>(stream_db) < store().database_count() &&
+         offset >= 0 && offset < std::numeric_limits<std::int64_t>::max() && replid.size() == 40 &&
+         std::all_of(replid.begin(), replid.end(), [](unsigned char c) {
+           return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+         });
+}
+
 const RdbLoadStats& rdb_last_load_stats() {
   return g_rdb_load_stats;
 }
@@ -1495,7 +1503,7 @@ std::string rdb_build_string(std::string& err, bool key_save_delay,
   write_aux("redis-bits", "64");
   write_aux("ctime", std::to_string(std::time(nullptr)));
   write_aux("used-mem", "0");
-  // A full sync's RDB carries the replication state it was taken at, as Redis's
+  // An RDB with live/cached history carries the state it was taken at, as Redis's
   // rdbSaveInfoAuxFields() writes it: the replica selects repl-stream-db for its master's stream.
   if (repl != nullptr) {
     write_aux("repl-stream-db", std::to_string(repl->stream_db));
@@ -1701,9 +1709,11 @@ std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl)
 // ── RDB Load ───────────────────────────────────────────────────────────
 
 bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace, int* repl_stream_db) {
+              const std::function<void()>& before_replace, RdbReplicationInfo* repl,
+              const std::function<void(int, const std::string&)>& expired) {
   err.clear();
-  if (repl_stream_db != nullptr) *repl_stream_db = -1;
+  if (repl) *repl = {};
+  RdbReplicationInfo loaded_repl;
 
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
@@ -1765,6 +1775,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   auto& ds = store();
   auto load = [&](bool apply) {
     RdbReader r(filedata.data() + 9, filedata.size() - 9);
+    RdbReplicationInfo parsed_repl;
     if (apply) {
       g_rdb_load_stats = {};
       if (before_replace) before_replace();
@@ -1822,12 +1833,27 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
           if (apply) ds.select_db(prev_db);
           return false;
         }
-        // rdbLoadRio(): the database the master's stream has selected, for a replica's full sync.
-        if (apply && repl_stream_db != nullptr && aux_key == "repl-stream-db") {
-          char* end = nullptr;
-          const long db = std::strtol(aux_val.c_str(), &end, 10);
-          if (end != aux_val.c_str() && *end == '\0' && db >= 0 && db < 16)
-            *repl_stream_db = static_cast<int>(db);
+        // AUX names are case-insensitive in Redis. Parse complete, bounded values: malformed
+        // optional metadata must never authorize PSYNC against an unrelated dataset.
+        std::transform(aux_key.begin(), aux_key.end(), aux_key.begin(),
+                       [](unsigned char c) { return c >= 'A' && c <= 'Z' ? c + ('a' - 'A') : c; });
+        auto integer = [&]() -> std::optional<std::int64_t> {
+          std::int64_t n;
+          const auto [end, ec] =
+              std::from_chars(aux_val.data(), aux_val.data() + aux_val.size(), n);
+          if (ec != std::errc{} || end != aux_val.data() + aux_val.size()) return std::nullopt;
+          return n;
+        };
+        if (aux_key == "repl-stream-db") {
+          const auto db = integer();
+          parsed_repl.stream_db =
+              db && *db >= 0 && static_cast<std::uint64_t>(*db) < ds.database_count()
+                  ? static_cast<int>(*db)
+                  : -1;
+        } else if (aux_key == "repl-id") {
+          parsed_repl.replid = aux_val;
+        } else if (aux_key == "repl-offset") {
+          parsed_repl.offset = integer().value_or(-1);
         }
         continue;
       }
@@ -2004,6 +2030,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         if (expire_at && *expire_at < load_now && !ds.replica_expiry()) {
           ds.del(key);
           ++g_rdb_load_stats.expired;
+          if (expired) expired(ds.current_db(), key);
         } else {
           ++g_rdb_load_stats.loaded;
         }
@@ -2015,13 +2042,16 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
       return false;
     }
+    if (apply) loaded_repl = std::move(parsed_repl);
     return true;
   };
   // A full sync must refuse an out-of-range SELECTDB before its callback publishes the
   // snapshot or clears libraries/persistence/history. Decode one value at a time, discarding
   // it, then re-read the same immutable bytes to apply; no second whole dataset is retained.
   if (before_replace && !load(false)) return false;
-  return load(true);
+  if (!load(true)) return false;
+  if (repl) *repl = std::move(loaded_repl);
+  return true;
 }
 
 // ── DUMP / RESTORE ─────────────────────────────────────────────────────

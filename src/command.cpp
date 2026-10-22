@@ -1249,6 +1249,21 @@ void note_rdb_saved(std::int64_t epoch_at_start) {
   g_last_bgsave_status = "ok";
 }
 
+// Redis's rdbPopulateSaveInfo(): only a master with a real backlog, or a replica
+// with an applied live/cached upstream, can describe resumable snapshot history.
+std::optional<RdbReplicationInfo> rdb_replication_info() {
+  if (g_replication_role == "slave" ? !g_cached_master : !g_backlog_has_replica)
+    return std::nullopt;
+  return RdbReplicationInfo{g_replication_role == "slave" ? g_master_stream_session.db_index
+                                                          : std::max(g_last_repl_db, 0),
+                            g_master_replid, g_master_repl_offset};
+}
+
+bool save_rdb_with_history(std::string& err) {
+  const auto info = rdb_replication_info();
+  return rdb_save(g_snapshot_path, err, info ? &*info : nullptr);
+}
+
 // Redis's rdbSaveBackground(): forks a child that writes the RDB, for the BGSAVE command and the
 // save points. A failed fork() marks the BGSAVE as failed (rdb_last_bgsave_status:err, so writes
 // are refused while save points are set) and is logged. The change count and the save time move
@@ -1258,11 +1273,12 @@ bool do_bgsave_fork(const RdbReplicationInfo* repl = nullptr) {
   ++g_stat_rdb_saves;
   g_dirty_before_bgsave = static_cast<std::int64_t>(store().mutation_epoch());
   g_lastbgsave_try = now_ms() / 1000;
+  const auto history = repl ? std::optional<RdbReplicationInfo>(*repl) : rdb_replication_info();
   const auto fork_t0 = std::chrono::steady_clock::now();
   const pid_t pid = fork_child();
   if (pid == 0) {
     std::string err;
-    const bool ok = rdb_save(g_snapshot_path, err, repl);
+    const bool ok = rdb_save(g_snapshot_path, err, history ? &*history : nullptr);
     if (ok) {
       log(LogLevel::Info, "DB saved on disk");
     } else {
@@ -7599,7 +7615,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     const auto epoch =
                                         static_cast<std::int64_t>(store().mutation_epoch());
                                     std::string err;
-                                    if (!rdb_save(g_snapshot_path, err)) {
+                                    if (!save_rdb_with_history(err)) {
                                       log(LogLevel::Warn, err);
                                       return std::string("-ERR\r\n");
                                     }
@@ -8619,7 +8635,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 std::string err;
                 if (!nosave) {
                   const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
-                  if (!rdb_save(g_snapshot_path, err)) {
+                  if (!save_rdb_with_history(err)) {
                     log(LogLevel::Warn, err);
                     return std::string("-ERR\r\n");
                   }
@@ -10049,7 +10065,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                       kill_rdb_child();
                       if (!g_save_params.empty()) {
                         std::string err;
-                        if (rdb_save(g_snapshot_path, err)) {
+                        if (save_rdb_with_history(err)) {
                           // The dispatch counts this FLUSHALL as one change when it returns, and
                           // Redis's rdbSave() leaves the change count at 0 after a FLUSHALL, so the
                           // count restarts after this command.
@@ -16615,6 +16631,60 @@ void configure_replication(bool replica, const std::string& host, int port) {
   store().set_replica_expiry(replica);
 }
 
+void feed_rdb_startup_expiry(int db, const std::string& key) {
+  if (g_replication_role == "slave") return;
+  // loadDataFromDisk(): the initial backlog holds only DELs generated while loading.
+  // Force a SELECT for the first one, even in DB 0.
+  if (!g_backlog_has_replica) {
+    start_backlog();
+    g_last_repl_db = -1;
+  }
+  if (g_last_repl_db != db) {
+    backlog_append(encode_command_resp({"SELECT", std::to_string(db)}));
+    g_last_repl_db = db;
+  }
+  backlog_append(encode_command_resp({"DEL", key}));
+}
+
+void restore_rdb_replication(const RdbReplicationInfo& info) {
+  if (!info.valid() ||
+      info.offset > std::numeric_limits<std::int64_t>::max() - 1 - g_master_repl_offset) {
+    // Optional metadata cannot authorize history after a missing/invalid snapshot. Keep
+    // the ordinary fresh-master behavior, with no active backlog or cached upstream.
+    g_cached_master = false;
+    g_backlog_has_replica = false;
+    g_repl_backlog.reset_at(0);
+    g_master_repl_offset = 0;
+    g_last_repl_db = -1;
+    return;
+  }
+  if (g_replication_role == "slave") {
+    g_master_replid = info.replid;
+    g_master_repl_offset = info.offset;
+    g_replica_read_offset = info.offset;
+    g_master_stream_session = SessionState{};
+    g_master_stream_session.db_index = info.stream_db;
+    g_cached_master = true;
+    g_repl_backlog.reset_at(info.offset);
+    g_backlog_has_replica = false;  // Redis creates it only when the upstream accepts CONTINUE.
+  } else {
+    // A restarted master has a fresh primary ID. Only the snapshot point and DELs
+    // actually generated during loading can be offered under the old secondary ID.
+    std::string pending;
+    const auto base = g_repl_backlog.base();
+    g_repl_backlog.get_slice(base, pending);
+    g_master_replid2 = info.replid;
+    g_second_replid_offset = info.offset + 1;
+    g_master_repl_offset = info.offset + g_repl_backlog.total;
+    g_repl_backlog.reset_at(info.offset + base);
+    g_repl_backlog.append(pending);
+    g_replicas_taken_to = g_master_repl_offset;
+    g_backlog_has_replica = true;
+    g_repl_no_replicas_since = now_ms() / 1000;
+    if (pending.empty()) g_last_repl_db = -1;
+  }
+}
+
 void start_configured_replication() {
   if (g_replication_role == "slave") {
     const auto gen = g_repl_generation.fetch_add(1) + 1;
@@ -17314,7 +17384,7 @@ bool finish_shutdown() {
     log(LogLevel::Info, "Saving the final RDB snapshot before exiting.");
     const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
     std::string err;
-    if (rdb_save(g_snapshot_path, err)) {
+    if (save_rdb_with_history(err)) {
       note_rdb_saved(epoch);
     } else {
       log(LogLevel::Warn, err);
@@ -17894,6 +17964,7 @@ void drain_replica_cmd_queue() {
           g_master_replid = request->replid;
           disconnect_replicas();
         }
+        if (!g_backlog_has_replica) start_backlog();
         request->cached = true;
       }
     }
@@ -17936,7 +18007,7 @@ void drain_replica_cmd_queue() {
       // full sync). The checksum is checked as for any load (a real Redis master writes the same
       // CRC64 as PeaDB, or 0 with rdbchecksum no); on a mismatch keys and libraries are kept and
       // the sync is tried again.
-      int stream_db = -1;
+      RdbReplicationInfo loaded_repl;
       try {
         ok = rdb_load(
             path, err,
@@ -17973,7 +18044,7 @@ void drain_replica_cmd_queue() {
               }
               functions_flush_all();
             },
-            &stream_db);
+            &loaded_repl);
       } catch (const std::exception& e) {
         err = e.what();
       }
@@ -17990,7 +18061,7 @@ void drain_replica_cmd_queue() {
         g_master_repl_offset = offset;
         g_cached_master = true;
         start_backlog();
-        if (stream_db >= 0) g_master_stream_session.db_index = stream_db;
+        if (loaded_repl.stream_db >= 0) g_master_stream_session.db_index = loaded_repl.stream_db;
         note_rdb_saved(static_cast<std::int64_t>(store().mutation_epoch()));
         if (g_aof_sync_suspended) restart_aof_after_sync();
       }

@@ -150,6 +150,11 @@ void configure_runtime_port(int port);
 // Set the configured role before loading persistence; connect once the event loop is ready.
 void configure_replication(bool replica, const std::string& host, int port);
 void start_configured_replication();
+// Startup RDB history only (never AOF/DEBUG RELOAD/full sync). Expired keys feed a bounded
+// backlog while loading a master; restore rebases those bytes onto validated snapshot history.
+struct RdbReplicationInfo;
+void feed_rdb_startup_expiry(int db, const std::string& key);
+void restore_rdb_replication(const RdbReplicationInfo& info);
 void configure_max_clients(int max_clients);
 int configured_max_clients();  // read live by the accept loop, so CONFIG SET maxclients applies
 // Raises the open-files soft limit so `max_clients` clients fit (Redis's adjustOpenFilesLimit())

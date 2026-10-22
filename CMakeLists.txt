@@ -146,6 +146,10 @@ if(BUILD_TESTING)
   target_link_libraries(rdb_crc64_test PRIVATE peadb_core)
   add_test(NAME rdb_crc64_test COMMAND rdb_crc64_test)
 
+  add_executable(rdb_replication_test tests/unit/rdb_replication_test.cpp)
+  target_link_libraries(rdb_replication_test PRIVATE peadb_core)
+  add_test(NAME rdb_replication_test COMMAND rdb_replication_test)
+
   add_executable(list_zset_in_place_test tests/unit/list_zset_in_place_test.cpp)
   target_link_libraries(list_zset_in_place_test PRIVATE peadb_core)
   add_test(NAME list_zset_in_place_test COMMAND list_zset_in_place_test)

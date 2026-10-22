@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import pathlib
 import socket
 import subprocess
@@ -8,6 +9,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _readiness import wait_until_ready
+from _isolated_server import IsolatedServer
+from test_replica_offset_parity import PEADB, REDIS, check
+from test_replica_resync_parity import ports
 
 
 def rx(s, n):
@@ -59,11 +63,36 @@ def cmd(s, *a):
     return recv(s)
 
 
-def main():
-    p = subprocess.Popen([str(ROOT / "peadb-server"), "--port", "6466", "--bind", "127.0.0.1", "--loglevel", "warning"])
+def snapshot(sock):
+    # replicationCron sends bare newlines while the disk snapshot is pending. They
+    # precede the bulk header and do not belong to the RDB payload (Redis 7.2.5).
+    deadline = time.monotonic() + 10
+    keepalives = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('SYNC never sent an RDB bulk header')
+        sock.settimeout(remaining)
+        prefix = rx(sock, 1)
+        if prefix != b"\n":
+            break
+        keepalives += 1
+    assert prefix == b"$", f'unexpected SYNC header prefix: {prefix!r}'
+    size = int(rl(sock))
+    assert size > 9, f'invalid RDB size: {size}'
+    payload = rx(sock, size)
+    assert payload.startswith(b"REDIS"), 'SYNC must send the full-state native RDB'
+    return keepalives
+
+
+def run(binary):
+    port = ports(1)[0]
+    p = IsolatedServer([binary, "--port", str(port), "--bind", "127.0.0.1", "--loglevel", "warning",
+                        "--save", "", "--shutdown-timeout", "0", "--repl-diskless-sync", "no",
+                        "--repl-diskless-sync-delay", "0"])
     try:
-        wait_until_ready(6466, process=p)
-        with socket.create_connection(("127.0.0.1", 6466), timeout=2) as s:
+        wait_until_ready(port, process=p)
+        with socket.create_connection(("127.0.0.1", port), timeout=2) as s:
             assert cmd(s, "FLUSHALL") == "OK"
             assert cmd(s, "SET", "k", "v") == "OK"
             assert cmd(s, "OBJECT", "REFCOUNT", "k") == 1
@@ -73,16 +102,29 @@ def main():
             assert cmd(s, "GET", "k2") is None
             assert cmd(s, "SELECT", "0") == "OK"
             assert cmd(s, "GET", "k2") == "v2"
-
-        with socket.create_connection(("127.0.0.1", 6466), timeout=2) as rs:
+            # Two keys at 600 ms each guarantee a pending snapshot across a cron
+            # keepalive tick; this exercises framing under load without relying on luck.
+            assert cmd(s, "CONFIG", "SET", "rdb-key-save-delay", "600000") == "OK"
+        with socket.create_connection(("127.0.0.1", port), timeout=5) as rs:
             rs.sendall(b"SYNC\r\n")
-            assert rx(rs, 1) == b"$"
-            rx(rs, int(rl(rs)))  # consume full-state RDB
-        print("P1 OBJECT/SWAPDB/SYNC tests passed")
-        return 0
+            assert snapshot(rs) > 0, 'delayed snapshot must exercise keepalive framing'
+        print("P1 OBJECT/SWAPDB/SYNC tests passed:", binary, flush=True)
     finally:
         p.terminate()
-        p.wait(timeout=3)
+        try:
+            p.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+
+
+def main():
+    check(REDIS is not None, 'pinned Redis reference required')
+    version = subprocess.check_output([REDIS, '--version'], text=True)
+    check(' v=7.2.5 ' in version, f'Redis 7.2.5 required: {version}')
+    run(REDIS)
+    run(os.environ.get('PEADB_TEST_BIN', PEADB))
+    return 0
 
 
 if __name__ == "__main__":

@@ -43,12 +43,13 @@ void rdb_set_key_save_delay(int usec);
 int rdb_key_save_delay();
 void debug_delay(int usec);
 
-// The replication state a full sync's RDB carries (Redis's rdbSaveInfo): the database the
+// The replication state an RDB carries (Redis's rdbSaveInfo): the database the
 // replication stream has selected, and the replication id and offset the RDB was taken at.
 struct RdbReplicationInfo {
-  int stream_db = 0;
+  int stream_db = -1;
   std::string replid;
-  std::int64_t offset = 0;
+  std::int64_t offset = -1;
+  bool valid() const;
 };
 
 // Serialize all databases to an in-memory RDB blob, with the repl-stream-db,
@@ -64,9 +65,13 @@ std::string rdb_save_to_string(std::string& err, const RdbReplicationInfo* repl 
 // the callback publishes the snapshot and the loader flushes the keyspace. It discards one value
 // at a time, then re-decodes the same bytes to apply. Function-library Lua compilation/collisions
 // and apply-time allocation failures are not staged and can still fail after replacement.
-// `repl_stream_db`, when given, receives the file's repl-stream-db aux field (-1 without one).
+// `repl`, when given, is reset on entry and published only after a successful load. Invalid or
+// absent AUX values cannot authorize resumption; valid() requires complete, bounded history.
+// `expired` is used only by master startup to feed DELs for keys dropped during loading.
 bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace = nullptr, int* repl_stream_db = nullptr);
+              const std::function<void()>& before_replace = nullptr,
+              RdbReplicationInfo* repl = nullptr,
+              const std::function<void(int, const std::string&)>& expired = nullptr);
 
 // INFO persistence counters for the last RDB application (startup, DEBUG RELOAD, full sync).
 // Validation passes do not change these; a replica retains expired keys as Redis does.

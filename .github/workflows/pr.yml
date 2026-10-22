@@ -50,3 +50,13 @@ jobs:
           if [ -f scripts/ci/check_compat_delta.py ]; then
             python3 scripts/ci/check_compat_delta.py
           fi
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-failure-logs
+          path: |
+            artifacts/integration/
+            build/Testing/Temporary/LastTest.log
+          if-no-files-found: ignore

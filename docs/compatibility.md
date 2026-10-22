@@ -66,6 +66,8 @@ See [`../compat/delta.md`](../compat/delta.md) for authoritative, per-feature de
 
 ## Persistence & durability
 
+RDB restarts can resume replication from saved history when the upstream still holds the requested bytes. AOF restarts and snapshots without usable metadata require full synchronization. Restart guarantees and fallback boundaries are documented in [delta item 47](../compat/delta.md).
+
 Full sync uses a forked disk snapshot at `dir`/`dbfilename`, even with save points disabled, so the master needs a writable data directory and space for the snapshot. RDB bytes stream separately from the replica output buffer; post-fork command bytes retain the configured buffer limits. See [`../compat/delta.md`](../compat/delta.md) item 46 for behavior and remaining diskless/writer differences.
 
 A replica and an AOF reload apply writes regardless of client limits or the local cluster slot map. Replication errors are logged and counted in `INFO stats` as `unexpected_error_replies`. With a local persistence error, a replica stops on the next write from its master unless `replica-ignore-disk-write-errors yes` is set; that setting keeps applying with a rate-limited warning, as Redis 7.2.5 does. See [`../compat/delta.md`](../compat/delta.md) item 43.
