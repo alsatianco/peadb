@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Sharing Audit"
+  short_description: "Find sensitive and personal content before sharing Git"
+  default_prompt: "Use $git-sharing-audit to check this repository and its history for content that should not be pushed to public or shared Git, and report redacted findings."
