@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Record the complete native logging baseline: missing watchdog traces, incompatible fatal-signal log destination/header and unsupported DEBUG SEGFAULT prevent adoption. Keep the suite unadopted and separate these diagnostic prerequisites from file/syslog/pidfile support.
+
 - Adopt unmodified native `integration/psync2` without skips after a pinned Redis reference and repeated PeaDB runs. Validate every timed-loop cycle while retaining raw repetitions and using stable parity credit; require matching counting policies in the suite ratchet.
 
 - Fix Linux integration fixtures to use matching IPv4 replication endpoints and parse SYNC keepalive newlines before its RDB bulk header. Exercise a delayed save against Redis first, isolate test data/ports and retain PR failure logs; record prevention guidance in AGENTS.md.
