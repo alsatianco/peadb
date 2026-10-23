@@ -48,6 +48,7 @@ add_library(peadb_core
     src/config.cpp
     src/config_rewrite.cpp
     src/logger.cpp
+    src/watchdog.cpp
     src/protocol.cpp
     src/server.cpp
     src/sha256.cpp
@@ -62,6 +63,9 @@ add_library(peadb_core
 target_include_directories(peadb_core PUBLIC include)
 target_link_libraries(peadb_core PUBLIC lua_bundled m)
 target_compile_options(peadb_core PRIVATE -Wall -Wextra -Wno-unused-parameter)
+# Retain frames for the watchdog's bounded, signal-safe interrupted-stack walk.
+target_compile_options(peadb_core PUBLIC -fno-omit-frame-pointer)
+target_compile_options(lua_bundled PRIVATE -fno-omit-frame-pointer)
 target_compile_definitions(peadb_core PUBLIC PEADB_VERSION="${PROJECT_VERSION}")
 
 add_executable(peadb-server src/main.cpp)

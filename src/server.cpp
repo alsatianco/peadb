@@ -1,4 +1,5 @@
 #include "server.hpp"
+#include "watchdog.hpp"
 
 #include "command.hpp"
 #include "datastore.hpp"
@@ -1161,7 +1162,9 @@ int run_server(const ServerConfig& config) {
   };
 
   start_configured_replication();
+  EventLoopWatchdog watchdog;
   while (!shutdown_requested()) {
+    watchdog_rearm();
     // A SIGTERM or SIGINT asked for a shutdown, or a shutdown waits for replicas: run it here,
     // between commands, as Redis does from serverCron() (it is not safe inside the signal
     // handler).

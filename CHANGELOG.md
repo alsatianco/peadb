@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Implement the event-loop watchdog: startup/runtime `watchdog-period`, one-shot timer rearming, signal-safe interrupted-stack capture and supplemental symbols, with disable/update/recovery and Redis-first stall regressions. The fixed housekeeping tick imposes a 200 ms minimum; fatal-signal diagnostics and native logging adoption remain separate work (delta 60).
+
 - Record the complete native logging baseline: missing watchdog traces, incompatible fatal-signal log destination/header and unsupported DEBUG SEGFAULT prevent adoption. Keep the suite unadopted and separate these diagnostic prerequisites from file/syslog/pidfile support.
 
 - Adopt unmodified native `integration/psync2` without skips after a pinned Redis reference and repeated PeaDB runs. Validate every timed-loop cycle while retaining raw repetitions and using stable parity credit; require matching counting policies in the suite ratchet.

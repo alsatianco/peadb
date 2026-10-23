@@ -1,4 +1,5 @@
 #include "command.hpp"
+#include "watchdog.hpp"
 #include "config_rewrite.hpp"
 #include "zmalloc.hpp"
 #include "command_metadata.generated.hpp"
@@ -70,6 +71,8 @@ void register_key_waiter(const std::string& key, int fd);
 void unregister_key_waiter(int fd);
 void notify_key_written(const std::string& key, int db_index);
 bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen);
+// A named command entry point keeps real diagnostic frames identifiable.
+std::string debugCommand(const std::vector<std::string>& args, SessionState& session, bool&);
 
 namespace {
 
@@ -5460,6 +5463,13 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             return true;
           }}},
         {"timeout", live_number(g_config_timeout)},
+        {"watchdog-period",
+         {[] { return std::to_string(watchdog_period()); },
+          [](const std::string& v, std::string& err) {
+            if (configure_watchdog(std::stoi(v))) return true;
+            err = "Unable to configure event-loop watchdog";
+            return false;
+          }}},
         {"tcp-keepalive", live_number(g_tcp_keepalive)},
         {"repl-timeout",
          {[] { return std::to_string(g_repl_timeout.load()); },
@@ -8536,197 +8546,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   "'. Try CONFIG HELP.");
             }});
 
-    t.emplace(
-        "DEBUG",
-        CommandSpec{
-            "DEBUG",
-            -2,
-            {"admin"},
-            0,
-            0,
-            0,
-            [](const std::vector<std::string>& args, SessionState& session, bool&) {
-              if (args.size() == 3 && upper(args[1]) == "SET-ACTIVE-EXPIRE") {
-                std::int64_t v = 0;
-                if (!parse_i64(args[2], v) || (v != 0 && v != 1))
-                  return encode_error("value is not an integer or out of range");
-                g_active_expire = (v == 1);
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "SET-DISABLE-DENY-SCRIPTS") {
-                std::int64_t v = 0;
-                if (!parse_i64(args[2], v) || (v != 0 && v != 1))
-                  return encode_error("value is not an integer or out of range");
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "DIGEST-VALUE") {
-                auto v = store().debug_digest_value(args[2]);
-                return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
-              }
-              if (args.size() == 2 && upper(args[1]) == "DIGEST") {
-                return encode_simple(store().debug_digest());
-              }
-              if (args.size() >= 2 && upper(args[1]) == "RELOAD") {
-                // Save + flush + load, exercising the full RDB self-roundtrip. Flags mirror Redis:
-                //   NOSAVE  — skip the save; load the on-disk dump as-is.
-                //   NOFLUSH — don't empty the keyspace/functions before loading.
-                //   MERGE   — function loads overwrite existing libraries (else a NOFLUSH reload
-                //             collides with "already exists" and fails the whole load).
-                bool nosave = false, noflush = false, merge = false;
-                for (std::size_t i = 2; i < args.size(); ++i) {
-                  const auto o = upper(args[i]);
-                  if (o == "NOSAVE")
-                    nosave = true;
-                  else if (o == "NOFLUSH")
-                    noflush = true;
-                  else if (o == "MERGE")
-                    merge = true;
-                }
-                std::string err;
-                if (!nosave) {
-                  const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
-                  if (!save_rdb_with_history(err)) {
-                    log(LogLevel::Warn, err);
-                    return std::string("-ERR\r\n");
-                  }
-                  note_rdb_saved(epoch);
-                }
-                if (!noflush) {
-                  store().flushall();
-                  functions_flush_all();
-                }
-                g_rdb_load_functions_replace = merge;
-                const bool ok = rdb_load(g_snapshot_path, err);
-                g_rdb_load_functions_replace =
-                    true;  // restore safe default for replica/startup loads
-                if (!ok) return encode_error("Error trying to load the RDB dump: " + err);
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "OBJECT") {
-                // Raw dict peek like Redis debugCommand: a logically-expired-but-unreaped
-                // key still reports its object info instead of erroring/expiring.
-                const DataStore::LazyExpireDisabled raw_lookup(store());
-                if (!store().key_exists_raw(args[2])) return encode_error("no such key");
-                const auto enc = store().object_encoding(args[2]).value_or("raw");
-                const auto dump = rdb_dump_key(args[2]);
-                const std::size_t serialized = dump.size() >= 10 ? dump.size() - 10 : dump.size();
-                const auto idle = store().object_idletime_seconds(args[2]).value_or(0);
-                const auto lru = store().object_lru_clock(args[2]).value_or(0);
-                return encode_simple("Value at:0x0 refcount:1 encoding:" + enc +
-                                     " serializedlength:" + std::to_string(serialized) +
-                                     " lru:" + std::to_string(lru) +
-                                     " lru_seconds_idle:" + std::to_string(idle));
-              }
-              if (args.size() == 2 && upper(args[1]) == "LOADAOF") {
-                // Redis's flushAppendOnlyFile(1) first. Bytes the file still cannot take would be
-                // lost from memory by the reload and written after it, so PeaDB refuses then.
-                if (g_aof_state == AofState::On) flush_append_only_file({});
-                if (!g_aof_buf.empty()) return misconf_reply();
-                if (g_aof_fd >= 0) ::fsync(g_aof_fd);
-                if (std::filesystem::exists(g_aof_path)) {
-                  store().flushall();
-                  std::string err;
-                  if (!load_aof_file(g_aof_path.string(), err)) {
-                    return encode_error("Error trying to load the AOF: " + err);
-                  }
-                }
-                return encode_simple("OK");
-              }
-              if ((args.size() >= 3 && args.size() <= 5) && upper(args[1]) == "POPULATE") {
-                std::int64_t count = 0;
-                if (!parse_i64(args[2], count) || count < 0)
-                  return encode_error("value is not an integer or out of range");
-                const std::string prefix = args.size() >= 4 ? args[3] : "key:";
-                std::int64_t vsize = 0;
-                if (args.size() == 5 && (!parse_i64(args[4], vsize) || vsize < 0))
-                  return encode_error("value is not an integer or out of range");
-                for (std::int64_t i = 0; i < count; ++i) {
-                  std::string val = "value:" + std::to_string(i);
-                  if (vsize > 0) val.resize(static_cast<std::size_t>(vsize), 'A');
-                  store().set(prefix + std::to_string(i), val, false, false, std::nullopt, false);
-                }
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "SET-SKIP-CHECKSUM-VALIDATION") {
-                std::int64_t v = 0;
-                if (!parse_i64(args[2], v) || (v != 0 && v != 1))
-                  return encode_error("value is not an integer or out of range");
-                rdb_set_skip_checksum_validation(v == 1);
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "QUICKLIST-PACKED-THRESHOLD") {
-                return encode_simple("OK");  // accepted; meaningful once real quicklists exist
-              }
-              if (args.size() == 3 && upper(args[1]) == "PAUSE-CRON") {
-                std::int64_t v = 0;
-                if (!parse_i64(args[2], v) || (v != 0 && v != 1))
-                  return encode_error("value is not an integer or out of range");
-                g_pause_cron = (v == 1);
-                return encode_simple("OK");
-              }
-              if (args.size() == 2 && upper(args[1]) == "JMAP") return encode_simple("OK");
-              if (args.size() == 3 && upper(args[1]) == "SLEEP") {
-                double secs = 0;
-                try {
-                  secs = std::stod(args[2]);
-                } catch (...) {
-                  return encode_error("Invalid debug sleep time");
-                }
-                if (secs > 0) {
-                  std::this_thread::sleep_for(
-                      std::chrono::microseconds(static_cast<long long>(secs * 1000000)));
-                }
-                return encode_simple("OK");
-              }
-              if (args.size() == 3 && upper(args[1]) == "PROTOCOL") {
-                // Mirror Redis debug.c: the addReply* helpers downgrade automatically in RESP2,
-                // so every type has a distinct RESP2 vs RESP3 wire form.
-                const bool r3 = session.resp_version == RespVersion::Resp3;
-                const auto ptype = lower(args[2]);
-                if (ptype == "string") return encode_bulk("Hello World");
-                if (ptype == "integer") return encode_integer(12345);
-                if (ptype == "double") return encode_double(3.141, session.resp_version);
-                if (ptype == "bignum") {
-                  const std::string n = "1234567999999999999999999999999999999";
-                  return r3 ? ("(" + n + "\r\n") : encode_bulk(n);
-                }
-                if (ptype == "null") return encode_null(session.resp_version);
-                if (ptype == "array") return std::string("*3\r\n:0\r\n:1\r\n:2\r\n");
-                if (ptype == "set")
-                  return std::string(r3 ? "~3\r\n" : "*3\r\n") + ":0\r\n:1\r\n:2\r\n";
-                if (ptype == "map")
-                  return r3 ? std::string("%3\r\n:0\r\n#f\r\n:1\r\n#t\r\n:2\r\n#f\r\n")
-                            : std::string("*6\r\n:0\r\n:0\r\n:1\r\n:1\r\n:2\r\n:0\r\n");
-                if (ptype == "verbatim") {
-                  const std::string s = "This is a verbatim\nstring";  // 25 bytes
-                  return encode_verbatim(s, session.resp_version);
-                }
-                if (ptype == "true") return std::string(r3 ? "#t\r\n" : ":1\r\n");
-                if (ptype == "false") return std::string(r3 ? "#f\r\n" : ":0\r\n");
-                if (ptype == "attrib") {
-                  // The attribute prefix is emitted only in RESP3; the trailing real reply
-                  // (a normal bulk string) is always sent so RESP2 clients get a valid reply.
-                  std::string out;
-                  if (r3) out += "|1\r\n$14\r\nkey-popularity\r\n*2\r\n$7\r\nkey:123\r\n:90\r\n";
-                  out += encode_bulk("Some real reply following the attribute");
-                  return out;
-                }
-                if (ptype == "push") {
-                  if (!r3) return encode_error("RESP2 is not supported by this command");
-                  std::string out = ">2\r\n";
-                  out += encode_bulk("server-cpu-usage");
-                  out += encode_integer(42);
-                  out += encode_bulk("Some real reply following the push reply");
-                  return out;
-                }
-                return encode_error(
-                    "Wrong protocol type name. Please use one of the following: "
-                    "string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|"
-                    "false");
-              }
-              return encode_error(
-                  "unknown subcommand or wrong number of arguments for 'DEBUG'. Try DEBUG HELP.");
-            }});
+    t.emplace("DEBUG", CommandSpec{"DEBUG", -2, {"admin"}, 0, 0, 0, debugCommand});
 
     t.emplace(
         "MODULE",
@@ -16025,6 +15845,186 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 
 }  // namespace
 
+std::string debugCommand(const std::vector<std::string>& args, SessionState& session, bool&) {
+  if (args.size() == 3 && upper(args[1]) == "SET-ACTIVE-EXPIRE") {
+    std::int64_t v = 0;
+    if (!parse_i64(args[2], v) || (v != 0 && v != 1))
+      return encode_error("value is not an integer or out of range");
+    g_active_expire = (v == 1);
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "SET-DISABLE-DENY-SCRIPTS") {
+    std::int64_t v = 0;
+    if (!parse_i64(args[2], v) || (v != 0 && v != 1))
+      return encode_error("value is not an integer or out of range");
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "DIGEST-VALUE") {
+    auto v = store().debug_digest_value(args[2]);
+    return v.has_value() ? encode_bulk(*v) : encode_null(RespVersion::Resp2);
+  }
+  if (args.size() == 2 && upper(args[1]) == "DIGEST") {
+    return encode_simple(store().debug_digest());
+  }
+  if (args.size() >= 2 && upper(args[1]) == "RELOAD") {
+    // Save + flush + load, exercising the full RDB self-roundtrip. Flags mirror Redis:
+    //   NOSAVE  — skip the save; load the on-disk dump as-is.
+    //   NOFLUSH — don't empty the keyspace/functions before loading.
+    //   MERGE   — function loads overwrite existing libraries (else a NOFLUSH reload
+    //             collides with "already exists" and fails the whole load).
+    bool nosave = false, noflush = false, merge = false;
+    for (std::size_t i = 2; i < args.size(); ++i) {
+      const auto o = upper(args[i]);
+      if (o == "NOSAVE")
+        nosave = true;
+      else if (o == "NOFLUSH")
+        noflush = true;
+      else if (o == "MERGE")
+        merge = true;
+    }
+    std::string err;
+    if (!nosave) {
+      const auto epoch = static_cast<std::int64_t>(store().mutation_epoch());
+      if (!save_rdb_with_history(err)) {
+        log(LogLevel::Warn, err);
+        return std::string("-ERR\r\n");
+      }
+      note_rdb_saved(epoch);
+    }
+    if (!noflush) {
+      store().flushall();
+      functions_flush_all();
+    }
+    g_rdb_load_functions_replace = merge;
+    const bool ok = rdb_load(g_snapshot_path, err);
+    g_rdb_load_functions_replace = true;  // restore safe default for replica/startup loads
+    if (!ok) return encode_error("Error trying to load the RDB dump: " + err);
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "OBJECT") {
+    // Raw dict peek like Redis debugCommand: a logically-expired-but-unreaped
+    // key still reports its object info instead of erroring/expiring.
+    const DataStore::LazyExpireDisabled raw_lookup(store());
+    if (!store().key_exists_raw(args[2])) return encode_error("no such key");
+    const auto enc = store().object_encoding(args[2]).value_or("raw");
+    const auto dump = rdb_dump_key(args[2]);
+    const std::size_t serialized = dump.size() >= 10 ? dump.size() - 10 : dump.size();
+    const auto idle = store().object_idletime_seconds(args[2]).value_or(0);
+    const auto lru = store().object_lru_clock(args[2]).value_or(0);
+    return encode_simple("Value at:0x0 refcount:1 encoding:" + enc + " serializedlength:" +
+                         std::to_string(serialized) + " lru:" + std::to_string(lru) +
+                         " lru_seconds_idle:" + std::to_string(idle));
+  }
+  if (args.size() == 2 && upper(args[1]) == "LOADAOF") {
+    // Redis's flushAppendOnlyFile(1) first. Bytes the file still cannot take would be
+    // lost from memory by the reload and written after it, so PeaDB refuses then.
+    if (g_aof_state == AofState::On) flush_append_only_file({});
+    if (!g_aof_buf.empty()) return misconf_reply();
+    if (g_aof_fd >= 0) ::fsync(g_aof_fd);
+    if (std::filesystem::exists(g_aof_path)) {
+      store().flushall();
+      std::string err;
+      if (!load_aof_file(g_aof_path.string(), err)) {
+        return encode_error("Error trying to load the AOF: " + err);
+      }
+    }
+    return encode_simple("OK");
+  }
+  if ((args.size() >= 3 && args.size() <= 5) && upper(args[1]) == "POPULATE") {
+    std::int64_t count = 0;
+    if (!parse_i64(args[2], count) || count < 0)
+      return encode_error("value is not an integer or out of range");
+    const std::string prefix = args.size() >= 4 ? args[3] : "key:";
+    std::int64_t vsize = 0;
+    if (args.size() == 5 && (!parse_i64(args[4], vsize) || vsize < 0))
+      return encode_error("value is not an integer or out of range");
+    for (std::int64_t i = 0; i < count; ++i) {
+      std::string val = "value:" + std::to_string(i);
+      if (vsize > 0) val.resize(static_cast<std::size_t>(vsize), 'A');
+      store().set(prefix + std::to_string(i), val, false, false, std::nullopt, false);
+    }
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "SET-SKIP-CHECKSUM-VALIDATION") {
+    std::int64_t v = 0;
+    if (!parse_i64(args[2], v) || (v != 0 && v != 1))
+      return encode_error("value is not an integer or out of range");
+    rdb_set_skip_checksum_validation(v == 1);
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "QUICKLIST-PACKED-THRESHOLD") {
+    return encode_simple("OK");  // accepted; meaningful once real quicklists exist
+  }
+  if (args.size() == 3 && upper(args[1]) == "PAUSE-CRON") {
+    std::int64_t v = 0;
+    if (!parse_i64(args[2], v) || (v != 0 && v != 1))
+      return encode_error("value is not an integer or out of range");
+    g_pause_cron = (v == 1);
+    return encode_simple("OK");
+  }
+  if (args.size() == 2 && upper(args[1]) == "JMAP") return encode_simple("OK");
+  if (args.size() == 3 && upper(args[1]) == "SLEEP") {
+    double secs = 0;
+    try {
+      secs = std::stod(args[2]);
+    } catch (...) {
+      return encode_error("Invalid debug sleep time");
+    }
+    if (secs > 0) {
+      std::this_thread::sleep_for(
+          std::chrono::microseconds(static_cast<long long>(secs * 1000000)));
+    }
+    return encode_simple("OK");
+  }
+  if (args.size() == 3 && upper(args[1]) == "PROTOCOL") {
+    // Mirror Redis debug.c: the addReply* helpers downgrade automatically in RESP2,
+    // so every type has a distinct RESP2 vs RESP3 wire form.
+    const bool r3 = session.resp_version == RespVersion::Resp3;
+    const auto ptype = lower(args[2]);
+    if (ptype == "string") return encode_bulk("Hello World");
+    if (ptype == "integer") return encode_integer(12345);
+    if (ptype == "double") return encode_double(3.141, session.resp_version);
+    if (ptype == "bignum") {
+      const std::string n = "1234567999999999999999999999999999999";
+      return r3 ? ("(" + n + "\r\n") : encode_bulk(n);
+    }
+    if (ptype == "null") return encode_null(session.resp_version);
+    if (ptype == "array") return std::string("*3\r\n:0\r\n:1\r\n:2\r\n");
+    if (ptype == "set") return std::string(r3 ? "~3\r\n" : "*3\r\n") + ":0\r\n:1\r\n:2\r\n";
+    if (ptype == "map")
+      return r3 ? std::string("%3\r\n:0\r\n#f\r\n:1\r\n#t\r\n:2\r\n#f\r\n")
+                : std::string("*6\r\n:0\r\n:0\r\n:1\r\n:1\r\n:2\r\n:0\r\n");
+    if (ptype == "verbatim") {
+      const std::string s = "This is a verbatim\nstring";  // 25 bytes
+      return encode_verbatim(s, session.resp_version);
+    }
+    if (ptype == "true") return std::string(r3 ? "#t\r\n" : ":1\r\n");
+    if (ptype == "false") return std::string(r3 ? "#f\r\n" : ":0\r\n");
+    if (ptype == "attrib") {
+      // The attribute prefix is emitted only in RESP3; the trailing real reply
+      // (a normal bulk string) is always sent so RESP2 clients get a valid reply.
+      std::string out;
+      if (r3) out += "|1\r\n$14\r\nkey-popularity\r\n*2\r\n$7\r\nkey:123\r\n:90\r\n";
+      out += encode_bulk("Some real reply following the attribute");
+      return out;
+    }
+    if (ptype == "push") {
+      if (!r3) return encode_error("RESP2 is not supported by this command");
+      std::string out = ">2\r\n";
+      out += encode_bulk("server-cpu-usage");
+      out += encode_integer(42);
+      out += encode_bulk("Some real reply following the push reply");
+      return out;
+    }
+    return encode_error(
+        "Wrong protocol type name. Please use one of the following: "
+        "string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|"
+        "false");
+  }
+  return encode_error(
+      "unknown subcommand or wrong number of arguments for 'DEBUG'. Try DEBUG HELP.");
+}
+
 static std::string handle_command_impl(const std::vector<std::string>& args, SessionState& session,
                                        bool& should_close);
 
@@ -16718,6 +16718,9 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("slowlog-log-slower-than", g_slowlog_threshold_us);
   num("slowlog-max-len", g_slowlog_max_len);
   num("latency-monitor-threshold", g_latency_monitor_threshold_ms);
+  int watchdog = 0;
+  num("watchdog-period", watchdog);
+  configure_watchdog(watchdog);
   num("proto-max-bulk-len", g_proto_max_bulk_len);
   num("client-query-buffer-limit", g_client_query_buffer_limit);
   num("tcp-keepalive", g_tcp_keepalive);

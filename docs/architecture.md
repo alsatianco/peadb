@@ -8,6 +8,8 @@ PeaDB runs a **single-threaded event loop** (like Redis). One thread accepts con
 
 Besides the event-loop thread there are two helper threads: a detached **replica supervisor** that `REPLICAOF` starts, which runs the sync, reads the master's command stream and reconnects with backoff until a newer `REPLICAOF` replaces it (it only touches atomics and queues commands for the event loop), and a **lazyfree** worker that destructs large detached objects (`UNLINK`, `FLUSHALL`/`FLUSHDB ASYNC`) off the loop. Both preserve the single-writer invariant: command processing and `DataStore` mutation happen only on the event-loop thread, and the lazyfree worker only ever touches data that was first *moved out* of the live keyspace (exclusive ownership transferred under a mutex-guarded queue), so there is no fine-grained locking on the hot path and no race with live data.
 
+Enabling `watchdog-period` starts a diagnostic reporter thread, owned and joined by the event loop. Each loop pass rearms a one-shot ITIMER_REAL timer; a stalled pass receives SIGALRM. Worker-thread delivery is forwarded to the main thread. The handler records the interrupted PC and walks the bounded main-stack frame chain without an allocator, unwinder or lock, emits raw addresses through the signal logger, then submits one bounded nonblocking pipe record. Only the reporter resolves symbols and uses the normal logger; a full pipe drops supplemental symbols rather than blocking command execution. Frame pointers are retained in the core, executable and bundled Lua builds. Missing library frames can truncate a chain, and symbol resolution may wait for a loader/allocator lock, so raw addresses remain the primary diagnostic. The timer's 200 ms minimum follows the actual fixed 100 ms housekeeping tick; `hz`/`dynamic-hz` behavior remains a compatibility gap. Disable cancels the timer and discards pending alarms; shutdown joins the reporter. The watchdog is armed when the event loop starts, after startup loading.
+
 ## Source layout
 
 | File | Responsibility |
@@ -20,6 +22,7 @@ Besides the event-loop thread there are two helper threads: a detached **replica
 | `src/lua_engine.cpp` | Lua 5.1 scripting (`EVAL`/`EVALSHA`/`FCALL`), dispatched back through `handle_command` |
 | `src/protocol.cpp` | RESP parsing (operates on `std::string_view`; only argument values are copied) |
 | `src/config_rewrite.cpp` | Typed CONFIG REWRITE serialization of live configuration, old-file/comment preservation and durable atomic publication; role/include/default-user boundaries are in delta item 25 |
+| `src/watchdog.cpp` | One-shot event-loop watchdog, signal-safe interrupted-stack capture and owned supplemental symbol reporter |
 | `src/config.cpp` | Config file + command-line loading, following Redis 7.2.5's `loadServerConfig()` (settings table, with flags and defaults, generated from Redis's `config.c` into `include/redis_config_table.generated.hpp`); its value checks are shared with `CONFIG SET` |
 | `include/poller.hpp` | epoll / kqueue abstraction |
 
