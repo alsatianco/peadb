@@ -1,11 +1,21 @@
 {
-  "comment": "Canonical upstream-TCL-suite adoption ledger. mode: native (harness spawns peadb-server), external (--host/--port, limited coverage), excluded (out of scope, reason required). last_counts/skipfile_lines are the ratchet baselines maintained by scripts/ci/check_suite_ratchet.py --update; regressions require a compat/delta.md change. The headline parity number is sum(ok)/sum(ok+err+skipfile_lines) over non-excluded suites (scripts/redis/parse_tcl_results.py).",
+  "comment": "Canonical upstream-TCL-suite adoption ledger. mode: native (harness spawns peadb-server), external (--host/--port, limited coverage), excluded (out of scope, reason required). counting_policy identifies explicit parser normalization for timed suites; raw repetitions remain in generated reports. last_counts/skipfile_lines are the ratchet baselines maintained by scripts/ci/check_suite_ratchet.py --update; regressions require a compat/delta.md change. The headline parity number is sum(ok)/sum(ok+err+skipfile_lines) over non-excluded suites (scripts/redis/parse_tcl_results.py).",
   "suites": {
     "integration/block-repl": {
       "last_counts": {
         "err": 0,
         "ignored": 2,
         "ok": 2
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
+    "integration/psync2": {
+      "counting_policy": "psync2-one-cycle-v1",
+      "last_counts": {
+        "err": 0,
+        "ignored": 6,
+        "ok": 12
       },
       "mode": "native",
       "skipfile_lines": 0

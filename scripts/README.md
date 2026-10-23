@@ -77,6 +77,8 @@ Artifacts and logs:
 
 The full runner's `redis` stage clears previous `artifacts/redis-native/*.log`, command-coverage files and failure/reproduction lists, then runs the native sweep. Only a successful sweep whose logs contain the harness completion message and no errors/exceptions produces `artifacts/redis-parity/pass_rate.json` and `pass_rate.md`; the stage then enforces the ledger with an explicit results path. Sweep, parsing or ratchet failures fail the overall gate while later stages still run. Failed-sweep logs remain available for diagnosis; previous parity reports are removed before the sweep. `SKIP=redis` skips this entire stage, leaves existing artifacts untouched and provides no fresh parity evidence. The runner starts its own test servers; it does not require a server already listening on port 6379. See [the ratchet rules](../compat/delta.md#verification-the-parity-ratchet).
 
+The result parser retains raw repetition counts for timed upstream suites while using explicit stable accounting for the ledger and headline rate. See [timed-suite accounting](../compat/delta.md#verification-the-parity-ratchet) for PSYNC2’s complete-cycle requirements, report fields and failure rules; `check_suite_ratchet.py --update` preserves that normalized baseline.
+
 ## Common prerequisites
 
 Depending on the script, you may need:

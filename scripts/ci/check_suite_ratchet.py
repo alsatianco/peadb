@@ -14,7 +14,9 @@ consciously registered as deltas, never silent) — detected via uncommitted /
 staged git changes, or forced with ``RATCHET_ALLOW_REGRESSION=1``.
 
 Improvements (more ok, fewer skipfile lines, newly adopted suites) always pass;
-run with ``--update`` to fold them back into the ledger.
+run with ``--update`` to fold them back into the ledger. Timed-suite counts
+use the parser's documented normalization; raw repetitions do not raise their
+baselines. A counting-policy mismatch always fails, even with a delta update.
 
 Usage:
     check_suite_ratchet.py [--results artifacts/redis-parity/pass_rate.json]
@@ -67,6 +69,9 @@ def main() -> int:
         if got is None:
             failures.append(f"{suite}: adopted in ledger but missing from results")
             continue
+        if got.get("counting_policy") != entry.get("counting_policy"):
+            failures.append(f"{suite}: counting policy differs from ledger "
+                            f"({entry.get('counting_policy')} -> {got.get('counting_policy')})")
         if got["err"] > 0:
             failures.append(f"{suite}: {got['err']} failing test(s) — adopted suites must stay green")
         base = entry.get("last_counts") or {}

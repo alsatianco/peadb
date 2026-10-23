@@ -9,13 +9,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Adopt unmodified native `integration/psync2` without skips after a pinned Redis reference and repeated PeaDB runs. Validate every timed-loop cycle while retaining raw repetitions and using stable parity credit; require matching counting policies in the suite ratchet.
+
 - Fix Linux integration fixtures to use matching IPv4 replication endpoints and parse SYNC keepalive newlines before its RDB bulk header. Exercise a delayed save against Redis first, isolate test data/ports and retain PR failure logs; record prevention guidance in AGENTS.md.
 
 - Restore RDB replication history across ordinary saves and restarts, including the selected stream database, cached upstream PSYNC, master secondary history and load-time expiry DELs. Missing/invalid metadata and AOF startup retain full-sync fallback; see compatibility delta 47.
 
-- Implement `CONFIG REWRITE`: persist live settings and replication role to the startup config file, preserve comments/includes and canonicalize aliases/duplicates, escape binary values, and publish through fsynced temporary-file replacement with Redis-compatible errors. Redis-first restart and disk-fault regressions cover the change; PSYNC2 adoption remains pending complete repeated native runs; RDB restart history is implemented in item 47.
+- Implement `CONFIG REWRITE`: persist live settings and replication role to the startup config file, preserve comments/includes and canonicalize aliases/duplicates, escape binary values, and publish through fsynced temporary-file replacement with Redis-compatible errors. Redis-first restart and disk-fault regressions cover the change; RDB restart history and subsequent native PSYNC2 adoption are recorded in item 47.
 
-- Record the native PSYNC2 baseline blockers: CONFIG REWRITE refusal prevents the upstream restart check, and an independent Redis comparison confirms RDB restart requires a full sync instead of resuming replication history. The suite remains unadopted; see compatibility items 25 and 47.
+- Record the native PSYNC2 baseline blockers: CONFIG REWRITE refusal prevents the upstream restart check, and an independent Redis comparison confirms RDB restart requires a full sync instead of resuming replication history. The subsequent fixes and adoption are recorded in compatibility items 25 and 47.
 
 - Fix upstream master connection filtering in CLIENT KILL, expire replication backlogs with Redis-compatible role and ID handling, and preserve the selected stream database in queued full-sync snapshots. Adopt native `integration/replication-psync` without skips, with Redis-first regressions for connection lifecycle, backlog lifetime and full-sync database selection.
 
