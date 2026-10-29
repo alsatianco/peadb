@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Record the unchanged native replication baseline against pinned Redis 7.2.5: isolate propagation, accounting, delayed-handshake and loading failures, plus the writable-replica setup refusal. Keep the suite unadopted and later checks explicitly unrun; see compatibility delta 8.
+
 - Adopt the unmodified native Redis logging suite without skips, covering watchdog stack traces and crash reports for SIGABRT and DEBUG SEGFAULT after a pinned reference and three complete PeaDB runs.
 
 - Send fatal-signal reports to stdout with the actual interrupted instruction, bounded main-stack frames and executable load address for offline symbols. Honor runtime `crash-log-enabled`, preserve signal termination and require explicit startup opt-in for real `DEBUG SEGFAULT`; cold worker capture avoids lazy TLS allocation (deltas 60–61).
