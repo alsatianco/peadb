@@ -9,6 +9,8 @@ The same checks run on peadb-server and on the pinned redis-server (Redis side f
 - SET's options are read like Redis's parseExtendedStringArgumentsOrReply(): conflicting options are a syntax error before any value is checked, and EX, PX, EXAT and PXAT must be positive (GETEX too, which looks up its key before it checks the value).
 - MGET, MSETNX and SORT's BY and GET patterns leave a key of another type as it is (PeaDB turned it into an empty string).
 
+Short-lived expiry fixtures use explicit PXAT timestamps: observing them to build expected records can itself lazily expire them on a slow runner. Exact replication and AOF comparisons remain active.
+
 Without a pinned Redis 7.2.x, only the PeaDB side runs.
 """
 import os
@@ -271,8 +273,11 @@ def run_sets(c, events):
     # A key whose TTL has passed but that is not deleted yet (active expiry is off): a SET that XX
     # then stops sends only the key's DEL; a SETNX that runs goes out with the DEL in MULTI/EXEC.
     for key in ('exp1', 'exp2'):
-        assert c('SET', key, 'v', 'PX', 50) == '+OK'
-        expected.append(pxat(c, key))
+        deadline_ms = int(time.time() * 1000) + 50
+        assert c('SET', key, 'v', 'PXAT', deadline_ms) == '+OK'
+        # A later GET/PEXPIRETIME can itself expire the key on a slow runner,
+        # changing both the expected payload and the DEL/transaction ordering.
+        expected.append(['SET', key, 'v', 'PXAT', str(deadline_ms)])
     time.sleep(0.1)
     assert c('SET', 'exp1', 'w', 'XX') is None
     expected.append(['DEL', 'exp1'])
