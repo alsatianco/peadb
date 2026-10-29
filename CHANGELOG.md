@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Adopt the unmodified native Redis logging suite without skips, covering watchdog stack traces and crash reports for SIGABRT and DEBUG SEGFAULT after a pinned reference and three complete PeaDB runs.
+
 - Send fatal-signal reports to stdout with the actual interrupted instruction, bounded main-stack frames and executable load address for offline symbols. Honor runtime `crash-log-enabled`, preserve signal termination and require explicit startup opt-in for real `DEBUG SEGFAULT`; cold worker capture avoids lazy TLS allocation (deltas 60–61).
 
 - Implement the event-loop watchdog: startup/runtime `watchdog-period`, one-shot timer rearming, signal-safe interrupted-stack capture and supplemental symbols, with disable/update/recovery and Redis-first stall regressions. The fixed housekeeping tick imposes a 200 ms minimum; fatal-signal diagnostics and native logging adoption remain separate work (delta 60).

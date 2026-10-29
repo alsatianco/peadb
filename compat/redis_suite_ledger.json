@@ -10,6 +10,15 @@
       "mode": "native",
       "skipfile_lines": 0
     },
+    "integration/logging": {
+      "last_counts": {
+        "err": 0,
+        "ignored": 1,
+        "ok": 3
+      },
+      "mode": "native",
+      "skipfile_lines": 0
+    },
     "integration/psync2": {
       "counting_policy": "psync2-one-cycle-v1",
       "last_counts": {
