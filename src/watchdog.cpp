@@ -1,6 +1,7 @@
 #include "watchdog.hpp"
 
 #include "logger.hpp"
+#include "signal_trace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -15,12 +16,7 @@
 #include <sys/time.h>
 #include <stdexcept>
 #include <thread>
-#include <sys/ucontext.h>
 #include <unistd.h>
-
-#if defined(__APPLE__) && defined(__arm64e__)
-#include <ptrauth.h>
-#endif
 
 namespace peadb {
 namespace {
@@ -34,10 +30,7 @@ volatile sig_atomic_t report_fd = -1;
 int reader_fd = -1;
 std::thread reporter;
 
-struct Trace {
-  void* frames[48];
-  int count;
-};
+using Trace = SignalTrace;
 static_assert(sizeof(Trace) <= 512);  // POSIX minimum PIPE_BUF: one atomic nonblocking write
 
 bool schedule(int period) {
@@ -61,42 +54,8 @@ __attribute__((no_sanitize("address", "undefined"))) void capture(int, siginfo_t
     errno = saved_errno;
     return;
   }
-  auto* uc = static_cast<ucontext_t*>(context);
-  std::uintptr_t pc = 0, fp = 0, sp = 0;
-#if defined(__APPLE__) && defined(__aarch64__)
-  pc = uc->uc_mcontext->__ss.__pc;
-  fp = uc->uc_mcontext->__ss.__fp;
-  sp = uc->uc_mcontext->__ss.__sp;
-#elif defined(__APPLE__) && defined(__x86_64__)
-  pc = uc->uc_mcontext->__ss.__rip;
-  fp = uc->uc_mcontext->__ss.__rbp;
-  sp = uc->uc_mcontext->__ss.__rsp;
-#elif defined(__linux__) && defined(__aarch64__)
-  pc = uc->uc_mcontext.pc;
-  fp = uc->uc_mcontext.regs[29];
-  sp = uc->uc_mcontext.sp;
-#elif defined(__linux__) && defined(__x86_64__)
-  pc = uc->uc_mcontext.gregs[REG_RIP];
-  fp = uc->uc_mcontext.gregs[REG_RBP];
-  sp = uc->uc_mcontext.gregs[REG_RSP];
-#endif
-  Trace trace{};
-  trace.count = 0;
-  if (pc) trace.frames[trace.count++] = reinterpret_cast<void*>(pc);
-  const auto low = stack_low.load(std::memory_order_relaxed);
-  const auto high = stack_high.load(std::memory_order_relaxed);
-  while (trace.count < 48 && fp >= sp && fp >= low && high >= 2 * sizeof(std::uintptr_t) &&
-         fp <= high - 2 * sizeof(std::uintptr_t) && fp % alignof(std::uintptr_t) == 0) {
-    auto* frame = reinterpret_cast<const volatile std::uintptr_t*>(fp);
-    const std::uintptr_t next = frame[0];
-    auto* address = reinterpret_cast<void*>(frame[1]);
-#if defined(__APPLE__) && defined(__arm64e__)
-    address = ptrauth_strip(address, ptrauth_key_return_address);
-#endif
-    if (address) trace.frames[trace.count++] = address;
-    if (next <= fp) break;
-    fp = next;
-  }
+  const auto trace = capture_signal_trace(context, stack_low.load(std::memory_order_relaxed),
+                                          stack_high.load(std::memory_order_relaxed));
   // Keep the raw diagnostic usable even if symbolization waits on a loader or
   // allocator lock held by the stalled main thread.
   log_from_signal_handler(LogLevel::Warn, "--- WATCHDOG TIMER EXPIRED ---");

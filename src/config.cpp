@@ -564,6 +564,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "slowlog-max-len",
                                                        "latency-monitor-threshold",
                                                        "watchdog-period",
+                                                       "crash-log-enabled",
                                                        "proto-max-bulk-len",
                                                        "client-query-buffer-limit",
                                                        "tcp-keepalive",

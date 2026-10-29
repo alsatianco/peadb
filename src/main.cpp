@@ -1,4 +1,5 @@
 #include "config.hpp"
+#include "crash.hpp"
 #include "datastore.hpp"
 #include "logger.hpp"
 #include "command.hpp"
@@ -14,48 +15,8 @@
 #include <fstream>
 #include <filesystem>
 #include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <exception>
-#include <execinfo.h>
 #include <sys/stat.h>
 #include <unistd.h>
-
-// Fatal-signal crash report: dump signal, faulting address, and a backtrace to
-// stderr so a production segfault leaves an actionable artifact (Redis does the
-// same). SA_RESETHAND restores the default handler, so the trailing raise() then
-// produces a core dump as usual.
-static void crash_handler(int sig, siginfo_t* info, void*) {
-  char hdr[160];
-  const int n =
-      std::snprintf(hdr, sizeof(hdr), "\n=== PeaDB crashed: signal %d (%s), fault addr %p ===\n",
-                    sig, strsignal(sig), info ? info->si_addr : nullptr);
-  if (n > 0) {
-    ssize_t w = ::write(STDERR_FILENO, hdr, static_cast<size_t>(n));
-    (void)w;
-  }
-  void* frames[64];
-  const int nframes = backtrace(frames, 64);
-  backtrace_symbols_fd(frames, nframes, STDERR_FILENO);
-  ::raise(sig);  // re-raise with default disposition (SA_RESETHAND) for the core dump
-}
-
-static void install_crash_handlers() {
-  struct sigaction sa {};
-  sa.sa_sigaction = crash_handler;
-  sigemptyset(&sa.sa_mask);
-  sa.sa_flags = SA_SIGINFO | SA_RESETHAND;
-  for (int sig : {SIGSEGV, SIGABRT, SIGBUS, SIGFPE, SIGILL}) {
-    sigaction(sig, &sa, nullptr);
-  }
-  std::set_terminate([]() {
-    const char msg[] = "\n=== PeaDB std::terminate (unhandled exception) ===\n";
-    ssize_t w = ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
-    (void)w;
-    std::abort();  // → SIGABRT → crash_handler dumps the backtrace
-  });
-}
 
 int main(int argc, char** argv) {
   // Capture before worker threads can create files; CONFIG REWRITE uses Redis's
@@ -75,7 +36,7 @@ int main(int argc, char** argv) {
     sigaction(SIGTERM, &sa, nullptr);
     sigaction(SIGINT, &sa, nullptr);
   }
-  install_crash_handlers();
+  peadb::install_crash_handlers();
 
   // Command line, as in Redis's main() (server.c): -v/--version or -h/--help as the first
   // argument; otherwise an optional config file as the first argument (when it does not start

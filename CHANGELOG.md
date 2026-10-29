@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Send fatal-signal reports to stdout with the actual interrupted instruction, bounded main-stack frames and executable load address for offline symbols. Honor runtime `crash-log-enabled`, preserve signal termination and require explicit startup opt-in for real `DEBUG SEGFAULT`; cold worker capture avoids lazy TLS allocation (deltas 60–61).
+
 - Implement the event-loop watchdog: startup/runtime `watchdog-period`, one-shot timer rearming, signal-safe interrupted-stack capture and supplemental symbols, with disable/update/recovery and Redis-first stall regressions. The fixed housekeeping tick imposes a 200 ms minimum; fatal-signal diagnostics and native logging adoption remain separate work (delta 60).
 
 - Record the complete native logging baseline: missing watchdog traces, incompatible fatal-signal log destination/header and unsupported DEBUG SEGFAULT prevent adoption. Keep the suite unadopted and separate these diagnostic prerequisites from file/syslog/pidfile support.

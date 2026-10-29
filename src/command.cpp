@@ -1,5 +1,6 @@
 #include "command.hpp"
 #include "watchdog.hpp"
+#include "crash.hpp"
 #include "config_rewrite.hpp"
 #include "zmalloc.hpp"
 #include "command_metadata.generated.hpp"
@@ -5460,6 +5461,12 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
                   std::to_string(allowed);
               return false;
             }
+            return true;
+          }}},
+        {"crash-log-enabled",
+         {[] { return std::string(crash_log_enabled() ? "yes" : "no"); },
+          [](const std::string& value, std::string&) {
+            configure_crash_log(value == "yes");
             return true;
           }}},
         {"timeout", live_number(g_config_timeout)},
@@ -15846,6 +15853,18 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 }  // namespace
 
 std::string debugCommand(const std::vector<std::string>& args, SessionState& session, bool&) {
+  if (args.size() >= 2 && upper(args[1]) == "SEGFAULT") {
+    // Existing DEBUG verbs still have the documented item61 gap. Never expose a
+    // new process-crashing verb through that legacy default: require explicit opt-in.
+    const auto setting = g_config_values.find("enable-debug-command");
+    if (setting == g_config_values.end() || !allow_protected_action(setting->second, session))
+      return encode_error(
+          "DEBUG command not allowed. If the enable-debug-command option is set to \"local\", "
+          "you can run it from a local connection, otherwise you need to set this option in the "
+          "configuration file, and then restart the server.");
+    debug_segfault();
+    return encode_error("Unable to generate a debug fault");
+  }
   if (args.size() == 3 && upper(args[1]) == "SET-ACTIVE-EXPIRE") {
     std::int64_t v = 0;
     if (!parse_i64(args[2], v) || (v != 0 && v != 1))
@@ -16721,6 +16740,9 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   int watchdog = 0;
   num("watchdog-period", watchdog);
   configure_watchdog(watchdog);
+  bool crashlog = true;
+  yes("crash-log-enabled", crashlog);
+  configure_crash_log(crashlog);
   num("proto-max-bulk-len", g_proto_max_bulk_len);
   num("client-query-buffer-limit", g_client_query_buffer_limit);
   num("tcp-keepalive", g_tcp_keepalive);
