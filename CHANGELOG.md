@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Match Redis 7.2.5 propagation for GETSET (SET) and immediate/woken BRPOPLPUSH (one RPOPLPUSH), including renamed BRPOPLPUSH. Share move execution without a nested BLMOVE dispatch, keep genuine BLMOVE as LMOVE, suppress empty EXEC/Lua moves and preserve singleton self-move TTLs during execution/replay; verify actual replication/AOF streams, replica counters, TTLs and AOF replay across both engines (delta 15).
+
 - Record the unchanged native replication baseline against pinned Redis 7.2.5: isolate propagation, accounting, delayed-handshake and loading failures, plus the writable-replica setup refusal. Keep the suite unadopted and later checks explicitly unrun; see compatibility delta 8.
 
 - Adopt the unmodified native Redis logging suite without skips, covering watchdog stack traces and crash reports for SIGABRT and DEBUG SEGFAULT after a pinned reference and three complete PeaDB runs.

@@ -2399,6 +2399,9 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
       else
         emit = false;
     }
+  } else if (cmd == "GETSET" && args.size() == 3) {
+    // Redis getsetCommand() replaces argv[0] with SET, including a nil old value.
+    out = {"SET", args[1], args[2]};
   } else if (cmd == "GETDEL" && args.size() == 2) {
     out = {"DEL", args[1]};
   } else if (cmd == "SPOP" && args.size() >= 2 && reply_ptr != nullptr) {
@@ -2541,8 +2544,8 @@ bool canonicalize_propagated_command(const std::vector<std::string>& args,
     // so a replica or the AOF never blocks on it.
     out = {"LMOVE", args[1], args[2], args[3], args[4]};
   } else if (cmd == "BRPOPLPUSH") {
-    // Runs as BLMOVE through handle_command(), which propagates the move; propagating
-    // BRPOPLPUSH as well moved a second element on replicas and on AOF replay.
+    // The shared move handler emits RPOPLPUSH itself, including for a renamed
+    // BRPOPLPUSH. Never propagate the blocking argv a second time.
     emit = false;
   } else if (cmd == "XREADGROUP") {
     emit = false;
@@ -6401,6 +6404,67 @@ std::string migrate_command(const std::vector<std::string>& args, SessionState& 
   }
   if (deleted.size() > 1) propagate_write(deleted, session, nullptr);
   return reply;
+}
+
+// Redis's blmoveGenericCommand(): share execution without a nested client dispatch.
+// Preserve the original argv so propagation and blocked wakeups retain BRPOPLPUSH's identity.
+std::string blocking_move_command(const std::vector<std::string>& args, SessionState& session,
+                                  bool legacy) {
+  long double timeout_sec = 0;
+  if (auto terr = parse_block_timeout_sec(args.back(), timeout_sec); !terr.empty()) {
+    return terr;
+  }
+  const std::string src = args[1];
+  const std::string dst = args[2];
+  const std::string where_from = legacy ? "RIGHT" : upper(args[3]);
+  const std::string where_to = legacy ? "LEFT" : upper(args[4]);
+  if ((where_from != "LEFT" && where_from != "RIGHT") ||
+      (where_to != "LEFT" && where_to != "RIGHT")) {
+    return encode_error("syntax error");
+  }
+  // Only the source type is checked up front. The destination type is checked
+  // when an element is actually moved — an empty source blocks regardless of the
+  // dst type (Redis blmoveGenericCommand).
+  if (store().is_wrongtype_for_list(src)) return wrongtype_error_reply();
+
+  bool wrongtype = false;
+  if (store().llen(src, wrongtype) > 0 && store().is_wrongtype_for_list(dst)) {
+    return wrongtype_error_reply();  // src has data but dst is wrong type: source
+                                     // intact
+  }
+  const auto self_expire = src == dst ? store().pexpiretime(src) : -1;
+  std::optional<std::string> popped;
+  if (where_from == "LEFT")
+    popped = store().lpop(src, wrongtype);
+  else
+    popped = store().rpop(src, wrongtype);
+  if (wrongtype) return wrongtype_error_reply();
+  if (popped.has_value()) {
+    std::vector<std::string> one{*popped};
+    if (where_to == "LEFT")
+      (void)store().lpush(dst, one, wrongtype);
+    else
+      (void)store().rpush(dst, one, wrongtype);
+    if (self_expire >= 0) (void)store().expire(src, self_expire);
+    if (legacy) propagate_write({"RPOPLPUSH", src, dst}, session, nullptr);
+    return encode_bulk(*popped);
+  }
+  // In Lua script or EXEC context: return nil immediately (no blocking)
+  if (g_in_lua_script || g_executing_exec) {
+    g_write_changed_nothing = true;
+    return encode_null(RespVersion::Resp2);
+  }
+  session.blocked.type = BlockType::List;
+  session.blocked.pop_left = (where_from == "LEFT");
+  session.blocked.keys = {src};
+  session.blocked.original_args = args;
+  session.blocked.original_args[0] = legacy ? "BRPOPLPUSH" : "BLMOVE";
+  if (timeout_sec > 0) {
+    session.blocked.deadline_ms = now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L);
+  } else {
+    session.blocked.deadline_ms = 0;
+  }
+  return std::string();
 }
 
 const std::unordered_map<std::string, CommandSpec>& command_table() {
@@ -10658,6 +10722,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                        return wrongtype_error_reply();
 
                                      bool wrongtype = false;
+                                     const auto self_expire =
+                                         src == dst ? store().pexpiretime(src) : -1;
                                      std::optional<std::string> popped;
                                      if (where_from == "LEFT")
                                        popped = store().lpop(src, wrongtype);
@@ -10673,68 +10739,20 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                      else
                                        (void)store().rpush(dst, one, wrongtype);
                                      if (wrongtype) return wrongtype_error_reply();
+                                     if (self_expire >= 0) (void)store().expire(src, self_expire);
                                      return encode_bulk(*popped);
                                    }});
 
     t.emplace("BLMOVE",
-              CommandSpec{
-                  "BLMOVE",
-                  6,
-                  {"write", "blocking"},
-                  1,
-                  2,
-                  1,
-                  [](const std::vector<std::string>& args, SessionState& session, bool&) {
-                    long double timeout_sec = 0;
-                    if (auto terr = parse_block_timeout_sec(args[5], timeout_sec); !terr.empty()) {
-                      return terr;
-                    }
-                    const std::string src = args[1];
-                    const std::string dst = args[2];
-                    const std::string where_from = upper(args[3]);
-                    const std::string where_to = upper(args[4]);
-                    if ((where_from != "LEFT" && where_from != "RIGHT") ||
-                        (where_to != "LEFT" && where_to != "RIGHT")) {
-                      return encode_error("syntax error");
-                    }
-                    // Only the source type is checked up front. The destination type is checked
-                    // when an element is actually moved — an empty source blocks regardless of the
-                    // dst type (Redis blmoveGenericCommand).
-                    if (store().is_wrongtype_for_list(src)) return wrongtype_error_reply();
-
-                    bool wrongtype = false;
-                    if (store().llen(src, wrongtype) > 0 && store().is_wrongtype_for_list(dst)) {
-                      return wrongtype_error_reply();  // src has data but dst is wrong type: source
-                                                       // intact
-                    }
-                    std::optional<std::string> popped;
-                    if (where_from == "LEFT")
-                      popped = store().lpop(src, wrongtype);
-                    else
-                      popped = store().rpop(src, wrongtype);
-                    if (wrongtype) return wrongtype_error_reply();
-                    if (popped.has_value()) {
-                      std::vector<std::string> one{*popped};
-                      if (where_to == "LEFT")
-                        (void)store().lpush(dst, one, wrongtype);
-                      else
-                        (void)store().rpush(dst, one, wrongtype);
-                      return encode_bulk(*popped);
-                    }
-                    // In Lua script or EXEC context: return nil immediately (no blocking)
-                    if (g_in_lua_script || g_executing_exec) return encode_null(RespVersion::Resp2);
-                    session.blocked.type = BlockType::List;
-                    session.blocked.pop_left = (where_from == "LEFT");
-                    session.blocked.keys = {src};
-                    session.blocked.original_args = args;
-                    if (timeout_sec > 0) {
-                      session.blocked.deadline_ms =
-                          now_ms() + static_cast<std::int64_t>(timeout_sec * 1000.0L);
-                    } else {
-                      session.blocked.deadline_ms = 0;
-                    }
-                    return std::string();
-                  }});
+              CommandSpec{"BLMOVE",
+                          6,
+                          {"write", "blocking"},
+                          1,
+                          2,
+                          1,
+                          [](const std::vector<std::string>& args, SessionState& session, bool&) {
+                            return blocking_move_command(args, session, false);
+                          }});
 
     t.emplace("BRPOPLPUSH",
               CommandSpec{"BRPOPLPUSH",
@@ -10744,10 +10762,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           2,
                           1,
                           [](const std::vector<std::string>& args, SessionState& session, bool&) {
-                            std::vector<std::string> proxy = {"BLMOVE", args[1], args[2],
-                                                              "RIGHT",  "LEFT",  args[3]};
-                            bool close = false;
-                            return handle_command(proxy, session, close);
+                            return blocking_move_command(args, session, true);
                           }});
 
     // BLMPOP timeout numkeys key [key ...] LEFT|RIGHT [COUNT n] (Redis 7.0). The
@@ -13289,10 +13304,14 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                          if (store().is_wrongtype_for_list(args[2]))
                                            return wrongtype_error_reply();
                                          bool wt = false;
+                                         const auto self_expire =
+                                             args[1] == args[2] ? store().pexpiretime(args[1]) : -1;
                                          auto val = store().rpop(args[1], wt);
                                          if (wt) return wrongtype_error_reply();
                                          if (!val) return encode_null(session.resp_version);
                                          store().lpush(args[2], {*val}, wt);
+                                         if (self_expire >= 0)
+                                           (void)store().expire(args[1], self_expire);
                                          return encode_bulk(*val);
                                        }});
 
@@ -15804,7 +15823,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
       }
       spec.redis_name = lower(spec.name);
       spec.propagates_effects = spec.redis_name == "xreadgroup" || spec.redis_name == "xclaim" ||
-                                spec.redis_name == "xautoclaim";
+                                spec.redis_name == "xautoclaim" || spec.redis_name == "brpoplpush";
       const auto& index = redis_command_index();
       const auto redis = index.flags.find(spec.redis_name);
       spec.redis_flags = redis == index.flags.end() ? 0 : redis->second;
@@ -17684,6 +17703,7 @@ std::string try_unblock_client_impl(SessionState& session) {
 
     for (const auto& key : session.blocked.keys) {
       bool wrongtype = false;
+      const auto self_expire = is_blmove && orig[1] == orig[2] ? store().pexpiretime(key) : -1;
       std::optional<std::string> val;
       if (session.blocked.pop_left) {
         val = store().lpop(key, wrongtype);
@@ -17698,7 +17718,7 @@ std::string try_unblock_client_impl(SessionState& session) {
         // session.blocked.keys, which clear() would invalidate.
         const std::string captured_key = key;
 
-        if (is_blmove && orig.size() >= 5) {
+        if (is_blmove) {
           // BLMOVE src dst wherefrom whereto timeout / BRPOPLPUSH src dst timeout
           const std::string dst = orig[2];
           const std::string where_to = cmd0 == "BRPOPLPUSH" ? "LEFT" : upper(orig[4]);
@@ -17718,8 +17738,12 @@ std::string try_unblock_client_impl(SessionState& session) {
             (void)store().lpush(dst, one, wt);
           else
             (void)store().rpush(dst, one, wt);
-          propagate(
-              {"LMOVE", captured_key, dst, session.blocked.pop_left ? "LEFT" : "RIGHT", where_to});
+          if (self_expire >= 0) (void)store().expire(captured_key, self_expire);
+          if (cmd0 == "BRPOPLPUSH")
+            propagate({"RPOPLPUSH", captured_key, dst});
+          else
+            propagate({"LMOVE", captured_key, dst, session.blocked.pop_left ? "LEFT" : "RIGHT",
+                       where_to});
           clear_block();
           return encode_bulk(*val);
         }
