@@ -16,11 +16,11 @@ namespace peadb {
 
 // Function-library persistence hooks. Libraries live at the server level (command.cpp), not in
 // the DataStore, so RDB save/load calls back through these (RDB opcode 245 / FUNCTION2, matching
-// Redis). `dump` returns every library's full source; `load` feeds one library source back and
-// returns false (setting err) on a collision, which fails the whole RDB load — this drives the
-// DEBUG RELOAD NOFLUSH-without-MERGE "already exists" semantics. Registered once at startup by
-// functions_register_rdb_hooks().
-using FunctionDumpFn = std::function<std::vector<std::string>()>;
+// Redis). `dump` visits each library's full source without copying the registry; `load` feeds one
+// source back and returns false (setting err) on a collision, which fails the whole RDB load — this
+// drives the DEBUG RELOAD NOFLUSH-without-MERGE "already exists" semantics. Registered once at
+// startup by functions_register_rdb_hooks().
+using FunctionDumpFn = std::function<void(const std::function<void(const std::string&)>&)>;
 using FunctionLoadFn = std::function<bool(const std::string& library_code, std::string& err)>;
 void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 
@@ -29,6 +29,15 @@ void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 struct RdbReplicationInfo;
 bool rdb_save(const std::filesystem::path& path, std::string& err,
               const RdbReplicationInfo* repl = nullptr);
+
+// Serialize the same complete RDB to a blocking sink, with at most 64 KiB per call. The sink
+// follows write(2): positive short writes are retried, -1/EINTR is retried, zero or any other
+// error aborts. It must consume/copy bytes before returning and must not mutate the datastore
+// or re-enter command execution. The caller owns the sink and any flush/fsync/publication.
+// Output buffering is bounded; a value/compact encoding may still be materialized. On failure
+// a partial RDB may have reached the sink; err is set and no further writes are attempted.
+using RdbWriteFn = std::function<ssize_t(const void*, std::size_t)>;
+bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl = nullptr);
 
 // The temp file rdb_save() writes in process `pid` before the rename: temp-<pid>.rdb in the
 // dump's directory. rdb_remove_temp_file() deletes the one in the working directory (Redis's

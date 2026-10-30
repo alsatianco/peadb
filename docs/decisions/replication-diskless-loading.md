@@ -2,7 +2,7 @@
 
 Date: 2026-10-30
 
-Status: accepted design; implementation and acceptance remain pending. This record does not enable diskless replication or close a compatibility gap. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
+Status: accepted design; bounded RDB output is implemented (R4a), while diskless transport, loading and their acceptance remain pending. This record does not enable diskless replication or close a compatibility gap. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
 
 ## Problem and specification
 
@@ -10,7 +10,7 @@ Diskless synchronization must send a snapshot while it is being generated, witho
 
 The specification is [Redis 7.2.5, commit f60370ce28b946c1146dcea77c9c399d39601aaa](https://github.com/redis/redis/tree/f60370ce28b946c1146dcea77c9c399d39601aaa). In that revision, `replication.c` owns `syncCommand()`, `shouldStartChildReplication()`, `startBgsaveForReplication()`, the `rdbPipe*` handlers, `useDisklessLoad()` and `readSyncBulkPayload()`; `rdb.c` owns `rdbSaveRioWithEOFMark()`, `rdbSaveToSlavesSockets()`, the explicit `rdbLoadingCtx` and loading progress; `server.c` owns command admission and `processEventsWhileBlocked()`. The complete [integration/replication suite](https://github.com/redis/redis/blob/f60370ce28b946c1146dcea77c9c399d39601aaa/tests/integration/replication.tcl) is an acceptance input, including the cases after writable-replica setup that the older PeaDB baseline did not reach.
 
-The audited implementation has useful boundaries to preserve: [master snapshot transfers](../../src/server.cpp) keep file bytes outside `WriteBuf`, [the replication supervisor](../../src/command.cpp) tags handoffs with a generation and acknowledges applied command offsets, and [the RDB loader contract](../../include/rdb.hpp) validates structure before replacing a full-sync dataset. Its function compilation and apply-time allocations are not transactional. The [codec](../../src/rdb.cpp) builds or reads a complete string and addresses the singleton datastore and global function hooks; the current loading handoff blocks the event loop. These interfaces must change before a streaming load can safely serve clients.
+The audited implementation has useful boundaries to preserve: [master snapshot transfers](../../src/server.cpp) keep file bytes outside `WriteBuf`, [the replication supervisor](../../src/command.cpp) tags handoffs with a generation and acknowledges applied command offsets, and [the RDB loader contract](../../include/rdb.hpp) validates structure before replacing a full-sync dataset. Its function compilation and apply-time allocations are not transactional. The [codec](../../src/rdb.cpp) now streams snapshot output through a bounded sink but still reads a complete string and addresses the singleton datastore and global function hooks; the current loading handoff blocks the event loop. These interfaces must change before a streaming load can safely serve clients.
 
 ## Decisions
 
@@ -51,7 +51,7 @@ Separate pipe EOF, trailer delivery, child exit and child reaping. Redis uses an
 
 ## Codec and framing boundaries
 
-Introduce a sink interface used by the common RDB writer, with bounded buffering, incremental CRC64 and propagated write errors. File saves keep their atomic publication wrapper; a socket-target child writes to its pipe. DUMP and FUNCTION DUMP may retain an in-memory sink because their API returns a bulk payload. No pipe path may call `rdb_build_string()` to construct the entire snapshot first. Keep the existing key-save delay on the actual common serialization path.
+The common RDB writer now has a blocking sink interface with 64 KiB buffering, incremental CRC64 and propagated write errors; key names and function sources are visited without copying their registries. Individual values/compact encodings may still be materialized. File saves keep their atomic publication wrapper; a socket-target child writes to its pipe. DUMP and FUNCTION DUMP may retain an in-memory sink because their API returns a bulk payload. No pipe path may call `rdb_build_string()` to construct the entire snapshot first. Keep the existing key-save delay on the actual common serialization path.
 
 Introduce a reader/source interface with bounded read-ahead and incremental checksum accounting, then make the common value decoders consume it. Parse each byte once; retrying an entire large value after every short socket read can become quadratic. Memory may include the active dataset, a staging dataset, the largest value being decoded and bounded I/O buffers, but must not include another whole serialized RDB. Stream groups, consumers, PEL, function sources and all existing legacy encodings stay on the common decoder.
 

@@ -25,6 +25,7 @@
 #include <exception>
 #include <fstream>
 #include <sstream>
+#include <system_error>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -43,7 +44,7 @@ namespace {
 bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
 bool g_rdb_checksum = true;               // rdbchecksum (startup-only, as in Redis)
 int g_rdb_key_save_delay = 0;             // rdb-key-save-delay (hidden Redis setting, for tests)
-FunctionDumpFn g_function_dump_hook;      // returns every function library's source
+FunctionDumpFn g_function_dump_hook;      // visits every function library's source
 FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
 RdbLoadStats g_rdb_load_stats;
 }  // namespace
@@ -207,8 +208,13 @@ namespace {
 
 class RdbWriter {
  public:
+  explicit RdbWriter(RdbWriteFn sink = {}, bool checksum = false)
+      : sink_(std::move(sink)), checksum_enabled_(checksum) {
+  }
+
   void write_u8(uint8_t v) {
-    buf_.push_back(static_cast<char>(v));
+    const char byte = static_cast<char>(v);
+    write_raw(&byte, 1);
   }
   void write_u16_le(uint16_t v) {
     write_u8(v & 0xff);
@@ -225,10 +231,42 @@ class RdbWriter {
     write_u32_le(static_cast<uint32_t>(v >> 32));
   }
   void write_raw(const void* p, size_t n) {
-    buf_.append(reinterpret_cast<const char*>(p), n);
+    const auto* bytes = static_cast<const char*>(p);
+    if (!sink_) {
+      buf_.append(bytes, n);
+      return;
+    }
+    while (n != 0) {
+      const auto count = std::min(n, kBufferSize - buf_.size());
+      buf_.append(bytes, count);
+      bytes += count;
+      n -= count;
+      if (buf_.size() == kBufferSize) flush();
+    }
   }
   void write_raw(const std::string& s) {
-    buf_ += s;
+    write_raw(s.data(), s.size());
+  }
+
+  void flush() {
+    if (!sink_) return;
+    if (checksum_enabled_) checksum_ = crc64(checksum_, buf_.data(), buf_.size());
+    std::size_t offset = 0;
+    while (offset < buf_.size()) {
+      const auto remaining = buf_.size() - offset;
+      const auto written = sink_(buf_.data() + offset, remaining);
+      if (written < 0 && errno == EINTR) continue;
+      if (written <= 0 || static_cast<std::size_t>(written) > remaining) {
+        throw std::system_error(written < 0 ? errno : EIO, std::generic_category());
+      }
+      offset += static_cast<std::size_t>(written);
+    }
+    buf_.clear();
+  }
+
+  uint64_t checksum() {
+    flush();
+    return checksum_;
   }
 
   // Redis "length" encoding
@@ -254,27 +292,25 @@ class RdbWriter {
   void write_string(const std::string& s) {
     // Try integer encoding for small ints
     if (!s.empty() && s.size() <= 20) {
-      try {
-        std::int64_t val = std::stoll(s);
-        // Verify it's exact (no leading zeros, etc.)
-        if (std::to_string(val) == s) {
-          if (val >= -128 && val <= 127) {
-            write_u8(0xC0 | RDB_ENC_INT8);  // 11 000000
-            write_u8(static_cast<uint8_t>(static_cast<int8_t>(val)));
-            return;
-          }
-          if (val >= -32768 && val <= 32767) {
-            write_u8(0xC0 | RDB_ENC_INT16);
-            write_u16_le(static_cast<uint16_t>(static_cast<int16_t>(val)));
-            return;
-          }
-          if (val >= -2147483648LL && val <= 2147483647LL) {
-            write_u8(0xC0 | RDB_ENC_INT32);
-            write_u32_le(static_cast<uint32_t>(static_cast<int32_t>(val)));
-            return;
-          }
+      std::int64_t val;
+      const auto parsed = std::from_chars(s.data(), s.data() + s.size(), val);
+      if (parsed.ec == std::errc{} && parsed.ptr == s.data() + s.size() &&
+          std::to_string(val) == s) {
+        if (val >= -128 && val <= 127) {
+          write_u8(0xC0 | RDB_ENC_INT8);
+          write_u8(static_cast<uint8_t>(static_cast<int8_t>(val)));
+          return;
         }
-      } catch (...) {
+        if (val >= -32768 && val <= 32767) {
+          write_u8(0xC0 | RDB_ENC_INT16);
+          write_u16_le(static_cast<uint16_t>(static_cast<int16_t>(val)));
+          return;
+        }
+        if (val >= -2147483648LL && val <= 2147483647LL) {
+          write_u8(0xC0 | RDB_ENC_INT32);
+          write_u32_le(static_cast<uint32_t>(static_cast<int32_t>(val)));
+          return;
+        }
       }
     }
     // Raw string
@@ -297,6 +333,10 @@ class RdbWriter {
   }
 
  private:
+  static constexpr std::size_t kBufferSize = 64 * 1024;
+  RdbWriteFn sink_;
+  bool checksum_enabled_ = false;
+  uint64_t checksum_ = 0;
   std::string buf_;
 };
 
@@ -1477,15 +1517,12 @@ bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empt
 
 // Wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
 // Used by file saves, including full-sync snapshots.
-std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
-  err.clear();
+void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
   auto& ds = store();
   // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
   // saving deletes nothing, so no key leaves the dataset without its DEL (compat/delta.md item 37).
   // A master that loads the file leaves them out; a replica keeps them until its master's DEL.
   const DataStore::LazyExpireDisabled no_lazy_expire(ds);
-
-  RdbWriter w;
 
   // Magic + version
   char header[10];
@@ -1513,36 +1550,40 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
   // Function libraries (server-level, not per-db) — one FUNCTION2 opcode + string per library,
   // written after AUX and before the keyspace, matching Redis's RDB layout.
   if (g_function_dump_hook) {
-    for (const auto& code : g_function_dump_hook()) {
+    g_function_dump_hook([&](const std::string& code) {
       w.write_u8(RDB_OPCODE_FUNCTION2);
       w.write_string(code);
-    }
+    });
   }
 
-  // Iterate databases
-  // We need access to internals. Use a temporary approach:
-  // Export via the existing data access methods
-  const int prev_db = ds.current_db();
+  // Traverse names in place: no snapshot-sized key vector. Getters cannot expire keys while
+  // no_lazy_expire is active, and sinks must not re-enter the datastore.
+  struct RestoreDatabase {
+    DataStore& ds;
+    int previous;
+    ~RestoreDatabase() {
+      ds.select_db(previous);
+    }
+  } restore_db{ds, ds.current_db()};
 
-  for (int dbi = 0; dbi < 16; ++dbi) {
+  for (std::size_t dbi = 0; dbi < ds.database_count(); ++dbi) {
     ds.select_db(dbi);
-    auto all_keys = ds.keys("*");
-    if (all_keys.empty()) continue;
+    std::size_t key_count = 0, expire_count = 0;
+    ds.for_each_key([&](const std::string& key) {
+      ++key_count;
+      if (ds.pexpiretime(key) >= 0) ++expire_count;
+    });
+    if (key_count == 0) continue;
 
     w.write_u8(RDB_OPCODE_SELECTDB);
     w.write_length(static_cast<uint64_t>(dbi));
 
     // RESIZEDB
     w.write_u8(RDB_OPCODE_RESIZEDB);
-    w.write_length(all_keys.size());
-    // Count keys with expire
-    size_t expire_count = 0;
-    for (const auto& k : all_keys) {
-      if (ds.pexpiretime(k) >= 0) ++expire_count;
-    }
+    w.write_length(key_count);
     w.write_length(expire_count);
 
-    for (const auto& key : all_keys) {
+    ds.for_each_key([&](const std::string& key) {
       struct DelayAfterKey {
         int usec;
         ~DelayAfterKey() {
@@ -1560,7 +1601,7 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
 
       if (type_str == "string") {
         auto val = ds.get(key);
-        if (!val.has_value()) continue;
+        if (!val.has_value()) return;
         w.write_u8(RDB_TYPE_STRING);
         w.write_string(key);
         w.write_string(*val);
@@ -1568,7 +1609,7 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
       } else if (type_str == "list") {
         bool wrongtype = false;
         auto items = ds.lrange(key, 0, -1, wrongtype);
-        if (wrongtype) continue;
+        if (wrongtype) return;
         w.write_u8(RDB_TYPE_LIST_QUICKLIST_2);
         w.write_string(key);
         write_quicklist(w, items, ds.encoding_limits().list_size);
@@ -1576,7 +1617,7 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
       } else if (type_str == "set") {
         bool wrongtype = false;
         auto members = ds.smembers(key, wrongtype);
-        if (wrongtype) continue;
+        if (wrongtype) return;
         w.write_u8(RDB_TYPE_SET);
         w.write_string(key);
         w.write_length(members.size());
@@ -1585,7 +1626,7 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
       } else if (type_str == "hash") {
         bool wrongtype = false;
         auto fields = ds.hgetall(key, wrongtype);
-        if (wrongtype) continue;
+        if (wrongtype) return;
         w.write_u8(RDB_TYPE_HASH);
         w.write_string(key);
         w.write_length(fields.size());
@@ -1597,7 +1638,7 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
       } else if (type_str == "zset") {
         bool wrongtype = false;
         auto items = ds.zrange(key, 0, -1, true, wrongtype);
-        if (wrongtype || items.empty()) continue;
+        if (wrongtype || items.empty()) return;
         w.write_u8(RDB_TYPE_ZSET_2);
         w.write_string(key);
         w.write_length(items.size());
@@ -1608,25 +1649,42 @@ std::string rdb_build_string(std::string& err, const RdbReplicationInfo* repl) {
 
       } else if (type_str == "stream") {
         DataStore::StreamDump d;
-        if (!ds.dump_stream(key, d)) continue;
+        if (!ds.dump_stream(key, d)) return;
         w.write_u8(RDB_TYPE_STREAM_LISTPACKS_3);
         w.write_string(key);
         write_stream(w, d);
       }
-    }
+    });
   }
-  ds.select_db(prev_db);
 
   // EOF marker
   w.write_u8(RDB_OPCODE_EOF);
 
   // CRC64 of everything before it; with rdbchecksum no, Redis writes 0 ("no checksum") instead.
-  const uint64_t checksum = g_rdb_checksum ? crc64(0, w.data().data(), w.data().size()) : 0;
+  const uint64_t checksum = g_rdb_checksum ? w.checksum() : 0;
   w.write_u64_le(checksum);
 
-  return w.data();
+  w.flush();
 }
 }  // end anonymous namespace
+
+bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl) {
+  err.clear();
+  if (!sink) {
+    err = "Error saving DB: missing output sink";
+    return false;
+  }
+  try {
+    RdbWriter writer(sink, g_rdb_checksum);
+    rdb_serialize(writer, repl);
+    return true;
+  } catch (const std::system_error& e) {
+    err = std::string("Write error saving DB: ") + e.code().message();
+  } catch (const std::exception& e) {
+    err = std::string("Error saving DB: ") + e.what();
+  }
+  return false;
+}
 
 bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbReplicationInfo* repl) {
   err.clear();
@@ -1646,13 +1704,9 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
           ") for saving: " + std::strerror(errno);
     return false;
   }
-  std::string data;
-  try {
-    data = rdb_build_string(err, repl);
-  } catch (const std::exception& e) {  // e.g. out of memory: the whole file is built in memory
-    err = std::string("Error saving DB: ") + e.what();
-  }
-  if (!err.empty()) {
+  if (!rdb_write([fd](const void* data, std::size_t size) { return ::write(fd, data, size); }, err,
+                 repl)) {
+    if (err.starts_with("Write error saving DB:")) err.insert(21, " on disk");
     ::close(fd);
     ::unlink(tmp_path.c_str());
     return false;
@@ -1664,20 +1718,14 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
     ::unlink(tmp_path.c_str());
     return false;
   };
-  std::size_t written = 0;
-  while (written < data.size()) {
-    const ssize_t rc = ::write(fd, data.data() + written, data.size() - written);
-    if (rc < 0 && errno == EINTR) continue;
-    if (rc <= 0) {
-      if (rc == 0) errno = EIO;
-      return write_error();
-    }
-    written += static_cast<std::size_t>(rc);
-  }
   // Fail fast on fsync error: a successful rename of an unfsynced temp file
   // can leave the new RDB with stale or torn contents after a power loss.
   if (::fsync(fd) != 0) return write_error();
-  ::close(fd);
+  if (::close(fd) != 0) {
+    err = std::string("Write error saving DB on disk: ") + std::strerror(errno);
+    ::unlink(tmp_path.c_str());
+    return false;
+  }
 
   if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
     err = "Error moving temp DB file " + tmp_path + " on the final destination " + path.string() +

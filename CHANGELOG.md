@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Stream RDB saves through bounded 64 KiB output with incremental CRC64, preserving atomic file publication and retries after disk errors. Visit key names and function sources in place; retain in-memory DUMP results and current disk-backed replication transport (deltas 46/58).
+
 - Implement writable replicas with startup/runtime read-only aliases, transaction/script/function admission, local AOF durability without downstream propagation, explicit read/write expiry behavior and bounded local-TTL reclamation. Preserve inherited TTL ownership and replace local data/functions/tracking on upstream full sync; verify all four Redis/PeaDB engine pairings (delta 24).
 
 - Count each blocked list, sorted-set, stream and WAIT invocation cancelled by a role change as one failed call and one UNBLOCKED error reply, retaining its dispatch identity without duplicating calls or charging the successful role-change command (delta 22).

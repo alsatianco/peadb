@@ -16709,11 +16709,8 @@ void init_replication_id() {
 // Wire RDB save/load to the function-library registry (see rdb.hpp). Call once at startup.
 void functions_register_rdb_hooks() {
   rdb_register_function_hooks(
-      []() {
-        std::vector<std::string> codes;
-        codes.reserve(g_libraries.size());
-        for (const auto& [lc, lib] : g_libraries) codes.push_back(lib.code);
-        return codes;
+      [](const std::function<void(const std::string&)>& visit) {
+        for (const auto& [lc, lib] : g_libraries) visit(lib.code);
       },
       [](const std::string& code, std::string& err) {
         std::string name;
