@@ -1024,6 +1024,7 @@ int run_server(const ServerConfig& config) {
   g_unblock_blocked_clients_cb = [&](const std::string& error) {
     if (blocked_count <= 0 && wait_count <= 0) return;
     for (auto& [fd, sess] : sessions) {
+      record_blocked_error(sess, error);
       if (sess.blocked.type != BlockType::None) {
         sess.blocked = BlockedState{};
         --blocked_count;

@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Count each blocked list, sorted-set, stream and WAIT invocation cancelled by a role change as one failed call and one UNBLOCKED error reply, retaining its dispatch identity without duplicating calls or charging the successful role-change command (delta 22).
+
 - Match Redis 7.2.5 propagation for GETSET (SET) and immediate/woken BRPOPLPUSH (one RPOPLPUSH), including renamed BRPOPLPUSH. Share move execution without a nested BLMOVE dispatch, keep genuine BLMOVE as LMOVE, suppress empty EXEC/Lua moves and preserve singleton self-move TTLs during execution/replay; verify actual replication/AOF streams, replica counters, TTLs and AOF replay across both engines (delta 15).
 
 - Record the unchanged native replication baseline against pinned Redis 7.2.5: isolate propagation, accounting, delayed-handshake and loading failures, plus the writable-replica setup refusal. Keep the suite unadopted and later checks explicitly unrun; see compatibility delta 8.

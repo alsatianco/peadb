@@ -17605,6 +17605,16 @@ void replication_cron(std::int64_t now) {
 
 // ─── Blocking client support ──────────────────────────────────────────────
 
+void record_blocked_error(const SessionState& session, const std::string& reply) {
+  if ((session.blocked.type == BlockType::None && !session.wait_state.has_value()) ||
+      !is_error_reply(reply))
+    return;
+  // The deferred invocation was counted by handle_command(). Its original_args may use a
+  // canonical name for wakeup/propagation, whereas last_cmd is the actual dispatch stats key.
+  record_cmd_failed(session.last_cmd);
+  record_error_stat(error_code_from_reply(reply));
+}
+
 std::string try_unblock_client_impl(SessionState& session) {
   if (session.blocked.type == BlockType::None) return {};
 

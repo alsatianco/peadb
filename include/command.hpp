@@ -282,6 +282,9 @@ void unregister_key_waiter(int fd);
 bool has_pending_wakeups();
 void clear_pending_wakeups();
 std::string try_unblock_client(SessionState& session);
+// Record an error cancelling a blocked key command or WAIT before clearing its state.
+// Dispatch already counted the call; retain that stats key (including command renames).
+void record_blocked_error(const SessionState& session, const std::string& reply);
 // Apply replication commands queued by the streaming thread onto the event loop thread.
 void drain_replica_cmd_queue();
 
