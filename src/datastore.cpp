@@ -242,9 +242,9 @@ void DataStore::unfreeze_time() {
   time_frozen_ = false;
 }
 
-void DataStore::remove_expired(DB& db, DB::iterator it) {
+void DataStore::remove_expired(DB& db, DB::iterator it, bool force) {
   const std::size_t dbi = db_index_of(db);
-  if (replica_expiry_) {
+  if (replica_expiry_ && !force) {
     replica_hidden_[dbi].insert(db.extract(it));
     has_replica_hidden_ = true;
     return;
@@ -309,10 +309,17 @@ void DataStore::restore_paused_hidden() {
   }
 }
 
-bool DataStore::expire_if_needed(DB& db, const std::string& key) {
+bool DataStore::expire_if_needed(DB& db, const std::string& key, bool write) {
+  const bool force = replica_expiry_ && writable_replica_ && write;
+  if (force && has_replica_hidden_) {
+    // A preceding read (including in the same script/EXEC) hid this entry. A write
+    // must still physically expire it, count it and propagate its DEL to the AOF.
+    auto node = replica_hidden_[db_index_of(db)].extract(key);
+    if (node && db.find(key) == db.end()) db.insert(std::move(node));
+  }
   const auto it = db.find(key);
   if (it == db.end() || !logically_expired(it->second)) return false;
-  remove_expired(db, it);
+  remove_expired(db, it, force);
   return true;
 }
 
@@ -358,7 +365,7 @@ std::optional<std::string> DataStore::get_string(const std::string& key, bool& w
 bool DataStore::set(const std::string& key, const std::string& value, bool nx, bool xx,
                     std::optional<std::int64_t> expire_at_ms, bool keep_ttl) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   const bool exists_now = it != db.end();
   if (nx && exists_now) return false;
@@ -373,28 +380,29 @@ bool DataStore::set(const std::string& key, const std::string& value, bool nx, b
   e.encoding_no_intset = false;
   if (!exists_now || !keep_ttl) {
     e.expire_at_ms = expire_at_ms;
+    if (expire_at_ms) remember_replica_expire(current_db_, key);
   }
   return true;
 }
 
-std::optional<std::string> DataStore::getdel(const std::string& key) {
-  auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
-  const auto it = db.find(key);
-  if (it == db.end()) return std::nullopt;
-  const auto out = it->second.str();
-  db.erase(it);
+std::optional<std::string> DataStore::getdel(const std::string& key, bool& deleted) {
+  // getdelCommand reads first, then dbSyncDelete even if the read hid an expired key.
+  auto out = get(key);
+  deleted = del_raw(key);
   return out;
 }
 
 bool DataStore::del(const std::string& key) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   return db.erase(key) > 0;
 }
 
 bool DataStore::del_raw(const std::string& key) {
-  return dbs_[current_db_].erase(key) > 0;
+  const auto live = dbs_[current_db_].erase(key);
+  const auto replica_hidden = replica_hidden_[current_db_].erase(key);
+  const auto paused_hidden = hidden_expired_[current_db_].erase(key);
+  return live + replica_hidden + paused_hidden > 0;
 }
 
 std::size_t DataStore::exists(const std::vector<std::string>& keys) {
@@ -407,57 +415,57 @@ std::size_t DataStore::exists(const std::vector<std::string>& keys) {
   return n;
 }
 
-std::string DataStore::type_of(const std::string& key) {
+std::string DataStore::type_of(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return "none";
   return type_name(it->second.type());
 }
 
-bool DataStore::is_wrongtype_for_string(const std::string& key) {
+bool DataStore::is_wrongtype_for_string(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::String;
 }
 
-bool DataStore::is_wrongtype_for_hash(const std::string& key) {
+bool DataStore::is_wrongtype_for_hash(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::Hash;
 }
 
-bool DataStore::is_wrongtype_for_list(const std::string& key) {
+bool DataStore::is_wrongtype_for_list(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::List;
 }
 
-bool DataStore::is_wrongtype_for_set(const std::string& key) {
+bool DataStore::is_wrongtype_for_set(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::Set;
 }
 
-bool DataStore::is_wrongtype_for_zset(const std::string& key) {
+bool DataStore::is_wrongtype_for_zset(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::ZSet;
 }
 
-bool DataStore::is_wrongtype_for_stream(const std::string& key) {
+bool DataStore::is_wrongtype_for_stream(const std::string& key, bool write) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, write);
   auto it = db.find(key);
   if (it == db.end()) return false;
   return it->second.type() != ValueType::Stream;
@@ -493,18 +501,19 @@ std::int64_t DataStore::expiretime(const std::string& key) {
   return p / 1000;
 }
 
-bool DataStore::expire(const std::string& key, std::int64_t expire_at_ms) {
+bool DataStore::expire(const std::string& key, std::int64_t expire_at_ms, bool remember) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return false;
   it->second.expire_at_ms = expire_at_ms;
+  if (remember) remember_replica_expire(current_db_, key);
   return true;
 }
 
 bool DataStore::persist(const std::string& key) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end() || !it->second.expire_at_ms.has_value()) return false;
   it->second.expire_at_ms.reset();
@@ -560,13 +569,17 @@ std::optional<std::string> DataStore::randomkey() {
 
 bool DataStore::rename(const std::string& src, const std::string& dst, bool nx_only) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, src);
-  expire_if_needed(db, dst);
+  expire_if_needed(db, src, /*write=*/true);
+  expire_if_needed(db, dst, /*write=*/true);
   auto src_it = db.find(src);
   if (src_it == db.end()) return false;
   if (nx_only && db.find(dst) != db.end()) return false;
-  db[dst] = src_it->second;
+  // Insertion may rehash; move the payload and erase the source before inserting.
+  if (src == dst) return true;
+  Entry value = std::move(src_it->second);
   db.erase(src_it);
+  db[dst] = std::move(value);
+  remember_replica_expire(current_db_, dst);
   return true;
 }
 
@@ -585,16 +598,17 @@ std::int64_t DataStore::move_key(const std::string& key, int dst_db) {
   if (dst_db == current_db_) return 0;
 
   auto& src = dbs_[current_db_];
-  expire_if_needed(src, key);
+  expire_if_needed(src, key, /*write=*/true);
   auto sit = src.find(key);
   if (sit == src.end()) return 0;
 
   auto& dst = dbs_[dst_db];
-  expire_if_needed(dst, key);
+  expire_if_needed(dst, key, /*write=*/true);
   if (dst.find(key) != dst.end()) return 0;
 
   dst[key] = sit->second;
   src.erase(sit);
+  remember_replica_expire(dst_db, key);
   return 1;
 }
 
@@ -607,10 +621,12 @@ std::int64_t DataStore::copy_key(const std::string& src, const std::string& dst,
   if (src_it == src_db.end()) return 0;
 
   auto& dst_db = dbs_[db];
-  expire_if_needed(dst_db, dst);
+  expire_if_needed(dst_db, dst, /*write=*/true);
   if (!replace && dst_db.find(dst) != dst_db.end()) return 0;
 
-  dst_db[dst] = src_it->second;
+  Entry value = src_it->second;
+  dst_db[dst] = std::move(value);
+  remember_replica_expire(db, dst);
   return 1;
 }
 
@@ -619,6 +635,8 @@ std::int64_t DataStore::incrby(const std::string& key, std::int64_t by, bool& ok
   ok = false;
   err.clear();
 
+  if (replica_expiry_ && writable_replica_)
+    expire_if_needed(dbs_[current_db_], key, /*write=*/true);
   auto val = get(key);
   long long base = 0;
   if (val.has_value()) {
@@ -654,6 +672,8 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
   ok = false;
   err.clear();
 
+  if (replica_expiry_ && writable_replica_)
+    expire_if_needed(dbs_[current_db_], key, /*write=*/true);
   auto val = get(key);
   long double base = 0.0;
   if (val.has_value()) {
@@ -701,7 +721,7 @@ std::string DataStore::incrbyfloat(const std::string& key, long double by, bool&
 
 std::size_t DataStore::append(const std::string& key, const std::string& value) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -736,7 +756,7 @@ int DataStore::setbit(const std::string& key, std::uint64_t bit_offset, int bit,
   }
 
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -808,7 +828,7 @@ std::size_t DataStore::setrange(const std::string& key, std::size_t offset,
   constexpr std::size_t kMaxStringLen = 512ULL * 1024ULL * 1024ULL;
 
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end() && value.empty()) {
     ok = true;
@@ -896,7 +916,7 @@ std::int64_t DataStore::hset(const std::string& key,
                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
 
   auto it = db.find(key);
   if (it == db.end()) {
@@ -937,7 +957,7 @@ std::int64_t DataStore::hdel(const std::string& key, const std::vector<std::stri
                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::Hash) {
@@ -1027,7 +1047,7 @@ std::int64_t DataStore::lpush(const std::string& key, const std::vector<std::str
                               bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -1046,7 +1066,7 @@ std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::str
                               bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -1064,7 +1084,7 @@ std::int64_t DataStore::rpush(const std::string& key, const std::vector<std::str
 std::optional<std::string> DataStore::lpop(const std::string& key, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
   if (it->second.type() != ValueType::List) {
@@ -1081,7 +1101,7 @@ std::optional<std::string> DataStore::lpop(const std::string& key, bool& wrongty
 std::optional<std::string> DataStore::rpop(const std::string& key, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
   if (it->second.type() != ValueType::List) {
@@ -1138,7 +1158,7 @@ std::vector<std::string> DataStore::lrange(const std::string& key, std::int64_t 
 DataStore::LsetResult DataStore::lset(const std::string& key, std::int64_t index,
                                       const std::string& value) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return LsetResult::NoKey;
   if (it->second.type() != ValueType::List) return LsetResult::WrongType;
@@ -1155,7 +1175,7 @@ std::int64_t DataStore::lrem(const std::string& key, std::int64_t count, const s
   wrongtype = false;
   key_removed = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::List) {
@@ -1197,7 +1217,7 @@ std::int64_t DataStore::linsert(const std::string& key, bool before, const std::
                                 const std::string& value, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::List) {
@@ -1216,7 +1236,7 @@ bool DataStore::ltrim(const std::string& key, std::int64_t start, std::int64_t s
   wrongtype = false;
   key_removed = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return false;
   if (it->second.type() != ValueType::List) {
@@ -1247,7 +1267,7 @@ std::int64_t DataStore::sadd(const std::string& key, const std::vector<std::stri
                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -1287,7 +1307,7 @@ std::int64_t DataStore::srem(const std::string& key, const std::vector<std::stri
                              bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::Set) {
@@ -1350,7 +1370,7 @@ std::int64_t DataStore::scard(const std::string& key, bool& wrongtype) {
 std::optional<std::string> DataStore::spop(const std::string& key, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return std::nullopt;
   if (it->second.type() != ValueType::Set) {
@@ -1402,7 +1422,7 @@ DataStore::ZAddResult DataStore::zadd_one(const std::string& key, double score,
                                           bool lt, bool incr) {
   ZAddResult r;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     Entry e;
@@ -1449,7 +1469,7 @@ std::int64_t DataStore::zrem(const std::string& key, const std::vector<std::stri
   wrongtype = false;
   key_removed = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::ZSet) {
@@ -1538,7 +1558,7 @@ std::vector<std::pair<std::string, double>> DataStore::zpop(const std::string& k
   wrongtype = false;
   std::vector<std::pair<std::string, double>> out;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return out;
   if (it->second.type() != ValueType::ZSet) {
@@ -1570,7 +1590,7 @@ std::optional<std::string> DataStore::xadd(
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   const bool key_exists = it != db.end();
   if (key_exists && it->second.type() != ValueType::Stream) {
@@ -1787,7 +1807,7 @@ bool DataStore::xgroup_create(const std::string& key, const std::string& group,
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     if (!mkstream) {
@@ -1834,7 +1854,7 @@ bool DataStore::xgroup_setid(const std::string& key, const std::string& group,
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     err = "NOGROUP No such key or consumer group";
@@ -2046,7 +2066,7 @@ std::int64_t DataStore::xdel(const std::string& key, const std::vector<std::stri
                              bool& wrongtype, bool is_trim) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::Stream) {
@@ -2224,7 +2244,7 @@ std::vector<DataStore::PendingItem> DataStore::xpending_extended(
 int DataStore::xgroup_destroy(const std::string& key, const std::string& group, bool& wrongtype) {
   wrongtype = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return 0;
   if (it->second.type() != ValueType::Stream) {
@@ -2240,7 +2260,7 @@ int DataStore::xgroup_createconsumer(const std::string& key, const std::string& 
   wrongtype = false;
   err.clear();
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
@@ -2269,7 +2289,7 @@ std::int64_t DataStore::xgroup_delconsumer(const std::string& key, const std::st
   err.clear();
   if (existed) *existed = false;
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     err = "NOGROUP No such key '" + key + "' or consumer group '" + group + "'";
@@ -2551,7 +2571,7 @@ bool DataStore::xsetid(const std::string& key, const std::string& id, bool& wron
     }
   }
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) {
     err = "ERR no such key";
@@ -3485,6 +3505,47 @@ std::string DataStore::debug_digest() {
   return std::string(24, '0') + buf;
 }
 
+// Local TTL ownership is transient and keyed by name/DB, like Redis's bitmap.
+void DataStore::remember_replica_expire(int db, const std::string& key) {
+  if (!replica_expiry_ || !writable_replica_ || lazy_expire_disabled_ != 0) return;
+  const auto it = dbs_[db].find(key);
+  if (it != dbs_[db].end() && it->second.expire_at_ms)
+    replica_expiring_[key] |= std::uint64_t{1} << db;
+}
+
+void DataStore::expire_local_replica_keys() {
+  if (replica_expiring_.empty() || expire_paused_) return;
+  std::vector<std::string> keys;
+  std::size_t buckets = 0;
+  // Bound both entries and empty buckets; never scan the master's whole keyspace.
+  do {
+    replica_expire_cursor_ = replica_expiring_.scan(
+        replica_expire_cursor_, [&](const auto& kv) { keys.push_back(kv.first); });
+  } while (replica_expire_cursor_ != 0 && keys.size() < 64 && ++buckets < 640);
+  const auto now = now_ms();
+  for (const auto& key : keys) {
+    const auto tracked = replica_expiring_.find(key);
+    if (tracked == replica_expiring_.end()) continue;
+    std::uint64_t keep = 0;
+    for (std::size_t dbi = 0; dbi < dbs_.size(); ++dbi) {
+      const auto bit = std::uint64_t{1} << dbi;
+      if (!(tracked->second & bit)) continue;
+      // A prior read may have hidden it until the command boundary.
+      auto& db = dbs_[dbi];
+      const auto it = db.find(key);
+      if (it == db.end() || !it->second.expire_at_ms) continue;
+      if (logically_expired(it->second, now))
+        remove_expired(db, it, /*force=*/true);
+      else
+        keep |= bit;
+    }
+    if (keep)
+      tracked->second = keep;
+    else
+      replica_expiring_.erase(tracked);
+  }
+}
+
 std::vector<std::pair<int, std::string>> DataStore::active_expire_cycle(std::size_t budget_per_db) {
   std::vector<std::pair<int, std::string>> expired;
   const auto now = now_ms();
@@ -3521,6 +3582,8 @@ void DataStore::flushall() {
   for (auto& db : dbs_) db.clear();
   for (auto& hidden : hidden_expired_) hidden.clear();
   for (auto& hidden : replica_hidden_) hidden.clear();
+  replica_expiring_.clear();
+  replica_expire_cursor_ = 0;
 }
 
 void DataStore::flushdb() {
@@ -3597,7 +3660,7 @@ bool DataStore::entry_is_big(const Entry& e) {
 
 bool DataStore::unlink(const std::string& key) {
   auto& db = dbs_[current_db_];
-  expire_if_needed(db, key);
+  expire_if_needed(db, key, /*write=*/true);
   auto it = db.find(key);
   if (it == db.end()) return false;
   if (entry_is_big(it->second)) {
@@ -3626,6 +3689,8 @@ void DataStore::flushall_async() {
   }
   for (auto& hidden : hidden_expired_) hidden.clear();
   for (auto& hidden : replica_hidden_) hidden.clear();
+  replica_expiring_.clear();
+  replica_expire_cursor_ = 0;
 }
 
 std::size_t DataStore::dbsize() {

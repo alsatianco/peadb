@@ -552,6 +552,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "min-replicas-to-write",
                                                        "min-replicas-max-lag",
                                                        "replica-serve-stale-data",
+                                                       "replica-read-only",
                                                        "busy-reply-threshold",
                                                        "replica-ignore-disk-write-errors",
                                                        "repl-timeout",
@@ -599,7 +600,6 @@ const std::unordered_map<std::string, FixedSetting>& fixed_settings() {
       {"rdbcompression", {"no", nullptr}},
       {"lfu-decay-time", {"0", nullptr}},  // LFU counters never decay
       {"maxmemory-clients", {"0", nullptr}},
-      {"replica-read-only", {"yes", nullptr}},
       {"replica-ignore-maxmemory", {"yes", nullptr}},
       {"tls-port", {"0", kTlsRefusal}},
       {"tls-replication", {"no", kTlsRefusal}},

@@ -112,6 +112,9 @@ def config_map(conn):
 # Commands whose replies must be the same on both engines (the server state is the same after
 # each one on both, since every case that changes something puts it back).
 SAME_REPLY = [
+    ('CONFIG', 'SET', 'replica-read-only', 'no'),
+    ('CONFIG', 'GET', 'slave-read-only'),
+    ('CONFIG', 'SET', 'slave-read-only', 'yes'),
     ('CONFIG', 'GET_XX'),
     ('CONFIG', 'SET', 'a'),
     ('CONFIG', 'GET'),
@@ -203,9 +206,6 @@ PEADB_ONLY = [
      "-ERR CONFIG SET failed (possibly related to argument 'rdbcompression') - PeaDB always uses "
      "'no' for this setting and cannot change it (compat/delta.md item 24)"),
     (('CONFIG', 'SET', 'rdbcompression', 'no'), '+OK'),
-    (('CONFIG', 'SET', 'replica-read-only', 'no'),
-     "-ERR CONFIG SET failed (possibly related to argument 'replica-read-only') - PeaDB always "
-     "uses 'yes' for this setting and cannot change it (compat/delta.md item 24)"),
     (('CONFIG', 'SET', 'port', '1'),
      "-ERR CONFIG SET failed (possibly related to argument 'port') - PeaDB cannot change this "
      "setting while it runs yet (compat/delta.md item 25)"),

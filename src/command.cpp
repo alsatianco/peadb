@@ -423,6 +423,7 @@ std::int64_t g_config_min_replicas_to_write = 0;
 std::int64_t g_config_min_replicas_max_lag = 10;
 bool g_in_lua_script = false;
 bool g_config_replica_serve_stale_data = true;
+bool g_config_replica_read_only = true;
 // ── Security ──
 std::string g_requirepass;  // empty = no auth required (Redis default)
 std::string g_masterauth;   // sent to master during replica handshake
@@ -1152,11 +1153,11 @@ bool running_stale() {
 // to queue in MULTI) or an EXEC by what it queued; never for the AOF or the master stream
 // (mustObeyClient()). A command that writes by Redis's flags (getCommandFlags(): a script or
 // function counts when it declares flags without no-writes) is refused while fewer good replicas
-// are connected than min-replicas-to-write, then on a replica, which is always read-only.
+// are connected than min-replicas-to-write, then on a read-only replica.
 std::string write_refusal(bool writes) {
   if (!writes) return {};
   if (noreplicas_should_reject()) return kNoReplicasReply;
-  if (g_replication_role == "slave") return kReadonlyReplicaReply;
+  if (g_replication_role == "slave" && g_config_replica_read_only) return kReadonlyReplicaReply;
   return {};
 }
 
@@ -1209,7 +1210,7 @@ std::string script_prepare_refusal(bool declared, int flags, bool ro) {
            "'allow-stale' flag is not set on the script.\r\n";
   }
   if (!(flags & kFuncNoWrites)) {
-    if (g_replication_role == "slave")
+    if (g_replication_role == "slave" && g_config_replica_read_only)
       return "-READONLY Can not run script with write flag on readonly replica\r\n";
     if (std::string misconf = script_misconf_reply(); !misconf.empty()) return misconf;
     if (ro) return encode_error("Can not execute a script with write flag using *_ro command.");
@@ -4594,49 +4595,49 @@ extern "C" void* RedisModule_GetApi(const char*) {
   return nullptr;
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_string_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_string(key)) {
+  if (store().is_wrongtype_for_string(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_hash_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_hash(key)) {
+  if (store().is_wrongtype_for_hash(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_list_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_list(key)) {
+  if (store().is_wrongtype_for_list(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_set_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_set(key)) {
+  if (store().is_wrongtype_for_set(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_zset_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_zset(key)) {
+  if (store().is_wrongtype_for_zset(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
 }
 
-template <typename Fn>
+template <bool Write = false, typename Fn>
 std::string with_stream_key(const std::string& key, Fn&& fn) {
-  if (store().is_wrongtype_for_stream(key)) {
+  if (store().is_wrongtype_for_stream(key, Write)) {
     return wrongtype_error_reply();
   }
   return fn();
@@ -4685,7 +4686,8 @@ bool parse_lex_bound(const std::string& s, LexBound& b) {
 // the order of Redis's zrangeGenericCommand(): the options, then the range, then the key.
 std::string zrange_select(const std::vector<std::string>& args, std::size_t key_idx,
                           std::size_t min_idx, std::size_t opts_idx, bool allow_withscores,
-                          std::vector<std::pair<std::string, double>>& items, bool& withscores) {
+                          std::vector<std::pair<std::string, double>>& items, bool& withscores,
+                          bool write = false) {
   const std::string& key = args[key_idx];
   enum class Mode { Index, ByScore, ByLex };
   Mode mode = Mode::Index;
@@ -4730,7 +4732,7 @@ std::string zrange_select(const std::vector<std::string>& args, std::size_t key_
   } else if (!parse_lex_bound(lo_s, lex_lo) || !parse_lex_bound(hi_s, lex_hi)) {
     return encode_error("min or max not valid string range item");
   }
-  if (store().is_wrongtype_for_zset(key)) return wrongtype_error_reply();
+  if (store().is_wrongtype_for_zset(key, write)) return wrongtype_error_reply();
   bool wt = false;
   auto all = store().zrange(key, 0, -1, true, wt);  // ascending {member,score}
   if (wt) return wrongtype_error_reply();
@@ -4790,7 +4792,7 @@ std::string list_pop_command(const std::vector<std::string>& args, bool left, Re
     if (!parse_i64(args[2], count)) return encode_error("value is not an integer or out of range");
     if (count < 0) return encode_error("value is out of range, must be positive");
   }
-  return with_list_key(args[1], [&]() {
+  return with_list_key<true>(args[1], [&]() {
     bool wrongtype = false;
     if (!has_count) {
       auto v = left ? store().lpop(args[1], wrongtype) : store().rpop(args[1], wrongtype);
@@ -5626,6 +5628,13 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
         {"min-replicas-to-write", live_number(g_config_min_replicas_to_write)},
         {"min-replicas-max-lag", live_number(g_config_min_replicas_max_lag)},
         {"replica-serve-stale-data", live_bool(g_config_replica_serve_stale_data)},
+        {"replica-read-only",
+         {[] { return std::string(g_config_replica_read_only ? "yes" : "no"); },
+          [](const std::string& v, std::string&) {
+            g_config_replica_read_only = v == "yes";
+            store().set_writable_replica(!g_config_replica_read_only);
+            return true;
+          }}},
         {"replica-ignore-disk-write-errors", live_bool(g_replica_ignore_disk_write_errors)},
         {"busy-reply-threshold", live_number(g_config_lua_time_limit)},
         {"proto-max-bulk-len", live_number(g_proto_max_bulk_len)},
@@ -6425,10 +6434,10 @@ std::string blocking_move_command(const std::vector<std::string>& args, SessionS
   // Only the source type is checked up front. The destination type is checked
   // when an element is actually moved — an empty source blocks regardless of the
   // dst type (Redis blmoveGenericCommand).
-  if (store().is_wrongtype_for_list(src)) return wrongtype_error_reply();
+  if (store().is_wrongtype_for_list(src, /*write=*/true)) return wrongtype_error_reply();
 
   bool wrongtype = false;
-  if (store().llen(src, wrongtype) > 0 && store().is_wrongtype_for_list(dst)) {
+  if (store().llen(src, wrongtype) > 0 && store().is_wrongtype_for_list(dst, /*write=*/true)) {
     return wrongtype_error_reply();  // src has data but dst is wrong type: source
                                      // intact
   }
@@ -6445,7 +6454,7 @@ std::string blocking_move_command(const std::vector<std::string>& args, SessionS
       (void)store().lpush(dst, one, wrongtype);
     else
       (void)store().rpush(dst, one, wrongtype);
-    if (self_expire >= 0) (void)store().expire(src, self_expire);
+    if (self_expire >= 0) (void)store().expire(src, self_expire, /*remember=*/false);
     if (legacy) propagate_write({"RPOPLPUSH", src, dst}, session, nullptr);
     return encode_bulk(*popped);
   }
@@ -7543,6 +7552,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     "\r\n"
                     "expired_keys:" +
                     std::to_string(store().stat_expired_keys()) +
+                    "\r\n"
+                    "slave_expires_tracked_keys:" +
+                    std::to_string(store().replica_expires_tracked_keys()) +
                     "\r\n"
                     "evicted_keys:" +
                     std::to_string(store().stat_evicted_keys()) +
@@ -8750,7 +8762,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             // to be a string.
                             std::optional<std::string> old;
                             if (opts.get) {
-                              if (store().is_wrongtype_for_string(args[1]))
+                              if (store().is_wrongtype_for_string(args[1], /*write=*/true))
                                 return wrongtype_error_reply();
                               old = store().get(args[1]);
                             }
@@ -8860,7 +8872,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               return encode_error("wrong number of arguments for 'msetnx' command");
                             // A key of any type stops it, as Redis's lookupKeyWrite() finds it.
                             for (std::size_t i = 1; i < args.size(); i += 2) {
-                              if (store().type_of(args[i]) != "none") {
+                              if (store().type_of(args[i], /*write=*/true) != "none") {
                                 g_write_changed_nothing = true;
                                 return encode_integer(0);
                               }
@@ -8880,8 +8892,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     1,
                                     [](const std::vector<std::string>& args, SessionState&, bool&) {
                                       return with_string_key(args[1], [&]() {
-                                        auto v = store().getdel(args[1]);
-                                        if (!v.has_value())
+                                        bool deleted = false;
+                                        auto v = store().getdel(args[1], deleted);
+                                        if (!deleted)
                                           g_write_changed_nothing = true;  // nothing deleted
                                         return v.has_value() ? encode_bulk(*v)
                                                              : encode_null(RespVersion::Resp2);
@@ -8895,7 +8908,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     1,
                                     1,
                                     [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                      return with_string_key(args[1], [&]() {
+                                      return with_string_key<true>(args[1], [&]() {
                                         auto old = store().get(args[1]);
                                         (void)store().set(args[1], args[2], false, false,
                                                           std::nullopt, false);
@@ -8952,7 +8965,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             1,
             1,
             [](const std::vector<std::string>& args, SessionState&, bool&) {
-              return with_string_key(args[1], [&]() {
+              return with_string_key<true>(args[1], [&]() {
                 if (!must_obey_client() && static_cast<std::int64_t>(store().strlen(args[1])) +
                                                    static_cast<std::int64_t>(args[2].size()) >
                                                g_proto_max_bulk_len) {
@@ -8991,7 +9004,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             if (!parse_i64(args[3], bit) || (bit != 0 && bit != 1)) {
                               return encode_error("bit is not an integer or out of range");
                             }
-                            return with_string_key(args[1], [&]() {
+                            return with_string_key<true>(args[1], [&]() {
                               bool ok = false;
                               std::string err;
                               const int prev =
@@ -9050,7 +9063,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 // Subtraction form avoids signed overflow when offset is near INT64_MAX.
                 return encode_error("string exceeds maximum allowed size (proto-max-bulk-len)");
               }
-              return with_string_key(args[1], [&]() {
+              return with_string_key<true>(args[1], [&]() {
                 bool ok = false;
                 std::string err;
                 const auto out =
@@ -9177,7 +9190,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                    return with_string_key(args[1], [&]() {
+                                    return with_string_key<true>(args[1], [&]() {
                                       bool ok = false;
                                       std::string err;
                                       auto v = store().incrby(args[1], 1, ok, err);
@@ -9196,7 +9209,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             std::int64_t by = 0;
                             if (!parse_i64(args[2], by))
                               return encode_error("value is not an integer or out of range");
-                            return with_string_key(args[1], [&]() {
+                            return with_string_key<true>(args[1], [&]() {
                               bool ok = false;
                               std::string err;
                               auto v = store().incrby(args[1], by, ok, err);
@@ -9211,7 +9224,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                    return with_string_key(args[1], [&]() {
+                                    return with_string_key<true>(args[1], [&]() {
                                       bool ok = false;
                                       std::string err;
                                       auto v = store().incrby(args[1], -1, ok, err);
@@ -9234,7 +9247,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               return encode_error(
                                   "decrement would overflow");  // -INT64_MIN is unrepresentable
                             }
-                            return with_string_key(args[1], [&]() {
+                            return with_string_key<true>(args[1], [&]() {
                               bool ok = false;
                               std::string err;
                               auto v = store().incrby(args[1], -by, ok, err);
@@ -9253,7 +9266,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             long double by = 0;
                             if (!parse_strict_float(args[2], by))
                               return encode_error("value is not a valid float");
-                            return with_string_key(args[1], [&]() {
+                            return with_string_key<true>(args[1], [&]() {
                               bool ok = false;
                               std::string err;
                               auto v = store().incrbyfloat(args[1], by, ok, err);
@@ -9811,7 +9824,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 }
               }
               const std::string& key = args[1];
-              if (!replace && store().type_of(key) != "none")
+              if (!replace && store().type_of(key, /*write=*/true) != "none")
                 return std::string("-BUSYKEY Target key name already exists.\r\n");
               std::int64_t ttl = 0;
               if (!parse_strict_int(args[2], ttl))
@@ -10212,7 +10225,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           [](const std::vector<std::string>& args, SessionState&, bool&) {
                             if (((args.size() - 2) % 2) != 0)
                               return encode_error("wrong number of arguments for 'hset' command");
-                            return with_hash_key(args[1], [&]() {
+                            return with_hash_key<true>(args[1], [&]() {
                               std::vector<std::pair<std::string, std::string>> fields;
                               for (std::size_t i = 2; i < args.size(); i += 2)
                                 fields.emplace_back(args[i], args[i + 1]);
@@ -10273,7 +10286,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           [](const std::vector<std::string>& args, SessionState&, bool&) {
                             if (((args.size() - 2) % 2) != 0)
                               return encode_error("wrong number of arguments for 'hmset' command");
-                            return with_hash_key(args[1], [&]() {
+                            return with_hash_key<true>(args[1], [&]() {
                               std::vector<std::pair<std::string, std::string>> fields;
                               for (std::size_t i = 2; i < args.size(); i += 2)
                                 fields.emplace_back(args[i], args[i + 1]);
@@ -10291,7 +10304,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     1,
                                     1,
                                     [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                      return with_hash_key(args[1], [&]() {
+                                      return with_hash_key<true>(args[1], [&]() {
                                         bool wrongtype = false;
                                         auto existing = store().hget(args[1], args[2], wrongtype);
                                         if (wrongtype) return wrongtype_error_reply();
@@ -10352,7 +10365,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     1,
                     1,
                     [](const std::vector<std::string>& args, SessionState&, bool&) {
-                      return with_hash_key(args[1], [&]() {
+                      return with_hash_key<true>(args[1], [&]() {
                         std::int64_t increment = 0;
                         if (!parse_i64(args[3], increment))
                           return encode_error("value is not an integer or out of range");
@@ -10387,7 +10400,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     1,
                     1,
                     [](const std::vector<std::string>& args, SessionState&, bool&) {
-                      return with_hash_key(args[1], [&]() {
+                      return with_hash_key<true>(args[1], [&]() {
                         long double increment = 0;
                         if (!parse_strict_float(args[3], increment))
                           return encode_error("value is not a valid float");
@@ -10446,7 +10459,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                    return with_hash_key(args[1], [&]() {
+                                    return with_hash_key<true>(args[1], [&]() {
                                       std::vector<std::string> fields(args.begin() + 2, args.end());
                                       bool wrongtype = false;
                                       const auto removed = store().hdel(args[1], fields, wrongtype);
@@ -10528,7 +10541,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           1,
                           1,
                           [](const std::vector<std::string>& args, SessionState& session, bool&) {
-                            return with_list_key(args[1], [&]() {
+                            return with_list_key<true>(args[1], [&]() {
                               std::vector<std::string> vals(args.begin() + 2, args.end());
                               bool wrongtype = false;
                               auto n = store().lpush(args[1], vals, wrongtype);
@@ -10546,7 +10559,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           1,
                           1,
                           [](const std::vector<std::string>& args, SessionState& session, bool&) {
-                            return with_list_key(args[1], [&]() {
+                            return with_list_key<true>(args[1], [&]() {
                               std::vector<std::string> vals(args.begin() + 2, args.end());
                               bool wrongtype = false;
                               auto n = store().rpush(args[1], vals, wrongtype);
@@ -10632,7 +10645,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             // Try immediate pop first
                             for (std::size_t i = 1; i + 1 < args.size(); ++i) {
                               const auto& key = args[i];
-                              if (store().is_wrongtype_for_list(key))
+                              if (store().is_wrongtype_for_list(key, /*write=*/true))
                                 return wrongtype_error_reply();
                               bool wrongtype = false;
                               auto v = store().lpop(key, wrongtype);
@@ -10675,7 +10688,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             }
                             for (std::size_t i = 1; i + 1 < args.size(); ++i) {
                               const auto& key = args[i];
-                              if (store().is_wrongtype_for_list(key))
+                              if (store().is_wrongtype_for_list(key, /*write=*/true))
                                 return wrongtype_error_reply();
                               bool wrongtype = false;
                               auto v = store().rpop(key, wrongtype);
@@ -10717,8 +10730,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                          (where_to != "LEFT" && where_to != "RIGHT")) {
                                        return encode_error("syntax error");
                                      }
-                                     if (store().is_wrongtype_for_list(src) ||
-                                         store().is_wrongtype_for_list(dst))
+                                     if (store().is_wrongtype_for_list(src, /*write=*/true) ||
+                                         store().is_wrongtype_for_list(dst, /*write=*/true))
                                        return wrongtype_error_reply();
 
                                      bool wrongtype = false;
@@ -10739,7 +10752,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                      else
                                        (void)store().rpush(dst, one, wrongtype);
                                      if (wrongtype) return wrongtype_error_reply();
-                                     if (self_expire >= 0) (void)store().expire(src, self_expire);
+                                     if (self_expire >= 0)
+                                       (void)store().expire(src, self_expire, /*remember=*/false);
                                      return encode_bulk(*popped);
                                    }});
 
@@ -10806,7 +10820,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               for (std::int64_t i = 0; i < numkeys; ++i) {
                 const auto& key = args[static_cast<std::size_t>(3 + i)];
                 bool wrongtype = false;
-                if (store().is_wrongtype_for_list(key)) return wrongtype_error_reply();
+                if (store().is_wrongtype_for_list(key, /*write=*/true))
+                  return wrongtype_error_reply();
                 const auto len = store().llen(key, wrongtype);
                 if (len == 0) continue;
                 std::vector<std::string> enc;
@@ -10917,7 +10932,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               return terr;
                             }
                             for (std::size_t i = 1; i + 1 < args.size(); ++i) {
-                              const auto tp = store().type_of(args[i]);
+                              const auto tp = store().type_of(args[i], /*write=*/true);
                               if (tp != "none" && tp != "zset") return wrongtype_error_reply();
                               bool wrongtype = false;
                               auto vals = store().zpop(args[i], 1, false, wrongtype);
@@ -10959,7 +10974,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               return terr;
                             }
                             for (std::size_t i = 1; i + 1 < args.size(); ++i) {
-                              const auto tp = store().type_of(args[i]);
+                              const auto tp = store().type_of(args[i], /*write=*/true);
                               if (tp != "none" && tp != "zset") return wrongtype_error_reply();
                               bool wrongtype = false;
                               auto vals = store().zpop(args[i], 1, true, wrongtype);
@@ -10994,7 +11009,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                    return with_set_key(args[1], [&]() {
+                                    return with_set_key<true>(args[1], [&]() {
                                       std::vector<std::string> members(args.begin() + 2,
                                                                        args.end());
                                       bool wrongtype = false;
@@ -11011,7 +11026,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
-                                    return with_set_key(args[1], [&]() {
+                                    return with_set_key<true>(args[1], [&]() {
                                       std::vector<std::string> members(args.begin() + 2,
                                                                        args.end());
                                       bool wrongtype = false;
@@ -11079,7 +11094,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           1,
                           1,
                           [](const std::vector<std::string>& args, SessionState&, bool&) {
-                            return with_set_key(args[1], [&]() {
+                            return with_set_key<true>(args[1], [&]() {
                               bool wrongtype = false;
                               if (args.size() >= 3) {
                                 std::int64_t count = 0;
@@ -11164,7 +11179,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           "GT, LT, and/or NX options at the same time are not compatible");
                     }
 
-                    return with_zset_key(args[1], [&]() {
+                    return with_zset_key<true>(args[1], [&]() {
                       // Validate every score before applying anything (Redis parses all pairs
                       // first, so a bad later pair leaves the zset untouched). NaN is invalid.
                       std::vector<double> scores;
@@ -11177,7 +11192,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                         scores.push_back(static_cast<double>(score));
                       }
                       // XX never creates the key: bail before zadd_one materializes an empty zset.
-                      if (xx && store().type_of(args[1]) == "none") {
+                      if (xx && store().type_of(args[1], /*write=*/true) == "none") {
                         if (incr) return encode_null(RespVersion::Resp2);
                         return encode_integer(0);
                       }
@@ -11236,7 +11251,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             // XX&&NX cases).
                             if ((nx && xx) || pos >= args.size() || ((args.size() - pos) % 3) != 0)
                               return encode_error("syntax error");
-                            return with_zset_key(args[1], [&]() {
+                            return with_zset_key<true>(args[1], [&]() {
                               int added = 0, changed = 0;
                               for (std::size_t i = pos; i < args.size(); i += 3) {
                                 long double lon = 0;
@@ -11323,7 +11338,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               count = static_cast<std::size_t>(c);
                             }
                             if (args.size() > 3) return encode_error("syntax error");
-                            return with_zset_key(args[1], [&]() {
+                            return with_zset_key<true>(args[1], [&]() {
                               bool wrongtype = false;
                               auto vals = store().zpop(args[1], count, false, wrongtype);
                               if (wrongtype) return wrongtype_error_reply();
@@ -11363,7 +11378,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                               count = static_cast<std::size_t>(c);
                             }
                             if (args.size() > 3) return encode_error("syntax error");
-                            return with_zset_key(args[1], [&]() {
+                            return with_zset_key<true>(args[1], [&]() {
                               bool wrongtype = false;
                               auto vals = store().zpop(args[1], count, true, wrongtype);
                               if (wrongtype) return wrongtype_error_reply();
@@ -11679,10 +11694,10 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                       return encode_error("wrong number of arguments for 'xadd' command");
 
                     // If NOMKSTREAM and key doesn't exist, return null
-                    if (nomkstream && store().type_of(args[1]) == "none")
+                    if (nomkstream && store().type_of(args[1], /*write=*/true) == "none")
                       return encode_null(RespVersion::Resp2);
 
-                    return with_stream_key(args[1], [&]() {
+                    return with_stream_key<true>(args[1], [&]() {
                       std::vector<std::pair<std::string, std::string>> fields;
                       for (std::size_t i = idx; i < args.size(); i += 2)
                         fields.push_back({args[i], args[i + 1]});
@@ -11734,7 +11749,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                   1,
                                   [](const std::vector<std::string>& args, SessionState&, bool&) {
                                     std::vector<std::string> ids(args.begin() + 2, args.end());
-                                    return with_stream_key(args[1], [&]() {
+                                    return with_stream_key<true>(args[1], [&]() {
                                       bool wrongtype = false;
                                       const auto n = store().xdel(args[1], ids, wrongtype);
                                       if (wrongtype) return wrongtype_error_reply();
@@ -11841,7 +11856,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                   }
                   return encode_error("syntax error");
                 }
-                return with_stream_key(args[2], [&]() {
+                return with_stream_key<true>(args[2], [&]() {
                   bool wrongtype = false;
                   std::string err;
                   const bool ok =
@@ -11867,7 +11882,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     return encode_error("value for ENTRIESREAD must be positive or -1");
                   have_er = true;
                 }
-                return with_stream_key(args[2], [&]() {
+                return with_stream_key<true>(args[2], [&]() {
                   bool wrongtype = false;
                   std::string err;
                   const bool ok = store().xgroup_setid(args[2], args[3], args[4], wrongtype, err,
@@ -11880,7 +11895,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (sub == "DESTROY") {
                 if (args.size() != 4)
                   return encode_error("wrong number of arguments for 'xgroup|destroy' command");
-                return with_stream_key(args[2], [&]() {
+                return with_stream_key<true>(args[2], [&]() {
                   bool wrongtype = false;
                   const int n = store().xgroup_destroy(args[2], args[3], wrongtype);
                   if (wrongtype) return wrongtype_error_reply();
@@ -11894,7 +11909,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 if (args.size() != 5)
                   return encode_error(
                       "wrong number of arguments for 'xgroup|createconsumer' command");
-                return with_stream_key(args[2], [&]() {
+                return with_stream_key<true>(args[2], [&]() {
                   bool wrongtype = false;
                   std::string err;
                   const int n =
@@ -11910,7 +11925,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               if (sub == "DELCONSUMER") {
                 if (args.size() != 5)
                   return encode_error("wrong number of arguments for 'xgroup|delconsumer' command");
-                return with_stream_key(args[2], [&]() {
+                return with_stream_key<true>(args[2], [&]() {
                   bool wrongtype = false;
                   std::string err;
                   bool existed = false;
@@ -13100,7 +13115,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           [](const std::vector<std::string>& args, SessionState& session,
                              bool&) -> std::string {
                             // Redis looks the key up before it parses the index.
-                            const auto type = store().type_of(args[1]);
+                            const auto type = store().type_of(args[1], /*write=*/true);
                             if (type == "none") return encode_error("no such key");
                             if (type != "list") return wrongtype_error_reply();
                             std::int64_t index;
@@ -13238,9 +13253,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     1,
                                     [](const std::vector<std::string>& args, SessionState&,
                                        bool&) -> std::string {
-                                      if (store().is_wrongtype_for_list(args[1]))
+                                      if (store().is_wrongtype_for_list(args[1], /*write=*/true))
                                         return wrongtype_error_reply();
-                                      if (store().type_of(args[1]) == "none")
+                                      if (store().type_of(args[1], /*write=*/true) == "none")
                                         return encode_integer(0);
                                       std::vector<std::string> vals(args.begin() + 2, args.end());
                                       bool wt = false;
@@ -13258,9 +13273,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                     1,
                                     [](const std::vector<std::string>& args, SessionState&,
                                        bool&) -> std::string {
-                                      if (store().is_wrongtype_for_list(args[1]))
+                                      if (store().is_wrongtype_for_list(args[1], /*write=*/true))
                                         return wrongtype_error_reply();
-                                      if (store().type_of(args[1]) == "none")
+                                      if (store().type_of(args[1], /*write=*/true) == "none")
                                         return encode_integer(0);
                                       std::vector<std::string> vals(args.begin() + 2, args.end());
                                       bool wt = false;
@@ -13299,9 +13314,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                        1,
                                        [](const std::vector<std::string>& args,
                                           SessionState& session, bool&) -> std::string {
-                                         if (store().is_wrongtype_for_list(args[1]))
+                                         if (store().is_wrongtype_for_list(args[1], /*write=*/true))
                                            return wrongtype_error_reply();
-                                         if (store().is_wrongtype_for_list(args[2]))
+                                         if (store().is_wrongtype_for_list(args[2], /*write=*/true))
                                            return wrongtype_error_reply();
                                          bool wt = false;
                                          const auto self_expire =
@@ -13311,7 +13326,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                          if (!val) return encode_null(session.resp_version);
                                          store().lpush(args[2], {*val}, wt);
                                          if (self_expire >= 0)
-                                           (void)store().expire(args[1], self_expire);
+                                           (void)store().expire(args[1], self_expire,
+                                                                /*remember=*/false);
                                          return encode_bulk(*val);
                                        }});
 
@@ -13372,7 +13388,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
               }
               for (std::int64_t k = 0; k < numkeys; ++k) {
                 const auto& key = args[static_cast<std::size_t>(k + 2)];
-                if (store().is_wrongtype_for_list(key)) return wrongtype_error_reply();
+                if (store().is_wrongtype_for_list(key, /*write=*/true))
+                  return wrongtype_error_reply();
                 bool wt = false;
                 if (store().llen(key, wt) == 0) continue;
                 std::vector<std::string> popped;
@@ -13622,7 +13639,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
           if (!mode_s.empty()) proxy.push_back(mode_s);
           std::vector<std::pair<std::string, double>> victims;
           bool ws = false;
-          auto err = zrange_select(proxy, 1, 2, 4, false, victims, ws);
+          auto err = zrange_select(proxy, 1, 2, 4, false, victims, ws, /*write=*/true);
           if (!err.empty()) return err;
           if (victims.empty()) return encode_integer(0);
           std::vector<std::string> members;
@@ -13751,7 +13768,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     1,
                     1,
                     [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-                      if (store().is_wrongtype_for_zset(args[1])) return wrongtype_error_reply();
+                      if (store().is_wrongtype_for_zset(args[1], /*write=*/true))
+                        return wrongtype_error_reply();
                       long double incr = 0;
                       if (!parse_strict_float(args[2], incr))
                         return encode_error("value is not a valid float");
@@ -14777,7 +14795,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             1,
             [](const std::vector<std::string>& args, SessionState& session, bool&) -> std::string {
               // BITFIELD: GET/SET/INCRBY on signed/unsigned integer bitfields with OVERFLOW modes.
-              if (store().is_wrongtype_for_string(args[1])) return wrongtype_error_reply();
+              if (store().is_wrongtype_for_string(args[1], /*write=*/true))
+                return wrongtype_error_reply();
               auto val = store().get(args[1]);
               std::string s = val ? *val : "";
               auto get_bit = [&](std::size_t bit_pos) -> int {
@@ -15229,7 +15248,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                   1,
                   1,
                   [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-                    if (store().is_wrongtype_for_stream(args[1])) return wrongtype_error_reply();
+                    if (store().is_wrongtype_for_stream(args[1], /*write=*/true))
+                      return wrongtype_error_reply();
                     // Simplified: for MAXLEN, trim the stream
                     bool wt = false;
                     auto entries = store().xrange(args[1], "-", "+", false, wt);
@@ -15505,7 +15525,8 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                   1,
                   [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
                     const std::string& key = args[1];
-                    if (store().is_wrongtype_for_string(key)) return wrongtype_error_reply();
+                    if (store().is_wrongtype_for_string(key, /*write=*/true))
+                      return wrongtype_error_reply();
                     auto cur = store().get(key);
                     if (cur.has_value() && !hll_is_valid(*cur))
                       return encode_error("WRONGTYPE Key is not a valid HyperLogLog string value.");
@@ -15574,27 +15595,27 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
             }});
 
     // ─── SMOVE ───────────────────────────────────────────────────────────
-    t.emplace(
-        "SMOVE",
-        CommandSpec{"SMOVE",
-                    4,
-                    {"write", "fast"},
-                    1,
-                    2,
-                    1,
-                    [](const std::vector<std::string>& args, SessionState&, bool&) -> std::string {
-                      const std::string& src = args[1];
-                      const std::string& dst = args[2];
-                      const std::string& m = args[3];
-                      if (store().is_wrongtype_for_set(src) || store().is_wrongtype_for_set(dst))
-                        return wrongtype_error_reply();
-                      bool wt = false;
-                      if (!store().sismember(src, m, wt)) return encode_integer(0);
-                      if (wt) return wrongtype_error_reply();
-                      store().srem(src, {m}, wt);
-                      store().sadd(dst, {m}, wt);
-                      return encode_integer(1);
-                    }});
+    t.emplace("SMOVE", CommandSpec{"SMOVE",
+                                   4,
+                                   {"write", "fast"},
+                                   1,
+                                   2,
+                                   1,
+                                   [](const std::vector<std::string>& args, SessionState&,
+                                      bool&) -> std::string {
+                                     const std::string& src = args[1];
+                                     const std::string& dst = args[2];
+                                     const std::string& m = args[3];
+                                     if (store().is_wrongtype_for_set(src, /*write=*/true) ||
+                                         store().is_wrongtype_for_set(dst, /*write=*/true))
+                                       return wrongtype_error_reply();
+                                     bool wt = false;
+                                     if (!store().sismember(src, m, wt)) return encode_integer(0);
+                                     if (wt) return wrongtype_error_reply();
+                                     store().srem(src, {m}, wt);
+                                     store().sadd(dst, {m}, wt);
+                                     return encode_integer(1);
+                                   }});
 
     // ─── ZRANGESTORE — shares the unified range selector with ZRANGE ───
     t.emplace(
@@ -16332,8 +16353,9 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
     const bool first_write =
         !g_script_write_dirty && (spec_command_flags(spec, args) & kRedisCmdWrite) != 0;
     if (first_write && !must_obey_client()) {
-      std::string refusal =
-          g_replication_role == "slave" ? std::string(kReadonlyReplicaReply) : misconf_reply();
+      std::string refusal = g_replication_role == "slave" && g_config_replica_read_only
+                                ? std::string(kReadonlyReplicaReply)
+                                : misconf_reply();
       if (refusal.empty() && noreplicas_should_reject()) refusal = kNoReplicasReply;
       if (!refusal.empty()) return reject(refusal);
     }
@@ -16745,6 +16767,8 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   num("min-replicas-to-write", g_config_min_replicas_to_write);
   num("min-replicas-max-lag", g_config_min_replicas_max_lag);
   yes("replica-serve-stale-data", g_config_replica_serve_stale_data);
+  yes("replica-read-only", g_config_replica_read_only);
+  store().set_writable_replica(!g_config_replica_read_only);
   yes("replica-ignore-disk-write-errors", g_replica_ignore_disk_write_errors);
   num("busy-reply-threshold", g_config_lua_time_limit);
   yes("lazyfree-lazy-server-del", g_lazyfree_lazy_server_del);
@@ -16912,8 +16936,8 @@ void configure_save(const std::string& spec) {
 
 // Active expiry driver (called from the event loop). On a master, physically
 // expires keys and propagates a DEL to replicas so they stay in sync. On a
-// replica, does nothing — a replica deletes a key only when the master's DEL
-// arrives, which prevents master/replica divergence from independent expiry clocks.
+// replica, reclaims only TTLs assigned locally; master-owned keys wait for the
+// master's DEL unless a local write lookup explicitly expires them.
 void on_client_disconnect(int fd) {
   g_monitor_fds.erase(fd);
   // If this client owns an in-progress BUSY episode, release it. The cooperative "while true do"
@@ -16953,8 +16977,7 @@ std::int64_t client_pause_end_ms() {
 }
 
 void run_active_expire_cycle() {
-  if (g_pause_cron) return;  // DEBUG PAUSE-CRON
-  if (g_replication_role == "slave") return;
+  if (g_pause_cron) return;                              // DEBUG PAUSE-CRON
   if (paused_actions_with_update(kPauseExpire)) return;  // CLIENT PAUSE stops expiry
   const auto t0 = std::chrono::steady_clock::now();
   {
@@ -16962,7 +16985,10 @@ void run_active_expire_cycle() {
     // AOF write and one backlog append, each DEL on its own, as Redis's beforeSleep() writes the
     // DELs of a cycle (one write and, with appendfsync always, one fsync instead of one per key).
     const ExecutionUnit unit(nullptr, /*may_wrap=*/false);
-    store().active_expire_cycle();
+    if (g_replication_role == "slave")
+      store().expire_local_replica_keys();
+    else
+      store().active_expire_cycle();
   }
   // Record the cycle's wall time as an "expire-cycle" latency event (LATENCY monitor).
   const auto cycle_ms =
@@ -17748,7 +17774,7 @@ std::string try_unblock_client_impl(SessionState& session) {
             (void)store().lpush(dst, one, wt);
           else
             (void)store().rpush(dst, one, wt);
-          if (self_expire >= 0) (void)store().expire(captured_key, self_expire);
+          if (self_expire >= 0) (void)store().expire(captured_key, self_expire, /*remember=*/false);
           if (cmd0 == "BRPOPLPUSH")
             propagate({"RPOPLPUSH", captured_key, dst});
           else

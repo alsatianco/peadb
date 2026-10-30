@@ -1205,7 +1205,7 @@ int run_server(const ServerConfig& config) {
 
     const auto loop_now_ms = DataStore::now_ms();
     if (active_expire_enabled() && (loop_now_ms - last_active_expire_ms) >= 100) {
-      run_active_expire_cycle();  // master expires + propagates DEL; replica is a no-op
+      run_active_expire_cycle();  // master expiry, or only locally assigned replica TTLs
       last_active_expire_ms = loop_now_ms;
     }
     aof_cron(loop_now_ms);
