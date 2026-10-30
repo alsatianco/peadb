@@ -12,6 +12,7 @@
 // References: Redis src/rdb.h, src/rdb.c
 
 #include "rdb.hpp"
+#include "rdb_reader.hpp"
 #include "datastore.hpp"
 #include "logger.hpp"
 
@@ -23,7 +24,6 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <fstream>
 #include <sstream>
 #include <system_error>
 #include <string>
@@ -36,6 +36,7 @@
 #include <limits>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace peadb {
@@ -342,244 +343,7 @@ class RdbWriter {
 
 // ── Binary reader ──────────────────────────────────────────────────────
 
-class RdbReader {
- public:
-  RdbReader(const std::string& data) : data_(data), pos_(0) {
-  }
-  RdbReader(const char* p, size_t n) : data_(p, n), pos_(0) {
-  }
-
-  bool ok() const {
-    return pos_ <= data_.size();
-  }
-  bool eof() const {
-    return pos_ >= data_.size();
-  }
-  size_t pos() const {
-    return pos_;
-  }
-  size_t remaining() const {
-    return data_.size() - pos_;
-  }
-
-  bool read_u8(uint8_t& v) {
-    if (pos_ >= data_.size()) return false;
-    v = static_cast<uint8_t>(data_[pos_++]);
-    return true;
-  }
-
-  bool read_u16_le(uint16_t& v) {
-    if (remaining() < 2) return false;
-    v = static_cast<uint16_t>(static_cast<uint8_t>(data_[pos_])) |
-        (static_cast<uint16_t>(static_cast<uint8_t>(data_[pos_ + 1])) << 8);
-    pos_ += 2;
-    return true;
-  }
-
-  bool read_u32_le(uint32_t& v) {
-    if (remaining() < 4) return false;
-    v = static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_])) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 1])) << 8) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 16) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3])) << 24);
-    pos_ += 4;
-    return true;
-  }
-
-  bool read_u32_be(uint32_t& v) {
-    if (remaining() < 4) return false;
-    v = (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_])) << 24) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 1])) << 16) |
-        (static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 2])) << 8) |
-        static_cast<uint32_t>(static_cast<uint8_t>(data_[pos_ + 3]));
-    pos_ += 4;
-    return true;
-  }
-
-  bool read_u64_le(uint64_t& v) {
-    if (remaining() < 8) return false;
-    uint32_t lo, hi;
-    read_u32_le(lo);
-    read_u32_le(hi);
-    v = static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32);
-    return true;
-  }
-
-  bool read_u64_be(uint64_t& v) {
-    if (remaining() < 8) return false;
-    v = 0;
-    for (int i = 7; i >= 0; --i) {
-      v |= static_cast<uint64_t>(static_cast<uint8_t>(data_[pos_++])) << (i * 8);
-    }
-    return true;
-  }
-
-  bool read_bytes(std::string& out, size_t n) {
-    if (remaining() < n) return false;
-    out.assign(data_, pos_, n);
-    pos_ += n;
-    return true;
-  }
-
-  bool skip(size_t n) {
-    if (remaining() < n) return false;
-    pos_ += n;
-    return true;
-  }
-
-  // Read Redis length encoding. Returns (length, is_encoded).
-  bool read_length(uint64_t& len, bool& is_encoded) {
-    is_encoded = false;
-    uint8_t byte;
-    if (!read_u8(byte)) return false;
-    uint8_t type = (byte >> 6) & 0x03;
-    switch (type) {
-      case 0:  // 00xxxxxx
-        len = byte & 0x3f;
-        return true;
-      case 1: {  // 01xxxxxx
-        uint8_t next;
-        if (!read_u8(next)) return false;
-        len = ((static_cast<uint64_t>(byte) & 0x3f) << 8) | next;
-        return true;
-      }
-      case 2: {  // 10xxxxxx
-        if ((byte & 0x3f) == 0) {
-          // 10000000 — 4-byte big-endian
-          uint32_t v;
-          if (!read_u32_be(v)) return false;
-          len = v;
-          return true;
-        } else if ((byte & 0x3f) == 1) {
-          // 10000001 — 8-byte big-endian
-          if (!read_u64_be(len)) return false;
-          return true;
-        }
-        return false;
-      }
-      case 3:  // 11xxxxxx — special encoding
-        is_encoded = true;
-        len = byte & 0x3f;
-        return true;
-    }
-    return false;
-  }
-
-  // Read a Redis-encoded string
-  bool read_string(std::string& out) {
-    uint64_t len;
-    bool is_encoded;
-    if (!read_length(len, is_encoded)) return false;
-    if (is_encoded) {
-      switch (len) {
-        case RDB_ENC_INT8: {
-          uint8_t v;
-          if (!read_u8(v)) return false;
-          out = std::to_string(static_cast<int8_t>(v));
-          return true;
-        }
-        case RDB_ENC_INT16: {
-          uint16_t v;
-          if (!read_u16_le(v)) return false;
-          out = std::to_string(static_cast<int16_t>(v));
-          return true;
-        }
-        case RDB_ENC_INT32: {
-          uint32_t v;
-          if (!read_u32_le(v)) return false;
-          out = std::to_string(static_cast<int32_t>(v));
-          return true;
-        }
-        case RDB_ENC_LZF: {
-          // LZF compressed string
-          uint64_t clen, ulen;
-          bool enc2;
-          if (!read_length(clen, enc2) || enc2) return false;
-          if (!read_length(ulen, enc2) || enc2) return false;
-          // LZF's longest back-reference makes 264 bytes out of 3, so a declared length over 88
-          // times the compressed one cannot be right; refuse it before allocating, which also
-          // stops a few bytes from claiming gigabytes (Redis refuses such data too, after a lazy
-          // allocation PeaDB's zero-filled one cannot copy).
-          if (ulen / 88 > clen) return false;
-          std::string compressed;
-          if (!read_bytes(compressed, static_cast<size_t>(clen))) return false;
-          // Simple LZF decompression
-          out.resize(static_cast<size_t>(ulen));
-          if (!lzf_decompress(compressed.data(), clen, &out[0], ulen)) return false;
-          return true;
-        }
-        default:
-          return false;
-      }
-    }
-    return read_bytes(out, static_cast<size_t>(len));
-  }
-
-  bool read_double_binary(double& v) {
-    uint64_t bits;
-    if (!read_u64_le(bits)) return false;
-    std::memcpy(&v, &bits, 8);
-    return true;
-  }
-
-  // Old-style double: length-prefixed string or special bytes
-  bool read_double_old(double& v) {
-    uint8_t len;
-    if (!read_u8(len)) return false;
-    if (len == 255) {
-      v = -std::numeric_limits<double>::infinity();
-      return true;
-    }
-    if (len == 254) {
-      v = std::numeric_limits<double>::infinity();
-      return true;
-    }
-    if (len == 253) {
-      v = std::numeric_limits<double>::quiet_NaN();
-      return true;
-    }
-    std::string s;
-    if (!read_bytes(s, len)) return false;
-    char* end = nullptr;
-    v = std::strtod(s.c_str(), &end);
-    return !s.empty() && end == s.c_str() + s.size();
-  }
-
- private:
-  bool lzf_decompress(const char* in, size_t in_len, char* out, size_t out_len) {
-    size_t ip = 0, op = 0;
-    while (ip < in_len) {
-      uint8_t ctrl = static_cast<uint8_t>(in[ip++]);
-      if (ctrl < 32) {
-        // Literal run
-        size_t len = static_cast<size_t>(ctrl) + 1;
-        if (ip + len > in_len || op + len > out_len) return false;
-        std::memcpy(out + op, in + ip, len);
-        ip += len;
-        op += len;
-      } else {
-        // Back-reference
-        size_t len = (ctrl >> 5) + 2;
-        if (len == 9) {  // 7 + 2
-          if (ip >= in_len) return false;
-          len += static_cast<uint8_t>(in[ip++]);
-        }
-        size_t ref = ((static_cast<size_t>(ctrl) & 0x1f) << 8);
-        if (ip >= in_len) return false;
-        ref += static_cast<uint8_t>(in[ip++]);
-        ref += 1;
-        if (op < ref || op + len > out_len) return false;
-        // Copy byte-by-byte (may overlap)
-        for (size_t i = 0; i < len; ++i) out[op + i] = out[op - ref + i];
-        op += len;
-      }
-    }
-    return op == out_len;
-  }
-
-  std::string data_;
-  size_t pos_;
-};
+using detail::RdbReader;
 
 // ── Listpack encoder/decoder ───────────────────────────────────────────
 // Redis 7 uses listpack for small hashes, zsets, etc.
@@ -1758,28 +1522,44 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   if (repl) *repl = {};
   RdbReplicationInfo loaded_repl;
 
-  std::ifstream in(path, std::ios::binary);
-  if (!in.is_open()) {
+  // Keep the opened inode through validation, the replacement callback (which can rename it),
+  // and application. A path re-open after publication could decode a different snapshot.
+  struct InputFile {
+    int fd;
+    ~InputFile() {
+      if (fd >= 0) ::close(fd);
+    }
+  } file{::open(path.c_str(), O_RDONLY)};
+  if (file.fd < 0) {
     err = "cannot open RDB file";
     return false;
   }
-  std::string filedata((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  in.close();
-
-  if (filedata.size() < 9) {
+  struct stat st {};
+  if (::fstat(file.fd, &st) != 0 || st.st_size < 0 ||
+      static_cast<std::uintmax_t>(st.st_size) > std::numeric_limits<std::size_t>::max()) {
+    err = "cannot stat RDB file";
+    return false;
+  }
+  const auto file_size = static_cast<std::size_t>(st.st_size);
+  const detail::RdbReadFn source = [&](void* p, std::size_t n) {
+    return ::read(file.fd, p, n);
+  };
+  RdbReader input(source, file_size, true);
+  std::string header;
+  if (!input.read_bytes(header, 9)) {
     err = "RDB file too short";
     return false;
   }
 
   // Check magic
-  if (filedata.substr(0, 5) != "REDIS") {
+  if (header.substr(0, 5) != "REDIS") {
     err = "invalid RDB magic";
     return false;
   }
 
   int rdb_ver = 0;
   try {
-    rdb_ver = std::stoi(filedata.substr(5, 4));
+    rdb_ver = std::stoi(header.substr(5, 4));
   } catch (...) {
     err = "invalid RDB version";
     return false;
@@ -1796,13 +1576,18 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   // never replaces the dataset in memory.
   if (rdb_ver >= 5 && g_rdb_checksum && !g_skip_checksum_validation) {
     uint64_t stored = 0;
-    const auto* tail =
-        reinterpret_cast<const unsigned char*>(filedata.data() + filedata.size() - 8);
-    for (int i = 0; i < 8; ++i) stored |= static_cast<uint64_t>(tail[i]) << (8 * i);
+    if (input.remaining() < 8 || !input.skip(input.remaining() - 8)) {
+      err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
+      return false;
+    }
+    const uint64_t computed = input.checksum();
+    if (!input.read_u64_le(stored)) {
+      err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
+      return false;
+    }
     if (stored == 0) {
       log(LogLevel::Info, "RDB file was saved with checksum disabled: no check performed.");
     } else {
-      const uint64_t computed = crc64(0, filedata.data(), filedata.size() - 8);
       if (computed != stored) {
         char msg[128];
         std::snprintf(
@@ -1817,7 +1602,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
 
   auto& ds = store();
   auto load = [&](bool apply) {
-    RdbReader r(filedata.data() + 9, filedata.size() - 9);
+    if (::lseek(file.fd, 9, SEEK_SET) == -1) {
+      err = "cannot seek RDB file";
+      return false;
+    }
+    RdbReader r(source, file_size - 9);
     RdbReplicationInfo parsed_repl;
     if (apply) {
       g_rdb_load_stats = {};
@@ -1830,6 +1619,14 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     if (apply) no_lazy_expire.emplace(ds);
     const std::int64_t load_now = DataStore::now_ms();
     const int prev_db = ds.current_db();
+    struct RestoreDatabase {
+      DataStore& ds;
+      int previous;
+      bool apply;
+      ~RestoreDatabase() {
+        if (apply) ds.select_db(previous);
+      }
+    } restore_db{ds, prev_db, apply};
     if (apply) ds.select_db(0);
 
     std::optional<int64_t> pending_expire;
@@ -1854,7 +1651,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         bool enc;
         if (!r.read_length(idle_seconds, enc) || enc) {
           err = "malformed IDLE";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         continue;
@@ -1863,7 +1659,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         uint8_t freq;
         if (!r.read_u8(freq)) {
           err = "malformed FREQ";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         continue;
@@ -1873,7 +1668,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         std::string aux_key, aux_val;
         if (!r.read_string(aux_key) || !r.read_string(aux_val)) {
           err = "malformed AUX field";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         // AUX names are case-insensitive in Redis. Parse complete, bounded values: malformed
@@ -1905,11 +1699,9 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         std::string code;
         if (!r.read_string(code)) {
           err = "malformed FUNCTION payload";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         if (apply && g_function_load_hook && !g_function_load_hook(code, err)) {
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         continue;
@@ -1920,13 +1712,11 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         bool enc;
         if (!r.read_length(dbnum, enc) || enc) {
           err = "malformed SELECTDB";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         if (dbnum >= ds.database_count()) {
           err = "FATAL: Data file was created with a Redis server configured to handle more than " +
                 std::to_string(ds.database_count()) + " databases. Exiting";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         if (apply) ds.select_db(static_cast<int>(dbnum));
@@ -1938,7 +1728,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         bool enc1, enc2;
         if (!r.read_length(db_size, enc1) || enc1 || !r.read_length(exp_size, enc2) || enc2) {
           err = "malformed RESIZEDB";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         continue;
@@ -1948,7 +1737,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         uint64_t ms;
         if (!r.read_u64_le(ms)) {
           err = "malformed EXPIRETIME_MS";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         pending_expire = static_cast<int64_t>(ms);
@@ -1959,7 +1747,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         uint32_t sec;
         if (!r.read_u32_le(sec)) {
           err = "malformed EXPIRETIME";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         pending_expire = static_cast<int64_t>(sec) * 1000;
@@ -1970,7 +1757,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       std::string key;
       if (!r.read_string(key)) {
         err = "malformed key";
-        if (apply) ds.select_db(prev_db);
         return false;
       }
 
@@ -1983,7 +1769,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         if (!read_dump_value(r, type, value, true, &load_error)) {
           err = load_error.empty() ? "Bad data format (RDB type " + std::to_string(type) + ")"
                                    : load_error;
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         if (apply) rdb_store_dump_value(key, std::move(value), expire_at);
@@ -1993,20 +1778,17 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         bool enc = false;
         if (!r.read_length(nentries, enc) || enc) {
           err = "malformed stream";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         for (uint64_t i = 0; i < nentries; ++i) {
           std::string id;
           if (!r.read_string(id)) {
             err = "malformed stream entry id";
-            if (apply) ds.select_db(prev_db);
             return false;
           }
           uint64_t nf = 0;
           if (!r.read_length(nf, enc) || enc) {
             err = "malformed stream entry";
-            if (apply) ds.select_db(prev_db);
             return false;
           }
           std::vector<std::pair<std::string, std::string>> fields;
@@ -2014,7 +1796,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
             std::string f, v;
             if (!r.read_string(f) || !r.read_string(v)) {
               err = "malformed stream field";
-              if (apply) ds.select_db(prev_db);
               return false;
             }
             fields.emplace_back(std::move(f), std::move(v));
@@ -2024,7 +1805,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         uint64_t lms = 0, lseq = 0;
         if (!r.read_length(lms, enc) || enc || !r.read_length(lseq, enc) || enc) {
           err = "malformed stream last-id";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         d.last_ms = lms;
@@ -2032,20 +1812,17 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
         uint64_t ngroups = 0;
         if (!r.read_length(ngroups, enc) || enc) {
           err = "malformed stream groups";
-          if (apply) ds.select_db(prev_db);
           return false;
         }
         for (uint64_t gi = 0; gi < ngroups; ++gi) {
           DataStore::StreamGroupDump gd;
           if (!r.read_string(gd.name) || !r.read_string(gd.last_delivered_id)) {
             err = "malformed stream group";
-            if (apply) ds.select_db(prev_db);
             return false;
           }
           uint64_t npel = 0;
           if (!r.read_length(npel, enc) || enc) {
             err = "malformed stream pel";
-            if (apply) ds.select_db(prev_db);
             return false;
           }
           for (uint64_t pi = 0; pi < npel; ++pi) {
@@ -2054,7 +1831,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
             if (!r.read_string(p.id) || !r.read_string(p.consumer) || !r.read_length(dms, enc) ||
                 enc || !r.read_length(dcnt, enc) || enc) {
               err = "malformed stream pel entry";
-              if (apply) ds.select_db(prev_db);
               return false;
             }
             p.delivery_ms = static_cast<std::int64_t>(dms);
@@ -2080,8 +1856,8 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
     }
 
-    if (apply) ds.select_db(prev_db);
-    if (!saw_eof || (rdb_ver >= 5 && r.remaining() < 8)) {
+    uint64_t checksum_footer;
+    if (!saw_eof || (rdb_ver >= 5 && !r.read_u64_le(checksum_footer))) {
       err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
       return false;
     }

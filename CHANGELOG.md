@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Stream RDB file input through bounded readers instead of retaining and copying the entire serialized snapshot. Preserve checksum and full-sync structural validation before replacement, retain the opened inode through publication, borrow DUMP payloads and restore database/expiry scope on decode exceptions (delta 58).
+
 - Stream RDB saves through bounded 64 KiB output with incremental CRC64, preserving atomic file publication and retries after disk errors. Visit key names and function sources in place; retain in-memory DUMP results and current disk-backed replication transport (deltas 46/58).
 
 - Implement writable replicas with startup/runtime read-only aliases, transaction/script/function admission, local AOF durability without downstream propagation, explicit read/write expiry behavior and bounded local-TTL reclamation. Preserve inherited TTL ownership and replace local data/functions/tracking on upstream full sync; verify all four Redis/PeaDB engine pairings (delta 24).

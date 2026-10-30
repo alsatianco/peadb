@@ -67,11 +67,13 @@ struct RdbReplicationInfo {
 // is (DEBUG RELOAD flushes it before the call, as Redis does). When `before_replace` is
 // given (full sync), a structural decoding pass also checks all database IDs and values before
 // the callback publishes the snapshot and the loader flushes the keyspace. It discards one value
-// at a time, then re-decodes the same bytes to apply. Function-library Lua compilation/collisions
-// and apply-time allocation failures are not staged and can still fail after replacement.
-// `repl`, when given, is reset on entry and published only after a successful load. Invalid or
-// absent AUX values cannot authorize resumption; valid() requires complete, bounded history.
-// `expired` is used only by master startup to feed DELs for keys dropped during loading.
+// at a time, then re-decodes the same opened inode to apply. Checksum validation and both decode
+// passes use bounded input; no complete serialized snapshot is retained. Callers must not modify
+// that inode during loading (renaming it in before_replace is supported). Function
+// compilation/collisions and apply-time allocation failures are not staged and can still fail after
+// replacement. `repl`, when given, is reset on entry and published only after a successful load.
+// Invalid or absent AUX values cannot authorize resumption; valid() requires complete, bounded
+// history. `expired` is used only by master startup to feed DELs for keys dropped during loading.
 bool rdb_load(const std::filesystem::path& path, std::string& err,
               const std::function<void()>& before_replace = nullptr,
               RdbReplicationInfo* repl = nullptr,

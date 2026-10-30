@@ -138,6 +138,10 @@ if(BUILD_TESTING)
   target_link_libraries(rdb_writer_test PRIVATE peadb_core)
   add_test(NAME rdb_writer_test COMMAND rdb_writer_test)
 
+  add_executable(rdb_reader_test tests/unit/rdb_reader_test.cpp)
+  target_link_libraries(rdb_reader_test PRIVATE peadb_core)
+  add_test(NAME rdb_reader_test COMMAND rdb_reader_test)
+
   add_executable(rdb_replication_test tests/unit/rdb_replication_test.cpp)
   target_link_libraries(rdb_replication_test PRIVATE peadb_core)
   add_test(NAME rdb_replication_test COMMAND rdb_replication_test)
