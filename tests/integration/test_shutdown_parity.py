@@ -19,7 +19,7 @@ import time
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _redis_path import redis_server_path  # noqa: E402
-from _readiness import ObservedProcess  # noqa: E402
+from _readiness import ObservedProcess, wait_until_ready  # noqa: E402
 
 PEADB = str(ROOT / 'peadb-server')
 REDIS = redis_server_path()
@@ -68,17 +68,16 @@ def start(binary, port, workdir, *extra):
     proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--dir', workdir,
                              '--loglevel', 'notice', *extra],
                             stdout=log, stderr=subprocess.STDOUT)
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        if proc.poll() is not None:
-            raise RuntimeError(f'{binary} exited: {open(log_path).read()}')
-        try:
-            socket.create_connection(('127.0.0.1', port), timeout=0.2).close()
-            return proc
-        except OSError:
-            time.sleep(0.05)
-    proc.kill()
-    raise RuntimeError(f'{binary} did not start on port {port}')
+    try:
+        wait_until_ready(port, process=proc, timeout=10)
+    except BaseException:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        with open(log_path, errors='replace') as failed_log:
+            print(failed_log.read(), flush=True)
+        raise
+    return proc
 
 
 def stop(proc):
@@ -403,23 +402,31 @@ def check_signals(name, binary, work):
     # needs the load to be still running when the signal arrives; on a machine fast enough to
     # finish first it reports that and checks nothing.
     workdir = os.path.join(work, f'{name}-loading')
-    # The pinned redis-server writes the dump when there is one: PeaDB loads Redis's RDB files
-    # (compat/delta.md item 27), and its own RDB writer needs about 20 s for these 2,000,000 keys
-    # (item 58), which would put this test at the runner's 30 s limit.
-    proc = start(REDIS or binary, port, workdir, '--save', '', '--enable-debug-command', 'yes')
-    try:
-        c = Conn(port, timeout=120)
-        assert c('DEBUG', 'POPULATE', '2000000') == '+OK', name
-        assert c('SAVE') == '+OK', name
-        assert c('SHUTDOWN', 'NOSAVE') is None, name
-        assert wait_exit(proc, timeout=60) == 0, name
-    finally:
-        stop(proc)
+    # Both engines load the same two-million-key reference fixture, in independent
+    # directories. Generate it once: repeated POPULATE/SAVE work can consume the
+    # supervisor's entire 30s budget before the second engine's signal check.
     dump = os.path.join(workdir, 'dump.rdb')
+    fixture = os.path.join(work, 'loading-fixture.rdb')
+    if not os.path.exists(fixture):
+        proc = start(REDIS or binary, port, workdir, '--save', '', '--enable-debug-command', 'yes')
+        try:
+            c = Conn(port, timeout=120)
+            assert c('DEBUG', 'POPULATE', '2000000') == '+OK', name
+            assert c('DBSIZE') == 2000000, name
+            assert c('SAVE') == '+OK', name
+            assert c('SHUTDOWN', 'NOSAVE') is None, name
+            assert wait_exit(proc, timeout=60) == 0, name
+            c.close()
+        finally:
+            stop(proc)
+        shutil.copyfile(dump, fixture)
+    else:
+        os.makedirs(workdir, exist_ok=True)
+        shutil.copyfile(fixture, dump)
     before = os.stat(dump).st_mtime_ns
     log_path = os.path.join(workdir, 'server.log')
-    log_start = os.path.getsize(log_path)
     with open(log_path, 'ab') as log:
+        log_start = log.tell()
         proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--dir',
                                  workdir, '--loglevel', 'notice', '--save', '3600 1'],
                                 stdout=log, stderr=subprocess.STDOUT)
