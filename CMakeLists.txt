@@ -53,6 +53,7 @@ add_library(peadb_core
     src/protocol.cpp
     src/server.cpp
     src/sha256.cpp
+    src/functions.cpp
     src/lua_engine.cpp
     src/rdb.cpp
     src/zmalloc.cpp
@@ -141,6 +142,14 @@ if(BUILD_TESTING)
   add_executable(rdb_reader_test tests/unit/rdb_reader_test.cpp)
   target_link_libraries(rdb_reader_test PRIVATE peadb_core)
   add_test(NAME rdb_reader_test COMMAND rdb_reader_test)
+
+  add_executable(function_registry_allocation_test tests/unit/function_registry_allocation_test.cpp)
+  target_link_libraries(function_registry_allocation_test PRIVATE peadb_core)
+  add_test(NAME function_registry_allocation_test COMMAND function_registry_allocation_test)
+
+  add_executable(rdb_target_test tests/unit/rdb_target_test.cpp)
+  target_link_libraries(rdb_target_test PRIVATE peadb_core)
+  add_test(NAME rdb_target_test COMMAND rdb_target_test)
 
   add_executable(rdb_replication_test tests/unit/rdb_replication_test.cpp)
   target_link_libraries(rdb_replication_test PRIVATE peadb_core)

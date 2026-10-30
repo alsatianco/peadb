@@ -9,6 +9,7 @@
 #include "datastore.hpp"
 #include "errors.hpp"
 #include "lua_engine.hpp"
+#include "functions.hpp"
 #include <map>
 #include "protocol.hpp"
 #include "rdb.hpp"
@@ -770,18 +771,6 @@ std::string g_module_dma_buf;
 struct ModuleCallCtx {
   std::string reply;
   bool replied = false;
-};
-struct FunctionEntry {
-  std::string name;  // display name (original case)
-  std::string description;
-  int flags = 0;          // FunctionFlags bitmask
-  int callback_ref = -1;  // Lua registry ref for the callback closure
-};
-struct FunctionLibrary {
-  std::string name;    // display name (original case)
-  std::string engine;  // always "LUA"
-  std::string code;    // full source including the shebang line
-  std::vector<FunctionEntry> functions;
 };
 struct CmdStats {
   std::int64_t calls = 0;
@@ -1770,8 +1759,6 @@ std::int64_t process_rss_bytes() {
   return static_cast<std::int64_t>(ru.ru_maxrss);  // macOS: bytes
 #endif
 }
-std::map<std::string, FunctionLibrary> g_libraries;         // lc library name -> library
-std::unordered_map<std::string, std::string> g_func_index;  // lc function name -> lc library name
 bool g_rdb_load_functions_replace = true;  // RDB function-load collision policy (see hooks)
 bool g_script_readonly_context = false;
 RespVersion g_script_client_resp_version = RespVersion::Resp2;
@@ -2001,139 +1988,20 @@ std::string lower(std::string s) {
   return s;
 }
 
-bool valid_lib_name(const std::string& s) {
-  if (s.empty()) return false;
-  for (unsigned char c : s)
-    if (!(std::isalnum(c) || c == '_')) return false;
-  return true;
-}
-
-// Parse the `#!<engine> name=<name> [meta ...]` shebang. On success fills engine/name and body
-// (= source after the shebang line). On failure sets `err` to the exact Redis message.
-bool parse_function_shebang(const std::string& payload, std::string& engine, std::string& name,
-                            std::string& body, std::string& err) {
-  engine.clear();
-  name.clear();
-  body.clear();
-  if (payload.rfind("#!", 0) != 0) {
-    err = "Missing library metadata";
-    return false;
-  }
-  const auto nl = payload.find('\n');
-  if (nl == std::string::npos) {
-    err = "Invalid library metadata";
-    return false;
-  }
-  const std::string line = payload.substr(0, nl);
-  body = payload.substr(nl + 1);  // Redis: the code starts at the '\n' (shebang line excluded)
-  std::vector<std::string> parts;
-  for (std::size_t i = 0; i < line.size();) {
-    while (i < line.size() && std::isspace(static_cast<unsigned char>(line[i]))) ++i;
-    const std::size_t s = i;
-    while (i < line.size() && !std::isspace(static_cast<unsigned char>(line[i]))) ++i;
-    if (i > s) parts.push_back(line.substr(s, i - s));
-  }
-  if (parts.empty()) {
-    err = "Invalid library metadata";
-    return false;
-  }
-  engine = parts[0].rfind("#!", 0) == 0 ? parts[0].substr(2) : parts[0];
-  bool have_name = false;
-  for (std::size_t i = 1; i < parts.size(); ++i) {
-    const std::string& tok = parts[i];
-    if (tok.size() >= 5 && lower(tok.substr(0, 5)) == "name=") {
-      if (have_name) {
-        err = "Invalid metadata value, name argument was given multiple times";
-        return false;
-      }
-      std::string v = tok.substr(5);
-      if (v.size() >= 2 && v.front() == '"' && v.back() == '"') v = v.substr(1, v.size() - 2);
-      name = v;
-      have_name = true;
-    } else {
-      err = "Invalid metadata value given: " + tok;
-      return false;
-    }
-  }
-  if (!have_name) {
-    err = "Library name was not given";
-    return false;
-  }
-  return true;
-}
-
-// Load (or REPLACE) a single library from its full source. On success returns true and sets
-// out_name; on failure returns false and sets err (exact Redis text, no "ERR " prefix). On any
-// failure the existing library (if replacing) is left untouched.
-bool load_function_library(const std::string& code, bool replace, std::string& out_name,
+bool load_function_library(const std::string& code, bool replace, std::string& name,
                            std::string& err) {
-  std::string engine, name, body;
-  if (!parse_function_shebang(code, engine, name, body, err)) return false;
-  if (!valid_lib_name(name)) {
-    err =
-        "Library names can only contain letters, numbers, or underscores(_) and must be at least "
-        "one character long";
-    return false;
-  }
-  if (upper(engine) != "LUA") {
-    err = "Engine '" + engine + "' not found";
-    return false;
-  }
-  const std::string lc = lower(name);
-  auto existing = g_libraries.find(lc);
-  if (existing != g_libraries.end() && !replace) {
-    err = "Library '" + name + "' already exists";
-    return false;
-  }
-
-  std::vector<LuaRegisteredFunction> fns;
-  if (!lua_engine_load_library(body, fns, err))
-    return false;  // err set (compile/register/timeout/no-functions)
-
-  // Reject collision with a function that belongs to a DIFFERENT library.
-  for (const auto& f : fns) {
-    auto idx = g_func_index.find(lower(f.name));
-    if (idx != g_func_index.end() && idx->second != lc) {
-      err = "Function " + f.name + " already exists";
-      for (auto& g : fns) lua_engine_unref_function(g.callback_ref);
-      return false;
-    }
-  }
-  // Commit. Drop the old library (functions + refs) only now that the new one is valid.
-  if (existing != g_libraries.end()) {
-    for (auto& f : existing->second.functions) {
-      g_func_index.erase(lower(f.name));
-      lua_engine_unref_function(f.callback_ref);
-    }
-    g_libraries.erase(existing);
-  }
-  FunctionLibrary lib;
-  lib.name = name;
-  lib.engine = "LUA";
-  lib.code = code;
-  for (const auto& f : fns) {
-    lib.functions.push_back({f.name, f.description, f.flags, f.callback_ref});
-    g_func_index[lower(f.name)] = lc;
-  }
-  g_libraries[lc] = std::move(lib);
-  out_name = name;
-  return true;
+  return live_functions().load(code, replace, name, err);
 }
-
-// Release every library's callbacks and clear the registry (FUNCTION FLUSH / RDB load reset).
 void functions_flush_all() {
-  for (auto& [lc, lib] : g_libraries)
-    for (auto& f : lib.functions) lua_engine_unref_function(f.callback_ref);
-  g_libraries.clear();
-  g_func_index.clear();
+  live_functions().clear();
 }
 
 // FUNCTION DUMP: Redis's payload (one FUNCTION2 opcode and source string per library, the RDB
 // version and the CRC64), so a payload moves between PeaDB and Redis in both directions.
 std::string functions_dump() {
   std::vector<std::string> codes;
-  codes.reserve(g_libraries.size());
-  for (const auto& [lc, lib] : g_libraries) codes.push_back(lib.code);
+  codes.reserve(live_functions().libraries().size());
+  for (const auto& [lc, lib] : live_functions().libraries()) codes.push_back(lib->code);
   return rdb_dump_functions(codes);
 }
 
@@ -2143,44 +2011,17 @@ bool functions_restore(const std::string& payload, const std::string& policy, st
   std::vector<std::string> codes;
   if (!rdb_parse_function_payload(payload, codes, err)) return false;
 
-  // APPEND rejects a library whose name already exists (Redis message here omits the quotes
-  // that FUNCTION LOAD uses). Pre-checked before any mutation so the state is untouched.
-  if (policy == "APPEND") {
-    for (const auto& code : codes) {
-      std::string eng, nm, body, e;
-      if (parse_function_shebang(code, eng, nm, body, e) && g_libraries.count(lower(nm))) {
-        err = "Library " + nm + " already exists";
-        return false;
-      }
-    }
-  }
-
-  // Snapshot current library sources so we can roll back atomically on failure.
-  std::vector<std::string> snapshot;
-  for (const auto& [lc, lib] : g_libraries) snapshot.push_back(lib.code);
-
-  if (policy == "FLUSH") functions_flush_all();
-  const bool replace = (policy == "REPLACE");
-  std::string name;
-  for (const auto& code : codes) {
-    if (!load_function_library(code, replace, name, err)) {
-      functions_flush_all();
-      std::string ignore, e2;
-      for (const auto& s : snapshot) load_function_library(s, true, ignore, e2);
-      return false;
-    }
-  }
-  return true;
+  return live_functions().restore(codes, policy, err);
 }
 
 // Shared FCALL / FCALL_RO body. `ro_command` is true for FCALL_RO.
 std::string do_fcall(const std::vector<std::string>& args, SessionState& session, bool ro_command) {
-  auto idx = g_func_index.find(lower(args[1]));
-  if (idx == g_func_index.end()) return encode_error("Function not found");
+  auto idx = live_functions().index().find(lower(args[1]));
+  if (idx == live_functions().index().end()) return encode_error("Function not found");
   const FunctionEntry* entry = nullptr;
-  auto libit = g_libraries.find(idx->second);
-  if (libit != g_libraries.end())
-    for (const auto& f : libit->second.functions)
+  auto libit = live_functions().libraries().find(idx->second);
+  if (libit != live_functions().libraries().end())
+    for (const auto& f : libit->second->functions)
       if (lower(f.name) == lower(args[1])) {
         entry = &f;
         break;
@@ -2202,8 +2043,8 @@ std::string do_fcall(const std::vector<std::string>& args, SessionState& session
   // Cooperative BUSY simulation for trivially-infinite functions, mirroring eval_miniscript: a
   // real infinite loop would block the single-threaded event loop, so instead we advertise BUSY
   // and let another client observe it / issue FUNCTION KILL. (FUNCTION STATS reports this too.)
-  if (libit->second.code.find("while true do") != std::string::npos ||
-      libit->second.code.find("while 1 do") != std::string::npos) {
+  if (libit->second->code.find("while true do") != std::string::npos ||
+      libit->second->code.find("while 1 do") != std::string::npos) {
     g_script_kill_requested.store(false, std::memory_order_release);
     g_script_busy.store(true, std::memory_order_release);
     g_busy_script_session = &session;
@@ -3442,8 +3283,8 @@ bool rewrite_aof_file(std::string& err) {
   };
   // Function libraries are server-level state, not in the keyspace — emit them first so an AOF
   // rewrite (and any later DEBUG LOADAOF / restart) preserves loaded functions.
-  for (const auto& [lc, lib] : g_libraries) {
-    write_all(encode_command_resp({"FUNCTION", "LOAD", "REPLACE", lib.code}));
+  for (const auto& [lc, lib] : live_functions().libraries()) {
+    write_all(encode_command_resp({"FUNCTION", "LOAD", "REPLACE", lib->code}));
     if (write_failed) {
       ::close(tmp_fd);
       ::unlink(tmp_path.c_str());
@@ -6037,11 +5878,11 @@ ScriptShebang parse_script_shebang(const std::string& body) {
 
 // The flags of the library function `name` (kFunc*), or nothing when there is no such function.
 std::optional<int> function_flags(const std::string& name) {
-  const auto idx = g_func_index.find(lower(name));
-  if (idx == g_func_index.end()) return std::nullopt;
-  const auto lib = g_libraries.find(idx->second);
-  if (lib == g_libraries.end()) return std::nullopt;
-  for (const auto& f : lib->second.functions)
+  const auto idx = live_functions().index().find(lower(name));
+  if (idx == live_functions().index().end()) return std::nullopt;
+  const auto lib = live_functions().libraries().find(idx->second);
+  if (lib == live_functions().libraries().end()) return std::nullopt;
+  for (const auto& f : lib->second->functions)
     if (lower(f.name) == lower(name)) return f.flags;
   return std::nullopt;
 }
@@ -9982,14 +9823,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 return encode_bulk(name);
               }
               if (sub == "DELETE" && args.size() == 3) {
-                const std::string lc = lower(args[2]);
-                auto it = g_libraries.find(lc);
-                if (it == g_libraries.end()) return encode_error("Library not found");
-                for (auto& f : it->second.functions) {
-                  g_func_index.erase(lower(f.name));
-                  lua_engine_unref_function(f.callback_ref);
-                }
-                g_libraries.erase(it);
+                if (!live_functions().erase(args[2])) return encode_error("Library not found");
                 propagate_write({"FUNCTION", "DELETE", args[2]}, session, nullptr);
                 store().increment_mutation_epoch();
                 return encode_simple("OK");
@@ -10027,11 +9861,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                   }
                 }
                 std::vector<std::string> libs;
-                for (const auto& [lc, lib] : g_libraries) {
-                  if (have_pat && lib.name != pat && fnmatch(pat.c_str(), lib.name.c_str(), 0) != 0)
+                for (const auto& [lc, lib] : live_functions().libraries()) {
+                  if (have_pat && lib->name != pat &&
+                      fnmatch(pat.c_str(), lib->name.c_str(), 0) != 0)
                     continue;
                   std::vector<std::string> fns;
-                  for (const auto& f : lib.functions) {
+                  for (const auto& f : lib->functions) {
                     std::vector<std::string> flagnames;
                     if (f.flags & kFuncNoWrites) flagnames.push_back(encode_bulk("no-writes"));
                     if (f.flags & kFuncAllowOom) flagnames.push_back(encode_bulk("allow-oom"));
@@ -10050,11 +9885,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     fns.push_back(encode_map(fkv, session.resp_version));
                   }
                   std::vector<std::string> lkv = {
-                      encode_bulk("library_name"), encode_bulk(lib.name),    encode_bulk("engine"),
-                      encode_bulk(lib.engine),     encode_bulk("functions"), encode_array(fns)};
+                      encode_bulk("library_name"), encode_bulk(lib->name),   encode_bulk("engine"),
+                      encode_bulk(lib->engine),    encode_bulk("functions"), encode_array(fns)};
                   if (withcode) {
                     lkv.push_back(encode_bulk("library_code"));
-                    lkv.push_back(encode_bulk(lib.code));
+                    lkv.push_back(encode_bulk(lib->code));
                   }
                   libs.push_back(encode_map(lkv, session.resp_version));
                 }
@@ -10070,11 +9905,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 } else {
                   running = encode_null(session.resp_version);
                 }
-                std::size_t nfuncs = g_func_index.size();
+                std::size_t nfuncs = live_functions().index().size();
                 std::string engines = encode_map(
                     {encode_bulk("LUA"),
                      encode_map({encode_bulk("libraries_count"),
-                                 encode_integer(static_cast<long long>(g_libraries.size())),
+                                 encode_integer(
+                                     static_cast<long long>(live_functions().libraries().size())),
                                  encode_bulk("functions_count"),
                                  encode_integer(static_cast<long long>(nfuncs))},
                                 session.resp_version)},
@@ -11573,8 +11409,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                      {"last-generated-id", encode_bulk(si.last_id)},
                      {"max-deleted-entry-id", encode_bulk(si.max_deleted_id)},
                      {"entries-added", encode_integer(static_cast<long long>(si.entries_added))},
-                     {"recorded-first-entry-id",
-                      encode_bulk(si.first.first.empty() ? "0-0" : si.first.first)},
+                     {"recorded-first-entry-id", encode_bulk(si.recorded_first_id)},
                      {"groups", encode_integer(static_cast<long long>(si.groups))},
                      {"first-entry", entry_reply(si.first)},
                      {"last-entry", entry_reply(si.last)}});
@@ -16710,7 +16545,7 @@ void init_replication_id() {
 void functions_register_rdb_hooks() {
   rdb_register_function_hooks(
       [](const std::function<void(const std::string&)>& visit) {
-        for (const auto& [lc, lib] : g_libraries) visit(lib.code);
+        for (const auto& [lc, lib] : live_functions().libraries()) visit(lib->code);
       },
       [](const std::string& code, std::string& err) {
         std::string name;

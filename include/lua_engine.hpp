@@ -14,6 +14,9 @@ void lua_engine_init();
 // Destroy the Lua engine (call at shutdown).
 void lua_engine_shutdown();
 
+// True only while an initialized engine belongs to this thread.
+bool lua_engine_on_owner_thread();
+
 // Evaluate a Lua script with the given keys and argv.
 // Returns the RESP-encoded reply.
 std::string lua_engine_eval(const std::string& script, const std::vector<std::string>& keys,

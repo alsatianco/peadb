@@ -58,7 +58,7 @@ struct RdbReplicationInfo {
   int stream_db = -1;
   std::string replid;
   std::int64_t offset = -1;
-  bool valid() const;
+  bool valid(std::size_t database_count = 16) const;
 };
 
 // Load a Redis-compatible RDB file into the datastore (startup, DEBUG RELOAD, a replica's full
@@ -87,6 +87,27 @@ struct RdbLoadStats {
 };
 const RdbLoadStats& rdb_last_load_stats();
 
+class FunctionRegistry;
+// Independent load inputs/outputs: no singleton, live hooks or runtime role is consulted.
+// Decode on the Lua-owning thread. A failure/exception may leave a partial target; callers
+// stage into private objects and discard them on failure. This API does not publish/swap.
+// Use a fresh function registry for complete replacement; otherwise sources merge into it
+// with the selected library-collision policy. AUX output is reset on entry and assigned only on
+// success. Counters reset when applying begins; expiry callbacks run only for keys explicitly
+// dropped by the selected policy.
+struct RdbLoadTarget {
+  DataStore& datastore;
+  FunctionRegistry& functions;
+  RdbLoadStats& stats;
+  enum class Expiry { DropExpired, KeepExpired } expiry = Expiry::DropExpired;
+  bool replace_functions = true;
+  bool checksum = true;
+  bool skip_checksum_validation = false;
+  RdbReplicationInfo* replication = nullptr;
+  std::function<void(int, const std::string&)> expired;
+};
+bool rdb_load_into(const std::filesystem::path& path, RdbLoadTarget& target, std::string& err);
+
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);
 
@@ -114,6 +135,8 @@ bool rdb_decode_dump_payload(const std::string& payload, DumpValue& out, std::st
 
 // Store a value rdb_decode_dump_payload() read under `key`, which must not exist, with its expire
 // time if it has one.
+void rdb_store_dump_value(DataStore& datastore, const std::string& key, DumpValue&& value,
+                          std::optional<std::int64_t> expire_at_ms);
 void rdb_store_dump_value(const std::string& key, DumpValue&& value,
                           std::optional<std::int64_t> expire_at_ms);
 

@@ -90,6 +90,7 @@ struct Entry {
     std::uint64_t last_seq = 0;
     std::uint64_t entries_added = 0;     // total ever XADDed (XINFO entries-added)
     std::string max_deleted_id = "0-0";  // highest id ever XDELed (XINFO max-deleted-entry-id)
+    bool legacy_empty_first_id = false;  // Redis type-15 migration uses UINT64_MAX-UINT64_MAX
     std::unordered_map<std::string, StreamGroup> groups;
   };
   using Payload =
@@ -393,6 +394,7 @@ class DataStore {
   struct StreamInfo {
     std::int64_t length = 0;
     std::string last_id = "0-0";
+    std::string recorded_first_id = "0-0";
     std::string max_deleted_id = "0-0";
     std::uint64_t entries_added = 0;
     std::size_t groups = 0;
@@ -550,6 +552,7 @@ class DataStore {
     std::vector<StreamGroupDump> groups;
     std::optional<std::uint64_t> entries_added;  // absent in the old private RDB type
     std::string max_deleted_id = "0-0";
+    bool legacy_empty_first_id = false;
   };
   bool dump_stream(const std::string& key, StreamDump& out);  // false if absent / not a stream
   void restore_stream(const std::string& key, const StreamDump& d);

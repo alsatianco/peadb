@@ -12,6 +12,8 @@
 // References: Redis src/rdb.h, src/rdb.c
 
 #include "rdb.hpp"
+#include "functions.hpp"
+#include "lua_engine.hpp"
 #include "rdb_reader.hpp"
 #include "datastore.hpp"
 #include "logger.hpp"
@@ -50,9 +52,9 @@ FunctionLoadFn g_function_load_hook;      // loads one library's source (idempot
 RdbLoadStats g_rdb_load_stats;
 }  // namespace
 
-bool RdbReplicationInfo::valid() const {
-  return stream_db >= 0 && static_cast<std::size_t>(stream_db) < store().database_count() &&
-         offset >= 0 && offset < std::numeric_limits<std::int64_t>::max() && replid.size() == 40 &&
+bool RdbReplicationInfo::valid(std::size_t database_count) const {
+  return stream_db >= 0 && static_cast<std::size_t>(stream_db) < database_count && offset >= 0 &&
+         offset < std::numeric_limits<std::int64_t>::max() && replid.size() == 40 &&
          std::all_of(replid.begin(), replid.end(), [](unsigned char c) {
            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
          });
@@ -903,7 +905,9 @@ void write_stream(RdbWriter& w, const DataStore::StreamDump& d) {
   }
   w.write_length(d.entries.size());
   write_stream_id(w, {d.last_ms, d.last_seq});
-  write_stream_id(w, d.entries.empty() ? RdbStreamID{} : stream_id_parts(d.entries.front().first));
+  const RdbStreamID legacy_first{UINT64_MAX, UINT64_MAX};
+  write_stream_id(w, d.entries.empty() ? (d.legacy_empty_first_id ? legacy_first : RdbStreamID{})
+                                       : stream_id_parts(d.entries.front().first));
   write_stream_id(w, stream_id_parts(d.max_deleted_id));
   w.write_length(d.entries_added.value_or(d.entries.size()));
   // Redis orders groups, consumers and their pending IDs lexicographically / numerically.
@@ -1009,14 +1013,18 @@ bool read_stream(RdbReader& r, uint8_t type, DataStore::StreamDump& d) {
       return false;
   } else {
     added = length;
-    if (!entries.empty()) first = entries.begin()->first;
+    first = entries.empty() ? RdbStreamID{UINT64_MAX, UINT64_MAX} : entries.begin()->first;
   }
-  // The datastore derives first-id from surviving entries; refuse inconsistent metadata
-  // rather than silently changing it. All valid Redis streams obey these invariants.
+  // Redis's type-15 loader uses streamGetEdgeID(), whose empty first-ID sentinel is
+  // UINT64_MAX-UINT64_MAX. A subsequent Redis save writes that sentinel as type 21.
+  // Preserve it rather than rejecting a valid resave or silently normalizing XINFO.
+  const RdbStreamID legacy_first{UINT64_MAX, UINT64_MAX};
   if (type >= RDB_TYPE_STREAM_LISTPACKS_2 &&
-      (first != (entries.empty() ? RdbStreamID{} : entries.begin()->first) || added < length ||
-       max_deleted > last))
+      ((entries.empty() ? (first != RdbStreamID{} && first != legacy_first)
+                        : first != entries.begin()->first) ||
+       added < length || max_deleted > last))
     return false;
+  d.legacy_empty_first_id = entries.empty() && first == legacy_first;
   if (!entries.empty() && entries.rbegin()->first > last) return false;
   d.last_ms = last.first;
   d.last_seq = last.second;
@@ -1515,9 +1523,12 @@ void rdb_remove_temp_file(pid_t pid) {
 
 // ── RDB Load ───────────────────────────────────────────────────────────
 
-bool rdb_load(const std::filesystem::path& path, std::string& err,
-              const std::function<void()>& before_replace, RdbReplicationInfo* repl,
-              const std::function<void(int, const std::string&)>& expired) {
+namespace {
+bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStore& ds,
+                   const FunctionLoadFn& load_function, RdbLoadStats& stats, bool keep_expired,
+                   bool checksum, bool skip_checksum_validation,
+                   const std::function<void()>& before_replace, RdbReplicationInfo* repl,
+                   const std::function<void(int, const std::string&)>& expired) {
   err.clear();
   if (repl) *repl = {};
   RdbReplicationInfo loaded_repl;
@@ -1574,7 +1585,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   // DEBUG RELOAD and a replica's full sync. A stored 0 means the file was saved without a
   // checksum. Redis checks it after reading the keys; PeaDB checks it first, so a corrupt file
   // never replaces the dataset in memory.
-  if (rdb_ver >= 5 && g_rdb_checksum && !g_skip_checksum_validation) {
+  if (rdb_ver >= 5 && checksum && !skip_checksum_validation) {
     uint64_t stored = 0;
     if (input.remaining() < 8 || !input.skip(input.remaining() - 8)) {
       err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
@@ -1600,7 +1611,6 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     }
   }
 
-  auto& ds = store();
   auto load = [&](bool apply) {
     if (::lseek(file.fd, 9, SEEK_SET) == -1) {
       err = "cannot seek RDB file";
@@ -1609,7 +1619,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
     RdbReader r(source, file_size - 9);
     RdbReplicationInfo parsed_repl;
     if (apply) {
-      g_rdb_load_stats = {};
+      stats = {};
       if (before_replace) before_replace();
       ds.flushall();
     }
@@ -1701,7 +1711,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
           err = "malformed FUNCTION payload";
           return false;
         }
-        if (apply && g_function_load_hook && !g_function_load_hook(code, err)) {
+        if (apply && load_function && !load_function(code, err)) {
           return false;
         }
         continue;
@@ -1771,7 +1781,7 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
                                    : load_error;
           return false;
         }
-        if (apply) rdb_store_dump_value(key, std::move(value), expire_at);
+        if (apply) rdb_store_dump_value(ds, key, std::move(value), expire_at);
       } else {
         DataStore::StreamDump d;
         uint64_t nentries = 0;
@@ -1846,12 +1856,12 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
       }
       // Redis's rdbLoadRio(): a master does not load a key that has already expired.
       if (apply) {
-        if (expire_at && *expire_at < load_now && !ds.replica_expiry()) {
+        if (expire_at && *expire_at < load_now && !keep_expired) {
           ds.del(key);
-          ++g_rdb_load_stats.expired;
+          ++stats.expired;
           if (expired) expired(ds.current_db(), key);
         } else {
-          ++g_rdb_load_stats.loaded;
+          ++stats.loaded;
         }
       }
     }
@@ -1871,6 +1881,31 @@ bool rdb_load(const std::filesystem::path& path, std::string& err,
   if (!load(true)) return false;
   if (repl) *repl = std::move(loaded_repl);
   return true;
+}
+
+}  // namespace
+
+bool rdb_load_into(const std::filesystem::path& path, RdbLoadTarget& target, std::string& err) {
+  if (!lua_engine_on_owner_thread()) {
+    err = "RDB target loading requires the Lua-owning thread";
+    return false;
+  }
+  return rdb_load_impl(
+      path, err, target.datastore,
+      [&](const std::string& code, std::string& error) {
+        std::string name;
+        return target.functions.load(code, target.replace_functions, name, error);
+      },
+      target.stats, target.expiry == RdbLoadTarget::Expiry::KeepExpired, target.checksum,
+      target.skip_checksum_validation, nullptr, target.replication, target.expired);
+}
+
+bool rdb_load(const std::filesystem::path& path, std::string& err,
+              const std::function<void()>& before_replace, RdbReplicationInfo* repl,
+              const std::function<void(int, const std::string&)>& expired) {
+  auto& ds = store();
+  return rdb_load_impl(path, err, ds, g_function_load_hook, g_rdb_load_stats, ds.replica_expiry(),
+                       g_rdb_checksum, g_skip_checksum_validation, before_replace, repl, expired);
 }
 
 // ── DUMP / RESTORE ─────────────────────────────────────────────────────
@@ -2027,9 +2062,8 @@ bool rdb_decode_dump_payload(const std::string& payload, DumpValue& out, std::st
   return true;
 }
 
-void rdb_store_dump_value(const std::string& key, DumpValue&& value,
+void rdb_store_dump_value(DataStore& ds, const std::string& key, DumpValue&& value,
                           std::optional<int64_t> expire_at_ms) {
-  auto& ds = store();
   bool wrongtype = false;
   if (value.type == RDB_TYPE_STRING) {
     ds.set(key, value.str, false, false, expire_at_ms, false);
@@ -2049,6 +2083,11 @@ void rdb_store_dump_value(const std::string& key, DumpValue&& value,
       ds.zadd_one(key, score, member, false, false, false, false, false);
   }
   if (expire_at_ms) ds.expire(key, *expire_at_ms);
+}
+
+void rdb_store_dump_value(const std::string& key, DumpValue&& value,
+                          std::optional<int64_t> expire_at_ms) {
+  rdb_store_dump_value(store(), key, std::move(value), expire_at_ms);
 }
 
 }  // namespace peadb

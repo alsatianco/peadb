@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Preserve Redis's recorded-first-ID sentinel when empty legacy streams are migrated and resaved in native RDB format, including XINFO and subsequent XADD.
+
+- Isolate RDB file decoding into explicit datastore/function/expiry/counter/AUX targets and own function callbacks per registry on the Lua thread. Failed FUNCTION RESTORE now preserves existing callback closures and captured state; current full-sync transport and in-place loading remain unchanged.
+
 - Stream RDB file input through bounded readers instead of retaining and copying the entire serialized snapshot. Preserve checksum and full-sync structural validation before replacement, retain the opened inode through publication, borrow DUMP payloads and restore database/expiry scope on decode exceptions (delta 58).
 
 - Stream RDB saves through bounded 64 KiB output with incremental CRC64, preserving atomic file publication and retries after disk errors. Visit key names and function sources in place; retain in-memory DUMP results and current disk-backed replication transport (deltas 46/58).

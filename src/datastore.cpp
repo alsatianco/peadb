@@ -1698,6 +1698,7 @@ std::optional<std::string> DataStore::xadd(
   it->second.stream().entries_added++;
   const std::string out_id = stream_id_str(nid);
   it->second.stream_entries().push_back({out_id, fields});
+  it->second.stream().legacy_empty_first_id = false;
   return out_id;
 }
 
@@ -1717,6 +1718,10 @@ bool DataStore::stream_info(const std::string& key, StreamInfo& out, bool& wrong
   out.max_deleted_id = st.max_deleted_id;
   out.entries_added = st.entries_added;
   out.groups = st.groups.size();
+  out.recorded_first_id =
+      st.entries.empty()
+          ? (st.legacy_empty_first_id ? "18446744073709551615-18446744073709551615" : "0-0")
+          : st.entries.front().first;
   if (!st.entries.empty()) {
     out.first = st.entries.front();
     out.last = st.entries.back();
@@ -2419,7 +2424,10 @@ bool DataStore::xinfo_stream_full(const std::string& key, std::size_t count, Str
   out.length = static_cast<std::int64_t>(st.entries.size());
   out.last_id = stream_id_str({st.last_ms, st.last_seq});
   out.max_deleted_id = st.max_deleted_id.empty() ? "0-0" : st.max_deleted_id;
-  out.recorded_first_id = st.entries.empty() ? "0-0" : st.entries.front().first;
+  out.recorded_first_id =
+      st.entries.empty()
+          ? (st.legacy_empty_first_id ? "18446744073709551615-18446744073709551615" : "0-0")
+          : st.entries.front().first;
   out.entries_added = static_cast<std::int64_t>(st.entries_added);
   out.entries.clear();
   const std::size_t lim = count == 0 ? st.entries.size() : count;
@@ -2498,6 +2506,7 @@ bool DataStore::dump_stream(const std::string& key, StreamDump& out) {
   out.last_seq = e.stream_last_seq();
   out.entries_added = e.stream().entries_added;
   out.max_deleted_id = e.stream().max_deleted_id;
+  out.legacy_empty_first_id = e.stream().legacy_empty_first_id;
   out.groups.clear();
   for (const auto& [gname, g] : e.stream_groups()) {
     StreamGroupDump gd;
@@ -2529,6 +2538,7 @@ void DataStore::restore_stream(const std::string& key, const StreamDump& d) {
   // Old private snapshots have no historical counter; retain their minimum valid value.
   e.stream().entries_added = d.entries_added.value_or(d.entries.size());
   e.stream().max_deleted_id = d.max_deleted_id;
+  e.stream().legacy_empty_first_id = d.entries.empty() && d.legacy_empty_first_id;
   e.stream_last_ms() = d.last_ms;
   e.stream_last_seq() = d.last_seq;
   for (const auto& gd : d.groups) {
