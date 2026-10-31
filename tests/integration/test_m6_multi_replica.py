@@ -4,6 +4,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 from _readiness import wait_until_ready
 from _redis_path import skip_if_no_redis_server, skip_if_no_redis_cli
 from _isolated_server import IsolatedServer
+from test_replica_offset_parity import stop
 
 ROOT=pathlib.Path(__file__).resolve().parents[2]
 REDIS_SERVER=skip_if_no_redis_server()
@@ -14,9 +15,14 @@ def rc(port,*args):
 
 def start_redis(port,d):
  conf=pathlib.Path(d)/f'redis-{port}.conf'
- conf.write_text('\n'.join(['bind 127.0.0.1',f'port {port}',f'dir {d}','dbfilename dump.rdb','appendonly no','save ""','daemonize no'])+'\n',encoding='utf-8')
+ conf.write_text('\n'.join(['bind 127.0.0.1',f'port {port}',f'dir {d}','dbfilename dump.rdb','appendonly no','save ""','daemonize no','repl-diskless-sync-delay 0'])+'\n',encoding='utf-8')
  p=subprocess.Popen([REDIS_SERVER,str(conf)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
- time.sleep(0.25)
+ # This fixture tests replication data, not Redis's five-second diskless admission delay.
+ try:
+  wait_until_ready(port, process=p)
+ except BaseException:
+  stop(p)
+  raise
  return p
 
 def start_peadb(port):

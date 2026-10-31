@@ -12,6 +12,7 @@
 #include "functions.hpp"
 #include <map>
 #include "protocol.hpp"
+#include "replication_snapshot.hpp"
 #include "rdb.hpp"
 #include "redis_config_table.generated.hpp"
 #include "sha256.hpp"
@@ -18047,18 +18048,26 @@ class ReplicationIo {
     }
     return false;
   }
+  ssize_t readSome(void* buf, std::size_t len) {
+    while (wait(POLLIN)) {
+      const ssize_t n = ::recv(fd_, buf, len, 0);
+      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+      if (n <= 0) return -1;
+      last_io_ = now_ms();
+      if (!update_master_link(gen_, [&] { g_repl_transfer_lastio_ms = last_io_; })) return -1;
+      return n;
+    }
+    return -1;
+  }
   bool readExact(void* buf, std::size_t len) {
     auto* p = static_cast<char*>(buf);
-    while (len > 0 && wait(POLLIN)) {
-      const ssize_t n = ::recv(fd_, p, len, 0);
-      if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+    while (len > 0) {
+      const ssize_t n = readSome(p, len);
       if (n <= 0) return false;
-      last_io_ = now_ms();
-      update_master_link(gen_, [&] { g_repl_transfer_lastio_ms = last_io_; });
       p += n;
       len -= static_cast<std::size_t>(n);
     }
-    return len == 0;
+    return true;
   }
   bool readLine(std::string& out) {
     out.clear();
@@ -18209,8 +18218,9 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     log(LogLevel::Info,
         "(Non critical) Master does not understand REPLCONF listening-port: " + line);
 
-  // REPLCONF capa psync2
-  if (!io.send(repl_encode_cmd({"REPLCONF", "capa", "psync2"})) || !io.readLine(line)) {
+  // Both EOF spooling and PSYNC2 are supported by this receiver.
+  if (!io.send(repl_encode_cmd({"REPLCONF", "capa", "eof", "capa", "psync2"})) ||
+      !io.readLine(line)) {
     log(LogLevel::Error, "REPLICAOF: REPLCONF capa failed: " + line);
     ::close(fd);
     return false;
@@ -18230,6 +18240,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
       return false;
     }
   } while (line.empty());
+  std::string stream_read_ahead;
   const bool partial = line == "+CONTINUE" || line.rfind("+CONTINUE ", 0) == 0;
   if (partial) {
     if (!cached->cached) {
@@ -18290,18 +18301,14 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         return false;
       }
     } while (line.empty());
-    if (line.empty() || line[0] != '$') {
-      log(LogLevel::Error, "REPLICAOF: expected $<len>, got: " + line);
+    ReplicationSnapshot snapshot;
+    if (!snapshot.start(line)) {
+      log(LogLevel::Error, "REPLICAOF: bad RDB bulk header: " + line);
       ::close(fd);
       return false;
     }
-    std::int64_t rdb_len = 0;
-    if (!parse_i64(line.substr(1), rdb_len) || rdb_len < 0) {
-      log(LogLevel::Error, "REPLICAOF: bad RDB length: " + line);
-      ::close(fd);
-      return false;
-    }
-    update_master_link(gen, [&] { g_repl_transfer_size = rdb_len; });
+    update_master_link(gen,
+                       [&] { g_repl_transfer_size = std::max<std::int64_t>(snapshot.size(), 0); });
 
     // Stream the RDB into a temp file in the working directory (`dir`), created new like Redis's
     // readSyncBulkPayload() creates temp-<unixtime>.<pid>.rdb; the link's generation in the name
@@ -18317,28 +18324,34 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
         ::close(fd);
         return false;
       }
-      std::vector<char> chunk(65536);
-      std::int64_t remaining = rdb_len;
+      std::vector<char> chunk(ReplicationSnapshot::kChunk);
+      auto write_chunk = [&](std::string_view bytes) {
+        std::size_t written = 0;
+        while (written < bytes.size()) {
+          const ssize_t n = ::write(rfd, bytes.data() + written, bytes.size() - written);
+          if (n < 0 && errno == EINTR) continue;
+          if (n <= 0) return false;
+          written += static_cast<std::size_t>(n);
+        }
+        return true;
+      };
       bool write_ok = true;
-      while (remaining > 0 && write_ok) {
-        std::size_t want =
-            static_cast<std::size_t>(std::min(remaining, static_cast<std::int64_t>(chunk.size())));
-        if (!io.readExact(chunk.data(), want)) {
+      while (!snapshot.done()) {
+        const ssize_t n = io.readSome(chunk.data(), chunk.size());
+        if (n <= 0 || !snapshot.feed(std::string_view(chunk.data(), static_cast<std::size_t>(n)),
+                                     write_chunk, stream_read_ahead)) {
           write_ok = false;
           break;
         }
-        std::size_t written = 0;
-        while (written < want) {
-          const ssize_t n = ::write(rfd, chunk.data() + written, want - written);
-          if (n < 0 && errno == EINTR) continue;
-          if (n <= 0) {
-            write_ok = false;
-            break;
-          }
-          written += static_cast<std::size_t>(n);
+        if (!update_master_link(gen, [&] {
+              // INFO counts bytes received, including the uncommitted rolling suffix.
+              // These transfer counters never drive replication ACK offsets.
+              g_repl_transfer_read = snapshot.received() + snapshot.pending();
+              g_repl_transfer_size = std::max<std::int64_t>(snapshot.size(), 0);
+            })) {
+          write_ok = false;
+          break;
         }
-        remaining -= static_cast<std::int64_t>(want);
-        update_master_link(gen, [&] { g_repl_transfer_read = rdb_len - remaining; });
       }
       if (write_ok && ::fsync(rfd) != 0) write_ok = false;
       if (::close(rfd) != 0) write_ok = false;
@@ -18403,7 +18416,7 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     }
     cached->offset = fullresync_offset;
     log(LogLevel::Info,
-        "REPLICAOF: full sync complete, loaded " + std::to_string(rdb_len) + " bytes");
+        "REPLICAOF: full sync complete, loaded " + std::to_string(snapshot.received()) + " bytes");
 
   }  // full resync; CONTINUE keeps the dataset and backlog
 
@@ -18447,21 +18460,30 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
       log(LogLevel::Warn, "MASTER timeout: no data nor PING received...");
       break;
     }
-    pollfd readable{fd, POLLIN, 0};
-    const int ready = ::poll(&readable, 1, 100);
-    if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
-    if (ready < 0) break;
-    const ssize_t n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
-    if (n == 0) {
-      log(LogLevel::Warn, "REPLICAOF: master closed connection");
-      break;
+    ssize_t n;
+    if (!stream_read_ahead.empty()) {
+      // A trailer and the first commands can share one recv. Process these bytes before
+      // polling again, even if the master is waiting for an applied-offset ACK.
+      n = static_cast<ssize_t>(stream_read_ahead.size());
+      stream_buf.append(stream_read_ahead);
+      stream_read_ahead.clear();
+    } else {
+      pollfd readable{fd, POLLIN, 0};
+      const int ready = ::poll(&readable, 1, 100);
+      if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+      if (ready < 0) break;
+      n = ::recv(fd, recv_buf.data(), recv_buf.size(), 0);
+      if (n == 0) {
+        log(LogLevel::Warn, "REPLICAOF: master closed connection");
+        break;
+      }
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
+        log(LogLevel::Error, "REPLICAOF: recv error: " + std::string(strerror(errno)));
+        break;
+      }
+      stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
     }
-    if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) continue;
-      log(LogLevel::Error, "REPLICAOF: recv error: " + std::string(strerror(errno)));
-      break;
-    }
-    stream_buf.append(recv_buf.data(), static_cast<std::size_t>(n));
     if (!update_master_link(gen, [&] {
           g_replica_read_offset += n;  // readQueryFromClient(): read_reploff
           g_replica_last_io_ms = now_ms();

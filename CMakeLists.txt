@@ -91,6 +91,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(replication_snapshot_test tests/unit/replication_snapshot_test.cpp)
+  target_link_libraries(replication_snapshot_test PRIVATE peadb_core)
+  add_test(NAME replication_snapshot_test COMMAND replication_snapshot_test)
+
   add_executable(config_parser_test tests/unit/config_parser_test.cpp)
   target_link_libraries(config_parser_test PRIVATE peadb_core)
   add_test(NAME config_parser_test COMMAND config_parser_test)

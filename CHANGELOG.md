@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Receive Redis EOF-framed replication snapshots through the bounded disk spool, advertise EOF with PSYNC2, and retain coalesced command bytes after either snapshot framing mode. Preserve applied-offset ACKs, checksum validation and cancellation; master-side pipe transport and direct loading remain pending (delta 8).
+
 - Preserve Redis's recorded-first-ID sentinel when empty legacy streams are migrated and resaved in native RDB format, including XINFO and subsequent XADD.
 
 - Isolate RDB file decoding into explicit datastore/function/expiry/counter/AUX targets and own function callbacks per registry on the Lua thread. Failed FUNCTION RESTORE now preserves existing callback closures and captured state; current full-sync transport and in-place loading remain unchanged.
