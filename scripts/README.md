@@ -31,6 +31,8 @@ The former manual RESP3/Lua and replication debug drivers are covered by
 `tests/integration/test_p2_script_replication_shapes.py`. Run those through the
 integration supervisor for assertions, readiness checks and process cleanup.
 
+The [autonomous Codex plan runner](dev/auto-improve-codex.md) lives under `scripts/dev/`; its plan and runtime records stay ignored under `AI-TEMP/`. It resumes interrupted work, reviews unrelated edits for validated commits or named stashes, and retains the existing policy of pushing each requested commit.
+
 ## Running scripts
 
 General guidance:
