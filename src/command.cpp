@@ -1268,11 +1268,12 @@ bool do_bgsave_fork(const RdbReplicationInfo* repl = nullptr) {
   g_dirty_before_bgsave = static_cast<std::int64_t>(store().mutation_epoch());
   g_lastbgsave_try = now_ms() / 1000;
   const auto history = repl ? std::optional<RdbReplicationInfo>(*repl) : rdb_replication_info();
+  const pid_t parent_pid = ::getpid();
   const auto fork_t0 = std::chrono::steady_clock::now();
   const pid_t pid = fork_child();
   if (pid == 0) {
     std::string err;
-    const bool ok = rdb_save(g_snapshot_path, err, history ? &*history : nullptr);
+    const bool ok = rdb_save(g_snapshot_path, err, history ? &*history : nullptr, parent_pid);
     if (ok) {
       log(LogLevel::Info, "DB saved on disk");
     } else {

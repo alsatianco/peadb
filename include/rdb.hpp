@@ -25,10 +25,12 @@ using FunctionLoadFn = std::function<bool(const std::string& library_code, std::
 void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load);
 
 // Save all databases to a Redis-compatible RDB file, through temp-<pid>.rdb next to it (Redis's
-// rdbSave()). On failure `err` is the line Redis logs for it.
+// rdbSave()). On failure `err` is the line Redis logs for it. A nonzero parent_pid belongs
+// to a forked save: cancel at serialization/I/O/publication boundaries if that parent is gone.
+// Capture it before fork(), not with getppid() after the child may already have been orphaned.
 struct RdbReplicationInfo;
 bool rdb_save(const std::filesystem::path& path, std::string& err,
-              const RdbReplicationInfo* repl = nullptr);
+              const RdbReplicationInfo* repl = nullptr, pid_t parent_pid = 0);
 
 // Serialize the same complete RDB to a blocking sink, with at most 64 KiB per call. The sink
 // follows write(2): positive short writes are retried, -1/EINTR is retried, zero or any other
@@ -37,7 +39,10 @@ bool rdb_save(const std::filesystem::path& path, std::string& err,
 // Output buffering is bounded; a value/compact encoding may still be materialized. On failure
 // a partial RDB may have reached the sink; err is set and no further writes are attempted.
 using RdbWriteFn = std::function<ssize_t(const void*, std::size_t)>;
-bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl = nullptr);
+// parent_pid has the same cancellation contract as rdb_save(); zero leaves foreground callers
+// independent of process ancestry. The sink must separately handle a blocked consumer/timeout.
+bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl = nullptr,
+               pid_t parent_pid = 0);
 
 // The temp file rdb_save() writes in process `pid` before the rename: temp-<pid>.rdb in the
 // dump's directory. rdb_remove_temp_file() deletes the one in the working directory (Redis's

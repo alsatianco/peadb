@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Cancel forked RDB saves when the owning server exits, including disk-backed full-sync snapshots. Check parent ownership during serialization and before publication, remove partial output, and preserve the existing backup on cancellation (delta 8).
+
 - Receive Redis EOF-framed replication snapshots through the bounded disk spool, advertise EOF with PSYNC2, and retain coalesced command bytes after either snapshot framing mode. Preserve applied-offset ACKs, checksum validation and cancellation; master-side pipe transport and direct loading remain pending (delta 8).
 
 - Preserve Redis's recorded-first-ID sentinel when empty legacy streams are migrated and resaved in native RDB format, including XINFO and subsequent XADD.

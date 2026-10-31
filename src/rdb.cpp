@@ -100,6 +100,11 @@ void rdb_register_function_hooks(FunctionDumpFn dump, FunctionLoadFn load) {
 
 namespace {
 
+void check_save_parent(pid_t parent_pid) {
+  if (parent_pid != 0 && ::getppid() != parent_pid)
+    throw std::system_error(ECANCELED, std::generic_category(), "RDB save parent exited");
+}
+
 // fsync the parent directory of `path` so an atomic rename is durable across
 // power loss. File fsync alone only flushes contents, not the directory entry.
 bool fsync_parent_dir(const std::filesystem::path& path) {
@@ -1289,7 +1294,8 @@ bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empt
 
 // Wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
 // Used by file saves, including full-sync snapshots.
-void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
+void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pid = 0) {
+  check_save_parent(parent_pid);
   auto& ds = store();
   // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
   // saving deletes nothing, so no key leaves the dataset without its DEL (compat/delta.md item 37).
@@ -1323,6 +1329,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
   // written after AUX and before the keyspace, matching Redis's RDB layout.
   if (g_function_dump_hook) {
     g_function_dump_hook([&](const std::string& code) {
+      check_save_parent(parent_pid);
       w.write_u8(RDB_OPCODE_FUNCTION2);
       w.write_string(code);
     });
@@ -1342,6 +1349,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
     ds.select_db(dbi);
     std::size_t key_count = 0, expire_count = 0;
     ds.for_each_key([&](const std::string& key) {
+      check_save_parent(parent_pid);
       ++key_count;
       if (ds.pexpiretime(key) >= 0) ++expire_count;
     });
@@ -1356,6 +1364,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
     w.write_length(expire_count);
 
     ds.for_each_key([&](const std::string& key) {
+      check_save_parent(parent_pid);
       struct DelayAfterKey {
         int usec;
         ~DelayAfterKey() {
@@ -1440,15 +1449,22 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl) {
 }
 }  // end anonymous namespace
 
-bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl) {
+bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl,
+               pid_t parent_pid) {
   err.clear();
   if (!sink) {
     err = "Error saving DB: missing output sink";
     return false;
   }
   try {
-    RdbWriter writer(sink, g_rdb_checksum);
-    rdb_serialize(writer, repl);
+    RdbWriter writer(
+        [&](const void* data, std::size_t size) {
+          check_save_parent(parent_pid);
+          return sink(data, size);
+        },
+        g_rdb_checksum);
+    rdb_serialize(writer, repl, parent_pid);
+    check_save_parent(parent_pid);
     return true;
   } catch (const std::system_error& e) {
     err = std::string("Write error saving DB: ") + e.code().message();
@@ -1458,7 +1474,8 @@ bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInf
   return false;
 }
 
-bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbReplicationInfo* repl) {
+bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbReplicationInfo* repl,
+              pid_t parent_pid) {
   err.clear();
   auto cwd = [] {
     std::error_code ec;
@@ -1477,7 +1494,7 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
     return false;
   }
   if (!rdb_write([fd](const void* data, std::size_t size) { return ::write(fd, data, size); }, err,
-                 repl)) {
+                 repl, parent_pid)) {
     if (err.starts_with("Write error saving DB:")) err.insert(21, " on disk");
     ::close(fd);
     ::unlink(tmp_path.c_str());
@@ -1493,12 +1510,22 @@ bool rdb_save(const std::filesystem::path& path, std::string& err, const RdbRepl
   // Fail fast on fsync error: a successful rename of an unfsynced temp file
   // can leave the new RDB with stale or torn contents after a power loss.
   if (::fsync(fd) != 0) return write_error();
+  if (parent_pid != 0 && ::getppid() != parent_pid) {
+    errno = ECANCELED;
+    return write_error();
+  }
   if (::close(fd) != 0) {
     err = std::string("Write error saving DB on disk: ") + std::strerror(errno);
     ::unlink(tmp_path.c_str());
     return false;
   }
 
+  // close() may block too; recheck immediately before publishing the completed inode.
+  if (parent_pid != 0 && ::getppid() != parent_pid) {
+    err = "RDB save cancelled: parent exited before publication";
+    ::unlink(tmp_path.c_str());
+    return false;
+  }
   if (::rename(tmp_path.c_str(), path.c_str()) != 0) {
     err = "Error moving temp DB file " + tmp_path + " on the final destination " + path.string() +
           " (in server root dir " + cwd() + "): " + std::strerror(errno);

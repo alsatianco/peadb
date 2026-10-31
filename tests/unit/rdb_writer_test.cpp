@@ -105,6 +105,29 @@ int main() {
   check(ds.get(std::string("binary\0key", 10)) == std::string(150000, '\x80'),
         "binary value preserved");
 
+  // A child orphaned before its first key must not write any payload or publish a file.
+  // Our own PID cannot be our parent, independent of the host's process supervisor.
+  int cancelled_writes = 0;
+  ds.select_db(9);
+  check(!peadb::rdb_write(
+            [&](const void*, std::size_t n) -> ssize_t {
+              ++cancelled_writes;
+              return n;
+            },
+            err, nullptr, ::getpid()),
+        "already orphaned save refuses serialization");
+  check(cancelled_writes == 0 && !err.empty() && ds.current_db() == 9,
+        "cancelled save writes nothing and preserves selected database");
+  check(!peadb::rdb_save(path, err, nullptr, ::getpid()), "orphaned file save fails");
+  {
+    std::ifstream file(path, std::ios::binary);
+    const std::string unchanged((std::istreambuf_iterator<char>(file)), {});
+    check(unchanged == data, "cancelled save preserves previous backup");
+  }
+  check(!std::filesystem::exists(peadb::rdb_temp_file_name(path, ::getpid())),
+        "cancelled file save removes temporary output");
+  check(peadb::rdb_save(path, err, nullptr, ::getppid()), "live parent permits file save");
+
   for (int mode = 0; mode < 5; ++mode) {
     ds.select_db(9);
     int invoked = 0;
