@@ -5,6 +5,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Assert the invariants of the *committed* include/command_metadata.generated.hpp table
@@ -28,7 +29,7 @@ std::set<std::string> splitCats(const std::string& cats) {
 }
 
 const peadb::CommandMetaEntry* findEntry(const std::vector<peadb::CommandMetaEntry>& table,
-                                          const std::string& full_name) {
+                                         const std::string& full_name) {
   for (const auto& e : table) {
     if (full_name == e.full_name) return &e;
   }
@@ -59,10 +60,9 @@ int main() {
   // ACLCommandCategories order. Before the implicit-categories rule, only 15 appeared --
   // read, write, fast, slow, blocking, pubsub were all absent.
   const std::vector<std::string> kExpectedCategories = {
-      "keyspace", "read",     "write",       "set",         "sortedset",  "list",
-      "hash",     "string",   "bitmap",      "hyperloglog", "geo",        "stream",
-      "pubsub",   "admin",    "fast",        "slow",        "blocking",   "dangerous",
-      "connection", "transaction", "scripting",
+      "keyspace", "read",   "write",       "set",       "sortedset",  "list",        "hash",
+      "string",   "bitmap", "hyperloglog", "geo",       "stream",     "pubsub",      "admin",
+      "fast",     "slow",   "blocking",    "dangerous", "connection", "transaction", "scripting",
   };
   std::set<std::string> seen_categories;
   for (const auto& e : table) {
@@ -180,6 +180,23 @@ int main() {
         (entry->flags & check.must_not_have) != 0) {
       std::cerr << "invariant 7 violated: entry '" << entry->full_name << "' has flags 0x"
                 << std::hex << entry->flags << std::dec << "\n";
+      ++failures;
+    }
+  }
+
+  // Loading admission must not turn an invalid known subcommand into LOADING. Arity
+  // comes from the same pinned JSON as flags, rather than a handler-specific allowlist.
+  for (const auto& e : table) {
+    if (e.arity == 0) {
+      std::cerr << "Missing generated arity for " << e.full_name << "\n";
+      ++failures;
+    }
+  }
+  for (const auto& [name, expected] : std::vector<std::pair<std::string, int>>{
+           {"get", 2}, {"set", -3}, {"script|load", 3}, {"config|set", -4}, {"xinfo|groups", 3}}) {
+    const auto* e = findEntry(table, name);
+    if (e == nullptr || e->arity != expected) {
+      std::cerr << "Wrong generated arity for " << name << "\n";
       ++failures;
     }
   }

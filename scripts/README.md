@@ -83,6 +83,8 @@ The result parser retains raw repetition counts for timed upstream suites while 
 
 The replication/promotion smoke (`scripts/qa/run_sentinel_validation.sh`) explicitly disables the primary’s diskless admission delay because its two-second budget measures data synchronization. It uses PID-verified protocol readiness and a bounded exact-payload wait, retains all value/list/promotion assertions, and fails on missing Python/Redis CLI prerequisites instead of silently skipping. Diskless delay/threshold behavior is checked separately by the Redis-first integration fixtures.
 
+AOF write-error fixtures wait for a unique acknowledged barrier in the actual append file before rearming a fault. Under Redis’s `appendfsync everysec`, a reply can precede a postponed AOF flush; injecting immediately can fail the preceding command and change the next command’s admission. The barrier uses the existing bounded file-content wait and retains the fault/status/recovery assertions.
+
 ## Common prerequisites
 
 Depending on the script, you may need:

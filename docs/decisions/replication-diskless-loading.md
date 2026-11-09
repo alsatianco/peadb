@@ -2,7 +2,7 @@
 
 Date: 2026-10-30
 
-Status: accepted design; bounded codecs/explicit targets, EOF reception, master pipe/completion/ACK transport and live admission are implemented (R4a–R4d3). Direct/asynchronous loading remains pending. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
+Status: accepted design; bounded codecs/explicit targets, EOF reception, master pipe/completion/ACK transport and live admission are implemented (R4a–R4d3). Shared blocking/async command admission is implemented; the controlled event pump, startup service and direct/asynchronous loading remain pending. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
 
 ## Problem and specification
 
@@ -86,6 +86,8 @@ Coordinate AOF suspension/restart and old persistence children at Redis's load b
 ## Loading admission and event servicing
 
 Represent startup loading, replication loading and asynchronous replication loading in one event-loop-owned load state, while keeping link transfer progress distinct. Receiving a snapshot to disk is not yet loading it. Start direct-loading state when the RDB parser starts, so a deliberately slow producer makes it externally observable. INFO loading/progress must remain truthful while a client can actually request it; setting a flag around an uninterruptible call is insufficient.
+
+The shared loading-state and admission prerequisite is implemented, including exception-safe scope restoration, generated known-subcommand arity checks before admission and eviction suppression. It does not make a synchronous load externally observable: controlled pumping, progress and startup listener ordering below remain pending, and no production path enables async admission.
 
 Use the generated Redis command flags, including `LOADING` and `NO_ASYNC_LOADING`, and Redis's EXEC aggregate/inverse flags. Preserve authentication, stale/readonly, busy-script, OOM and error-counter precedence. During asynchronous loading, Redis still applies normal replica and script rules; it does not reduce all admission to a blanket readonly check. CONFIG SET additionally refuses settings marked `DENY_LOADING_CONFIG`, even for a no-change update such as `appendonly no`; other settings follow Redis's normal checks. REPLICAOF is refused by `NO_ASYNC_LOADING`. Test direct, pipelined, MULTI/EXEC, renamed-command and script/function paths. The exact error is `LOADING Redis is loading the dataset in memory`.
 

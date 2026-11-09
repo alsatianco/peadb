@@ -362,8 +362,28 @@ extern std::function<void(const std::function<void(const SessionState&)>&)> g_fo
 // its next commands.
 extern std::function<void(const std::function<std::string(const SessionState&)>& reply)>
     g_reply_blocked_on_shutdown_cb;
-// Set around the startup load: a signal then shuts down without saving (Redis's server.loading).
+// Event-loop-owned admission state, separate from link-thread snapshot-transfer statistics.
+// Async permits old-dataset service but rejects Redis's NO_ASYNC_LOADING commands. It is
+// infrastructure for staged loading; setting this mode does not implement direct load/swapdb.
+enum class LoadingMode { None, Blocking, Async };
+LoadingMode loading_mode();
+void set_loading_mode(LoadingMode mode);
+// Startup compatibility wrapper; an active load also forces signal shutdown to use NOSAVE.
 void set_loading(bool loading);
+class LoadingScope {
+ public:
+  explicit LoadingScope(LoadingMode mode) : previous_(loading_mode()) {
+    set_loading_mode(mode);
+  }
+  ~LoadingScope() {
+    set_loading_mode(previous_);
+  }
+  LoadingScope(const LoadingScope&) = delete;
+  LoadingScope& operator=(const LoadingScope&) = delete;
+
+ private:
+  LoadingMode previous_;
+};
 // shutdown-on-sigterm/-sigint values: "save nosave now force" words <-> kShutdown* flags.
 int parse_shutdown_flags(const std::string& value);
 std::string shutdown_flags_to_str(int flags);

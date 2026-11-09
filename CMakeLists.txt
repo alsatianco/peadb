@@ -91,6 +91,11 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(loading_admission_test tests/unit/loading_admission_test.cpp)
+  target_link_libraries(loading_admission_test PRIVATE peadb_core)
+  add_test(NAME loading_admission_test COMMAND loading_admission_test)
+  add_test(NAME loading_admission_renamed_test COMMAND loading_admission_test --renamed)
+
   add_executable(poller_pipe_test tests/unit/poller_pipe_test.cpp)
   target_include_directories(poller_pipe_test PRIVATE include)
   add_test(NAME poller_pipe_test COMMAND poller_pipe_test)

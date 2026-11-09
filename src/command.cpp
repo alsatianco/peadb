@@ -184,7 +184,8 @@ std::atomic<bool> g_bgrewrite_in_progress{false};
 // signal handler writes them.
 std::atomic<int> g_shutdown_asap{0};
 std::atomic<int> g_last_sig_received{0};
-std::atomic<bool> g_loading{false};  // the startup load is running (Redis's server.loading)
+std::atomic<bool> g_loading{false};  // any active load; also read by the signal handler
+bool g_async_loading = false;        // owned by the event-loop thread, like command execution
 // shutdown-on-sigterm and shutdown-on-sigint: kShutdown* flags, 0 for "default".
 int g_shutdown_on_sigterm = 0;
 int g_shutdown_on_sigint = 0;
@@ -676,7 +677,6 @@ int g_last_repl_db = 0;
 // streaming loop compare against their captured generation and stop when it changes,
 // so a new REPLICAOF promptly supersedes an in-flight sync/stream.
 std::atomic<std::uint64_t> g_repl_generation{0};
-std::atomic<bool> g_loading_replication{false};
 // Both startup and REPLICAOF use the same supervised link. The role is set before this starts;
 // the thread only receives data and hands it to the event loop, never mutating the datastore.
 void start_master_link(const std::string& host, int port, std::uint64_t gen) {
@@ -3011,7 +3011,7 @@ std::uint64_t eviction_time_limit_us() {
 // while a script is busy.
 bool is_safe_to_perform_evictions() {
   if (must_obey_client() || g_replication_role == "slave") return false;
-  if (g_script_busy.load(std::memory_order_relaxed)) return false;
+  if (g_script_busy.load(std::memory_order_relaxed) || g_loading.load()) return false;
   return !paused_actions_with_update(kPauseEvict);
 }
 
@@ -5759,6 +5759,10 @@ std::string config_set_reply(const std::vector<std::string>& args, const Session
     if ((spec->flags & kCfgProtected) != 0 && !allow_protected_action(protected_allowed, session)) {
       return encode_error(failed + "can't set protected config");
     }
+    // configSetCommand(): the first invalid option wins, including a loading refusal
+    // before value validation or no-change detection. Validate the whole batch before apply.
+    if (g_loading.load() && (spec->flags & kCfgDenyLoading) != 0)
+      return "-LOADING Redis is loading the dataset in memory\r\n";
     const std::string entry = lower(args[i]);
     for (const auto& c : changes) {
       if (c.entry == entry) return encode_error(failed + "duplicate parameter");
@@ -5911,6 +5915,7 @@ std::optional<int> function_flags(const std::string& name) {
 // Redis's command table (the pinned command JSON): each command's and subcommand's flags.
 struct RedisCommandIndex {
   std::unordered_map<std::string, std::uint64_t> flags;  // "name" or "name|sub", lower-case
+  std::unordered_map<std::string, int> arities;          // same pinned name/arity identity
   std::unordered_set<std::string> containers;            // the commands that have subcommands
 };
 const RedisCommandIndex& redis_command_index() {
@@ -5919,6 +5924,7 @@ const RedisCommandIndex& redis_command_index() {
     for (const auto& e : command_metadata()) {
       const std::string name = e.full_name;
       ix->flags[name] = e.flags;
+      ix->arities[name] = e.arity;
       if (const auto bar = name.find('|'); bar != std::string::npos)
         ix->containers.insert(name.substr(0, bar));
     }
@@ -5978,6 +5984,15 @@ std::uint64_t spec_command_flags(const CommandSpec& spec, const std::vector<std:
   if (!(*declared & kFuncNoWrites)) flags |= kRedisCmdWrite;
   if (*declared & kFuncAllowStale) flags |= kRedisCmdStale;
   return flags;
+}
+
+// Redis processCommand(): EXEC also carries aggregate/inverse flags from its queued commands.
+// Call only for external commands, after authentication and the earlier OOM/replica gates.
+bool loading_refuses(std::uint64_t flags, std::uint64_t inverse_flags = 0) {
+  if (loading_mode() == LoadingMode::Blocking)
+    return !(flags & kRedisCmdLoading) || (inverse_flags & kRedisCmdLoading);
+  if (loading_mode() == LoadingMode::Async) return flags & kRedisCmdNoAsyncLoading;
+  return false;
 }
 
 // The same by the name the client sent (`cmd`, also a name given by rename-command); 0 for a
@@ -7349,7 +7364,9 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 out +=
                     "# Persistence\r\n"
                     "loading:" +
-                    std::to_string(g_loading_replication.load() ? 1 : 0) +
+                    std::to_string(loading_mode() == LoadingMode::Blocking ? 1 : 0) +
+                    "\r\nasync_loading:" +
+                    std::to_string(loading_mode() == LoadingMode::Async ? 1 : 0) +
                     "\r\n"
                     "rdb_changes_since_last_save:" +
                     std::to_string(changes_since_save) +
@@ -7700,7 +7717,6 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                 g_replication_master_host.clear();
                 g_replication_master_port = 0;
                 g_replica_stale = false;
-                g_loading_replication.store(false);
                 g_repl_down_since_ms = 0;
                 if (g_aof_sync_suspended) restart_aof_after_sync();
                 // Redis's replicationUnsetMaster(): the replication id inherited from the old
@@ -16052,6 +16068,23 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
     g_script_repl_flags = 3;  // redis.set_repl scope is a single script invocation
   }
   const auto& table = command_table();
+  // Redis checks known subcommand arity before authentication, state admission and
+  // transaction queueing. The regular container handlers otherwise validate too late for
+  // loading refusals; use pinned metadata, including after rename-command.
+  if (g_loading.load() && !must_obey_client() && !in_lua_script_context() && !g_executing_exec) {
+    const auto found = table.find(cmd);
+    if (found != table.end() && found->second.redis_container && args.size() >= 2) {
+      const std::string full_name = found->second.redis_name + "|" + lower(args[1]);
+      const auto& arities = redis_command_index().arities;
+      const auto arity = arities.find(full_name);
+      if (arity != arities.end() && !arity_ok(args.size(), arity->second)) {
+        if (session.in_multi) session.multi_dirty = true;
+        record_cmd_rejected(cmd);
+        record_error_stat("ERR");
+        return encode_error("wrong number of arguments for '" + full_name + "' command");
+      }
+    }
+  }
   // SCRIPT KILL acts only on a busy eval; FUNCTION KILL only on a busy function. The mismatched
   // killer (SCRIPT KILL on a function, FUNCTION KILL on an eval) is NOT allowed through — it
   // falls into the busy gate below and is rejected with BUSY, matching Redis.
@@ -16131,6 +16164,13 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
         record_error_stat(error_code_from_reply(refusal));
         return refusal;
       }
+    }
+    if (!must_obey_client() && !spec_subcommand_unknown(qit->second, args) &&
+        loading_refuses(flags)) {
+      session.multi_dirty = true;
+      record_cmd_rejected(cmd);
+      record_error_stat("LOADING");
+      return "-LOADING Redis is loading the dataset in memory\r\n";
     }
     // Redis checks CLIENT PAUSE before it queues, so a write sent inside MULTI waits too.
     if (pause_holds(cmd, args, session)) {
@@ -16262,6 +16302,12 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
                         "are allowed in this context");
   }
   if (std::string refusal = stale_refusal(deny_stale); !refusal.empty()) return reject(refusal);
+
+  if (client_command && g_loading.load() && !spec_subcommand_unknown(spec, args)) {
+    const auto flags = spec_command_flags(spec, args) | (queued_exec ? session.multi_flags : 0);
+    if (loading_refuses(flags, queued_exec ? session.multi_inv_flags : 0))
+      return reject("-LOADING Redis is loading the dataset in memory\r\n");
+  }
 
   // CLIENT PAUSE: hold the command, after the checks that refuse it (as Redis's processCommand
   // does); the event loop runs it again when the pause ends.
@@ -17370,8 +17416,18 @@ bool shutdown_signal_pending() {
   return g_shutdown_asap.load() != 0;
 }
 
+LoadingMode loading_mode() {
+  if (!g_loading.load()) return LoadingMode::None;
+  return g_async_loading ? LoadingMode::Async : LoadingMode::Blocking;
+}
+
+void set_loading_mode(LoadingMode mode) {
+  g_async_loading = mode == LoadingMode::Async;
+  g_loading.store(mode != LoadingMode::None);
+}
+
 void set_loading(bool loading) {
-  g_loading.store(loading);
+  set_loading_mode(loading ? LoadingMode::Blocking : LoadingMode::None);
 }
 
 void shutdown_cron() {
@@ -18027,6 +18083,7 @@ void drain_replica_cmd_queue() {
       // the sync is tried again.
       RdbReplicationInfo loaded_repl;
       try {
+        const LoadingScope loading(LoadingMode::Blocking);
         ok = rdb_load(
             path, err,
             [&] {
@@ -18547,7 +18604,6 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
       log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF before loading the RDB");
       return false;
     }
-    update_master_link(gen, [] { g_loading_replication = true; });
     wake_event_loop_for_replica();
     bool load_ok = false;
     for (;;) {
@@ -18561,7 +18617,6 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     transfer_state.done();
-    update_master_link(gen, [] { g_loading_replication = false; });
     ::unlink(tmp_path.c_str());
     if (!load_ok) {
       ::close(fd);
@@ -18574,10 +18629,9 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
 
   }  // full resync; CONTINUE keeps the dataset and backlog
 
-  // Release loading gate; from here the event loop's READONLY guard rejects client writes.
+  // From here the event loop's READONLY guard rejects client writes.
   // Streaming commands are enqueued in g_replica_cmd_queue and applied by the event loop,
   // so DataStore mutations stay on the event loop thread (no concurrent access).
-  update_master_link(gen, [] { g_loading_replication = false; });
   {
     // The event loop sends the REPLCONF ACKs on this socket from now on (it knows what it has
     // applied); this thread only reads. A newer REPLICAOF has its own link.

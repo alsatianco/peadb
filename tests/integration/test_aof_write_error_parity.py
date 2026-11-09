@@ -375,6 +375,12 @@ def check_write_error(name, binary, work, shim):
         assert c('SET', 'b', '2') == '+OK'
         assert c('INCR', 'n') == 3
 
+        # Before rearming, drain a unique marker after INCR. With everysec Redis can reply
+        # while earlier bytes await a background fsync; failing those bytes before SET d
+        # would make SET d see MISCONF instead of testing its own failed append. An INCR n
+        # search is insufficient because the AOF already contains an earlier INCR n.
+        assert c('SET', 'aof-rearm-barrier', 'second-write-fault') == '+OK'
+        wait_in_aof(workdir, 'SET', 'aof-rearm-barrier', 'second-write-fault')
         # CONFIG SET appendonly no lifts the refusal (the status stays err); appendonly yes starts
         # a new AOF from the dataset and forgets the error.
         set_fault(flag, 'write ENOSPC')
