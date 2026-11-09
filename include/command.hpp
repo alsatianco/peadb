@@ -70,6 +70,10 @@ struct SessionState {
   std::int64_t woff = 0;
   // The replica said REPLCONF capa psync2: +CONTINUE then names the replication id.
   bool repl_capa_psync2 = false;
+  bool repl_capa_eof = false;
+  // Socket-target snapshots are online before their first post-load ACK, but must not
+  // send command bytes until that handshake completes.
+  bool repl_start_stream_on_ack = false;
   // A replica's last REPLCONF ACK (set when it starts streaming, as Redis's repl_ack_time), and
   // what it said with REPLCONF listening-port and ip-address: the shutdown's "Lagging replica"
   // log line names it by them (Redis's replicationGetSlaveName()).
@@ -255,6 +259,12 @@ void replicas_took_backlog();
 struct RdbReplicationInfo;
 int start_replication_snapshot(RdbReplicationInfo& info);
 extern std::function<void(const std::string& path, bool success)> g_replication_snapshot_done_cb;
+// Socket-target child: parent owns returned data-read and completion-write descriptors.
+// It closes completion only after draining the pipe, allowing successful child exit.
+int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd);
+void cancel_replication_pipe();
+bool replication_diskless_sync();
+extern std::function<void(bool success)> g_replication_pipe_done_cb;
 // beforeSleep()'s GETACK: WAIT asks the replicas for an ACK once per event-loop pass, after the
 // pass's commands (outside the WAIT, so it is not the client's write). replica_getack_pending()
 // says one waits (the event loop must not sleep then); send_pending_getack() adds it to the stream.

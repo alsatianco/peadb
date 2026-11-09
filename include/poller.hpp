@@ -80,6 +80,28 @@ struct Poller {
 #endif
   }
 
+  // Pipes have no write interest. Remove suspended Linux reads entirely: an epoll
+  // registration with events=0 still delivers HUP and spins after the child exits.
+  bool suspend_read(int fd) {
+#ifdef __linux__
+    return epoll_ctl(pfd, EPOLL_CTL_DEL, fd, nullptr) == 0;
+#else
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_READ, EV_DISABLE, 0, 0, nullptr);
+    return kevent(pfd, &kev, 1, nullptr, 0, nullptr) == 0;
+#endif
+  }
+
+  bool resume_read(int fd) {
+#ifdef __linux__
+    return add_read(fd);
+#else
+    struct kevent kev;
+    EV_SET(&kev, fd, EVFILT_READ, EV_ENABLE, 0, 0, nullptr);
+    return kevent(pfd, &kev, 1, nullptr, 0, nullptr) == 0;
+#endif
+  }
+
   void remove(int fd) {
 #ifdef __linux__
     epoll_ctl(pfd, EPOLL_CTL_DEL, fd, nullptr);

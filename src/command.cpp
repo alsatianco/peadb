@@ -175,6 +175,7 @@ std::int64_t g_rdb_save_time_last = -1;
 std::int64_t g_stat_rdb_saves = 0;
 bool g_rdb_bgsave_scheduled = false;
 bool g_bgsave_for_replication = false;
+bool g_bgsave_to_pipe = false;
 std::string g_bgsave_snapshot_path;
 std::atomic<pid_t> g_bgrewrite_child_pid{0};
 std::atomic<bool> g_bgrewrite_in_progress{false};
@@ -1305,6 +1306,18 @@ bool do_bgsave_fork(const RdbReplicationInfo* repl = nullptr) {
 // sets the error status. A child stopped by a signal could not delete its temp file. `stopped` is
 // set when the server killed the child itself, which, like Redis's SIGUSR1, is not an error.
 void bgsave_done(pid_t pid, int status, bool stopped) {
+  if (g_bgsave_to_pipe) {
+    g_bgsave_to_pipe = false;
+    g_bgsave_child_pid.store(0);
+    g_bgsave_in_progress.store(false);
+    // A socket transfer does not persist anything or alter disk-save status/baselines.
+    const bool success = !stopped && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    log(success ? LogLevel::Info : LogLevel::Warn,
+        success ? "Background RDB transfer terminated with success"
+                : "Background RDB transfer failed");
+    if (g_replication_pipe_done_cb) g_replication_pipe_done_cb(success);
+    return;
+  }
   if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
     log(LogLevel::Info, "Background saving terminated with success");
     g_dirty_at_last_save = g_dirty_before_bgsave;
@@ -1348,6 +1361,10 @@ void kill_rdb_child() {
     return;
   }
   // Already reaped elsewhere, so how it ended is unknown: count it as stopped.
+  if (g_bgsave_to_pipe) {
+    bgsave_done(pid, SIGKILL, true);
+    return;
+  }
   ::unlink(rdb_temp_file_name(g_bgsave_snapshot_path, pid).c_str());
   g_bgsave_child_pid.store(0);
   g_bgsave_in_progress.store(false);
@@ -6504,6 +6521,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                         } else if (opt == "CAPA") {
                           // Capabilities PeaDB does not know are ignored, as in Redis.
                           if (upper(args[i + 1]) == "PSYNC2") session.repl_capa_psync2 = true;
+                          if (upper(args[i + 1]) == "EOF") session.repl_capa_eof = true;
                         } else if (opt == "ACK") {
                           // replconfCommand(): only a replica's ACK counts, the offset never goes
                           // back, and there is no reply.
@@ -6512,6 +6530,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             return std::string();
                           if (offset > session.repl_ack_offset) session.repl_ack_offset = offset;
                           session.repl_ack_time_ms = now_ms();
+                          // A post-load ACK may arrive before the next cron reaps the child.
+                          // Completion callbacks defer client closes until dispatch ends.
+                          reap_background_children();
+                          if (session.repl_start_stream_on_ack &&
+                              session.repl_sync_state == ReplicaSyncState::Online)
+                            session.repl_start_stream_on_ack = false;
                           return std::string();
                         } else if (opt == "GETACK") {
                           // A replica answers its master with REPLCONF ACK and the offset it has
@@ -17379,6 +17403,98 @@ int start_replication_snapshot(RdbReplicationInfo& info) {
   info.replid = g_master_replid;
   info.offset = g_master_repl_offset;
   if (!do_bgsave_fork(&info)) return -1;
+  return 1;
+}
+
+std::function<void(bool)> g_replication_pipe_done_cb;
+
+bool replication_diskless_sync() {
+  const auto* spec = find_redis_config("repl-diskless-sync");
+  return spec && config_value(*spec) == "yes";
+}
+
+void cancel_replication_pipe() {
+  if (g_bgsave_to_pipe) kill_rdb_child();
+}
+
+int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd) {
+  if (has_active_child_process()) return 0;
+  info.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index
+                                                 : std::max(g_last_repl_db, 0);
+  info.replid = g_master_replid;
+  info.offset = g_master_repl_offset;
+  const std::string delimiter = gen_run_id();
+  int data[2] = {-1, -1}, completion[2] = {-1, -1};
+  auto close_pipes = [&] {
+    for (int fd : {data[0], data[1], completion[0], completion[1]})
+      if (fd >= 0) ::close(fd);
+  };
+  if (::pipe(data) != 0 || ::pipe(completion) != 0) {
+    close_pipes();
+    return -1;
+  }
+  for (int fd : {data[0], data[1], completion[0], completion[1]}) {
+    if (::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
+      close_pipes();
+      return -1;
+    }
+  }
+  const int flags = ::fcntl(data[0], F_GETFL, 0);
+  if (flags < 0 || ::fcntl(data[0], F_SETFL, flags | O_NONBLOCK) < 0) {
+    close_pipes();
+    return -1;
+  }
+  const pid_t parent_pid = ::getpid();
+  const auto fork_t0 = std::chrono::steady_clock::now();
+  const pid_t pid = fork_child();
+  if (pid == 0) {
+    ::close(data[0]);
+    ::close(completion[1]);
+    auto write_all = [&](const std::string& bytes) {
+      std::size_t offset = 0;
+      while (offset < bytes.size()) {
+        if (::getppid() != parent_pid) return false;
+        const ssize_t n = ::write(data[1], bytes.data() + offset, bytes.size() - offset);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return false;
+        offset += static_cast<std::size_t>(n);
+      }
+      return true;
+    };
+    std::string err;
+    const bool ok = write_all("$EOF:" + delimiter + "\r\n") &&
+                    rdb_write([&](const void* bytes,
+                                  std::size_t size) { return ::write(data[1], bytes, size); },
+                              err, &info, parent_pid) &&
+                    write_all(delimiter);
+    ::close(data[1]);
+    // EOF on this second pipe means every surviving recipient drained the data pipe.
+    // Parent loss also closes it; the captured owner prevents reporting success then.
+    char unused;
+    ssize_t n;
+    do {
+      n = ::read(completion[0], &unused, 1);
+    } while (n < 0 && errno == EINTR);
+    ::close(completion[0]);
+    ::_exit(ok && n == 0 && ::getppid() == parent_pid ? 0 : 1);
+  }
+  if (pid < 0) {
+    close_pipes();
+    return -1;
+  }
+  ::close(data[1]);
+  ::close(completion[0]);
+  read_fd = data[0];
+  completion_fd = completion[1];
+  g_latest_fork_usec = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - fork_t0)
+                           .count();
+  ++g_total_forks;
+  g_bgsave_to_pipe = true;
+  g_bgsave_in_progress.store(true);
+  g_bgsave_child_pid.store(pid);
+  g_bgsave_start_time = now_ms();
+  log(LogLevel::Info, "Background RDB transfer started by pid " + std::to_string(pid));
   return 1;
 }
 

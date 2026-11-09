@@ -23,6 +23,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <exception>
 #include <string>
 #include <string_view>
@@ -155,6 +156,7 @@ struct SnapshotTransfer {
   SnapshotTransfer() = default;
   SnapshotTransfer(const SnapshotTransfer&) = delete;
   SnapshotTransfer& operator=(const SnapshotTransfer&) = delete;
+  bool pipe = false;
   int file_fd = -1;
   std::int64_t bytes_left = 0;
   std::string chunk;
@@ -163,6 +165,24 @@ struct SnapshotTransfer {
   ~SnapshotTransfer() {
     if (file_fd >= 0) ::close(file_fd);
   }
+};
+
+// One chunk is shared by all socket-target recipients. No next read is allowed
+// while any cursor still refers to it. The command suffix stays in WriteBuf.
+struct PipeRelay {
+  struct Cursor {
+    std::uint64_t client_id;
+    std::size_t offset = 0;
+    std::int64_t progress_ms;
+  };
+  int read_fd = -1;
+  int completion_fd = -1;
+  bool reading = false;
+  bool eof = false;
+  std::uint64_t generation = 0;
+  std::array<char, 64 * 1024> chunk;
+  std::size_t size = 0;
+  std::unordered_map<int, Cursor> recipients;
 };
 
 // Empties a client buffer that has been used up. Redis gives such memory back (a reply block is
@@ -401,6 +421,9 @@ int run_server(const ServerConfig& config) {
   int replica_count = 0;
   std::unordered_map<int, SnapshotTransfer> snapshot_transfers;
   std::int64_t last_sync_keepalive_ms = 0;
+  PipeRelay relay;
+  std::function<bool(int, SessionState&)> flush_pipe;
+  std::function<void(int)> detach_pipe_recipient;
   // The replicas' connections, so what walks only replicas does not walk every client.
   std::unordered_set<int> replica_fds;
   // Clients whose command CLIENT PAUSE holds (SessionState::postponed). Redis counts them in
@@ -538,7 +561,8 @@ int run_server(const ServerConfig& config) {
     wbuf.append(data);
     const auto sit = sessions.find(fd);
     const bool snapshot_pending = sit != sessions.end() && sit->second.replica_stream &&
-                                  sit->second.repl_sync_state != ReplicaSyncState::Online;
+                                  (sit->second.repl_sync_state != ReplicaSyncState::Online ||
+                                   sit->second.repl_start_stream_on_ack);
     while (!snapshot_pending && !wbuf.empty()) {
       const ssize_t n = ::write(fd, wbuf.ptr(), wbuf.remaining());
       if (n < 0) {
@@ -589,6 +613,7 @@ int run_server(const ServerConfig& config) {
     auto ti = snapshot_transfers.find(fd);
     if (ti == snapshot_transfers.end()) return true;
     auto& transfer = ti->second;
+    if (transfer.pipe) return flush_pipe(fd, session);
     std::size_t budget = 64 * 1024;
     while (budget != 0) {
       if (transfer.offset == transfer.chunk.size()) {
@@ -636,6 +661,10 @@ int run_server(const ServerConfig& config) {
   // Helper: flush any pending output for a client fd.
   auto flush_output = [&](int fd) -> bool {
     auto si = sessions.find(fd);
+    if (si != sessions.end() && si->second.repl_start_stream_on_ack) {
+      poller.set_read_only(fd);
+      return true;
+    }
     if (si != sessions.end() && si->second.replica_stream &&
         si->second.repl_sync_state != ReplicaSyncState::Online) {
       if (!flush_snapshot(fd, si->second)) return false;
@@ -710,6 +739,7 @@ int run_server(const ServerConfig& config) {
     if (was_replica) --replica_count;
     sessions.erase(fd);
     replica_fds.erase(fd);
+    if (detach_pipe_recipient) detach_pipe_recipient(fd);
     if (was_replica) replica_disconnected();
     g_connected_clients.fetch_sub(1);
   };
@@ -720,12 +750,16 @@ int run_server(const ServerConfig& config) {
     if (listen_fd >= 0) ::close(listen_fd);
     if (unix_fd >= 0) ::close(unix_fd);
     if (cbus_fd >= 0) ::close(cbus_fd);
+    if (relay.read_fd >= 0) ::close(relay.read_fd);
+    if (relay.completion_fd >= 0) ::close(relay.completion_fd);
     for (const auto& entry : cbus_buffers) ::close(entry.first);
     for (const auto& entry : sessions) ::close(entry.first);
     for (const auto& entry : snapshot_transfers) {
       if (entry.second.file_fd >= 0) ::close(entry.second.file_fd);
     }
   };
+
+  std::vector<std::pair<int, std::uint64_t>> replica_failed_fds;  // fd, client id
 
   // CLIENT KILL: close clients matching a filter, except skip_fd (the caller, which
   // closes itself via should_close). Safe to erase here — the event loop skips fds no
@@ -771,13 +805,23 @@ int run_server(const ServerConfig& config) {
       }
       ++matched;
     }
-    for (int fd : to_kill) close_client(fd);
+    for (int fd : to_kill) {
+      // An internal disconnectSlaves() can include the replica currently issuing
+      // REPLICAOF. Keep its dispatch/input references alive until the command ends.
+      if (fd == self_dispatch_fd)
+        replica_failed_fds.emplace_back(fd, sessions.at(fd).client_id);
+      else
+        close_client(fd);
+    }
     return matched + kill_master_link(filter);
   };
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
     if (!session.replica_stream || session.repl_sync_state == ReplicaSyncState::WaitSnapshot)
       return true;
+    if (session.repl_sync_state == ReplicaSyncState::Online && !session.repl_start_stream_on_ack &&
+        !write_buffers[fd].empty())
+      poller.set_readwrite(fd);
     // Over its output-buffer limit already: it is closed at the end of the pass.
     if (!obuf_overflow_fds.empty() && std::find(obuf_overflow_fds.begin(), obuf_overflow_fds.end(),
                                                 fd) != obuf_overflow_fds.end())
@@ -802,7 +846,6 @@ int run_server(const ServerConfig& config) {
   // what it has not taken yet, then `data` (the bytes being appended), in its output buffer now.
   // A replica that fails is closed at the end of the pass (closing it here could pull a session
   // out from under the command that is running).
-  std::vector<std::pair<int, std::uint64_t>> replica_failed_fds;  // fd, client id
   g_feed_replicas_cb = [&](const std::string* data) {
     const std::size_t total_after =
         replication_event_count() + (data != nullptr ? data->size() : 0);
@@ -857,14 +900,157 @@ int run_server(const ServerConfig& config) {
     for (int fd : failed) replica_failed_fds.emplace_back(fd, sessions.at(fd).client_id);
   };
 
+  auto close_relay_pipes = [&] {
+    if (relay.read_fd >= 0) {
+      poller.remove(relay.read_fd);  // including a disabled kqueue registration
+      ::close(relay.read_fd);
+      relay.read_fd = -1;
+    }
+    if (relay.completion_fd >= 0) {
+      ::close(relay.completion_fd);
+      relay.completion_fd = -1;
+    }
+    relay.reading = false;
+  };
+
+  g_replication_pipe_done_cb = [&](bool success) {
+    // Reaping is independent of pipe readability: an externally killed child may
+    // have left the read filter suspended behind a slow socket.
+    const bool delivered = success && relay.eof && relay.size == 0;
+    close_relay_pipes();
+    for (const auto& [fd, cursor] : relay.recipients) {
+      auto si = sessions.find(fd);
+      if (si == sessions.end() || si->second.client_id != cursor.client_id) continue;
+      if (!delivered) {
+        replica_failed_fds.emplace_back(fd, cursor.client_id);
+        continue;
+      }
+      snapshot_transfers.erase(fd);
+      si->second.repl_sync_state = ReplicaSyncState::Online;
+      si->second.repl_start_stream_on_ack = true;
+      si->second.repl_ack_time_ms = DataStore::now_ms();
+      poller.set_read_only(fd);
+    }
+    relay.recipients.clear();
+    relay.size = 0;
+  };
+
+  auto fail_relay = [&] {
+    // cancel owns the PID and synchronously reaps it; its callback queues closes.
+    cancel_replication_pipe();
+  };
+
+  auto resume_relay = [&] {
+    if (relay.read_fd < 0 || relay.reading || relay.eof) return;
+    for (const auto& [fd, cursor] : relay.recipients) {
+      const auto ti = snapshot_transfers.find(fd);
+      if (cursor.offset != relay.size ||
+          (ti != snapshot_transfers.end() && ti->second.offset != ti->second.chunk.size()))
+        return;
+    }
+    relay.size = 0;
+    for (auto& [fd, cursor] : relay.recipients) cursor.offset = 0;
+    if (!poller.resume_read(relay.read_fd)) {
+      fail_relay();
+      return;
+    }
+    relay.reading = true;
+  };
+
+  detach_pipe_recipient = [&](int fd) {
+    if (relay.recipients.erase(fd) == 0) return;
+    if (relay.recipients.empty()) {
+      fail_relay();
+      return;
+    }
+    resume_relay();
+  };
+
+  flush_pipe = [&](int fd, SessionState& session) {
+    auto ci = relay.recipients.find(fd);
+    auto ti = snapshot_transfers.find(fd);
+    if (ci == relay.recipients.end() || ci->second.client_id != session.client_id ||
+        ti == snapshot_transfers.end())
+      return false;
+    auto& cursor = ci->second;
+    auto& preamble = ti->second;
+    // At most one shared chunk per invocation. Header is independent and precedes it.
+    while (preamble.offset != preamble.chunk.size() || cursor.offset != relay.size) {
+      const bool header = preamble.offset != preamble.chunk.size();
+      const char* bytes =
+          header ? preamble.chunk.data() + preamble.offset : relay.chunk.data() + cursor.offset;
+      const std::size_t size =
+          header ? preamble.chunk.size() - preamble.offset : relay.size - cursor.offset;
+      const ssize_t n = ::write(fd, bytes, size);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        return errno == EAGAIN || errno == EWOULDBLOCK;
+      }
+      if (n == 0) return false;
+      (header ? preamble.offset : cursor.offset) += static_cast<std::size_t>(n);
+      cursor.progress_ms = DataStore::now_ms();
+    }
+    poller.set_read_only(fd);  // no pending bytes: never spin on a writable socket
+    resume_relay();
+    return true;
+  };
+
+  auto read_relay = [&] {
+    if (relay.read_fd < 0 || !relay.reading) return;
+    ssize_t n;
+    do {
+      n = ::read(relay.read_fd, relay.chunk.data(), relay.chunk.size());
+    } while (n < 0 && errno == EINTR);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+    if (!poller.suspend_read(relay.read_fd)) {
+      fail_relay();
+      return;
+    }
+    relay.reading = false;
+    if (n < 0) {
+      fail_relay();
+      return;
+    }
+    if (n == 0) {
+      relay.eof = true;
+      // The previous chunk has drained everywhere before this read was enabled.
+      ::close(relay.completion_fd);
+      relay.completion_fd = -1;
+      return;
+    }
+    relay.size = static_cast<std::size_t>(n);
+    for (auto& [fd, cursor] : relay.recipients) {
+      cursor.offset = 0;
+      cursor.progress_ms = DataStore::now_ms();
+      if (!poller.set_readwrite(fd)) {
+        fail_relay();
+        return;
+      }
+    }
+  };
+
   auto replication_snapshot_cron = [&](std::int64_t now) {
     bool waiting = false;
+    bool socket_target = replication_diskless_sync();
     for (int fd : replica_fds) {
-      if (sessions.at(fd).repl_sync_state == ReplicaSyncState::WaitSnapshot) waiting = true;
+      const auto& session = sessions.at(fd);
+      if (session.repl_sync_state == ReplicaSyncState::WaitSnapshot) {
+        waiting = true;
+        if (!session.repl_capa_eof) socket_target = false;
+      }
     }
     if (waiting) {
       RdbReplicationInfo info;
-      const int result = start_replication_snapshot(info);
+      // Admission timing/thresholds remain R4d3; this preserves current batching.
+      const int result = socket_target
+                             ? start_replication_pipe(info, relay.read_fd, relay.completion_fd)
+                             : start_replication_snapshot(info);
+      if (result > 0 && socket_target) {
+        ++relay.generation;
+        relay.eof = false;
+        relay.size = 0;
+        relay.reading = false;
+      }
       std::vector<int> failed;
       for (int fd : replica_fds) {
         auto& session = sessions.at(fd);
@@ -874,16 +1060,36 @@ int run_server(const ServerConfig& config) {
           continue;
         }
         if (result == 0) continue;
-        session.repl_sync_state = ReplicaSyncState::SaveSnapshot;
+        session.repl_sync_state =
+            socket_target ? ReplicaSyncState::SendSnapshot : ReplicaSyncState::SaveSnapshot;
         session.repl_index = static_cast<std::size_t>(info.offset);
         auto& transfer = snapshot_transfers[fd];
+        transfer.pipe = socket_target;
+        if (socket_target)
+          relay.recipients.emplace(fd, PipeRelay::Cursor{session.client_id, 0, now});
         if (!session.repl_legacy_sync)
           transfer.chunk =
               "+FULLRESYNC " + info.replid + " " + std::to_string(info.offset) + "\r\n";
         poller.set_readwrite(fd);
       }
       for (int fd : failed) close_client(fd);
+      if (result > 0 && socket_target) {
+        if (!poller.add_read(relay.read_fd))
+          fail_relay();
+        else
+          relay.reading = true;
+      }
     }
+    // Socket-target transfer timeout measures stalled writes, not incoming ACKs.
+    std::vector<int> stalled;
+    for (const auto& [fd, cursor] : relay.recipients) {
+      const auto& preamble = snapshot_transfers.at(fd);
+      const bool pending = cursor.offset != relay.size || preamble.offset != preamble.chunk.size();
+      if (pending && now - cursor.progress_ms >
+                         static_cast<std::int64_t>(replication_timeout_seconds()) * 1000)
+        stalled.push_back(fd);
+    }
+    for (int fd : stalled) close_client(fd);
     if (now - last_sync_keepalive_ms < 1000) return;
     last_sync_keepalive_ms = now;
     std::vector<int> failed;
@@ -1193,6 +1399,8 @@ int run_server(const ServerConfig& config) {
     if (eviction_proc_running()) poll_ms = 0;
     // A WAIT that ran after this pass's replica flush still needs its GETACK sent.
     if (replica_getack_pending()) poll_ms = 0;
+    const int polled_pipe_fd = relay.read_fd;
+    const std::uint64_t polled_pipe_generation = relay.generation;
     const int nready = poller.wait(ep_events, poll_ms);
     if (nready < 0) {
       if (errno == EINTR) continue;
@@ -1256,6 +1464,12 @@ int run_server(const ServerConfig& config) {
       // Once SHUTDOWN has succeeded no other command runs: the final save already happened.
       if (shutdown_requested()) break;
       const int fd = ep_events[i].fd;
+      if (fd == polled_pipe_fd) {
+        if (relay.read_fd == polled_pipe_fd && relay.generation == polled_pipe_generation &&
+            (ep_events[i].readable || ep_events[i].error))
+          read_relay();
+        continue;
+      }
 
       // Skip fds already closed (e.g. by blocked-client cleanup above).
       if (fd != listen_fd && fd != cbus_fd && fd != unix_fd && !sessions.count(fd) &&
@@ -1601,6 +1815,9 @@ int run_server(const ServerConfig& config) {
   for (auto& [fd, _] : sessions) ::close(fd);
   for (auto& [fd, _] : cbus_buffers) ::close(fd);
   if (reserved_fd >= 0) close(reserved_fd);
+  cancel_replication_pipe();
+  close_relay_pipes();
+  g_replication_pipe_done_cb = nullptr;
   g_replication_snapshot_done_cb = nullptr;
   snapshot_transfers.clear();
   g_feed_replicas_cb = nullptr;  // it refers to this function's sessions

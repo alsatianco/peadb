@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Stream EOF-capable master replication snapshots through a bounded shared child-pipe relay, with independent child completion/reaping, backpressure and post-load ACK gating. Preserve disk fallback and persistent-save baselines; delay/threshold admission and direct replica loading remain incomplete (compatibility delta 8).
+
 - Cancel forked RDB saves when the owning server exits, including disk-backed full-sync snapshots. Check parent ownership during serialization and before publication, remove partial output, and preserve the existing backup on cancellation (delta 8).
 
 - Receive Redis EOF-framed replication snapshots through the bounded disk spool, advertise EOF with PSYNC2, and retain coalesced command bytes after either snapshot framing mode. Preserve applied-offset ACKs, checksum validation and cancellation; master-side pipe transport and direct loading remain pending (delta 8).

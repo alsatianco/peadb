@@ -91,6 +91,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(poller_pipe_test tests/unit/poller_pipe_test.cpp)
+  target_include_directories(poller_pipe_test PRIVATE include)
+  add_test(NAME poller_pipe_test COMMAND poller_pipe_test)
+
   add_executable(replication_snapshot_test tests/unit/replication_snapshot_test.cpp)
   target_link_libraries(replication_snapshot_test PRIVATE peadb_core)
   add_test(NAME replication_snapshot_test COMMAND replication_snapshot_test)
