@@ -347,7 +347,9 @@ def check_replica_keeps_applying(work, shim):
     master_dir = os.path.join(work, 'peadb-repl-master')
     replica_dir = os.path.join(work, 'peadb-repl-replica')
     flag = os.path.join(replica_dir, 'fail-fork')
-    master = start(PEADB, PORTS['peadb'], master_dir, '--save', '')
+    # This tests applying after a local save error, not the default five-second sync admission.
+    master = start(PEADB, PORTS['peadb'], master_dir, '--save', '',
+                   '--repl-diskless-sync-delay', '0')
     replica = None
     try:
         replica = start_with_shim('peadb', PEADB, REPLICA_PORT, replica_dir, shim, flag,
@@ -355,6 +357,7 @@ def check_replica_keeps_applying(work, shim):
         if replica is None:
             return
         m, r = Conn(PORTS['peadb']), Conn(REPLICA_PORT)
+        assert m('CONFIG', 'GET', 'repl-diskless-sync-delay') == ['repl-diskless-sync-delay', '0']
         assert r('REPLICAOF', '127.0.0.1', str(PORTS['peadb'])) == '+OK'
         wait_for(lambda: 'master_link_status:up' in r('INFO', 'replication'), 'replica link up')
         open(flag, 'w').close()

@@ -130,3 +130,5 @@ Notes:
 
 - Most scripts use only the Python standard library.
 - Some scripts under `scripts/examples/` use third-party packages (e.g. `redis`).
+
+`test_bgsave_status_parity.py` sets the replication source’s diskless-sync delay to zero in its local-save-error fixture. The unchanged five-second convergence bounds check stream application rather than compete with Redis’s default five-second admission delay; dedicated admission tests retain coverage of that setting.
