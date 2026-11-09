@@ -559,6 +559,8 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "repl-ping-replica-period",
                                                        "repl-backlog-ttl",
                                                        "repl-diskless-sync",
+                                                       "repl-diskless-sync-delay",
+                                                       "repl-diskless-sync-max-replicas",
                                                        "lazyfree-lazy-server-del",
                                                        "stop-writes-on-bgsave-error",
                                                        "aof-load-truncated",

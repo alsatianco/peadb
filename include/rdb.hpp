@@ -38,11 +38,14 @@ bool rdb_save(const std::filesystem::path& path, std::string& err,
 // or re-enter command execution. The caller owns the sink and any flush/fsync/publication.
 // Output buffering is bounded; a value/compact encoding may still be materialized. On failure
 // a partial RDB may have reached the sink; err is set and no further writes are attempted.
+// Redis's SLAVE_REQ_RDB_* flags. Filtered replication never publishes a disk snapshot.
+constexpr unsigned kRdbExcludeData = 1;
+constexpr unsigned kRdbExcludeFunctions = 2;
 using RdbWriteFn = std::function<ssize_t(const void*, std::size_t)>;
 // parent_pid has the same cancellation contract as rdb_save(); zero leaves foreground callers
 // independent of process ancestry. The sink must separately handle a blocked consumer/timeout.
 bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl = nullptr,
-               pid_t parent_pid = 0);
+               pid_t parent_pid = 0, unsigned filter = 0);
 
 // The temp file rdb_save() writes in process `pid` before the rename: temp-<pid>.rdb in the
 // dump's directory. rdb_remove_temp_file() deletes the one in the working directory (Redis's

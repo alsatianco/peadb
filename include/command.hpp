@@ -71,6 +71,11 @@ struct SessionState {
   // The replica said REPLCONF capa psync2: +CONTINUE then names the replication id.
   bool repl_capa_psync2 = false;
   bool repl_capa_eof = false;
+  // Immutable fork cohort requirements, separate from transport capabilities.
+  unsigned repl_snapshot_filter = 0;
+  bool repl_rdb_only = false;
+  std::int64_t repl_wait_start_ms = 0;
+  std::uint64_t repl_wait_seq = 0;
   // Socket-target snapshots are online before their first post-load ACK, but must not
   // send command bytes until that handshake completes.
   bool repl_start_stream_on_ack = false;
@@ -255,14 +260,20 @@ bool replication_stream_from(std::size_t from, std::string& out);
 // out bytes at once only once more than the backlog size has been written since).
 void replicas_took_backlog();
 // Start a disk-backed replication BGSAVE: 1 started, 0 another child is running, -1 failed.
-// The event loop batches waiting replicas onto this snapshot's id/offset before more writes.
+// Admission binds recipients to this snapshot's id/offset before more writes.
 struct RdbReplicationInfo;
 int start_replication_snapshot(RdbReplicationInfo& info);
 extern std::function<void(const std::string& path, bool success)> g_replication_snapshot_done_cb;
 // Socket-target child: parent owns returned data-read and completion-write descriptors.
 // It closes completion only after draining the pipe, allowing successful child exit.
-int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd);
+int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd,
+                           unsigned filter = 0);
 void cancel_replication_pipe();
+void cancel_unused_replication_snapshot();
+// Called at SYNC/PSYNC dispatch, before subsequent pipelined commands can run.
+extern std::function<void(SessionState&)> g_replication_sync_cb;
+std::int64_t replication_sync_delay();
+std::int64_t replication_sync_max_replicas();
 bool replication_diskless_sync();
 extern std::function<void(bool success)> g_replication_pipe_done_cb;
 // beforeSleep()'s GETACK: WAIT asks the replicas for an ACK once per event-loop pass, after the

@@ -1294,7 +1294,8 @@ bool read_dump_value(RdbReader& r, uint8_t type, DumpValue& out, bool allow_empt
 
 // Wait rdb-key-save-delay after each key, as Redis's rdbSaveKeyValuePair() does.
 // Used by file saves, including full-sync snapshots.
-void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pid = 0) {
+void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pid,
+                   unsigned filter) {
   check_save_parent(parent_pid);
   auto& ds = store();
   // Like Redis's rdbSaveRio(), every key is written, expired ones too (with their expire time):
@@ -1327,7 +1328,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pi
 
   // Function libraries (server-level, not per-db) — one FUNCTION2 opcode + string per library,
   // written after AUX and before the keyspace, matching Redis's RDB layout.
-  if (g_function_dump_hook) {
+  if (!(filter & kRdbExcludeFunctions) && g_function_dump_hook) {
     g_function_dump_hook([&](const std::string& code) {
       check_save_parent(parent_pid);
       w.write_u8(RDB_OPCODE_FUNCTION2);
@@ -1345,7 +1346,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pi
     }
   } restore_db{ds, ds.current_db()};
 
-  for (std::size_t dbi = 0; dbi < ds.database_count(); ++dbi) {
+  for (std::size_t dbi = 0; !(filter & kRdbExcludeData) && dbi < ds.database_count(); ++dbi) {
     ds.select_db(dbi);
     std::size_t key_count = 0, expire_count = 0;
     ds.for_each_key([&](const std::string& key) {
@@ -1450,7 +1451,7 @@ void rdb_serialize(RdbWriter& w, const RdbReplicationInfo* repl, pid_t parent_pi
 }  // end anonymous namespace
 
 bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInfo* repl,
-               pid_t parent_pid) {
+               pid_t parent_pid, unsigned filter) {
   err.clear();
   if (!sink) {
     err = "Error saving DB: missing output sink";
@@ -1463,7 +1464,7 @@ bool rdb_write(const RdbWriteFn& sink, std::string& err, const RdbReplicationInf
           return sink(data, size);
         },
         g_rdb_checksum);
-    rdb_serialize(writer, repl, parent_pid);
+    rdb_serialize(writer, repl, parent_pid, filter);
     check_save_parent(parent_pid);
     return true;
   } catch (const std::system_error& e) {

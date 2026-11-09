@@ -81,6 +81,8 @@ The full runner's `redis` stage clears previous `artifacts/redis-native/*.log`, 
 
 The result parser retains raw repetition counts for timed upstream suites while using explicit stable accounting for the ledger and headline rate. See [timed-suite accounting](../compat/delta.md#verification-the-parity-ratchet) for PSYNC2’s complete-cycle requirements, report fields and failure rules; `check_suite_ratchet.py --update` preserves that normalized baseline.
 
+The replication/promotion smoke (`scripts/qa/run_sentinel_validation.sh`) explicitly disables the primary’s diskless admission delay because its two-second budget measures data synchronization. It uses PID-verified protocol readiness and a bounded exact-payload wait, retains all value/list/promotion assertions, and fails on missing Python/Redis CLI prerequisites instead of silently skipping. Diskless delay/threshold behavior is checked separately by the Redis-first integration fixtures.
+
 ## Common prerequisites
 
 Depending on the script, you may need:

@@ -941,6 +941,8 @@ std::string sync_refusal(const SessionState& session) {
   if (g_replication_role == "slave" && g_replica_stale)
     return "-NOMASTERLINK Can't SYNC while not connected with my master\r\n";
   if (session.has_pending_replies) return "-ERR SYNC and PSYNC are invalid with pending output\r\n";
+  if (session.repl_snapshot_filter && !session.repl_capa_eof)
+    return "-ERR Filtered replica requires EOF capability\r\n";
   return std::string();
 }
 
@@ -1073,7 +1075,7 @@ bool g_pre_command_oom_state = false;
 // refreshGoodSlavesCount(): a connected socket alone is not a healthy replica. Count only
 // online replicas whose ACK arrived within the configured number of whole seconds.
 bool replica_has_fresh_ack(const SessionState& replica, std::int64_t now_s) {
-  return replica.repl_sync_state == ReplicaSyncState::Online &&
+  return !replica.repl_rdb_only && replica.repl_sync_state == ReplicaSyncState::Online &&
          now_s - replica.repl_ack_time_ms / 1000 <= g_config_min_replicas_max_lag;
 }
 
@@ -6487,67 +6489,88 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             g_sync_full.fetch_add(1, std::memory_order_relaxed);
                             session.repl_sync_state = ReplicaSyncState::WaitSnapshot;
                             session.repl_legacy_sync = true;
+                            if (g_replication_sync_cb) g_replication_sync_cb(session);
                             return std::string();
                           }});
 
-    t.emplace(
-        "REPLCONF",
-        CommandSpec{"REPLCONF",
-                    -1,
-                    {"admin"},
-                    0,
-                    0,
-                    0,
-                    [](const std::vector<std::string>& args, SessionState& session, bool&) {
-                      // REPLCONF listening-port <port>
-                      // REPLCONF capa eof|psync2
-                      // REPLCONF GETACK *
-                      // REPLCONF ACK <offset>
-                      for (std::size_t i = 1; i + 1 < args.size(); i += 2) {
-                        const auto opt = upper(args[i]);
-                        if (opt == "LISTENING-PORT") {
-                          // The replica's own port, which names it in the shutdown's "Lagging
-                          // replica" line.
-                          std::int64_t port = 0;
-                          if (!parse_i64(args[i + 1], port))
-                            return encode_error("value is not an integer or out of range");
-                          session.repl_listening_port = static_cast<int>(port);
-                        } else if (opt == "IP-ADDRESS") {
-                          if (args[i + 1].size() >= 256)  // NET_HOST_STR_LEN
-                            return encode_error(
-                                "REPLCONF ip-address provided by replica instance is too long: " +
-                                std::to_string(args[i + 1].size()) + " bytes");
-                          session.repl_ip_address = args[i + 1];
-                        } else if (opt == "CAPA") {
-                          // Capabilities PeaDB does not know are ignored, as in Redis.
-                          if (upper(args[i + 1]) == "PSYNC2") session.repl_capa_psync2 = true;
-                          if (upper(args[i + 1]) == "EOF") session.repl_capa_eof = true;
-                        } else if (opt == "ACK") {
-                          // replconfCommand(): only a replica's ACK counts, the offset never goes
-                          // back, and there is no reply.
-                          std::int64_t offset = 0;
-                          if (!session.replica_stream || !parse_i64(args[i + 1], offset))
-                            return std::string();
-                          if (offset > session.repl_ack_offset) session.repl_ack_offset = offset;
-                          session.repl_ack_time_ms = now_ms();
-                          // A post-load ACK may arrive before the next cron reaps the child.
-                          // Completion callbacks defer client closes until dispatch ends.
-                          reap_background_children();
-                          if (session.repl_start_stream_on_ack &&
-                              session.repl_sync_state == ReplicaSyncState::Online)
-                            session.repl_start_stream_on_ack = false;
-                          return std::string();
-                        } else if (opt == "GETACK") {
-                          // A replica answers its master with REPLCONF ACK and the offset it has
-                          // applied, which does not count this GETACK yet (it is added to the
-                          // replica's stream once it has run); nobody gets a reply
-                          // (replconfCommand() → replicationSendAck()).
-                          if (g_replication_role == "slave") send_replica_ack();
-                          return std::string();
+    t.emplace("REPLCONF",
+              CommandSpec{
+                  "REPLCONF",
+                  -1,
+                  {"admin"},
+                  0,
+                  0,
+                  0,
+                  [](const std::vector<std::string>& args, SessionState& session, bool&) {
+                    // REPLCONF listening-port <port>
+                    // REPLCONF capa eof|psync2
+                    // REPLCONF GETACK *
+                    // REPLCONF ACK <offset>
+                    if (args.size() % 2 == 0) return encode_error("syntax error");
+                    for (std::size_t i = 1; i + 1 < args.size(); i += 2) {
+                      const auto opt = upper(args[i]);
+                      if (opt == "RDB-ONLY") {
+                        std::int64_t value;
+                        if (!parse_i64(args[i + 1], value))
+                          return encode_error("value is not an integer or out of range");
+                        if (value < 0 || value > 1)
+                          return encode_error("value is out of range, value must between 0 and 1");
+                        session.repl_rdb_only = value != 0;
+                      } else if (opt == "RDB-FILTER-ONLY") {
+                        std::vector<std::string> filters;
+                        if (!split_config_args(args[i + 1], filters))
+                          return encode_error("Missing rdb-filter-only values");
+                        session.repl_snapshot_filter = kRdbExcludeData | kRdbExcludeFunctions;
+                        for (const auto& filter : filters) {
+                          if (upper(filter) != "FUNCTIONS")
+                            return encode_error("Unsupported rdb-filter-only option: " + filter);
+                          session.repl_snapshot_filter &= ~kRdbExcludeFunctions;
                         }
+                      } else if (opt == "LISTENING-PORT") {
+                        // The replica's own port, which names it in the shutdown's "Lagging
+                        // replica" line.
+                        std::int64_t port = 0;
+                        if (!parse_i64(args[i + 1], port))
+                          return encode_error("value is not an integer or out of range");
+                        session.repl_listening_port = static_cast<int>(port);
+                      } else if (opt == "IP-ADDRESS") {
+                        if (args[i + 1].size() >= 256)  // NET_HOST_STR_LEN
+                          return encode_error(
+                              "REPLCONF ip-address provided by replica instance is too long: " +
+                              std::to_string(args[i + 1].size()) + " bytes");
+                        session.repl_ip_address = args[i + 1];
+                      } else if (opt == "CAPA") {
+                        // Capabilities PeaDB does not know are ignored, as in Redis.
+                        if (upper(args[i + 1]) == "PSYNC2") session.repl_capa_psync2 = true;
+                        if (upper(args[i + 1]) == "EOF") session.repl_capa_eof = true;
+                      } else if (opt == "ACK") {
+                        // replconfCommand(): only a replica's ACK counts, the offset never goes
+                        // back, and there is no reply.
+                        std::int64_t offset = 0;
+                        if (!session.replica_stream || !parse_i64(args[i + 1], offset))
+                          return std::string();
+                        if (offset > session.repl_ack_offset) session.repl_ack_offset = offset;
+                        session.repl_ack_time_ms = now_ms();
+                        // A post-load ACK may arrive before the next cron reaps the child.
+                        // Completion callbacks defer client closes until dispatch ends.
+                        reap_background_children();
+                        if (session.repl_start_stream_on_ack &&
+                            session.repl_sync_state == ReplicaSyncState::Online)
+                          session.repl_start_stream_on_ack = false;
+                        return std::string();
+                      } else if (opt == "GETACK") {
+                        // A replica answers its master with REPLCONF ACK and the offset it has
+                        // applied, which does not count this GETACK yet (it is added to the
+                        // replica's stream once it has run); nobody gets a reply
+                        // (replconfCommand() → replicationSendAck()).
+                        if (g_replication_role == "slave") send_replica_ack();
+                        return std::string();
+                      } else {
+                        return encode_error("Unrecognized REPLCONF option: " + args[i]);
                       }
-                      return encode_simple("OK");
-                    }});
+                    }
+                    return encode_simple("OK");
+                  }});
 
     t.emplace("PSYNC",
               CommandSpec{
@@ -6594,12 +6617,12 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     // A partial resync was requested (replid given) but we can't serve it.
                     if (replid != "?") g_sync_partial_err.fetch_add(1, std::memory_order_relaxed);
 
-                    // The event loop batches requests and forks between commands, outside an
-                    // execution unit. While waiting for another child, no part of the stream
-                    // belongs to this sync.
+                    // Admission captures the fork boundary here, before another pipelined
+                    // command. Cron handles delayed/cohort requests when a child is busy.
                     attach_replica(session);
                     g_sync_full.fetch_add(1, std::memory_order_relaxed);
                     session.repl_sync_state = ReplicaSyncState::WaitSnapshot;
+                    if (g_replication_sync_cb) g_replication_sync_cb(session);
                     return std::string();
                   }});
 
@@ -17407,6 +17430,19 @@ int start_replication_snapshot(RdbReplicationInfo& info) {
 }
 
 std::function<void(bool)> g_replication_pipe_done_cb;
+std::function<void(SessionState&)> g_replication_sync_cb;
+
+std::int64_t replication_sync_delay() {
+  return std::stoll(config_value(*find_redis_config("repl-diskless-sync-delay")));
+}
+
+std::int64_t replication_sync_max_replicas() {
+  return std::stoll(config_value(*find_redis_config("repl-diskless-sync-max-replicas")));
+}
+
+void cancel_unused_replication_snapshot() {
+  if (g_bgsave_for_replication && !g_bgsave_to_pipe && g_save_params.empty()) kill_rdb_child();
+}
 
 bool replication_diskless_sync() {
   const auto* spec = find_redis_config("repl-diskless-sync");
@@ -17417,7 +17453,8 @@ void cancel_replication_pipe() {
   if (g_bgsave_to_pipe) kill_rdb_child();
 }
 
-int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd) {
+int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completion_fd,
+                           unsigned filter) {
   if (has_active_child_process()) return 0;
   info.stream_db = g_replication_role == "slave" ? g_master_stream_session.db_index
                                                  : std::max(g_last_repl_db, 0);
@@ -17465,7 +17502,7 @@ int start_replication_pipe(RdbReplicationInfo& info, int& read_fd, int& completi
     const bool ok = write_all("$EOF:" + delimiter + "\r\n") &&
                     rdb_write([&](const void* bytes,
                                   std::size_t size) { return ::write(data[1], bytes, size); },
-                              err, &info, parent_pid) &&
+                              err, &info, parent_pid, filter) &&
                     write_all(delimiter);
     ::close(data[1]);
     // EOF on this second pipe means every surviving recipient drained the data pipe.

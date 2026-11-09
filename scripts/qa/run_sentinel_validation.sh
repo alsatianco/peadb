@@ -12,8 +12,8 @@
 #   2. Starts a **replica** peadb-server on port 6471.
 #   3. Configures the replica: ``REPLICAOF 127.0.0.1 6470``.
 #   4. Writes test keys to the primary (strings + a list).
-#   5. Waits 2 seconds for replication sync, then reads the keys back from
-#      the replica and asserts they match.
+#   5. Disables the primary's diskless admission delay for this smoke and waits
+#      up to 2 seconds for exact replicated values, then rechecks every assertion.
 #   6. Promotes the replica: ``REPLICAOF NO ONE``.
 #   7. Writes a new key on the (now-independent) promoted replica and
 #      verifies it succeeds.
@@ -32,10 +32,10 @@
 #   --help      Show embedded usage text.
 #
 # Environment variables
-#   PEADB_BIN   Path to the peadb-server binary (default: ./build/peadb-server).
+#   PEADB_BIN   Path to the peadb-server binary (default: ./peadb-server).
 #
 # Prerequisites
-#   - ``redis-cli`` in PATH (typically from the ``redis-tools`` package).
+#   - ``python3`` and ``redis-cli`` in PATH (typically from the ``redis-tools`` package).
 #   - A built ``peadb-server`` binary.
 #   - Ports 6470 and 6471 must be free.
 #
@@ -76,7 +76,7 @@ Options:
 EOF
 }
 
-PEADB_BIN="${PEADB_BIN:-./build/peadb-server}"
+PEADB_BIN="${PEADB_BIN:-./peadb-server}"
 PRIMARY_PORT=6470
 REPLICA_PORT=6471
 DRY_RUN=0
@@ -132,24 +132,33 @@ if [[ "$DRY_RUN" -eq 1 ]]; then
   exit 0
 fi
 
-if ! command -v redis-cli >/dev/null 2>&1; then
-  echo "SKIP: redis-cli not found (install with: brew install redis)"
-  exit 0
-fi
+command -v redis-cli >/dev/null 2>&1 || fail "redis-cli not found"
+command -v python3 >/dev/null 2>&1 || fail "python3 not found"
 [[ -x "$PEADB_BIN" ]] || fail "peadb-server binary not found at $PEADB_BIN"
+
+wait_ready() {
+  python3 - "$ROOT_DIR" "$1" "$2" <<'PYREADY'
+import sys
+sys.path.insert(0, sys.argv[1] + '/tests/integration')
+from _readiness import ObservedProcess, wait_until_ready
+wait_until_ready(int(sys.argv[2]), process=ObservedProcess(int(sys.argv[3])))
+PYREADY
+}
 
 VALIDATION_DIR="$(mktemp -d "${TMPDIR:-/tmp}/peadb-repl-validation.XXXXXX")"
 mkdir "$VALIDATION_DIR/primary" "$VALIDATION_DIR/replica"
 
 echo "=== Starting primary on port $PRIMARY_PORT ==="
-"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel warning --dir "$VALIDATION_DIR/primary" &
+"$PEADB_BIN" --port "$PRIMARY_PORT" --bind 127.0.0.1 --loglevel warning \
+  --dir "$VALIDATION_DIR/primary" --save "" --repl-diskless-sync-delay 0 &
 PRIMARY_PID=$!
-sleep 1
+wait_ready "$PRIMARY_PORT" "$PRIMARY_PID"
 
 echo "=== Starting replica on port $REPLICA_PORT ==="
-"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel warning --dir "$VALIDATION_DIR/replica" &
+"$PEADB_BIN" --port "$REPLICA_PORT" --bind 127.0.0.1 --loglevel warning \
+  --dir "$VALIDATION_DIR/replica" --save "" &
 REPLICA_PID=$!
-sleep 1
+wait_ready "$REPLICA_PORT" "$REPLICA_PID"
 
 echo "=== Configuring replica ==="
 cli "$REPLICA_PORT" REPLICAOF 127.0.0.1 "$PRIMARY_PORT" | grep -qi ok || fail "REPLICAOF failed"
@@ -160,7 +169,30 @@ cli "$PRIMARY_PORT" SET sentinel:key2 "world" | grep -qi ok || fail "SET key2 fa
 cli "$PRIMARY_PORT" LPUSH sentinel:list a b c >/dev/null || fail "LPUSH failed"
 
 echo "=== Waiting for replication sync ==="
-sleep 2
+python3 - "$ROOT_DIR" "$REPLICA_PORT" "$REPLICA_PID" <<'PYSYNC'
+import socket
+import sys
+import time
+sys.path.insert(0, sys.argv[1] + '/tests/integration')
+from _readiness import ObservedProcess, _command
+process = ObservedProcess(int(sys.argv[3]))
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    if process.poll() is not None:
+        raise RuntimeError('replica exited before synchronization')
+    try:
+        with socket.create_connection(('127.0.0.1', int(sys.argv[2])), timeout=0.2) as sock:
+            with sock.makefile('rb') as stream:
+                if (_command(stream, sock, 'GET', 'sentinel:key1') == b'hello' and
+                    _command(stream, sock, 'GET', 'sentinel:key2') == b'world' and
+                    _command(stream, sock, 'LLEN', 'sentinel:list') == b':3'):
+                    break
+    except (OSError, ValueError):
+        pass
+    time.sleep(max(0, min(0.05, deadline - time.monotonic())))
+else:
+    raise RuntimeError('replicated payloads did not match within 2 seconds')
+PYSYNC
 
 echo "=== Verifying data on replica ==="
 V=$(cli "$REPLICA_PORT" GET sentinel:key1)
@@ -172,7 +204,6 @@ V=$(cli "$REPLICA_PORT" LLEN sentinel:list)
 
 echo "=== Promoting replica (REPLICAOF NO ONE) ==="
 cli "$REPLICA_PORT" REPLICAOF NO ONE | grep -qi ok || fail "REPLICAOF NO ONE failed"
-sleep 1
 
 echo "=== Writing to promoted replica ==="
 cli "$REPLICA_PORT" SET sentinel:promoted "yes" | grep -qi ok || fail "SET on promoted replica failed"

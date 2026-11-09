@@ -27,8 +27,11 @@ def rc(port, *args):
 
 
 def start(port, *extra):
+    # This fixture measures replication/reconnect, not diskless admission. Its
+    # unchanged five-second data deadline must not include Redis's default five-
+    # second admission delay plus handshake/load time.
     p = IsolatedServer([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                          "--loglevel", "warning", *extra])
+                          "--loglevel", "warning", "--repl-diskless-sync-delay", "0", *extra])
     wait_until_ready(port, process=p)
     return p
 

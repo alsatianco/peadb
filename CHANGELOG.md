@@ -9,7 +9,9 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
-- Stream EOF-capable master replication snapshots through a bounded shared child-pipe relay, with independent child completion/reaping, backpressure and post-load ACK gating. Preserve disk fallback and persistent-save baselines; delay/threshold admission and direct replica loading remain incomplete (compatibility delta 8).
+- Apply live diskless replication delay/threshold settings with immediate and request-compatible cron admission, filtered/RDB-only snapshots, guarded late disk reuse and useful-child cancellation (compatibility delta 8).
+
+- Stream EOF-capable master replication snapshots through a bounded shared child-pipe relay, with independent child completion/reaping, backpressure and post-load ACK gating. Preserve disk fallback and persistent-save baselines; direct replica loading remains incomplete (compatibility delta 8).
 
 - Cancel forked RDB saves when the owning server exits, including disk-backed full-sync snapshots. Check parent ownership during serialization and before publication, remove partial output, and preserve the existing backup on cancellation (delta 8).
 

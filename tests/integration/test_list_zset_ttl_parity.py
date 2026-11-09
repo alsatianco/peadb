@@ -212,8 +212,12 @@ class Conn:
 def start(binary, port, workdir, *extra):
     os.makedirs(workdir, exist_ok=True)
     log = open(os.path.join(workdir, 'server.log'), 'ab')
+    # Four full-sync pairings verify TTL/data semantics, not admission timing.
+    # Keep their existing waits, scale assertions and file budget independent of
+    # Redis's default five-second diskless admission delay.
     proc = subprocess.Popen([binary, '--port', str(port), '--bind', '127.0.0.1', '--save', '',
-                             '--dir', workdir, '--loglevel', 'warning', *extra],
+                             '--dir', workdir, '--loglevel', 'warning',
+                             '--repl-diskless-sync-delay', '0', *extra],
                             stdout=log, stderr=subprocess.STDOUT)
     deadline = time.time() + 15
     while time.time() < deadline:

@@ -157,6 +157,7 @@ struct SnapshotTransfer {
   SnapshotTransfer(const SnapshotTransfer&) = delete;
   SnapshotTransfer& operator=(const SnapshotTransfer&) = delete;
   bool pipe = false;
+  RdbReplicationInfo history;
   int file_fd = -1;
   std::int64_t bytes_left = 0;
   std::string chunk;
@@ -625,6 +626,7 @@ int run_server(const ServerConfig& config) {
         }
         if (transfer.bytes_left == 0) {
           snapshot_transfers.erase(ti);
+          if (session.repl_rdb_only) return false;  // close only after the last RDB byte
           session.repl_sync_state = ReplicaSyncState::Online;
           session.repl_ack_time_ms = DataStore::now_ms();
           // Disk-based Redis replicas read the command stream as soon as the RDB ends.
@@ -740,7 +742,14 @@ int run_server(const ServerConfig& config) {
     sessions.erase(fd);
     replica_fds.erase(fd);
     if (detach_pipe_recipient) detach_pipe_recipient(fd);
-    if (was_replica) replica_disconnected();
+    if (was_replica) {
+      bool useful_disk_recipient = false;
+      for (int rfd : replica_fds)
+        if (sessions.at(rfd).repl_sync_state == ReplicaSyncState::SaveSnapshot)
+          useful_disk_recipient = true;
+      if (!useful_disk_recipient) cancel_unused_replication_snapshot();
+      replica_disconnected();
+    }
     g_connected_clients.fetch_sub(1);
   };
 
@@ -817,7 +826,8 @@ int run_server(const ServerConfig& config) {
   };
 
   auto flush_replication_stream = [&](int fd, SessionState& session) {
-    if (!session.replica_stream || session.repl_sync_state == ReplicaSyncState::WaitSnapshot)
+    if (!session.replica_stream || session.repl_rdb_only ||
+        session.repl_sync_state == ReplicaSyncState::WaitSnapshot)
       return true;
     if (session.repl_sync_state == ReplicaSyncState::Online && !session.repl_start_stream_on_ack &&
         !write_buffers[fd].empty())
@@ -853,7 +863,8 @@ int run_server(const ServerConfig& config) {
       const auto it = sessions.find(rfd);
       if (it == sessions.end()) continue;
       SessionState& session = it->second;
-      if (session.repl_sync_state == ReplicaSyncState::WaitSnapshot) continue;
+      if (session.repl_rdb_only || session.repl_sync_state == ReplicaSyncState::WaitSnapshot)
+        continue;
       const std::pair<int, std::uint64_t> id{rfd, session.client_id};
       if (std::find(replica_failed_fds.begin(), replica_failed_fds.end(), id) !=
           replica_failed_fds.end())
@@ -921,7 +932,7 @@ int run_server(const ServerConfig& config) {
     for (const auto& [fd, cursor] : relay.recipients) {
       auto si = sessions.find(fd);
       if (si == sessions.end() || si->second.client_id != cursor.client_id) continue;
-      if (!delivered) {
+      if (!delivered || si->second.repl_rdb_only) {
         replica_failed_fds.emplace_back(fd, cursor.client_id);
         continue;
       }
@@ -1029,56 +1040,120 @@ int run_server(const ServerConfig& config) {
     }
   };
 
+  // The immediate SYNC path uses the triggering peer's capabilities/requirements;
+  // cron intersects capabilities of the oldest request-compatible waiting cohort.
+  auto start_snapshot_cohort = [&](bool socket_target, unsigned filter, std::int64_t now) {
+    RdbReplicationInfo info;
+    const int result =
+        socket_target ? start_replication_pipe(info, relay.read_fd, relay.completion_fd, filter)
+                      : start_replication_snapshot(info);
+    if (result == 0) return;
+    if (result > 0 && socket_target) {
+      ++relay.generation;
+      relay.eof = false;
+      relay.size = 0;
+      relay.reading = false;
+    }
+    for (int fd : replica_fds) {
+      auto& session = sessions.at(fd);
+      if (session.repl_sync_state != ReplicaSyncState::WaitSnapshot) continue;
+      if (result < 0) {
+        replica_failed_fds.emplace_back(fd, session.client_id);
+        continue;
+      }
+      if (session.repl_snapshot_filter != filter) continue;
+      session.repl_sync_state =
+          socket_target ? ReplicaSyncState::SendSnapshot : ReplicaSyncState::SaveSnapshot;
+      session.repl_index = static_cast<std::size_t>(info.offset);
+      auto& transfer = snapshot_transfers[fd];
+      transfer.pipe = socket_target;
+      transfer.history = info;
+      if (socket_target) relay.recipients.emplace(fd, PipeRelay::Cursor{session.client_id, 0, now});
+      if (!session.repl_legacy_sync)
+        transfer.chunk = "+FULLRESYNC " + info.replid + " " + std::to_string(info.offset) + "\r\n";
+      poller.set_readwrite(fd);
+    }
+    if (result > 0 && socket_target) {
+      if (!poller.add_read(relay.read_fd))
+        fail_relay();
+      else
+        relay.reading = true;
+    }
+  };
+
+  std::uint64_t replication_wait_seq = 0;
+  g_replication_sync_cb = [&](SessionState& session) {
+    if (replica_fds.insert(session.fd).second) ++replica_count;
+    session.repl_wait_start_ms = DataStore::now_ms();
+    session.repl_wait_seq = ++replication_wait_seq;
+    // Only SaveSnapshot still owns a complete, unsent command suffix. A standalone
+    // BGSAVE or an already-sending recipient cannot establish that invariant.
+    for (int fd : replica_fds) {
+      auto& source = sessions.at(fd);
+      if (fd == session.fd || source.repl_sync_state != ReplicaSyncState::SaveSnapshot ||
+          source.repl_snapshot_filter != session.repl_snapshot_filter ||
+          (source.repl_capa_eof && !session.repl_capa_eof) ||
+          (source.repl_capa_psync2 && !session.repl_capa_psync2) ||
+          (source.repl_rdb_only && !session.repl_rdb_only))
+        continue;
+      const auto failed_id = std::pair<int, std::uint64_t>{fd, source.client_id};
+      if (std::find(replica_failed_fds.begin(), replica_failed_fds.end(), failed_id) !=
+              replica_failed_fds.end() ||
+          !flush_replication_stream(fd, source))
+        continue;
+      const auto history = snapshot_transfers.at(fd).history;
+      const auto& suffix = write_buffers.at(fd);
+      if (suffix.offset != 0) continue;  // no already-consumed history can be copied
+      session.repl_sync_state = ReplicaSyncState::SaveSnapshot;
+      session.repl_index = source.repl_index;
+      auto& transfer = snapshot_transfers[session.fd];
+      transfer.history = history;
+      if (!session.repl_legacy_sync)
+        transfer.chunk =
+            "+FULLRESYNC " + history.replid + " " + std::to_string(history.offset) + "\r\n";
+      // Snapshot state keeps this copy buffered, with the normal replica limit.
+      // Copy before enqueue can insert/rehash write_buffers and invalidate suffix.
+      const std::string pending = session.repl_rdb_only ? std::string() : suffix.data;
+      if (!enqueue_output(session.fd, pending))
+        replica_failed_fds.emplace_back(session.fd, session.client_id);
+      poller.set_readwrite(session.fd);
+      return;
+    }
+    if (replication_diskless_sync() && session.repl_capa_eof && replication_sync_delay() != 0)
+      return;
+    // Active children (including a pipe snapshot) leave late arrivals waiting.
+    // Disk snapshot reuse requires complete fork history; it remains explicit debt.
+    start_snapshot_cohort(
+        (replication_diskless_sync() || session.repl_snapshot_filter != 0) && session.repl_capa_eof,
+        session.repl_snapshot_filter, session.repl_wait_start_ms);
+  };
+
   auto replication_snapshot_cron = [&](std::int64_t now) {
-    bool waiting = false;
-    bool socket_target = replication_diskless_sync();
+    const SessionState* first = nullptr;
     for (int fd : replica_fds) {
       const auto& session = sessions.at(fd);
-      if (session.repl_sync_state == ReplicaSyncState::WaitSnapshot) {
-        waiting = true;
-        if (!session.repl_capa_eof) socket_target = false;
-      }
+      if (session.repl_sync_state == ReplicaSyncState::WaitSnapshot &&
+          (!first || session.repl_wait_seq < first->repl_wait_seq))
+        first = &session;
     }
-    if (waiting) {
-      RdbReplicationInfo info;
-      // Admission timing/thresholds remain R4d3; this preserves current batching.
-      const int result = socket_target
-                             ? start_replication_pipe(info, relay.read_fd, relay.completion_fd)
-                             : start_replication_snapshot(info);
-      if (result > 0 && socket_target) {
-        ++relay.generation;
-        relay.eof = false;
-        relay.size = 0;
-        relay.reading = false;
-      }
-      std::vector<int> failed;
+    if (first) {
+      const unsigned filter = first->repl_snapshot_filter;
+      bool all_eof = true;
+      std::int64_t oldest = now;
+      std::int64_t waiting = 0;
       for (int fd : replica_fds) {
-        auto& session = sessions.at(fd);
-        if (session.repl_sync_state != ReplicaSyncState::WaitSnapshot) continue;
-        if (result < 0) {
-          failed.push_back(fd);
+        const auto& session = sessions.at(fd);
+        if (session.repl_sync_state != ReplicaSyncState::WaitSnapshot ||
+            session.repl_snapshot_filter != filter)
           continue;
-        }
-        if (result == 0) continue;
-        session.repl_sync_state =
-            socket_target ? ReplicaSyncState::SendSnapshot : ReplicaSyncState::SaveSnapshot;
-        session.repl_index = static_cast<std::size_t>(info.offset);
-        auto& transfer = snapshot_transfers[fd];
-        transfer.pipe = socket_target;
-        if (socket_target)
-          relay.recipients.emplace(fd, PipeRelay::Cursor{session.client_id, 0, now});
-        if (!session.repl_legacy_sync)
-          transfer.chunk =
-              "+FULLRESYNC " + info.replid + " " + std::to_string(info.offset) + "\r\n";
-        poller.set_readwrite(fd);
+        ++waiting;
+        all_eof = all_eof && session.repl_capa_eof;
+        oldest = std::min(oldest, session.repl_wait_start_ms);
       }
-      for (int fd : failed) close_client(fd);
-      if (result > 0 && socket_target) {
-        if (!poller.add_read(relay.read_fd))
-          fail_relay();
-        else
-          relay.reading = true;
-      }
+      const auto threshold = replication_sync_max_replicas();
+      if (!replication_diskless_sync() || (threshold > 0 && waiting >= threshold) ||
+          now / 1000 - oldest / 1000 >= replication_sync_delay())
+        start_snapshot_cohort((replication_diskless_sync() || filter != 0) && all_eof, filter, now);
     }
     // Socket-target transfer timeout measures stalled writes, not incoming ACKs.
     std::vector<int> stalled;
@@ -1173,8 +1248,7 @@ int run_server(const ServerConfig& config) {
       if (session.blocked_on_shutdown) ++shutdown_blocked_count;
       // A PSYNC/SYNC that CLIENT PAUSE ALL held makes this client a replica only now.
       if (!was_replica && session.replica_stream) {
-        ++replica_count;
-        replica_fds.insert(fd);
+        if (replica_fds.insert(fd).second) ++replica_count;
         if (!flush_replication_stream(fd, session)) to_close_out.push_back(fd);
       }
     }
@@ -1715,8 +1789,7 @@ int run_server(const ServerConfig& config) {
       if (session.blocked_on_shutdown) ++shutdown_blocked_count;
       if (session.repl_ack_offset != ack_before) replica_acked = true;
       if (!was_replica && session.replica_stream) {
-        ++replica_count;
-        replica_fds.insert(fd);
+        if (replica_fds.insert(fd).second) ++replica_count;
       }
 
       if (consumed_total > 0) {
@@ -1817,6 +1890,7 @@ int run_server(const ServerConfig& config) {
   if (reserved_fd >= 0) close(reserved_fd);
   cancel_replication_pipe();
   close_relay_pipes();
+  g_replication_sync_cb = nullptr;
   g_replication_pipe_done_cb = nullptr;
   g_replication_snapshot_done_cb = nullptr;
   snapshot_transfers.clear();
