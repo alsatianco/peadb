@@ -18,6 +18,7 @@
 #include "datastore.hpp"
 #include "logger.hpp"
 
+#include <chrono>
 #include <charconv>
 #include <cerrno>
 #include <cstdint>
@@ -46,9 +47,10 @@ namespace peadb {
 namespace {
 bool g_skip_checksum_validation = false;  // DEBUG SET-SKIP-CHECKSUM-VALIDATION
 bool g_rdb_checksum = true;               // rdbchecksum (startup-only, as in Redis)
-int g_rdb_key_save_delay = 0;             // rdb-key-save-delay (hidden Redis setting, for tests)
-FunctionDumpFn g_function_dump_hook;      // visits every function library's source
-FunctionLoadFn g_function_load_hook;      // loads one library's source (idempotent REPLACE)
+int g_rdb_key_load_delay = 0;
+int g_rdb_key_save_delay = 0;         // rdb-key-save-delay (hidden Redis setting, for tests)
+FunctionDumpFn g_function_dump_hook;  // visits every function library's source
+FunctionLoadFn g_function_load_hook;  // loads one library's source (idempotent REPLACE)
 RdbLoadStats g_rdb_load_stats;
 }  // namespace
 
@@ -80,9 +82,16 @@ int rdb_key_save_delay() {
   return g_rdb_key_save_delay;
 }
 
+void rdb_set_key_load_delay(int usec) {
+  g_rdb_key_load_delay = usec;
+}
+int rdb_key_load_delay() {
+  return g_rdb_key_load_delay;
+}
+
 void debug_delay(int usec) {
   // Redis's debugDelay(): a negative value sleeps 1 microsecond once in every -usec calls.
-  if (usec < 0) usec = (std::rand() % -usec) == 0 ? 1 : 0;
+  if (usec < 0) usec = (std::rand() % -static_cast<int64_t>(usec)) == 0 ? 1 : 0;
   if (usec <= 0) return;
   timespec left{usec / 1000000, static_cast<long>(usec % 1000000) * 1000};
   while (::nanosleep(&left, &left) != 0 && errno == EINTR) {
@@ -1552,11 +1561,14 @@ void rdb_remove_temp_file(pid_t pid) {
 // ── RDB Load ───────────────────────────────────────────────────────────
 
 namespace {
+struct RdbLoadCancelled {};
+
 bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStore& ds,
                    const FunctionLoadFn& load_function, RdbLoadStats& stats, bool keep_expired,
                    bool checksum, bool skip_checksum_validation,
                    const std::function<void()>& before_replace, RdbReplicationInfo* repl,
-                   const std::function<void(int, const std::string&)>& expired) {
+                   const std::function<void(int, const std::string&)>& expired,
+                   const RdbLoadControl* control) try {
   err.clear();
   if (repl) *repl = {};
   RdbReplicationInfo loaded_repl;
@@ -1580,10 +1592,24 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
     return false;
   }
   const auto file_size = static_cast<std::size_t>(st.st_size);
+  RdbLoadProgress progress{RdbLoadProgress::Phase::Checksum, 0, file_size, 0};
+  auto checkpoint = [&](std::size_t bytes) {
+    progress.bytes = bytes;
+    if (!control || !control->checkpoint) return;
+    const int previous = ds.current_db();
+    struct RestoreDatabase {
+      DataStore& ds;
+      int previous;
+      ~RestoreDatabase() {
+        ds.select_db(previous);
+      }
+    } restore{ds, previous};
+    if (!control->checkpoint(progress)) throw RdbLoadCancelled{};
+  };
   const detail::RdbReadFn source = [&](void* p, std::size_t n) {
     return ::read(file.fd, p, n);
   };
-  RdbReader input(source, file_size, true);
+  RdbReader input(source, file_size, true, checkpoint);
   std::string header;
   if (!input.read_bytes(header, 9)) {
     err = "RDB file too short";
@@ -1639,12 +1665,16 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
     }
   }
 
+  checkpoint(input.pos());
   auto load = [&](bool apply) {
+    progress.phase = apply ? RdbLoadProgress::Phase::Apply : RdbLoadProgress::Phase::Preflight;
+    progress.keys = 0;
+    checkpoint(9);
     if (::lseek(file.fd, 9, SEEK_SET) == -1) {
       err = "cannot seek RDB file";
       return false;
     }
-    RdbReader r(source, file_size - 9);
+    RdbReader r(source, file_size - 9, false, [&](std::size_t pos) { checkpoint(pos + 9); });
     RdbReplicationInfo parsed_repl;
     if (apply) {
       stats = {};
@@ -1673,6 +1703,7 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
     bool saw_eof = false;
 
     while (!r.eof()) {
+      checkpoint(r.pos() + 9);
       uint8_t type;
       if (!r.read_u8(type)) break;
 
@@ -1892,6 +1923,24 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
           ++stats.loaded;
         }
       }
+      ++progress.keys;
+      checkpoint(r.pos() + 9);
+      if (apply && control && control->key_delay != 0) {
+        int64_t usec = control->key_delay;
+        if (usec < 0) usec = (std::rand() % -usec) == 0 ? 1 : 0;
+        const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(usec);
+        while (usec > 0) {
+          // Poll independently of signals/bytes: a long synthetic delay must be cancellable.
+          checkpoint(r.pos() + 9);
+          const auto left = until - std::chrono::steady_clock::now();
+          if (left <= std::chrono::steady_clock::duration::zero()) break;
+          const auto ns = std::min<int64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(left).count(), 10000000);
+          const timespec pause{0, static_cast<long>(ns)};
+          if (::nanosleep(&pause, nullptr) != 0 && errno != EINTR)
+            throw std::system_error(errno, std::generic_category(), "RDB load delay");
+        }
+      }
     }
 
     uint64_t checksum_footer;
@@ -1899,6 +1948,7 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
       err = "Short read or OOM loading DB. Unrecoverable error, aborting now.";
       return false;
     }
+    checkpoint(r.pos() + 9);
     if (apply) loaded_repl = std::move(parsed_repl);
     return true;
   };
@@ -1909,6 +1959,9 @@ bool rdb_load_impl(const std::filesystem::path& path, std::string& err, DataStor
   if (!load(true)) return false;
   if (repl) *repl = std::move(loaded_repl);
   return true;
+} catch (const RdbLoadCancelled&) {
+  err = "RDB load cancelled";
+  return false;
 }
 
 }  // namespace
@@ -1925,15 +1978,18 @@ bool rdb_load_into(const std::filesystem::path& path, RdbLoadTarget& target, std
         return target.functions.load(code, target.replace_functions, name, error);
       },
       target.stats, target.expiry == RdbLoadTarget::Expiry::KeepExpired, target.checksum,
-      target.skip_checksum_validation, nullptr, target.replication, target.expired);
+      target.skip_checksum_validation, nullptr, target.replication, target.expired, target.control);
 }
 
 bool rdb_load(const std::filesystem::path& path, std::string& err,
               const std::function<void()>& before_replace, RdbReplicationInfo* repl,
-              const std::function<void(int, const std::string&)>& expired) {
+              const std::function<void(int, const std::string&)>& expired,
+              const RdbLoadControl* control) {
   auto& ds = store();
+  const RdbLoadControl defaults{{}, rdb_key_load_delay()};
   return rdb_load_impl(path, err, ds, g_function_load_hook, g_rdb_load_stats, ds.replica_expiry(),
-                       g_rdb_checksum, g_skip_checksum_validation, before_replace, repl, expired);
+                       g_rdb_checksum, g_skip_checksum_validation, before_replace, repl, expired,
+                       control ? control : &defaults);
 }
 
 // ── DUMP / RESTORE ─────────────────────────────────────────────────────

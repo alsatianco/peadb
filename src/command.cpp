@@ -5411,6 +5411,12 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
             rdb_set_key_save_delay(std::stoi(v));
             return true;
           }}},
+        {"key-load-delay",
+         {[] { return std::to_string(rdb_key_load_delay()); },
+          [](const std::string& v, std::string&) {
+            rdb_set_key_load_delay(std::stoi(v));
+            return true;
+          }}},
         {"shutdown-on-sigterm", live_shutdown_flags(g_shutdown_on_sigterm)},
         {"shutdown-on-sigint", live_shutdown_flags(g_shutdown_on_sigint)},
         {"shutdown-timeout", live_number(g_shutdown_timeout)},
@@ -16729,6 +16735,9 @@ void configure_runtime_settings(const std::unordered_map<std::string, std::strin
   int key_save_delay = rdb_key_save_delay();
   num("rdb-key-save-delay", key_save_delay);
   rdb_set_key_save_delay(key_save_delay);
+  int key_load_delay = rdb_key_load_delay();
+  num("key-load-delay", key_load_delay);
+  rdb_set_key_load_delay(key_load_delay);
   if (const auto it = raw.find("shutdown-on-sigterm"); it != raw.end())
     g_shutdown_on_sigterm = parse_shutdown_flags(it->second);
   if (const auto it = raw.find("shutdown-on-sigint"); it != raw.end())

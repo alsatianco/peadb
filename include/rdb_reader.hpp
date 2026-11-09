@@ -16,7 +16,7 @@ namespace peadb::detail {
 
 // Blocking read(2) contract: positive short reads and -1/EINTR retry, zero means EOF,
 // other errors fail. A callback must never return more than requested. No event servicing or
-// datastore mutation is permitted inside it yet. Streaming transport/admission is separate.
+// datastore mutation is permitted inside it. Streaming transport/admission is separate.
 using RdbReadFn = std::function<ssize_t(void*, std::size_t)>;
 
 class RdbReader {
@@ -25,8 +25,13 @@ class RdbReader {
   }
   RdbReader(const char* p, std::size_t n) : RdbReader(std::string_view(p, n)) {
   }
-  RdbReader(RdbReadFn source, std::size_t length, bool checksum = false)
-      : source_(std::move(source)), limit_(length), streamed_(true), track_checksum_(checksum) {
+  RdbReader(RdbReadFn source, std::size_t length, bool checksum = false,
+            std::function<void(std::size_t)> checkpoint = {})
+      : source_(std::move(source)),
+        checkpoint_(std::move(checkpoint)),
+        limit_(length),
+        streamed_(true),
+        track_checksum_(checksum) {
   }
   RdbReader(const RdbReader&) = delete;
   RdbReader& operator=(const RdbReader&) = delete;
@@ -238,6 +243,7 @@ class RdbReader {
     const std::size_t request = std::min(buffer_.size(), remaining());
     ssize_t got;
     do {
+      if (checkpoint_) checkpoint_(pos_);
       got = source_(buffer_.data(), request);
     } while (got == -1 && errno == EINTR);
     if (got <= 0 || static_cast<std::size_t>(got) > request) {
@@ -320,6 +326,7 @@ class RdbReader {
 
   std::string_view data_;
   RdbReadFn source_;
+  std::function<void(std::size_t)> checkpoint_;
   std::array<char, 64 * 1024> buffer_;
   std::size_t limit_ = 0, pos_ = 0, begin_ = 0, end_ = 0;
   std::uint64_t checksum_ = 0;

@@ -58,6 +58,8 @@ void rdb_remove_temp_file(pid_t pid);
 // microsecond once in every -N keys). debug_delay() is Redis's debugDelay().
 void rdb_set_key_save_delay(int usec);
 int rdb_key_save_delay();
+void rdb_set_key_load_delay(int usec);
+int rdb_key_load_delay();
 void debug_delay(int usec);
 
 // The replication state an RDB carries (Redis's rdbSaveInfo): the database the
@@ -67,6 +69,29 @@ struct RdbReplicationInfo {
   std::string replid;
   std::int64_t offset = -1;
   bool valid(std::size_t database_count = 16) const;
+};
+
+// Explicit, synchronous decoder control. Callbacks run before source refills (including EINTR
+// retries), between opcodes, after each decoded key and during delay waits (at most 10 ms apart).
+// They may observe progress and select a database, but must not mutate either load target,
+// compile Lua, recurse into loading or run commands without a separate server context guard.
+// The target's selected database is restored on return/exception. Returning false cancels with
+// "RDB load cancelled"; other exceptions propagate. No callback runs inside function compilation
+// or datastore insertion. A blocking read syscall/allocator/compact decode is not preemptible.
+// Bytes are consumed positions within each named pass, not received bytes or a sum of passes;
+// Keys count complete records within the named pass, not necessarily applied keys. Total
+// includes the header and checksum. Keep the control and callback alive for the entire load.
+struct RdbLoadProgress {
+  enum class Phase { Checksum, Preflight, Apply } phase;
+  std::size_t bytes = 0;
+  std::size_t total = 0;
+  std::uint64_t keys = 0;
+};
+struct RdbLoadControl {
+  std::function<bool(const RdbLoadProgress&)> checkpoint;
+  // Redis debugDelay semantics: positive microseconds per key, negative samples 1/-N.
+  // Applied only during application, including expired keys, never during preflight.
+  int key_delay = 0;
 };
 
 // Load a Redis-compatible RDB file into the datastore (startup, DEBUG RELOAD, a replica's full
@@ -85,7 +110,8 @@ struct RdbReplicationInfo {
 bool rdb_load(const std::filesystem::path& path, std::string& err,
               const std::function<void()>& before_replace = nullptr,
               RdbReplicationInfo* repl = nullptr,
-              const std::function<void(int, const std::string&)>& expired = nullptr);
+              const std::function<void(int, const std::string&)>& expired = nullptr,
+              const RdbLoadControl* control = nullptr);
 
 // INFO persistence counters for the last RDB application (startup, DEBUG RELOAD, full sync).
 // Validation passes do not change these; a replica retains expired keys as Redis does.
@@ -113,6 +139,7 @@ struct RdbLoadTarget {
   bool skip_checksum_validation = false;
   RdbReplicationInfo* replication = nullptr;
   std::function<void(int, const std::string&)> expired;
+  const RdbLoadControl* control = nullptr;
 };
 bool rdb_load_into(const std::filesystem::path& path, RdbLoadTarget& target, std::string& err);
 

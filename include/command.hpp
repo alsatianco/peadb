@@ -220,8 +220,9 @@ void configure_encoding_limits(const std::unordered_map<std::string, std::string
 // lazyfree-lazy-server-del, stop-writes-on-bgsave-error, aof-load-truncated,
 // slowlog-log-slower-than, slowlog-max-len, latency-monitor-threshold, proto-max-bulk-len,
 // client-query-buffer-limit, tcp-keepalive, lfu-log-factor, rdbchecksum, rdb-key-save-delay,
-// shutdown-on-sigterm and shutdown-on-sigint (values already checked). It also keeps every other
-// setting the config named, for CONFIG GET; `config_file` is the config file PeaDB was started with
+// key-load-delay, shutdown-on-sigterm and shutdown-on-sigint (values already checked). It also
+// keeps every other setting the config named, for CONFIG GET; `config_file` is the config file
+// PeaDB was started with
 // ("" for none), for CONFIG REWRITE.
 void configure_runtime_settings(const std::unordered_map<std::string, std::string>& raw,
                                 const std::string& config_file, unsigned int startup_umask = 0022);

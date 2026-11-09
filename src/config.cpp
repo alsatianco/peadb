@@ -577,6 +577,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "enable-protected-configs",
                                                        "rdbchecksum",
                                                        "rdb-key-save-delay",
+                                                       "key-load-delay",
                                                        "shutdown-on-sigterm",
                                                        "shutdown-on-sigint",
                                                        "shutdown-timeout"};
