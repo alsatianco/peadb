@@ -210,76 +210,71 @@ int main(int argc, char** argv) {
 
   peadb::log(peadb::LogLevel::Info, "Server initialized");
 
-  // The config loader has made `dir` the working directory, as Redis does.
-  const std::filesystem::path snap = config.dbfilename;
-  peadb::set_loading(true);
-  // Like Redis's loadDataFromDisk(), load the AOF or the RDB, never both: with the AOF on it holds
-  // every write, so loading the RDB under it would apply each write twice (compat/delta.md item
-  // 28). The RDB is not read even when the AOF is empty or new, as in Redis.
-  if (config.appendonly) {
-    const std::filesystem::path aof = config.appendfilename;
-    std::error_code ec;
-    if (std::filesystem::file_size(aof, ec) == 0 && !ec && std::filesystem::exists(snap, ec)) {
-      const std::string rdb = snap.string();
-      peadb::log(
-          peadb::LogLevel::Warn,
-          "The AOF " + aof.string() +
-              " is empty, and with appendonly yes only the AOF is loaded (as in Redis), "
-              "so " +
-              rdb + " is not loaded and the server starts with no data. To move the data in " +
-              rdb + " to the AOF, start with appendonly no and run CONFIG SET appendonly yes.");
-    }
-    if (std::filesystem::exists(aof)) {
+  const auto startup = [&]() -> int {
+    // The config loader has made `dir` the working directory, as Redis does.
+    const std::filesystem::path snap = config.dbfilename;
+    const peadb::LoadingScope loading(peadb::LoadingMode::Blocking);
+    // Like Redis's loadDataFromDisk(), load the AOF or the RDB, never both: with the AOF on it
+    // holds every write, so loading the RDB under it would apply each write twice (compat/delta.md
+    // item 28). The RDB is not read even when the AOF is empty or new, as in Redis.
+    if (config.appendonly) {
+      const std::filesystem::path aof = config.appendfilename;
+      std::error_code ec;
+      if (std::filesystem::file_size(aof, ec) == 0 && !ec && std::filesystem::exists(snap, ec)) {
+        const std::string rdb = snap.string();
+        peadb::log(
+            peadb::LogLevel::Warn,
+            "The AOF " + aof.string() +
+                " is empty, and with appendonly yes only the AOF is loaded (as in Redis), "
+                "so " +
+                rdb + " is not loaded and the server starts with no data. To move the data in " +
+                rdb + " to the AOF, start with appendonly no and run CONFIG SET appendonly yes.");
+      }
+      if (std::filesystem::exists(aof)) {
+        std::string err;
+        if (!peadb::load_aof_file(aof.string(), err)) {
+          if (peadb::shutdown_requested()) return 0;
+          // A tolerable truncated tail returns success; reaching here means real
+          // corruption. Refuse to start (Redis behaviour) rather than silently
+          // serving partial data.
+          peadb::log(peadb::LogLevel::Error,
+                     "FATAL: AOF load failed: " + err +
+                         " — refusing to start. Restore from backup or repair the AOF.");
+          return 1;
+        }
+      }
+    } else if (std::filesystem::exists(snap)) {
       std::string err;
-      if (!peadb::load_aof_file(aof.string(), err)) {
-        // A tolerable truncated tail returns success; reaching here means real
-        // corruption. Refuse to start (Redis behaviour) rather than silently
-        // serving partial data.
+      // Only an explicitly identified legacy snapshot may use the old reader. An unreadable,
+      // empty or otherwise invalid file must fail startup, never fall through to an empty DB.
+      bool is_legacy_snapshot = false;
+      {
+        std::ifstream probe(snap, std::ios::binary);
+        char header[sizeof("PEADB-SNAPSHOT-V1\n") - 1];
+        if (probe.read(header, sizeof(header)))
+          is_legacy_snapshot = std::string(header, sizeof(header)) == "PEADB-SNAPSHOT-V1\n";
+      }
+      peadb::RdbReplicationInfo repl;
+      bool loaded =
+          peadb::load_rdb_with_events(snap, err, nullptr, &repl, peadb::feed_rdb_startup_expiry);
+      if (!loaded && is_legacy_snapshot) {
+        peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");
+        loaded = peadb::store().load_snapshot_file(snap, err);
+      }
+      if (!loaded) {
+        if (peadb::shutdown_requested()) return 0;
+        peadb::log(peadb::LogLevel::Error, "FATAL: RDB load failed: " + err);
         peadb::log(peadb::LogLevel::Error,
-                   "FATAL: AOF load failed: " + err +
-                       " — refusing to start. Restore from backup or repair the AOF.");
+                   "Fatal error loading the DB, check server logs. Exiting.");
         return 1;
       }
+      peadb::restore_rdb_replication(repl);
     }
-  } else if (std::filesystem::exists(snap)) {
-    std::string err;
-    // Only an explicitly identified legacy snapshot may use the old reader. An unreadable,
-    // empty or otherwise invalid file must fail startup, never fall through to an empty DB.
-    bool is_legacy_snapshot = false;
-    {
-      std::ifstream probe(snap, std::ios::binary);
-      char header[sizeof("PEADB-SNAPSHOT-V1\n") - 1];
-      if (probe.read(header, sizeof(header)))
-        is_legacy_snapshot = std::string(header, sizeof(header)) == "PEADB-SNAPSHOT-V1\n";
-    }
-    peadb::RdbReplicationInfo repl;
-    bool loaded = peadb::rdb_load(snap, err, nullptr, &repl, peadb::feed_rdb_startup_expiry);
-    if (!loaded && is_legacy_snapshot) {
-      peadb::log(peadb::LogLevel::Info, "RDB load failed (" + err + "), trying legacy snapshot");
-      loaded = peadb::store().load_snapshot_file(snap, err);
-    }
-    if (!loaded) {
-      peadb::log(peadb::LogLevel::Error, "FATAL: RDB load failed: " + err);
-      peadb::log(peadb::LogLevel::Error, "Fatal error loading the DB, check server logs. Exiting.");
-      return 1;
-    }
-    peadb::restore_rdb_replication(repl);
-  }
 
-  peadb::set_loading(false);
-  // A SIGTERM or SIGINT during the load: exit without saving, as Redis does from
-  // whileBlockedCron(). Redis stops the load at once; PeaDB finishes it first, because it loads
-  // before it serves anything (compat/delta.md item 70).
-  if (peadb::shutdown_signal_pending()) {
-    peadb::set_loading(true);  // prepare_for_shutdown() then never saves
-    if (peadb::prepare_for_shutdown(peadb::kShutdownNosave)) return 0;
-    peadb::set_loading(false);
-    peadb::log(peadb::LogLevel::Warn,
-               "SIGTERM received but errors trying to shut down the server, "
-               "check the logs for more information");
-  }
+    return 0;
+  };
 
-  int rc = peadb::run_server(config);
+  int rc = peadb::run_server(config, startup);
   peadb::lua_engine_shutdown();
   return rc;
 }

@@ -181,6 +181,12 @@ def main():
         # engines. Keep its assertions active and allow for slower sanitizer/CI scheduling.
         test_budget = (60.0 if test.name == 'test_replication_backlog_ttl_parity.py' and
                        'TIMEOUT_SECS' not in os.environ else budget)
+        # The loading-service AOF fixture replays 600k commands with all value/source and
+        # cancellation assertions active. GCC/ARM ASAN progresses steadily but needs minutes;
+        # its internal 480s replay bound still fits inside this owned-process outer deadline.
+        if (test.name == 'test_loading_aof_service.py' and
+                os.environ.get('PEADB_TEST_SANITIZED') == '1'):
+            test_budget = max(test_budget, 600.0)
         code = run_test(test, test_budget, timeout_cmd, log)
         if code == 0:
             passed += 1

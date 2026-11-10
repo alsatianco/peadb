@@ -32,11 +32,11 @@
     "integration/rdb": {
       "last_counts": {
         "err": 0,
-        "ignored": 12,
-        "ok": 13
+        "ignored": 11,
+        "ok": 14
       },
       "mode": "native",
-      "skipfile_lines": 2
+      "skipfile_lines": 1
     },
     "integration/replication-2": {
       "last_counts": {

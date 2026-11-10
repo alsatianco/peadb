@@ -152,6 +152,23 @@ thread_local bool g_block_disabled = false;
 // The loader may suspend a dispatch at an explicit safe boundary. Keep its command scratch
 // alongside the other saved execution state, rather than hidden in handle_command_impl().
 thread_local std::string g_dispatch_command;
+struct LoadingProgress {
+  std::size_t bytes = 0, total = 0, last_service_bytes = 0;
+  std::int64_t started_ms = 0, serviced_ms = 0;
+  std::string phase;
+};
+LoadingProgress g_loading_progress;
+struct LoadingProgressScope {
+  LoadingProgress previous = std::move(g_loading_progress);
+  LoadingProgressScope() {
+    g_loading_progress = {};
+    g_loading_progress.started_ms = DataStore::now_ms();
+  }
+  ~LoadingProgressScope() {
+    g_loading_progress = std::move(previous);
+  }
+};
+bool production_loading_checkpoint(std::size_t bytes, std::size_t total, const std::string& phase);
 bool g_loading_events_active = false;  // event-loop thread only; never a second event pump
 int g_aof_fd = -1;
 std::string g_appendfsync = "everysec";
@@ -1828,6 +1845,7 @@ std::function<std::pair<std::size_t, std::size_t>()> g_client_buffers_cb;
 std::function<int()> g_blocked_clients_cb;
 std::function<int(const ClientKillFilter&, bool&)> g_client_kill_cb;
 std::function<void()> g_close_sockets_in_child_cb;
+std::function<void()> g_loading_service_cb;
 std::function<int(std::uint64_t, bool)> g_client_unblock_cb;
 std::function<void(const std::function<void(const SessionState&)>&)> g_for_each_replica_cb;
 std::function<void(const std::string*)> g_feed_replicas_cb;
@@ -7486,6 +7504,24 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                     "\r\n"
                     "aof_rewrite_buffer_length:" +
                     std::to_string(g_aof_rewrite_buf.size()) + "\r\n\r\n";
+              }
+              if (want("PERSISTENCE") && loading_mode() != LoadingMode::None) {
+                const auto& p = g_loading_progress;
+                const auto elapsed = std::max<std::int64_t>(0, now_ms() - p.started_ms) / 1000;
+                const auto remaining = p.total - std::min(p.bytes, p.total);
+                const auto eta = elapsed == 0
+                                     ? 1
+                                     : static_cast<std::int64_t>(static_cast<long double>(elapsed) *
+                                                                 remaining / (p.bytes + 1));
+                char percent[48];
+                std::snprintf(percent, sizeof(percent), "%.2f",
+                              p.total == 0 ? 0.0 : 100.0 * static_cast<double>(p.bytes) / p.total);
+                out += "loading_start_time:" + std::to_string(p.started_ms / 1000) +
+                       "\r\nloading_total_bytes:" + std::to_string(p.total) +
+                       "\r\nloading_rdb_used_mem:0\r\nloading_loaded_bytes:" +
+                       std::to_string(p.bytes) + "\r\nloading_loaded_perc:" + percent +
+                       "\r\nloading_eta_seconds:" + std::to_string(eta) +
+                       "\r\nloading_phase:" + p.phase + "\r\n";
               }
               if (want("STATS")) {
                 out +=
@@ -15862,6 +15898,11 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
 }  // namespace
 
 std::string debugCommand(const std::vector<std::string>& args, SessionState& session, bool&) {
+  // Redis DEBUG LOG: a non-mutating loading diagnostic used by the native client-lifetime test.
+  if (args.size() == 3 && upper(args[1]) == "LOG") {
+    log(LogLevel::Warn, args[2]);
+    return encode_simple("OK");
+  }
   if (args.size() >= 2 && upper(args[1]) == "SEGFAULT") {
     // Existing DEBUG verbs still have the documented item61 gap. Never expose a
     // new process-crashing verb through that legacy default: require explicit opt-in.
@@ -15924,7 +15965,7 @@ std::string debugCommand(const std::vector<std::string>& args, SessionState& ses
       functions_flush_all();
     }
     g_rdb_load_functions_replace = merge;
-    const bool ok = rdb_load(g_snapshot_path, err);
+    const bool ok = load_rdb_with_events(g_snapshot_path, err);
     g_rdb_load_functions_replace = true;  // restore safe default for replica/startup loads
     if (!ok) return encode_error("Error trying to load the RDB dump: " + err);
     return encode_simple("OK");
@@ -16235,7 +16276,8 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
       }
     }
     if (!must_obey_client() && !spec_subcommand_unknown(qit->second, args) &&
-        loading_refuses(flags)) {
+        (loading_refuses(flags) || (g_loading_events_active && qit->second.redis_name == "debug" &&
+                                    !(args.size() == 3 && upper(args[1]) == "LOG")))) {
       session.multi_dirty = true;
       record_cmd_rejected(cmd);
       record_error_stat("LOADING");
@@ -16374,7 +16416,9 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
 
   if (client_command && g_loading.load() && !spec_subcommand_unknown(spec, args)) {
     const auto flags = spec_command_flags(spec, args) | (queued_exec ? session.multi_flags : 0);
-    if (loading_refuses(flags, queued_exec ? session.multi_inv_flags : 0))
+    if (loading_refuses(flags, queued_exec ? session.multi_inv_flags : 0) ||
+        (g_loading_events_active && spec.redis_name == "debug" &&
+         !(args.size() == 3 && upper(args[1]) == "LOG")))
       return reject("-LOADING Redis is loading the dataset in memory\r\n");
   }
 
@@ -17072,6 +17116,7 @@ bool load_aof_file(const std::string& path, std::string& err, const std::functio
                    const AofLoadControl* control) {
   if (g_loading_events_active) throw std::logic_error("AOF load during loading event service");
   const LoadingScope loading(LoadingMode::Blocking);
+  const LoadingProgressScope progress;
   err.clear();
   struct InputFile {
     int fd;
@@ -17092,9 +17137,10 @@ bool load_aof_file(const std::string& path, std::string& err, const std::functio
   const auto total = static_cast<std::size_t>(st.st_size);
   std::uint64_t records = 0;
   const auto checkpoint = [&](std::size_t bytes) {
-    if (!control || !control->checkpoint) return;
     bool proceed = true;
-    service_loading_events([&] { proceed = control->checkpoint({bytes, total, records}); });
+    proceed = production_loading_checkpoint(bytes, total, "aof");
+    if (proceed && control && control->checkpoint)
+      service_loading_events([&] { proceed = control->checkpoint({bytes, total, records}); });
     if (!proceed) throw AofCancelled{};
   };
   AofInput input(file.fd, total, checkpoint);
@@ -17461,7 +17507,8 @@ bool shutdown_initiated() {
 bool prepare_for_shutdown(int flags) {
   if (shutdown_initiated()) return false;
   // A dataset that is still loading must not be saved over the file it comes from.
-  if (g_loading.load()) flags = (flags & ~kShutdownSave) | kShutdownNosave;
+  if (g_loading.load())
+    flags = (flags & ~kShutdownSave) | kShutdownNosave | kShutdownNow | kShutdownForce;
   g_shutdown_flags = flags;
   log(LogLevel::Info, "User requested shutdown...");
   // Lagging replicas get shutdown-timeout seconds to catch up, so no acknowledged write is lost:
@@ -17525,6 +17572,52 @@ void shutdown_signal_handler(int sig) {
 
 bool shutdown_signal_pending() {
   return g_shutdown_asap.load() != 0;
+}
+
+namespace {
+// Byte interval is a service opportunity,
+// with a 10ms time bound for key delays/small records. No ordinary cron/replication work runs.
+bool production_loading_checkpoint(std::size_t bytes, std::size_t total, const std::string& phase) {
+  auto& p = g_loading_progress;
+  if (p.phase != phase) {
+    p.phase = phase;
+    p.last_service_bytes = 0;
+    p.serviced_ms = 0;
+  }
+  p.bytes = bytes;
+  p.total = total;
+  const auto now = now_ms();
+  std::size_t interval = 2097152;
+  const auto setting = g_config_values.find("loading-process-events-interval-bytes");
+  if (setting != g_config_values.end()) interval = std::stoull(setting->second);
+  if (g_loading_service_cb &&
+      (shutdown_signal_pending() || p.serviced_ms == 0 || now - p.serviced_ms >= 10 ||
+       bytes - std::min(bytes, p.last_service_bytes) >= interval)) {
+    p.serviced_ms = now;
+    p.last_service_bytes = bytes;
+    service_loading_events(g_loading_service_cb);
+  }
+  return !shutdown_signal_pending() && !shutdown_requested();
+}
+}  // namespace
+
+bool load_rdb_with_events(const std::filesystem::path& path, std::string& err,
+                          const std::function<void()>& before_replace, RdbReplicationInfo* repl,
+                          const std::function<void(int, const std::string&)>& expired) {
+  if (g_loading_events_active) throw std::logic_error("RDB load during loading event service");
+  const LoadingScope loading(LoadingMode::Blocking);
+  const LoadingProgressScope progress;
+  RdbLoadControl control;
+  control.key_delay = rdb_key_load_delay();
+  control.checkpoint = [&](const RdbLoadProgress& p) {
+    const char* phase = p.phase == RdbLoadProgress::Phase::Checksum    ? "rdb-checksum"
+                        : p.phase == RdbLoadProgress::Phase::Preflight ? "rdb-preflight"
+                                                                       : "rdb-apply";
+    const bool proceed = production_loading_checkpoint(p.bytes, p.total, phase);
+    control.key_delay = rdb_key_load_delay();  // CONFIG SET takes effect at the next safe boundary.
+    return proceed;
+  };
+  return rdb_load(path, err, before_replace, repl, expired, &control);
 }
 
 void service_loading_events(const std::function<void()>& service) {
@@ -17596,11 +17689,17 @@ void set_loading(bool loading) {
 void shutdown_cron() {
   // Redis runs this in serverCron(), so DEBUG PAUSE-CRON holds it, and so does a script that runs
   // too long (serverCron() does not run until the script ends).
-  if (g_pause_cron || g_script_busy.load()) return;
+  if (g_script_busy.load() || (g_pause_cron && !g_loading.load())) return;
   // The SHUTDOWN command runs inside safe_handle_command(); this path needs its own guard, so an
   // exception (for example out of memory) is a failed shutdown and not a crash.
   try {
-    if (g_shutdown_asap.load() != 0 && !shutdown_initiated()) {
+    if (shutdown_initiated() && g_loading.load()) {
+      // A shutdown may have begun before this load. Its old SAVE flags must never
+      // reach finish_shutdown() against a partial target, even at its replica deadline.
+      g_shutdown_flags =
+          (g_shutdown_flags & ~kShutdownSave) | kShutdownNosave | kShutdownNow | kShutdownForce;
+      if (finish_shutdown()) request_shutdown();
+    } else if (g_shutdown_asap.load() != 0 && !shutdown_initiated()) {
       // A SIGTERM or SIGINT asked for a shutdown.
       int flags = 0;
       const int sig = g_last_sig_received.load();
@@ -18247,7 +18346,7 @@ void drain_replica_cmd_queue() {
       RdbReplicationInfo loaded_repl;
       try {
         const LoadingScope loading(LoadingMode::Blocking);
-        ok = rdb_load(
+        ok = load_rdb_with_events(
             path, err,
             [&] {
               // replicationAttachToNewMaster(): only after header/checksum and structural

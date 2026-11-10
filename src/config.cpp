@@ -578,6 +578,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "rdbchecksum",
                                                        "rdb-key-save-delay",
                                                        "key-load-delay",
+                                                       "loading-process-events-interval-bytes",
                                                        "shutdown-on-sigterm",
                                                        "shutdown-on-sigint",
                                                        "shutdown-timeout"};

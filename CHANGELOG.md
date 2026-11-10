@@ -9,9 +9,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
-- Stream AOF replay with bounded read-ahead and explicit byte/record progress and cancellation controls, preserving transaction and torn-tail repair boundaries. Startup network loading service remains pending (delta 70).
+- Serve authenticated INFO and Redis loading refusals while startup RDB/AOF and disk-spooled full sync load. Bound client I/O at safe decoder checkpoints, preserve nested dispatch/client lifetimes, report phased consumed-byte progress, and cancel loading shutdowns promptly without saving partial data. DEBUG other than LOG is deliberately refused during loading service to prevent reentrant dataset mutation (delta 70).
 
-- Isolate internal loading event callbacks from replay, transaction, propagation and database context; add explicit AOF record-boundary service and restore prior replay state on errors. Server event pumping, startup LOADING and cancellation remain pending (delta 70).
+- Stream AOF replay with bounded read-ahead and explicit byte/record progress and cancellation controls, preserving transaction and torn-tail repair boundaries.
+
+- Isolate internal loading event callbacks from replay, transaction, propagation and database context; add explicit AOF record-boundary service and restore prior replay state on errors.
 
 - Apply Redis’s hidden `key-load-delay` setting during RDB application and provide explicit bounded progress/cancellation callbacks for checksum, preflight and application. Callbacks restore database selection; controlled event service and startup LOADING remain pending (delta 70).
 

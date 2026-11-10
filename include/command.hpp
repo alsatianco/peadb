@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <filesystem>
 #include <string>
 #include <vector>
 #include <optional>
@@ -154,8 +155,8 @@ std::string configure_persistence(const std::string& dbfilename, bool appendonly
 // handlers. It is isolated from replay state by service_loading_events(). The caller owns
 // bounded client I/O and must not re-enter loading, drain replication or start persistence.
 // File input is bounded to 64 KiB plus the active command/transaction. Individual command
-// execution, allocation and blocking kernel reads are not preemptible. No production pump
-// or signal cancellation is registered by this API.
+// execution, allocation and blocking kernel reads are not preemptible. The production
+// server attaches guarded service/progress/cancellation when its callback is registered.
 struct AofLoadProgress {
   std::size_t bytes = 0;      // consumed input, never read-ahead or applied replication offsets
   std::size_t total = 0;      // size of the opened regular file at entry
@@ -399,6 +400,15 @@ void set_loading(bool loading);
 // Recursive service and service from Lua throw logic_error before invoking the callback.
 // This is an execution boundary, not a server event pump or a cancellation policy.
 void service_loading_events(const std::function<void()>& service);
+// Event-loop-owned production service, installed only while server sessions/listeners live.
+// Invoked inside service_loading_events(), never directly from a decoder.
+extern std::function<void()> g_loading_service_cb;
+// Shared production RDB wrapper: explicit decoder controls, guarded service/progress and
+// cancellation. DEBUG other than LOG is rejected before handlers when already servicing a load.
+bool load_rdb_with_events(const std::filesystem::path& path, std::string& err,
+                          const std::function<void()>& before_replace = {},
+                          RdbReplicationInfo* repl = nullptr,
+                          const std::function<void(int, const std::string&)>& expired = {});
 class LoadingScope {
  public:
   explicit LoadingScope(LoadingMode mode) : previous_(loading_mode()) {
