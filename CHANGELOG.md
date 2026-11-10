@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Give each replica file-load handoff an owned generation/attempt-tagged socket session and exception-safe completion. Add an internal cancellable event-loop socket source and Redis load-strategy selector; production direct/swapdb loading still awaits transactional publication (delta 8).
+
 - Add an explicit single-pass RDB source decoder for length and EOF frames, sharing file value/function/stream decoding, validating incremental CRC and exact trailers, and returning bounded command read-ahead. Production replica socket handoff and transactional swapdb remain pending (delta 8).
 
 - Serve authenticated INFO and Redis loading refusals while startup RDB/AOF and disk-spooled full sync load. Bound client I/O at safe decoder checkpoints, preserve nested dispatch/client lifetimes, report phased consumed-byte progress, and cancel loading shutdowns promptly without saving partial data. DEBUG other than LOG is deliberately refused during loading service to prevent reentrant dataset mutation (delta 70).

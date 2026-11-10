@@ -51,6 +51,7 @@ add_library(peadb_core
     src/crash.cpp
     src/watchdog.cpp
     src/protocol.cpp
+    src/replication_load.cpp
     src/server.cpp
     src/sha256.cpp
     src/functions.cpp
@@ -111,6 +112,11 @@ if(BUILD_TESTING)
   add_executable(replication_snapshot_test tests/unit/replication_snapshot_test.cpp)
   target_link_libraries(replication_snapshot_test PRIVATE peadb_core)
   add_test(NAME replication_snapshot_test COMMAND replication_snapshot_test)
+
+  add_executable(replication_load_test tests/unit/replication_load_test.cpp)
+  target_link_libraries(replication_load_test PRIVATE peadb_core)
+  add_test(NAME replication_load_test COMMAND replication_load_test)
+  set_tests_properties(replication_load_test PROPERTIES TIMEOUT 30)
 
   add_executable(config_parser_test tests/unit/config_parser_test.cpp)
   target_link_libraries(config_parser_test PRIVATE peadb_core)

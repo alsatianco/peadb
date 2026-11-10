@@ -13,6 +13,7 @@
 #include <map>
 #include "protocol.hpp"
 #include "replication_snapshot.hpp"
+#include "replication_load.hpp"
 #include "rdb.hpp"
 #include "redis_config_table.generated.hpp"
 #include "sha256.hpp"
@@ -381,22 +382,16 @@ void disconnect_replicas() {
   bool kill_self = false;
   g_client_kill_cb(filter, kill_self);
 }
-// Pending RDB load handed off from streaming thread to event loop. The streaming
-// thread sets g_replica_load_path + g_replica_load_pending=true and waits; the event
-// loop runs rdb_load() synchronously and signals completion via g_replica_load_pending=false.
-// The hand-off names the REPLICAOF generation it belongs to: a load from a link that a newer
-// REPLICAOF (or NO ONE) replaced is dropped, so it can neither replace the dataset nor touch the
-// new link's state. Everything here is protected by g_replica_cmd_queue_mu.
-std::string g_replica_load_path;
-std::uint64_t g_replica_load_gen = 0;
-std::uint64_t g_replica_load_seq = 0;       // counts hand-offs
-std::uint64_t g_replica_load_done_seq = 0;  // the last hand-off the event loop finished
-bool g_replica_load_ok = false;             // its result
-// The master's replication id and offset from its +FULLRESYNC, which the replica adopts once the
-// RDB has loaded.
-std::string g_replica_load_replid;
-std::int64_t g_replica_load_offset = 0;
-std::atomic<bool> g_replica_load_pending{false};
+// Post-spool handoff, under g_replica_cmd_queue_mu. Each attempt owns its completion and
+// socket lease, so a superseded link cannot observe a later attempt's result or close an fd
+// still borrowed by the event loop. Raw socket decoding/transactional publication is pending.
+struct PendingReplicaLoad {
+  std::shared_ptr<ReplicationLoadSession> session;
+  std::string path, replid;
+  std::int64_t offset;
+};
+std::shared_ptr<PendingReplicaLoad> g_replica_load;
+std::atomic<std::uint64_t> g_replica_load_attempt{0};
 bool g_active_expire = true;
 bool g_pause_cron = false;  // DEBUG PAUSE-CRON: freezes active expiry + save-point cron
 int g_last_aof_db = -1;     // db of the last AOF append; -1 forces a SELECT on next append
@@ -18309,27 +18304,24 @@ void drain_replica_cmd_queue() {
   // Apply any pending replica RDB load on the event loop thread before processing
   // queued commands. Running rdb_load() here serializes flushall+restore with all
   // event-loop reads/writes, eliminating the race against the streaming thread.
-  if (g_replica_load_pending.load()) {
-    std::string path;
-    std::string replid;
-    std::int64_t offset = 0;
-    std::uint64_t seq = 0;
-    // REPLICAOF runs on this thread too, so the generation cannot change before the load is done.
-    bool current = false;
-    {
+  std::shared_ptr<PendingReplicaLoad> load;
+  {
+    std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
+    load = std::move(g_replica_load);
+  }
+  if (load) {
+    const auto& path = load->path;
+    const auto& replid = load->replid;
+    const auto offset = load->offset;
+    ReplicationLoadLease lease(*load->session, load->session->identity, g_repl_generation.load());
+    const bool current = bool(lease);
+    if (current) {
+      // These commands are already represented by the full snapshot.
       std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-      path = g_replica_load_path;
-      g_replica_load_path.clear();
-      replid = g_replica_load_replid;
-      offset = g_replica_load_offset;
-      seq = g_replica_load_seq;
-      current = g_replica_load_gen == g_repl_generation.load();
-      // Commands still queued or held came from the stream before this full sync; the new
-      // dataset already holds their effects, so applying them now would apply them twice.
-      if (current) {
-        g_replica_cmd_queue.clear();
-        g_replica_cmd_held.clear();
-      }
+      g_replica_cmd_queue.clear();
+      g_replica_cmd_held.clear();
+    } else {
+      load->session->cancel();
     }
     bool ok = false;
     if (!current) {
@@ -18403,12 +18395,7 @@ void drain_replica_cmd_queue() {
         if (g_aof_sync_suspended) restart_aof_after_sync();
       }
     }
-    {
-      std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-      g_replica_load_done_seq = seq;
-      g_replica_load_ok = ok;
-      g_replica_load_pending.store(false);  // signal streaming thread
-    }
+    lease.finish(ok && load->session->identity.generation == g_repl_generation.load());
   }
 
   {
@@ -18843,41 +18830,31 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     // safe under concurrent access). The streaming thread waits here until completion.
     // One hand-off at a time: an older link's may still wait for the event loop. A newer REPLICAOF
     // makes this one give up.
-    std::uint64_t my_seq = 0;
+    auto session = std::make_shared<ReplicationLoadSession>(
+        fd, ReplicationLoadIdentity{gen, g_replica_load_attempt.fetch_add(1) + 1});
+    session->offer();
+    auto pending = std::make_shared<PendingReplicaLoad>(
+        PendingReplicaLoad{session, tmp_path, fullresync_replid, fullresync_offset});
     for (;;) {
       {
         std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-        if (g_repl_generation.load() != gen) break;
-        if (!g_replica_load_pending.load()) {
-          g_replica_load_path = tmp_path;
-          g_replica_load_gen = gen;
-          g_replica_load_replid = fullresync_replid;
-          g_replica_load_offset = fullresync_offset;
-          my_seq = ++g_replica_load_seq;
-          g_replica_load_pending.store(true);
+        if (g_repl_generation.load() != gen) {
+          session->cancel();
+          break;
+        }
+        if (!g_replica_load) {
+          g_replica_load = pending;
           break;
         }
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    if (my_seq == 0) {
-      ::unlink(tmp_path.c_str());
-      ::close(fd);
-      log(LogLevel::Info, "REPLICAOF: superseded by a newer REPLICAOF before loading the RDB");
-      return false;
     }
     wake_event_loop_for_replica();
-    bool load_ok = false;
-    for (;;) {
-      {
-        std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-        if (g_replica_load_done_seq == my_seq) {
-          load_ok = g_replica_load_ok;
-          break;
-        }
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
+    // Never abandon a claimed socket, even if a newer REPLICAOF supersedes this attempt.
+    // Cancellation before claim wakes immediately; a live lease returns only after unwinding.
+    const auto completion = session->wait([&] { return g_repl_generation.load() == gen; });
+    fd = session->take_socket();
+    const bool load_ok = completion.ok && g_repl_generation.load() == gen;
     transfer_state.done();
     ::unlink(tmp_path.c_str());
     if (!load_ok) {
