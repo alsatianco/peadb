@@ -377,7 +377,12 @@ def check_eviction_after_unit(name, binary, work):
         assert c('MULTI') == '+OK'
         assert c('SETRANGE', 'big', 300000, 'y') == '+QUEUED'
         assert c('SET', 'small', '1') == '+QUEUED'
-        assert other('CONFIG', 'SET', 'maxmemory', int(info(other, 'used_memory')) + 50000) == '+OK'
+        # Match getMaxmemoryState(): replica/AOF output buffers do not count toward eviction.
+        # Sample both fields in one reply; a slow replica may still hold the 1 MB SET above.
+        memory = dict(line.split(':', 1) for line in other('INFO', 'memory').splitlines()
+                      if ':' in line)
+        effective = int(memory['used_memory']) - int(memory['mem_not_counted_for_evict'])
+        assert other('CONFIG', 'SET', 'maxmemory', effective + 50000) == '+OK'
         assert c('EXEC') == [300001, '+OK'], name
         assert c('SET', 'end', 1) == '+OK', name  # the eviction runs before it
         assert other('CONFIG', 'SET', 'maxmemory', 0) == '+OK'
