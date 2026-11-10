@@ -117,7 +117,10 @@ def exercise(binary, label, renamed):
         if label == 'peadb':
             # Errors sent to other sessions must not fail the role-changing command.
             assert command_stats(client, 'replicaof') == (1, 0, 0)
-        wait_for(lambda: client('GET', 'upstream-value') == 'present',
+        # INFO is allowed during loading. Wait for the link before reading data
+        # so this probe does not add LOADING errors to the exact counters below.
+        wait_for(lambda: section(client, 'replication').get('master_link_status') == 'up'
+                 and client('GET', 'upstream-value') == 'present',
                  'real full sync after cancellation')
         stable = {name: command_stats(client, name) for name in names}
         # A no-op same-master REPLICAOF and promotion cannot count old blocks again.
