@@ -9,6 +9,7 @@
 #include <iostream>
 #include <stdexcept>
 #include <thread>
+#include <cstring>
 #include <unistd.h>
 
 namespace {
@@ -41,6 +42,37 @@ std::string framed(std::string body) {
 void write(const std::filesystem::path& path, const std::string& bytes) {
   std::ofstream file(path, std::ios::binary);
   file.write(bytes.data(), bytes.size());
+}
+int input_mode = 0;
+bool load_target(const std::filesystem::path& path, peadb::RdbLoadTarget& target,
+                 std::string& err) {
+  using namespace peadb;
+  if (input_mode == 0) return rdb_load_into(path, target, err);
+  std::ifstream input(path, std::ios::binary);
+  const bool eof = input_mode == 2;
+  const std::string marker(40, 'T');
+  const std::string suffix = "*1\r\n$4\r\nPING\r\n";
+  const auto tail = eof ? marker + suffix : suffix;
+  std::size_t offset = 0;
+  RdbStreamResult result;
+  const auto size = std::filesystem::file_size(path);
+  const bool loaded = rdb_load_stream_into(
+      [&](void* p, std::size_t n) -> ssize_t {
+        input.read(static_cast<char*>(p), n);
+        const auto got = static_cast<std::size_t>(input.gcount());
+        const auto extra = std::min(n - got, tail.size() - offset);
+        std::memcpy(static_cast<char*>(p) + got, tail.data() + offset, extra);
+        offset += extra;
+        return got + extra;
+      },
+      {eof ? RdbStreamFrame::Kind::Eof : RdbStreamFrame::Kind::Length, size, marker}, target,
+      result, err);
+  if (loaded) {
+    check(result.rdb_bytes == size && result.frame_bytes == size + (eof ? 40 : 0),
+          "rich stream exact frame positions");
+    check(result.read_ahead + tail.substr(offset) == suffix, "rich stream command suffix");
+  }
+  return loaded;
 }
 void run(const std::filesystem::path& path) {
   using namespace peadb;
@@ -102,66 +134,69 @@ void run(const std::filesystem::path& path) {
     throw std::runtime_error("live hook called");
     return false;
   });
-  for (bool keep : {false, true}) {
-    DataStore staging;
-    // Deliberately oppose runtime role and explicit TTL policy.
-    staging.set_replica_expiry(!keep);
-    staging.set_writable_replica(true);
-    staging.select_db(9);
-    unsigned expiry_hooks = 0;
-    staging.set_lazy_expire_hook([&](int, const std::string&) { ++expiry_hooks; });
-    FunctionRegistry functions;
-    RdbLoadStats stats{999, 999};
-    RdbReplicationInfo result{0, "old", 1};
-    RdbLoadTarget target{staging, functions, stats};
-    target.expiry = keep ? RdbLoadTarget::Expiry::KeepExpired : RdbLoadTarget::Expiry::DropExpired;
-    target.replication = &result;
-    unsigned dropped = 0;
-    target.expired = [&](int db, const std::string& key) {
-      check((db == 0 || db == 1 || db == 15) && key == "expired", "expiry target callback");
-      ++dropped;
-    };
-    check(rdb_load_into(path, target, err), "explicit rich load succeeds");
-    check(staging.current_db() == 9 && staging.replica_expiry() == !keep,
-          "target selection and role restored");
-    check(stats.loaded == (keep ? 24 : 21) && stats.expired == (keep ? 0 : 3) &&
-              dropped == (keep ? 0 : 3),
-          "isolated load counters/expiry");
-    check(
-        result.valid(staging.database_count()) && result.stream_db == 15 && result.offset == 12345,
-        "target AUX published");
-    check(expiry_hooks == 0 && staging.replica_expires_tracked_keys() == 0,
-          "loading never propagates/owns TTLs");
-    check(call(functions, "value") == ":42\r\n" && functions.libraries().size() == 1,
-          "private function callable");
-    DataStore::LazyExpireDisabled guard(staging);
-    for (int db : {0, 1, 15}) {
-      staging.select_db(db);
-      bool wrong = false;
-      check(staging.get("string") == binary && staging.get("large") == large,
-            "binary and large strings in target");
-      check(staging.lrange("list", 0, -1, wrong) == std::vector<std::string>({binary, "b"}),
-            "list in target");
-      check(staging.hget("hash", "f", wrong) == binary && staging.scard("set", wrong) == 2,
-            "hash and set in target");
-      check(staging.zrange("zset", 0, -1, true, wrong) ==
-                std::vector<std::pair<std::string, double>>({{binary, 1.25}}),
-            "zset in target");
-      DataStore::StreamDump actual;
-      check(staging.dump_stream("stream", actual) && actual.entries == stream.entries &&
-                actual.entries_added == 3 && actual.max_deleted_id == "3-0" &&
-                actual.groups.size() == 1,
-            "stream history in target");
-      if (!actual.groups.empty()) {
-        const auto& g = actual.groups[0];
-        check(g.name == "group" && g.entries_read == 2 && g.last_delivered_id == "2-0" &&
-                  g.consumers.size() == 2 && g.pending.size() == 1 &&
-                  g.pending[0].consumer == "consumer" && g.pending[0].delivery_ms == 123456 &&
-                  g.pending[0].delivery_count == 7,
-              "groups/consumers/PEL in target");
+  for (input_mode = 0; input_mode < 3; ++input_mode) {
+    for (bool keep : {false, true}) {
+      DataStore staging;
+      // Deliberately oppose runtime role and explicit TTL policy.
+      staging.set_replica_expiry(!keep);
+      staging.set_writable_replica(true);
+      staging.select_db(9);
+      unsigned expiry_hooks = 0;
+      staging.set_lazy_expire_hook([&](int, const std::string&) { ++expiry_hooks; });
+      FunctionRegistry functions;
+      RdbLoadStats stats{999, 999};
+      RdbReplicationInfo result{0, "old", 1};
+      RdbLoadTarget target{staging, functions, stats};
+      target.expiry =
+          keep ? RdbLoadTarget::Expiry::KeepExpired : RdbLoadTarget::Expiry::DropExpired;
+      target.replication = &result;
+      unsigned dropped = 0;
+      target.expired = [&](int db, const std::string& key) {
+        check((db == 0 || db == 1 || db == 15) && key == "expired", "expiry target callback");
+        ++dropped;
+      };
+      check(load_target(path, target, err), "explicit rich load succeeds");
+      check(staging.current_db() == 9 && staging.replica_expiry() == !keep,
+            "target selection and role restored");
+      check(stats.loaded == (keep ? 24 : 21) && stats.expired == (keep ? 0 : 3) &&
+                dropped == (keep ? 0 : 3),
+            "isolated load counters/expiry");
+      check(result.valid(staging.database_count()) && result.stream_db == 15 &&
+                result.offset == 12345,
+            "target AUX published");
+      check(expiry_hooks == 0 && staging.replica_expires_tracked_keys() == 0,
+            "loading never propagates/owns TTLs");
+      check(call(functions, "value") == ":42\r\n" && functions.libraries().size() == 1,
+            "private function callable");
+      DataStore::LazyExpireDisabled guard(staging);
+      for (int db : {0, 1, 15}) {
+        staging.select_db(db);
+        bool wrong = false;
+        check(staging.get("string") == binary && staging.get("large") == large,
+              "binary and large strings in target");
+        check(staging.lrange("list", 0, -1, wrong) == std::vector<std::string>({binary, "b"}),
+              "list in target");
+        check(staging.hget("hash", "f", wrong) == binary && staging.scard("set", wrong) == 2,
+              "hash and set in target");
+        check(staging.zrange("zset", 0, -1, true, wrong) ==
+                  std::vector<std::pair<std::string, double>>({{binary, 1.25}}),
+              "zset in target");
+        DataStore::StreamDump actual;
+        check(staging.dump_stream("stream", actual) && actual.entries == stream.entries &&
+                  actual.entries_added == 3 && actual.max_deleted_id == "3-0" &&
+                  actual.groups.size() == 1,
+              "stream history in target");
+        if (!actual.groups.empty()) {
+          const auto& g = actual.groups[0];
+          check(g.name == "group" && g.entries_read == 2 && g.last_delivered_id == "2-0" &&
+                    g.consumers.size() == 2 && g.pending.size() == 1 &&
+                    g.pending[0].consumer == "consumer" && g.pending[0].delivery_ms == 123456 &&
+                    g.pending[0].delivery_count == 7,
+                "groups/consumers/PEL in target");
+        }
+        check(staging.exists({"expired"}) == keep, "explicit role expiry policy");
+        check(staging.pexpiretime("string") == 9007199254740993LL, "exact absolute TTL");
       }
-      check(staging.exists({"expired"}) == keep, "explicit role expiry policy");
-      check(staging.pexpiretime("string") == 9007199254740993LL, "exact absolute TTL");
     }
   }
   check(live.current_db() == 7 && live.get("live") == "unchanged" &&
@@ -307,7 +342,7 @@ void compare_fixture(const std::filesystem::path& path) {
   target.expiry = RdbLoadTarget::Expiry::KeepExpired;
   target.replication = &aux;
   std::string err;
-  const bool loaded = rdb_load_into(path, target, err);
+  const bool loaded = load_target(path, target, err);
   check(loaded, "external snapshot loads into private target");
   if (!loaded) {
     std::cerr << err << '\n';
@@ -385,7 +420,17 @@ void compare_fixture(const std::filesystem::path& path) {
 int main(int argc, char** argv) {
   peadb::lua_engine_init();
   if (argc > 1) {
-    for (int i = 1; i < argc; ++i) compare_fixture(argv[i]);
+    int first = 1;
+    if (std::string(argv[1]) == "--stream-length") {
+      input_mode = 1;
+      ++first;
+    }
+    if (std::string(argv[1]) == "--stream-eof") {
+      input_mode = 2;
+      ++first;
+    }
+    if (first == argc) return 1;
+    for (int i = first; i < argc; ++i) compare_fixture(argv[i]);
     peadb::lua_engine_shutdown();
     return failures ? 1 : 0;
   }

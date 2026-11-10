@@ -143,6 +143,32 @@ struct RdbLoadTarget {
 };
 bool rdb_load_into(const std::filesystem::path& path, RdbLoadTarget& target, std::string& err);
 
+// Single-pass decoder for an exclusively owned replication source positioned after its bulk
+// header. Positive short reads and -1/EINTR retry; zero is EOF, other errors fail. The source
+// must not return more than requested or mutate a target. Nonblocking sockets need a separate
+// adapter that owns waiting/timeouts/generation cancellation and safe event servicing.
+using RdbReadFn = std::function<ssize_t(void*, std::size_t)>;
+struct RdbStreamFrame {
+  enum class Kind { Length, Eof } kind = Kind::Length;
+  std::size_t length = 0;  // exact RDB bytes for Length; ignored for Eof
+  std::string eof_marker;  // exactly 40 bytes for Eof; ignored for Length
+};
+struct RdbStreamResult {
+  std::size_t rdb_bytes = 0;    // through checksum, excluding the EOF trailer
+  std::size_t frame_bytes = 0;  // includes the EOF trailer
+  std::string read_ahead;       // already-read command bytes; at most 64 KiB
+};
+// Uses the same body decoder as file loads, without seeking, spooling or a checksum prepass.
+// Validates CRC after the RDB EOF, then exact length/trailer. The explicit private target may
+// be partial on any failure; discard it. This is not live dataset publication/rollback.
+// result and target.replication reset on entry and publish only after complete validation.
+// Controls report Apply positions (total=0 for unknown EOF length); callbacks restore target
+// DB selection. Exceptions propagate with target context restored. Source/read-ahead ownership
+// returns to the caller; Length never reads beyond its limit, Eof returns any buffered suffix.
+// Keep the target/registry on the Lua-owning thread. No production load strategy is enabled.
+bool rdb_load_stream_into(const RdbReadFn& source, const RdbStreamFrame& frame,
+                          RdbLoadTarget& target, RdbStreamResult& result, std::string& err);
+
 // Serialize a single key+value into Redis DUMP format (RDB payload + CRC64).
 std::string rdb_dump_key(const std::string& key);
 

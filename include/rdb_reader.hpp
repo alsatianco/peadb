@@ -17,7 +17,7 @@ namespace peadb::detail {
 // Blocking read(2) contract: positive short reads and -1/EINTR retry, zero means EOF,
 // other errors fail. A callback must never return more than requested. No event servicing or
 // datastore mutation is permitted inside it. Streaming transport/admission is separate.
-using RdbReadFn = std::function<ssize_t(void*, std::size_t)>;
+using RdbReadFn = peadb::RdbReadFn;
 
 class RdbReader {
  public:
@@ -47,6 +47,10 @@ class RdbReader {
   }
   std::uint64_t checksum() const {
     return checksum_;
+  }
+  std::string_view unread() const {
+    return streamed_ ? std::string_view(buffer_.data() + begin_, end_ - begin_)
+                     : data_.substr(pos_);
   }
   int error() const {
     return error_;

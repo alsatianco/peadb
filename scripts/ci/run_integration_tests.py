@@ -187,6 +187,12 @@ def main():
         if (test.name == 'test_loading_aof_service.py' and
                 os.environ.get('PEADB_TEST_SANITIZED') == '1'):
             test_budget = max(test_budget, 600.0)
+        # Native/legacy target interop runs three complete decoder modes, each retaining its
+        # 60s helper deadline under sanitizers. Native ARM ASAN takes ~96s in total; leave
+        # room for all three helpers plus Redis/PeaDB roundtrip startup and owned cleanup.
+        if (test.name == 'test_rdb_target_interop.py' and
+                os.environ.get('PEADB_TEST_SANITIZED') == '1'):
+            test_budget = max(test_budget, 240.0)
         code = run_test(test, test_budget, timeout_cmd, log)
         if code == 0:
             passed += 1

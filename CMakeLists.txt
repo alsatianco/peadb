@@ -164,6 +164,10 @@ if(BUILD_TESTING)
   target_link_libraries(rdb_load_control_test PRIVATE peadb_core)
   add_test(NAME rdb_load_control_test COMMAND rdb_load_control_test)
 
+  add_executable(rdb_stream_test tests/unit/rdb_stream_test.cpp)
+  target_link_libraries(rdb_stream_test PRIVATE peadb_core)
+  add_test(NAME rdb_stream_test COMMAND rdb_stream_test)
+
   add_executable(rdb_reader_test tests/unit/rdb_reader_test.cpp)
   target_link_libraries(rdb_reader_test PRIVATE peadb_core)
   add_test(NAME rdb_reader_test COMMAND rdb_reader_test)

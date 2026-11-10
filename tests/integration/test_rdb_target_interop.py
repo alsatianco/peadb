@@ -146,7 +146,10 @@ def run():
         # Linux ASAN/UBSAN needs ~30 CPU seconds for both complete large fixtures.
         # Keep the 65,536-element legacy list and every assertion; Release remains at 15s.
         budget = 60 if os.environ.get('PEADB_TEST_SANITIZED') == '1' else 15
-        subprocess.run([HELPER, str(legacy), str(work / 'dump.rdb')], check=True, timeout=budget)
+        for mode in ((), ('--stream-length',), ('--stream-eof',)):
+            # Each mode retains the complete fixtures/assertions and original per-process budget.
+            subprocess.run([HELPER, *mode, str(legacy), str(work / 'dump.rdb')],
+                           check=True, timeout=budget)
         for original in (legacy, work / 'dump.rdb'):
             output = Path(str(original) + '.peadb.rdb')
             subprocess.run([checker, str(output)], check=True, stdout=subprocess.DEVNULL)
