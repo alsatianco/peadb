@@ -132,3 +132,5 @@ Notes:
 - Some scripts under `scripts/examples/` use third-party packages (e.g. `redis`).
 
 `test_bgsave_status_parity.py` sets the replication source’s diskless-sync delay to zero in its local-save-error fixture. The unchanged five-second convergence bounds check stream application rather than compete with Redis’s default five-second admission delay; dedicated admission tests retain coverage of that setting.
+
+The B8 replication-safety fixture explicitly sets and verifies zero diskless-sync admission delay: its existing five-second full-sync bounds and WAIT latency assertion measure convergence, promotion and acknowledgement. The shared `test_replica_resync_parity.ports()` helper holds every socket in a requested bundle until all endpoints are selected, preventing immediate ephemeral-port reuse within that bundle (including RDB restart-history master/replica pairs); it releases them before server startup and does not provide a cross-process port lease.

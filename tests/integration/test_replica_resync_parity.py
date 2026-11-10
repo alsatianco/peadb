@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Cached-master PSYNC, changed IDs, backlog fallback and idle heartbeats (delta 47)."""
+from contextlib import ExitStack
 import os
 import socket
 import tempfile
@@ -10,8 +11,13 @@ from test_replica_offset_parity import (Conn, PEADB, REDIS, check, info, start, 
 
 def ports(count):
     out = []
-    for _ in range(count):
-        with socket.socket() as s:
+    # Keep the whole bundle bound until selection finishes. Closing each socket inside
+    # the loop lets bind(0) immediately return a port already selected for another server.
+    # This prevents duplicates within the bundle; callers still start servers promptly
+    # after release rather than owning a port lease across process creation.
+    with ExitStack() as reserved:
+        for _ in range(count):
+            s = reserved.enter_context(socket.socket())
             s.bind(('127.0.0.1', 0))
             out.append(s.getsockname()[1])
     return out

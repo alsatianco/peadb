@@ -82,7 +82,8 @@ def expect(c, m):
 
 def start(port, *extra):
     return IsolatedServer([str(SERVER), "--port", str(port), "--bind", "127.0.0.1",
-                             "--loglevel", "warning", *extra])
+                             # These bounds measure convergence/WAIT, not snapshot admission.
+                             "--repl-diskless-sync-delay", "0", "--loglevel", "warning", *extra])
 
 
 def info_field(s, field):
@@ -116,6 +117,8 @@ def test_promotion_rotates_replid():
     try:
         expect(wait_up(mp) and wait_up(rp), "both up")
         sm, sr = conn(mp), conn(rp)
+        expect(cmd(sm, "CONFIG", "GET", "repl-diskless-sync-delay") ==
+               ["repl-diskless-sync-delay", "0"], "source admission delay disabled")
         cmd(sm, "SET", "k", "v")
         expect(cmd(sr, "REPLICAOF", "127.0.0.1", str(mp)) == "OK", "replicaof")
         # wait for sync
@@ -146,6 +149,8 @@ def test_wait_resolves_fast_with_replica():
     try:
         expect(wait_up(mp) and wait_up(rp), "both up")
         sm, sr = conn(mp), conn(rp)
+        expect(cmd(sm, "CONFIG", "GET", "repl-diskless-sync-delay") ==
+               ["repl-diskless-sync-delay", "0"], "source admission delay disabled")
         cmd(sr, "REPLICAOF", "127.0.0.1", str(mp))
         ok = False
         for _ in range(50):
