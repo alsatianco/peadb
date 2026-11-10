@@ -63,6 +63,8 @@ Sanitizer build and integration settings live in the [nightly workflow](.github/
 
 **The parity ratchet**: adopted upstream suites must stay at 0 `[err]`; growing a skipfile (`scripts/redis/skipfiles/`) or lowering a ledger count requires updating `compat/delta.md` in the same change. See the "Verification" section of `compat/delta.md`.
 
+AOF loading regression coverage includes `aof_reader_test` (bounded serialized-input memory, byte/record controls, cancellation/context restoration and transaction/tail repair) plus the Redis-first AOF integration fixtures. Its internal controls do not establish startup network service; see [loading architecture](docs/architecture.md).
+
 ### Adopting an upstream TCL suite
 
 The parity work adopts one upstream suite (or a small batch) per commit:

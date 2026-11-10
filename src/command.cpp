@@ -2707,22 +2707,75 @@ enum class AofStep {
   BadFormat,   // the bytes are not a command (Redis's "bad file format")
 };
 
-// Reads the next command of an AOF held in memory, from `pos` (the start of a line, before the
-// end), the way Redis's loader does with fgets()/fread(): a `*<argc>` line, then for each argument
-// a `$<len>` line and the bytes. What counts as well formed is what redis-check-aof accepts: each
-// number (read like strtol()) is followed by CRLF and nothing else, a length is not negative, and
-// each argument is followed by CRLF. Redis's loader is looser (atoi(), and the two bytes after an
-// argument skipped unchecked), which only matters for a damaged file: torn bytes in the middle of
-// the file, as older PeaDB versions left them, could then be read as a different command.
-AofStep read_aof_step(std::string_view buf, std::size_t& pos, std::vector<std::string>& args) {
-  std::string_view line;
-  bool complete = false;  // the line ends in '\n' (fgets() returned a whole line)
+// The input owns only one bounded read-ahead buffer; command arguments are decoded once.
+// A checkpoint precedes every read/retry and follows complete records. Cancellation and I/O
+// failure must not be mistaken for a torn tail (which may truncate the source).
+struct AofCancelled {};
+struct AofReadError {
+  int error;
+};
+class AofInput {
+ public:
+  AofInput(int fd, std::size_t total, std::function<void(std::size_t)> checkpoint)
+      : fd_(fd), total_(total), checkpoint_(std::move(checkpoint)) {
+  }
+  std::size_t position() const {
+    return position_;
+  }
+  std::size_t remaining() const {
+    return total_ - position_;
+  }
+  bool line(std::string& out) {
+    out.clear();
+    char c;
+    // Redis's AOF_ANNOTATION_LINE_MAX_LEN. A longer header is a format error;
+    // annotation lines cannot make the loader retain an unbounded string either.
+    while (out.size() < 1024 && take(&c, 1)) {
+      out.push_back(c);
+      if (c == '\n') return true;
+    }
+    return false;
+  }
+  bool take(char* out, std::size_t count) {
+    while (count) {
+      if (begin_ == end_) {
+        ssize_t n;
+        for (;;) {
+          if (checkpoint_) checkpoint_(position_);
+          n = ::read(fd_, buffer_.data(), std::min(buffer_.size(), remaining()));
+          if (n >= 0) break;
+          const int error = errno;
+          if (error != EINTR) throw AofReadError{error};
+          // Callbacks may change errno; decide whether to retry before running one.
+        }
+        if (n == 0) return false;
+        begin_ = 0;
+        end_ = static_cast<std::size_t>(n);
+      }
+      const auto n = std::min(count, end_ - begin_);
+      std::memcpy(out, buffer_.data() + begin_, n);
+      out += n;
+      count -= n;
+      begin_ += n;
+      position_ += n;
+    }
+    return true;
+  }
+
+ private:
+  int fd_;
+  std::size_t total_, position_ = 0, begin_ = 0, end_ = 0;
+  std::function<void(std::size_t)> checkpoint_;
+  std::array<char, 65536> buffer_;
+};
+
+// The strict redis-check-aof-compatible validation of headers and CRLF is retained.
+// Redis's loader itself is looser for damaged files (atoi and unchecked trailing bytes).
+AofStep read_aof_step(AofInput& input, std::vector<std::string>& args) {
+  std::string line;
+  bool complete = false;
   const auto next_line = [&] {
-    const std::size_t nl = buf.find('\n', pos);
-    complete = nl != std::string_view::npos;
-    const std::size_t end = complete ? nl + 1 : buf.size();
-    line = buf.substr(pos, end - pos);
-    pos = end;
+    complete = input.line(line);
   };
   // strtol() of what follows the line's first byte; `end` is where it stops (1 with no digits).
   std::size_t end = 1;
@@ -2744,6 +2797,8 @@ AofStep read_aof_step(std::string_view buf, std::size_t& pos, std::vector<std::s
   };
 
   next_line();
+  if (line.empty()) return AofStep::ShortRead;
+  if (!complete && line.size() == 1024) return AofStep::BadFormat;
   if (line[0] == '#') return complete ? AofStep::Annotation : AofStep::ShortRead;
   if (line[0] != '*') return AofStep::BadFormat;
   if (line.size() == 1) return AofStep::ShortRead;  // Redis: buf[1] == '\0'
@@ -2754,17 +2809,21 @@ AofStep read_aof_step(std::string_view buf, std::size_t& pos, std::vector<std::s
   args.clear();
   args.reserve(static_cast<std::size_t>(std::min<long long>(argc, 1024)));
   for (long long j = 0; j < argc; ++j) {
-    if (pos >= buf.size()) return AofStep::ShortRead;
+    if (!input.remaining()) return AofStep::ShortRead;
     next_line();
+    if (line.empty()) return AofStep::ShortRead;
+    if (!complete && line.size() == 1024) return AofStep::BadFormat;
     if (line[0] != '$') return AofStep::BadFormat;
     if (!complete) return AofStep::ShortRead;
     const long long len = number();
     if (len < 0 || !number_ends_line()) return AofStep::BadFormat;
-    if (static_cast<unsigned long long>(len) + 2 > buf.size() - pos) return AofStep::ShortRead;
-    const std::size_t n = static_cast<std::size_t>(len);
-    if (buf[pos + n] != '\r' || buf[pos + n + 1] != '\n') return AofStep::BadFormat;
-    args.emplace_back(buf.substr(pos, n));
-    pos += n + 2;
+    if (input.remaining() < 2 || static_cast<unsigned long long>(len) > input.remaining() - 2)
+      return AofStep::ShortRead;
+    args.emplace_back(static_cast<std::size_t>(len), '\0');
+    if (!input.take(args.back().data(), args.back().size())) return AofStep::ShortRead;
+    char crlf[2];
+    if (!input.take(crlf, 2)) return AofStep::ShortRead;
+    if (crlf[0] != '\r' || crlf[1] != '\n') return AofStep::BadFormat;
   }
   return AofStep::Command;
 }
@@ -17009,22 +17068,39 @@ std::string configure_persistence(const std::string& dbfilename, bool appendonly
   return "Can't open the append-only file " + appendfilename + ": " + std::strerror(errno);
 }
 
-bool load_aof_file(const std::string& path, std::string& err,
-                   const std::function<void()>& service) {
+bool load_aof_file(const std::string& path, std::string& err, const std::function<void()>& service,
+                   const AofLoadControl* control) {
   if (g_loading_events_active) throw std::logic_error("AOF load during loading event service");
   const LoadingScope loading(LoadingMode::Blocking);
   err.clear();
-  std::ifstream in(path, std::ios::binary);
-  if (!in.is_open()) {
+  struct InputFile {
+    int fd;
+    ~InputFile() {
+      if (fd >= 0) ::close(fd);
+    }
+  } file{::open(path.c_str(), O_RDONLY | O_CLOEXEC)};
+  if (file.fd < 0) {
     err = "can't open the append log file " + path + " for reading: " + std::strerror(errno);
     return false;
   }
-  const std::string buffer((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-  const std::string_view view(buffer);
+  struct stat st {};
+  if (::fstat(file.fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0 ||
+      static_cast<std::uintmax_t>(st.st_size) > std::numeric_limits<std::size_t>::max()) {
+    err = "can't stat regular append log file " + path;
+    return false;
+  }
+  const auto total = static_cast<std::size_t>(st.st_size);
+  std::uint64_t records = 0;
+  const auto checkpoint = [&](std::size_t bytes) {
+    if (!control || !control->checkpoint) return;
+    bool proceed = true;
+    service_loading_events([&] { proceed = control->checkpoint({bytes, total, records}); });
+    if (!proceed) throw AofCancelled{};
+  };
+  AofInput input(file.fd, total, checkpoint);
   // Redis's loadSingleAppendOnlyFile(): `valid_up_to` is the end of the last whole command, where
   // a short read at the end cuts the file, so the next append does not land after torn bytes
   // (compat/delta.md item 30).
-  std::size_t pos = 0;
   std::size_t valid_up_to = 0;
   std::size_t valid_before_multi = 0;
   SessionState session{};
@@ -17047,29 +17123,41 @@ bool load_aof_file(const std::string& path, std::string& err,
   } replaying;
   std::vector<std::string> args;
   bool short_read = false;
-  while (pos < view.size()) {
-    if (service) service_loading_events(service);
-    const std::size_t start = pos;
-    const AofStep step = read_aof_step(view, pos, args);
-    if (step == AofStep::Annotation) continue;
-    if (step == AofStep::ShortRead) {
-      short_read = true;
-      break;
+  try {
+    checkpoint(0);
+    while (input.remaining()) {
+      if (service) service_loading_events(service);
+      const std::size_t start = input.position();
+      const AofStep step = read_aof_step(input, args);
+      if (step == AofStep::Annotation) continue;
+      if (step == AofStep::ShortRead) {
+        short_read = true;
+        break;
+      }
+      if (step == AofStep::BadFormat) {
+        err = "Bad file format reading the append only file " + path + " at offset " +
+              std::to_string(start) +
+              ": make a backup of your AOF file, then use ./redis-check-aof --fix <filename>";
+        return false;
+      }
+      if (upper(args[0]) == "MULTI") valid_before_multi = valid_up_to;
+      bool close = false;
+      const auto reply = handle_command(args, session, close);
+      if (is_error_reply(reply)) {
+        err = "AOF replay command failed at offset " + std::to_string(start);
+        return false;
+      }
+      valid_up_to = input.position();
+      ++records;
+      checkpoint(valid_up_to);
     }
-    if (step == AofStep::BadFormat) {
-      err = "Bad file format reading the append only file " + path + " at offset " +
-            std::to_string(start) +
-            ": make a backup of your AOF file, then use ./redis-check-aof --fix <filename>";
-      return false;
-    }
-    if (upper(args[0]) == "MULTI") valid_before_multi = valid_up_to;
-    bool close = false;
-    const auto reply = handle_command(args, session, close);
-    if (is_error_reply(reply)) {
-      err = "AOF replay command failed at offset " + std::to_string(start);
-      return false;
-    }
-    valid_up_to = pos;
+    checkpoint(input.position());
+  } catch (const AofCancelled&) {
+    err = "AOF load cancelled";
+    return false;
+  } catch (const AofReadError& failure) {
+    err = "Error reading the append only file " + path + ": " + std::strerror(failure.error);
+    return false;
   }
   // A MULTI without its EXEC at the end is cut off like a short read, as in Redis, and so is the
   // whole MULTI when the short read is inside it: Redis cuts after the last whole command there,

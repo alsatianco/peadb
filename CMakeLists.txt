@@ -91,6 +91,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(aof_reader_test tests/unit/aof_reader_test.cpp)
+  target_link_libraries(aof_reader_test PRIVATE peadb_core)
+  add_test(NAME aof_reader_test COMMAND aof_reader_test)
+
   add_executable(loading_service_test tests/unit/loading_service_test.cpp)
   target_link_libraries(loading_service_test PRIVATE peadb_core)
   add_test(NAME loading_service_test COMMAND loading_service_test)

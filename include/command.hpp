@@ -153,9 +153,24 @@ std::string configure_persistence(const std::string& dbfilename, bool appendonly
 // Optional internal event service runs between complete AOF records, outside command/EXEC
 // handlers. It is isolated from replay state by service_loading_events(). The caller owns
 // bounded client I/O and must not re-enter loading, drain replication or start persistence.
-// File reading and an individual parsed command are still synchronous/unbounded here.
+// File input is bounded to 64 KiB plus the active command/transaction. Individual command
+// execution, allocation and blocking kernel reads are not preemptible. No production pump
+// or signal cancellation is registered by this API.
+struct AofLoadProgress {
+  std::size_t bytes = 0;      // consumed input, never read-ahead or applied replication offsets
+  std::size_t total = 0;      // size of the opened regular file at entry
+  std::uint64_t records = 0;  // complete replay records, including MULTI/queued/EXEC records
+};
+struct AofLoadControl {
+  // Guarded observation/service before reads/EINTR retries and after records; never inside
+  // a handler/EXEC. Must not mutate the target, compile Lua, recurse or start persistence.
+  // False returns "AOF load cancelled" without truncating the file. Prior complete effects
+  // can remain; cancellation is not rollback. Exceptions propagate with context restored.
+  std::function<bool(const AofLoadProgress&)> checkpoint;
+};
 bool load_aof_file(const std::string& path, std::string& err,
-                   const std::function<void()>& service = {});
+                   const std::function<void()>& service = {},
+                   const AofLoadControl* control = nullptr);
 // Each event-loop pass: writes again what a failed AOF write left, and runs the everysec fsync.
 void aof_cron(std::int64_t now_ms);
 void reap_background_children();
