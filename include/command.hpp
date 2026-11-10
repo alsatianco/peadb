@@ -150,7 +150,12 @@ std::vector<std::string> command_names();
 std::string configure_persistence(const std::string& dbfilename, bool appendonly,
                                   const std::string& appendfilename,
                                   const std::string& appendfsync);
-bool load_aof_file(const std::string& path, std::string& err);
+// Optional internal event service runs between complete AOF records, outside command/EXEC
+// handlers. It is isolated from replay state by service_loading_events(). The caller owns
+// bounded client I/O and must not re-enter loading, drain replication or start persistence.
+// File reading and an individual parsed command are still synchronous/unbounded here.
+bool load_aof_file(const std::string& path, std::string& err,
+                   const std::function<void()>& service = {});
 // Each event-loop pass: writes again what a failed AOF write left, and runs the everysec fsync.
 void aof_cron(std::int64_t now_ms);
 void reap_background_children();
@@ -371,6 +376,14 @@ LoadingMode loading_mode();
 void set_loading_mode(LoadingMode mode);
 // Startup compatibility wrapper; an active load also forces signal shutdown to use NOSAVE.
 void set_loading(bool loading);
+// Execute an internal event-service callback at a safe loading checkpoint, with ordinary
+// client dispatch independent of the loader's replay/EXEC/propagation/selected-DB context.
+// Restores that context on return or exception; actual client/config/stream effects persist.
+// Requires an active load, the event-loop thread, no Lua frame/compilation/target iterator,
+// and distinct client sessions (never the loader's fake/master/active dispatch client).
+// Recursive service and service from Lua throw logic_error before invoking the callback.
+// This is an execution boundary, not a server event pump or a cancellation policy.
+void service_loading_events(const std::function<void()>& service);
 class LoadingScope {
  public:
   explicit LoadingScope(LoadingMode mode) : previous_(loading_mode()) {

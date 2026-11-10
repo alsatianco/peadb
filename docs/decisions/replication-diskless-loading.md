@@ -2,7 +2,7 @@
 
 Date: 2026-10-30
 
-Status: accepted design; bounded codecs/explicit targets, EOF reception, master pipe/completion/ACK transport and live admission are implemented (R4a–R4d3). Shared blocking/async command admission is implemented; the controlled event pump, startup service and direct/asynchronous loading remain pending. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
+Status: accepted design; bounded codecs/explicit targets, EOF reception, master pipe/completion/ACK transport and live admission are implemented (R4a–R4d3). Shared blocking/async command admission and guarded internal client-dispatch boundaries are implemented; the controlled server event pump, startup service and direct/asynchronous loading remain pending. Current support and verification belong to [delta items 8, 24, 46 and 70](../../compat/delta.md).
 
 ## Problem and specification
 
@@ -98,6 +98,8 @@ Use Redis's byte-interval setting to bound servicing opportunities and time-base
 For startup, initialize listeners and the loading pump before RDB or AOF replay; begin configured replication only after loading succeeds. Preserve AOF-over-RDB precedence, authenticating clients, no-save shutdown during load and immediate second-SIGINT behavior. Startup should answer permitted INFO/AUTH and LOADING for other commands, then require a successful authenticated protocol round trip for readiness. Moving the listener alone does not fix startup event servicing or prompt signal cancellation.
 
 Decoder prerequisite delivered (2026-11-10): explicit RDB controls now provide phased bounded byte/key progress and cancellation, restore target database selection around callbacks, and apply real `key-load-delay` with polling during delays. These callbacks do not permit target mutation or unguarded command dispatch. The controlled server pump, full replay/propagation context preservation, INFO publication, startup RDB/AOF service and prompt signal shutdown remain required; the [decoder architecture](../architecture.md) documents the implemented boundary.
+
+Execution-context prerequisite delivered (2026-11-10): `service_loading_events()` isolates nested clients from replay/master-stream flags, EXEC/blocking flags, execution nesting, pending propagation, selected DB and command/script bookkeeping, restoring on exceptions while retaining real client/config/stream effects. Explicit AOF callbacks run between complete records outside EXEC handlers and replay restores its prior state. RDB callbacks can invoke this boundary. No production event loop is attached yet; the caller must filter and bound I/O, pin active sessions, avoid Lua/iterators and own cancellation. Recursion/Lua/AOF re-entry is refused. Startup listeners, INFO progress, prompt signal cancellation and bounded AOF input remain open; neither direct loading nor swapdb is enabled.
 
 ## Acceptance and delivery boundaries
 

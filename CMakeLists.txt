@@ -91,6 +91,10 @@ endif()
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(loading_service_test tests/unit/loading_service_test.cpp)
+  target_link_libraries(loading_service_test PRIVATE peadb_core)
+  add_test(NAME loading_service_test COMMAND loading_service_test)
+
   add_executable(loading_admission_test tests/unit/loading_admission_test.cpp)
   target_link_libraries(loading_admission_test PRIVATE peadb_core)
   add_test(NAME loading_admission_test COMMAND loading_admission_test)

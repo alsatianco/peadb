@@ -149,6 +149,10 @@ std::string g_master_stream_command_name;
 // Set while re-dispatching a blocked XREAD/XREADGROUP from try_unblock_client so the
 // handler reads once instead of re-registering a block.
 thread_local bool g_block_disabled = false;
+// The loader may suspend a dispatch at an explicit safe boundary. Keep its command scratch
+// alongside the other saved execution state, rather than hidden in handle_command_impl().
+thread_local std::string g_dispatch_command;
+bool g_loading_events_active = false;  // event-loop thread only; never a second event pump
 int g_aof_fd = -1;
 std::string g_appendfsync = "everysec";
 // Redis's aof_last_write_status/aof_last_write_errno and aof_bio_fsync_status/aof_bio_fsync_errno:
@@ -16062,10 +16066,10 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
   }
 
   // Upper-case the command name in-place using a thread-local buffer to avoid allocation
-  thread_local std::string cmd_buf;
-  cmd_buf.assign(args[0]);
-  for (auto& c : cmd_buf) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-  const std::string& cmd = cmd_buf;
+  g_dispatch_command.assign(args[0]);
+  for (auto& c : g_dispatch_command)
+    c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+  const std::string& cmd = g_dispatch_command;
   const bool is_script_cmd = (cmd == "EVAL" || cmd == "EVALSHA" || cmd == "EVAL_RO" ||
                               cmd == "EVALSHA_RO" || cmd == "FCALL" || cmd == "FCALL_RO");
   if (is_script_cmd) {
@@ -16390,7 +16394,7 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
     }
   }
 
-  // `cmd` aliases a thread_local buffer that nested dispatch (EVAL/EXEC inner commands)
+  // `cmd` aliases the thread-local dispatch scratch that nested dispatch (EVAL/EXEC inner commands)
   // clobbers — snapshot the name for everything after the handler call. Command names
   // fit in SSO, so this never heap-allocates.
   const std::string cmd_after = cmd;
@@ -17005,7 +17009,10 @@ std::string configure_persistence(const std::string& dbfilename, bool appendonly
   return "Can't open the append-only file " + appendfilename + ": " + std::strerror(errno);
 }
 
-bool load_aof_file(const std::string& path, std::string& err) {
+bool load_aof_file(const std::string& path, std::string& err,
+                   const std::function<void()>& service) {
+  if (g_loading_events_active) throw std::logic_error("AOF load during loading event service");
+  const LoadingScope loading(LoadingMode::Blocking);
   err.clear();
   std::ifstream in(path, std::ios::binary);
   if (!in.is_open()) {
@@ -17026,15 +17033,22 @@ bool load_aof_file(const std::string& path, std::string& err) {
   // while its keys were alive, so `SET k 5 PXAT <past>` then `INCR k` must give 6 (and expire),
   // not a new key 1 without a TTL; the expired keys are deleted, with their DEL, after the load.
   const DataStore::LazyExpireDisabled no_lazy_expire(store());
-  g_replaying_aof = true;
   struct ReplayingAof {
+    bool previous = g_replaying_aof;
+    bool previous_master = g_applying_master_stream;
+    ReplayingAof() {
+      g_replaying_aof = true;
+      g_applying_master_stream = false;
+    }
     ~ReplayingAof() {
-      g_replaying_aof = false;
+      g_replaying_aof = previous;
+      g_applying_master_stream = previous_master;
     }
   } replaying;
   std::vector<std::string> args;
   bool short_read = false;
   while (pos < view.size()) {
+    if (service) service_loading_events(service);
     const std::size_t start = pos;
     const AofStep step = read_aof_step(view, pos, args);
     if (step == AofStep::Annotation) continue;
@@ -17423,6 +17437,58 @@ void shutdown_signal_handler(int sig) {
 
 bool shutdown_signal_pending() {
   return g_shutdown_asap.load() != 0;
+}
+
+void service_loading_events(const std::function<void()>& service) {
+  if (loading_mode() == LoadingMode::None || g_loading_events_active || in_lua_script_context())
+    throw std::logic_error("unsafe loading event service");
+  // These are execution-local values, not server state. Client/config/statistics changes and
+  // emitted AOF/backlog bytes survive servicing. In particular, do not roll back stream DB
+  // cursors or offsets after a permitted async client write.
+  struct ExecutionContext {
+    int db = store().current_db();
+    bool replaying = g_replaying_aof;
+    bool master_stream = g_applying_master_stream;
+    bool executing_exec = g_executing_exec;
+    bool block_disabled = g_block_disabled;
+    bool unchanged = g_write_changed_nothing;
+    bool script_error = g_script_inner_error_seen;
+    int script_repl = g_script_repl_flags;
+    int nesting = g_execution_nesting;
+    std::string command;
+    std::string master_command;
+    std::vector<PendingPropagation> pending;
+    ExecutionContext() {
+      command.swap(g_dispatch_command);
+      master_command.swap(g_master_stream_command_name);
+      pending.swap(g_also_propagate);
+      g_replaying_aof = false;
+      g_applying_master_stream = false;
+      g_executing_exec = false;
+      g_block_disabled = false;
+      g_write_changed_nothing = false;
+      g_script_inner_error_seen = false;
+      g_script_repl_flags = 3;
+      g_execution_nesting = 0;
+      g_loading_events_active = true;
+    }
+    ~ExecutionContext() {
+      store().select_db(db);
+      command.swap(g_dispatch_command);
+      master_command.swap(g_master_stream_command_name);
+      pending.swap(g_also_propagate);
+      g_replaying_aof = replaying;
+      g_applying_master_stream = master_stream;
+      g_executing_exec = executing_exec;
+      g_block_disabled = block_disabled;
+      g_write_changed_nothing = unchanged;
+      g_script_inner_error_seen = script_error;
+      g_script_repl_flags = script_repl;
+      g_execution_nesting = nesting;
+      g_loading_events_active = false;
+    }
+  } context;
+  if (service) service();
 }
 
 LoadingMode loading_mode() {
