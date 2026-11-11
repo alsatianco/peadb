@@ -41,6 +41,14 @@ Internal representations differ from Redis but preserve observable semantics:
 - **Streams** — in-memory entries + consumer-group PEL; core ops work, advanced PEL features are partial.
 - `OBJECT ENCODING` synthesizes Redis-style encoding names from element counts/sizes to mimic Redis's encoding-transition thresholds.
 
+### Prepared dataset exchange and retirement
+
+The internal [DataStore API](../include/datastore.hpp) exchanges database payloads, pause/replica-hidden keys and local TTL ownership without moving the live object's address, selected database, runtime policy, hooks, counters or worker synchronization. Callers must release map/entry references before exchange; each object's mutation epoch advances. A loader's staging datastore has ordinary decoded keys and no local TTL ownership. Hidden maps follow their keys if exchanged; expiry policy and its scoped guards remain with each object.
+
+`prepare_dataset_retirement()` allocates an empty ticket and starts the existing lazyfree worker before publication. Preparation failure changes neither dataset and is retryable. After exchange, `retire_dataset()` detaches the old datastore into that ticket and submits it through an intrusive queue without allocation, per-key traversal or inline destruction; the empty datastore remains usable. The worker frees keys, hidden maps and the TTL tracker, accounts pending physical keys and drains both retirement and ordinary lazyfree jobs before joining at shutdown. No Lua registry is handed to this worker. `dataset_exchange_test` sweeps preparation allocations, forbids caller allocation/free during exchange/submission and covers all databases, value types, hidden keys, aborted staging and 100,000-key retirement.
+
+These primitives are prerequisites for the [replica publication design](decisions/replication-diskless-loading.md#replica-loading-and-publication). The complete function/history/client/persistence boundary and production direct loading remain pending; a datastore exchange alone does not publish a replica snapshot safely.
+
 ## Key expiry
 
 Hybrid **lazy + active**, like Redis's `expireIfNeeded()` and `activeExpireCycle()`. A key is expired once the time is past its expire time (`now > when`). Lazy: a command that meets an expired key deletes it. Active: `active_expire_cycle()` runs at most every ~100 ms on a master, scanning up to 64 keys per database starting from a **randomly chosen bucket** (no front-bias / tail starvation).

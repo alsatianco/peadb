@@ -77,6 +77,8 @@ Matching ID means comparing the existing local replication history with the inco
 
 At a successful swap, first ensure the generation still matches and finish all fallible decoding, function compilation and EOF/CRC verification. In one event-loop publication boundary, invalidate the replaced keyspace's watches/blocking dependencies as Redis does, detach downstream history, exchange dataset and function contexts, clear local writable-replica TTL ownership, initialize the master's stream session/database/offset and backlog, and transfer socket ownership back. Wake/recheck affected clients only against the published state. Never acknowledge bytes received as though their commands had been applied. Discard pre-snapshot held commands and incomplete transactions without replaying effects already included in the snapshot.
 
+The datastore exchange/prepared retirement prerequisite is implemented; its ownership contract and validation are described in [storage architecture](../architecture.md#prepared-dataset-exchange-and-retirement). Production use still requires the complete publication boundary above.
+
 Retirement is part of the design: free old/staging data in bounded event-loop work or through an existing safe lazy-free ownership transfer, with function unrefs performed on the Lua-owning thread. Destroying a multi-million-key old dataset synchronously after a nominally fast swap can still stall every client. Allocation failure before publication aborts staging without replacing old state; no fallible work should be hidden inside a purported atomic exchange.
 
 ### Persistence during full sync

@@ -67,7 +67,7 @@ The sanitized `test_loading_aof_service.py` keeps its 600,000 replay records and
 
 AOF loading regression coverage includes `aof_reader_test` (bounded serialized-input memory, byte/record controls, cancellation/context restoration and transaction/tail repair) plus the Redis-first AOF integration fixtures. Production startup and disk-spooled full-sync loading use guarded bounded client service; regressions are in `test_loading_event_service.py`, `test_loading_aof_service.py`, `test_loading_fullsync_service.py` and `test_loading_shutdown_service.py`. See [loading architecture](docs/architecture.md) for cancellation and progress limits.
 
-The internal framed-source RDB API and its file/length/EOF fixture matrix are documented in [persistence architecture](docs/architecture.md#persistence). The post-spool production handoff uses owned generation/attempt socket sessions. The internal event-loop socket source and Redis strategy oracle are described in [replication architecture](docs/architecture.md#replication); raw-header activation and transactional publication remain pending.
+The internal framed-source RDB API and its file/length/EOF fixture matrix are documented in [persistence architecture](docs/architecture.md#persistence). The post-spool production handoff uses owned generation/attempt socket sessions. The internal event-loop socket source and Redis strategy oracle are described in [replication architecture](docs/architecture.md#replication); raw-header activation and transactional publication remain pending. Internal datastore exchange/prepared retirement and its allocation-failure regression are documented in [storage architecture](docs/architecture.md#prepared-dataset-exchange-and-retirement).
 
 ### Adopting an upstream TCL suite
 

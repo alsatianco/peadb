@@ -186,6 +186,11 @@ if(BUILD_TESTING)
   target_link_libraries(rdb_target_test PRIVATE peadb_core)
   add_test(NAME rdb_target_test COMMAND rdb_target_test)
 
+  add_executable(dataset_exchange_test tests/unit/dataset_exchange_test.cpp)
+  target_link_libraries(dataset_exchange_test PRIVATE peadb_core)
+  add_test(NAME dataset_exchange_test COMMAND dataset_exchange_test)
+  set_tests_properties(dataset_exchange_test PROPERTIES TIMEOUT 60)
+
   add_executable(rdb_replication_test tests/unit/rdb_replication_test.cpp)
   target_link_libraries(rdb_replication_test PRIVATE peadb_core)
   add_test(NAME rdb_replication_test COMMAND rdb_replication_test)

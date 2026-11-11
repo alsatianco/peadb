@@ -216,6 +216,56 @@ std::optional<std::int64_t> stream_cg_lag(const Entry::StreamT& st, const Entry:
 DataStore::DataStore() : current_db_(0), dbs_(16), hidden_expired_(16), replica_hidden_(16) {
 }
 
+DataStore::DatasetRetirement::DatasetRetirement(DataStore* owner)
+    : owner_(owner), dbs_(16), hidden_(16), replica_hidden_(16) {
+}
+DataStore::DatasetRetirement::~DatasetRetirement() = default;
+
+std::unique_ptr<DataStore::DatasetRetirement> DataStore::prepare_dataset_retirement() {
+  auto ticket = std::unique_ptr<DatasetRetirement>(new DatasetRetirement(this));
+  ensure_lazyfree_thread();
+  return ticket;
+}
+
+void DataStore::exchange_dataset(DataStore& other) noexcept {
+  if (&other == this) return;
+  dbs_.swap(other.dbs_);
+  hidden_expired_.swap(other.hidden_expired_);
+  replica_hidden_.swap(other.replica_hidden_);
+  replica_expiring_.swap(other.replica_expiring_);
+  std::swap(replica_expire_cursor_, other.replica_expire_cursor_);
+  std::swap(has_replica_hidden_, other.has_replica_hidden_);
+  ++mutation_epoch_;
+  ++other.mutation_epoch_;
+}
+
+void DataStore::retire_dataset(DataStore& detached,
+                               std::unique_ptr<DatasetRetirement> ticket) noexcept {
+  if (&detached == this || !ticket || ticket->owner_ != this || !lazyfree_started_)
+    std::terminate();
+  ticket->dbs_.swap(detached.dbs_);
+  ticket->hidden_.swap(detached.hidden_expired_);
+  ticket->replica_hidden_.swap(detached.replica_hidden_);
+  ticket->replica_expiring_.swap(detached.replica_expiring_);
+  detached.replica_expire_cursor_ = 0;
+  detached.has_replica_hidden_ = false;
+  ++detached.mutation_epoch_;
+  std::size_t keys = 0;
+  for (std::size_t i = 0; i < ticket->dbs_.size(); ++i)
+    keys += ticket->dbs_[i].size() + ticket->hidden_[i].size() + ticket->replica_hidden_[i].size();
+  lazyfree_pending_.fetch_add(keys, std::memory_order_relaxed);
+  {
+    std::lock_guard<std::mutex> lock(lazyfree_mu_);
+    auto* tail = ticket.get();
+    if (retirement_tail_)
+      retirement_tail_->next_ = std::move(ticket);
+    else
+      retirement_head_ = std::move(ticket);
+    retirement_tail_ = tail;
+  }
+  lazyfree_cv_.notify_one();
+}
+
 bool DataStore::select_db(int db_index) {
   if (db_index < 0 || db_index >= static_cast<int>(dbs_.size())) return false;
   current_db_ = db_index;
@@ -3615,25 +3665,38 @@ DataStore::~DataStore() {
 
 void DataStore::ensure_lazyfree_thread() {
   if (lazyfree_started_) return;
-  lazyfree_started_ = true;
   lazyfree_thread_ = std::thread([this] {
     for (;;) {
-      std::deque<DB> batch;
+      DB db;
+      std::unique_ptr<DatasetRetirement> retired;
       {
         std::unique_lock<std::mutex> lk(lazyfree_mu_);
-        lazyfree_cv_.wait(lk, [this] { return lazyfree_stop_ || !lazyfree_queue_.empty(); });
-        if (lazyfree_queue_.empty() && lazyfree_stop_) return;
-        batch.swap(lazyfree_queue_);
+        lazyfree_cv_.wait(
+            lk, [this] { return lazyfree_stop_ || !lazyfree_queue_.empty() || retirement_head_; });
+        if (lazyfree_queue_.empty() && !retirement_head_ && lazyfree_stop_) return;
+        if (retirement_head_) {
+          retired = std::move(retirement_head_);
+          retirement_head_ = std::move(retired->next_);
+          if (!retirement_head_) retirement_tail_ = nullptr;
+        } else {
+          db.swap(lazyfree_queue_.front());
+          lazyfree_queue_.pop_front();
+        }
       }
-      // Destruct the detached maps (and every Entry/payload they own) here, off the
-      // event-loop thread. These maps are exclusively owned by `batch` — moved out of the
-      // live keyspace before handoff — so there is no race with command processing.
-      std::size_t keys = 0;
-      for (const auto& db : batch) keys += db.size();
-      batch.clear();
+      // Exclusive detached ownership; no allocation, Lua access or live-map access.
+      std::size_t keys = db.size();
+      if (retired) {
+        for (std::size_t i = 0; i < retired->dbs_.size(); ++i)
+          keys += retired->dbs_[i].size() + retired->hidden_[i].size() +
+                  retired->replica_hidden_[i].size();
+        retired.reset();
+      }
+      db.clear();
       lazyfree_pending_.fetch_sub(keys, std::memory_order_relaxed);
     }
   });
+  // A failed std::thread construction must leave preparation retryable.
+  lazyfree_started_ = true;
 }
 
 void DataStore::lazyfree_enqueue(DB&& db) {

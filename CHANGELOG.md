@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Add internal stable-address datastore exchange and preallocated background retirement for old or failed staging datasets; preparation failures preserve both datasets. Production replica publication remains pending (delta 8).
+
 - Give each replica file-load handoff an owned generation/attempt-tagged socket session and exception-safe completion. Add an internal cancellable event-loop socket source and Redis load-strategy selector; production direct/swapdb loading still awaits transactional publication (delta 8).
 
 - Add an explicit single-pass RDB source decoder for length and EOF frames, sharing file value/function/stream decoding, validating incremental CRC and exact trailers, and returning bounded command read-ahead. Production replica socket handoff and transactional swapdb remain pending (delta 8).

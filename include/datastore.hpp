@@ -241,8 +241,37 @@ struct Entry {
 };
 
 class DataStore {
+  // Dataset ownership is separate from runtime hooks, policies and worker synchronization.
+  using DB = DictMap<std::string, Entry, DictStringHash, std::equal_to<std::string>,
+                     KeyspaceExpandAllowed>;
+
  public:
   DataStore();
+
+  // Internal main-thread publication primitives. Preparation may throw, without changing
+  // any data; exchange/retirement allocate nothing and never destroy entries on the caller.
+  // Exchange includes hidden keys and local TTL ownership, but preserves each object's
+  // address, selected DB, hooks, policies, statistics, expiry guards and lazyfree worker.
+  // Call only between commands with no outstanding Entry/map references. This is NOT the
+  // complete replication publication boundary (functions/history/clients/persistence).
+  class DatasetRetirement {
+   public:
+    ~DatasetRetirement();
+
+   private:
+    friend class DataStore;
+    explicit DatasetRetirement(DataStore* owner);
+    DataStore* owner_;
+    std::vector<DB> dbs_, hidden_, replica_hidden_;
+    Dict<std::string, std::uint64_t, DictStringHash> replica_expiring_;
+    std::unique_ptr<DatasetRetirement> next_;
+  };
+  std::unique_ptr<DatasetRetirement> prepare_dataset_retirement();
+  void exchange_dataset(DataStore& other) noexcept;
+  // Submit a detached dataset to THIS object's worker using a ticket prepared by THIS
+  // object. The detached store remains empty/usable. Unused tickets are safe to destroy.
+  // A ticket and its owner must remain alive until submission; self-retirement is invalid.
+  void retire_dataset(DataStore& detached, std::unique_ptr<DatasetRetirement> ticket) noexcept;
 
   bool select_db(int db_index);
   int current_db() const;
@@ -775,10 +804,6 @@ class DataStore {
   ~DataStore();
 
  private:
-  // The keyspace of one database: a Dict, so SCAN's cursor keeps Redis's guarantee across resizes.
-  using DB = DictMap<std::string, Entry, DictStringHash, std::equal_to<std::string>,
-                     KeyspaceExpandAllowed>;
-
   // Redis's keyIsExpired(): the key has a TTL that has passed, and lazy expiry is not disabled.
   bool logically_expired(const Entry& e, std::int64_t now) const {
     return e.expire_at_ms.has_value() && now > *e.expire_at_ms && lazy_expire_disabled_ == 0;
@@ -835,6 +860,8 @@ class DataStore {
   std::mutex lazyfree_mu_;
   std::condition_variable lazyfree_cv_;
   std::deque<DB> lazyfree_queue_;
+  std::unique_ptr<DatasetRetirement> retirement_head_;
+  DatasetRetirement* retirement_tail_ = nullptr;
   std::atomic<std::size_t> lazyfree_pending_{0};  // keys queued or being freed by the thread
   bool lazyfree_stop_ = false;
   bool lazyfree_started_ = false;
