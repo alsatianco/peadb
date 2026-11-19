@@ -143,7 +143,8 @@ def run(redis, helper, mode, occupied, matching, work):
 def main():
     redis = redis_server_path()
     assert redis and 'v=7.2.5 ' in subprocess.check_output([redis, '--version'], text=True)
-    candidates = [Path.cwd() / 'replication_load_test', ROOT / 'build' / 'replication_load_test']
+    build = 'build-asan' if os.environ.get('PEADB_TEST_SANITIZED') == '1' else 'build'
+    candidates = [ROOT / build / 'replication_load_test', Path.cwd() / 'replication_load_test']
     helper = Path(os.environ.get('PEADB_LOAD_HELPER', next(
         (str(p) for p in candidates if p.is_file()), '')))
     assert helper.is_file(), 'build replication_load_test first'
