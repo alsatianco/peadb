@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <optional>
+#include <map>
 #include <cstdint>
 #include <unordered_map>
 #include <functional>
@@ -58,8 +59,19 @@ struct SessionState {
   // processCommand() checks EXEC. Reset by MULTI.
   std::uint64_t multi_flags = 0;
   std::uint64_t multi_inv_flags = 0;
+  struct WatchedKey {
+    std::optional<std::string> digest;
+    bool expired = false;
+  };
   std::optional<std::uint64_t> watched_epoch;
-  std::unordered_map<std::string, std::optional<std::string>> watched_digests;
+  // Database identity survives SELECT. Repeated WATCH retains the original observation.
+  std::map<std::pair<int, std::string>, WatchedKey> watched_digests;
+  bool watched_dirty = false;
+  void clear_watches() {
+    watched_epoch.reset();
+    watched_digests.clear();
+    watched_dirty = false;
+  }
   bool asking = false;
   bool replica_stream = false;
   ReplicaSyncState repl_sync_state = ReplicaSyncState::Online;

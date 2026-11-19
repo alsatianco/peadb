@@ -16,6 +16,7 @@
 #include <thread>
 #include <chrono>
 #include <atomic>
+#include <array>
 #include <cstring>
 #include <stdexcept>
 
@@ -420,6 +421,124 @@ void large_discard_and_shutdown() {
   // Queue/worker destructors below own partially drained shutdown, before Lua shutdown.
   check(invoke(functions, "old") == ":1\r\n", "large abort keeps original closure state");
 }
+void watch_publication() {
+  // The publication API must follow Redis touchAllWatchedKeysInDb even for identical
+  // values; comparing final digests alone would incorrectly permit those transactions.
+  for (int outcome = 0; outcome < 5; ++outcome) {
+    DataStore live;
+    FunctionRegistry functions;
+    FunctionRetirementQueue queue;
+    live.set("key", "new-value", false, false, std::nullopt, false);
+    live.set("old-only", "v", false, false, std::nullopt, false);
+    live.set("expired-gone", "v", false, false, 1, false);
+    live.set("expired-both", "v", false, false, 1, false);
+    live.select_db(15);
+    live.set("ttl", "future", false, false, 4102444800000LL, false);
+    live.set_replica_expiry(true);
+    live.get("absent");
+    live.select_db(0);
+    live.get("expired-both");  // hidden replica key remains physically relevant to WATCH.
+    const auto epoch = live.mutation_epoch();
+    std::array<SessionState, 10> clients;
+    const std::array<const char*, 10> names = {
+        "key",         "old-only", "missing", "expired-gone",  "expired-both",
+        "expired-new", "ttl",      "key",     "incoming-only", "key"};
+    for (std::size_t i = 0; i < clients.size(); ++i) {
+      const int db = i == 6 ? 15 : (i == 7 ? 1 : 0);
+      live.select_db(db);
+      clients[i].db_index = 7;  // WATCH must retain its own database, not client's current DB.
+      clients[i].watched_digests.emplace(
+          std::make_pair(db, names[i]),
+          SessionState::WatchedKey{live.watch_digest(names[i]),
+                                   live.watch_state(db, names[i], DataStore::now_ms()).expired});
+    }
+    // Client8 began with a missing key that the incoming snapshot creates.
+    clients[8].watched_digests.begin()->second.digest.reset();
+    clients[9].watched_digests.begin()->second = {std::nullopt, true};
+    live.select_db(9);
+    auto bytes = snapshot();
+    bytes.resize(bytes.size() - 9);
+    bytes += char(0xfe);
+    bytes += char(0);
+    for (const char* key : {"expired-both", "expired-new"}) {
+      bytes += char(0xfc);
+      bytes += char(1);
+      bytes.append(7, '\0');
+      bytes += char(0);
+      string(bytes, key);
+      string(bytes, "v");
+    }
+    bytes += char(0);
+    string(bytes, "incoming-only");
+    string(bytes, "created");
+    bytes += char(0xff);
+    bytes.append(8, '\0');
+    RdbStreamFrame frame;
+    frame.length = bytes.size();
+    if (outcome == 4) bytes.back() = char(1);  // invalid CRC never publishes watch effects
+    std::size_t pos = 0;
+    std::string err;
+    ReplicationLoadStage stage(live, functions, queue, identity);
+    check(stage.load(reader(bytes, pos), frame, err) == (outcome != 4),
+          "WATCH replacement stage validates before touching clients");
+    std::array<SessionState*, 11> pinned{};
+    for (std::size_t i = 0; i < clients.size(); ++i) pinned[i] = &clients[i];
+    const auto before = caller_frees;
+    fail_after = 0;
+    forbid_free = true;
+    bool committed = false;
+    if (outcome == 2) {
+      stage.discard();
+    } else {
+      const auto current =
+          outcome == 1   ? ReplicationLoadIdentity{identity.generation, identity.attempt + 1}
+          : outcome == 3 ? ReplicationLoadIdentity{identity.generation + 1, identity.attempt}
+                         : identity;
+      committed = stage.publish(current, pinned);
+    }
+    const bool no_allocations = fail_after == 0, no_frees = caller_frees == before;
+    fail_after = -1;
+    forbid_free = false;
+    check(no_allocations && no_frees,
+          "WATCH publication/stale/discard allocates and frees nothing");
+    check(live.current_db() == 9, "WATCH publication never changes selected DB");
+    check(committed == (outcome == 0), "only exact identity publishes WATCH effects");
+    if (committed) {
+      check(clients[0].watched_dirty && clients[1].watched_dirty && clients[6].watched_dirty &&
+                clients[8].watched_dirty && clients[9].watched_dirty,
+            "identical/replaced/deleted/new and DB15 watches invalidate together");
+      check(!clients[2].watched_dirty && !clients[7].watched_dirty,
+            "missing keys and identical names in unaffected databases stay valid");
+      check(!clients[3].watched_dirty && !clients[3].watched_digests.begin()->second.expired,
+            "expired watched key removed clears its expired flag without invalidation");
+      check(!clients[4].watched_dirty && clients[4].watched_digests.begin()->second.expired,
+            "expired watched key remains expired without invalidation");
+      check(!clients[5].watched_dirty && clients[5].watched_digests.begin()->second.expired,
+            "missing watch replaced by expired key records expiry without invalidation");
+      // Exercise the actual EXEC dirty-CAS branch with a missing digest in the singleton
+      // store: digest comparison alone cannot explain this abort.
+      bool close = false;
+      check(handle_command({"WATCH", "ignored-while-dirty"}, clients[8], close) == "+OK\r\n" &&
+                clients[8].watched_digests.size() == 1,
+            "repeated WATCH cannot reset a replacement-invalidated subscription");
+      check(handle_command({"MULTI"}, clients[8], close) == "+OK\r\n" &&
+                handle_command({"PING"}, clients[8], close) == "+QUEUED\r\n" &&
+                handle_command({"EXEC"}, clients[8], close) == "*-1\r\n",
+            "EXEC honors replacement invalidation even when current digest is unchanged");
+      check(!clients[8].watched_dirty && clients[8].watched_digests.empty(),
+            "aborted EXEC clears replacement watch state");
+    } else {
+      for (const auto& client : clients)
+        check(!client.watched_dirty, "stale/aborted stage preserves every client watch");
+      check(clients[3].watched_digests.begin()->second.expired &&
+                !clients[5].watched_digests.begin()->second.expired,
+            "stale/aborted stage preserves watch expiry observations");
+      check(live.mutation_epoch() == epoch, "stale/aborted WATCH stage preserves live epoch");
+    }
+    drain(live, queue);
+  }
+}
+
 void exception_unwind() {
   DataStore live;
   FunctionRegistry functions;
@@ -449,6 +568,7 @@ int main() {
   successful_pair(true);
   rejected_loads();
   decode_allocation_failures();
+  watch_publication();
   exception_unwind();
   large_discard_and_shutdown();
   peadb::lua_engine_shutdown();

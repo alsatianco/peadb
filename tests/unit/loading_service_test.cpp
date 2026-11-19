@@ -4,6 +4,7 @@
 #include "rdb.hpp"
 
 #include <filesystem>
+#include <csignal>
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
@@ -222,9 +223,42 @@ void execution(const std::filesystem::path& dir) {
   store().select_db(9);
   check(store().get("nested") == "1", "nested AOF mutation persisted exactly once");
 }
+void late_signal(const std::filesystem::path& dir, bool aof) {
+  using namespace peadb;
+  const auto snapshot = dir / "signal.rdb";
+  const auto append = dir / "signal.aof";
+  std::string err;
+  store().select_db(0);
+  store().set("saved", "original", false, false, {}, false);
+  if (aof) {
+    write(append, resp({"SET", "from-aof", "value"}));
+  } else {
+    check(rdb_save(snapshot, err), "late-signal RDB fixture saved");
+  }
+  const auto before = aof ? read(append) : read(snapshot);
+  store().set("unsaved", "must-not-save", false, false, {}, false);
+  configure_persistence(snapshot.string(), false, append.string(), "always");
+  configure_runtime_settings({{"shutdown-on-sigterm", "save"}}, "");
+  unsigned calls = 0;
+  // Model SIGTERM arriving after the server pump's shutdown_cron and immediately
+  // before the final checkpoint cancellation read. No scheduler timing required.
+  g_loading_service_cb = [&] {
+    ++calls;
+    shutdown_signal_handler(SIGTERM);
+  };
+  const bool loaded =
+      aof ? load_aof_file(append.string(), err) : load_rdb_with_events(snapshot, err);
+  g_loading_service_cb = {};
+  check(!loaded && calls == 1, "late signal cancels at the first safe checkpoint");
+  check(shutdown_requested(), "late loading signal finalizes shutdown before scope unwind");
+  check(loading_mode() == LoadingMode::None, "late signal restores loading scope");
+  check((aof ? read(append) : read(snapshot)) == before,
+        "late signal preserves the exact persistence source");
+  if (aof) check(!std::filesystem::exists(snapshot), "late AOF signal cannot save partial state");
+}
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   using namespace peadb;
   char scratch[] = "/tmp/peadb-loading-service-XXXXXX";
   const char* created = mkdtemp(scratch);
@@ -237,6 +271,13 @@ int main() {
   functions_register_rdb_hooks();
   configure_security("secret", "", "", true, "no", {});
   configure_runtime_settings({{"enable-protected-configs", "yes"}}, "");
+  if (argc == 2) {
+    late_signal(dir, std::string(argv[1]) == "--late-signal-aof");
+    lua_engine_shutdown();
+    std::filesystem::remove_all(dir);
+    std::cout << "Late loading signal failures: " << failures << '\n';
+    return failures ? 1 : 0;
+  }
   rejected([] { service_loading_events([] {}); }, "service requires loading state");
   replay(dir);
   rdb(dir);

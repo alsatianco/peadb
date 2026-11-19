@@ -707,6 +707,13 @@ class DataStore {
   // watch_digest() is what WATCH and EXEC compare (Redis's watch code only asks keyIsExpired()).
   std::optional<ValueType> live_type(const std::string& key) const;
   std::optional<std::string> watch_digest(const std::string& key) const;
+  struct WatchState {
+    bool exists = false;
+    bool expired = false;
+  };
+  // Physical membership plus absolute TTL, including keys hidden for paused/replica
+  // expiry. No deletion, allocation, selection change, hooks or counter updates.
+  WatchState watch_state(int db, const std::string& key, std::int64_t now) const noexcept;
 
   // Observability counters
   std::int64_t stat_expired_keys() const {

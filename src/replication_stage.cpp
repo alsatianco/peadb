@@ -1,4 +1,5 @@
 #include "replication_stage.hpp"
+#include "command.hpp"
 
 #include <exception>
 #include <utility>
@@ -43,12 +44,35 @@ bool ReplicationLoadStage::load(const RdbReadFn& source, const RdbStreamFrame& f
   return true;
 }
 
-bool ReplicationLoadStage::publish(ReplicationLoadIdentity current) noexcept {
+bool ReplicationLoadStage::publish(ReplicationLoadIdentity current,
+                                   std::span<SessionState* const> clients) noexcept {
   check_owner();
   if (state_ != State::Ready) return false;
   if (current != identity_) {
     discard();
     return false;
+  }
+  // Redis multi.c touchAllWatchedKeysInDb, with one publication-time clock sample.
+  // Inspect physical keys without constructing value digests or expiring either target.
+  const auto now = DataStore::now_ms();
+  for (auto* client : clients) {
+    if (!client) continue;
+    for (auto& [key, watch] : client->watched_digests) {
+      const auto old = live_.watch_state(key.first, key.second, now);
+      const auto incoming = data_.watch_state(key.first, key.second, now);
+      if (!old.exists && !incoming.exists) continue;
+      if (watch.expired) {
+        if (!incoming.exists) {
+          watch.expired = false;
+          continue;
+        }
+        if (incoming.expired) continue;
+      } else if (!old.exists && incoming.expired) {
+        watch.expired = true;
+        continue;
+      }
+      client->watched_dirty = true;
+    }
   }
   live_.exchange_dataset(data_);
   live_functions_.swap(functions_);

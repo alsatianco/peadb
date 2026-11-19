@@ -9,6 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Finalize signals received after loading event service before returning cancellation, preserving clean startup shutdown and preventing partial-data saves (delta 70).
+
+- Keep WATCH subscriptions tied to their database across SELECT and retain repeated observations. Add internal validated-stage WATCH replacement invalidation, including identical values and expired/missing keys; production direct/swapdb loading remains pending (delta 8).
+
 - Add a single-use private replica load stage that prepares paired key/function retirement, validates complete frames before exchange, rejects stale generation/attempt completion and safely discards partial loads on exceptions. Production direct loading and full publication remain pending (delta 8).
 
 - Add internal prepared, budgeted function-registry retirement on the Lua-owning thread, preserving shared callbacks and splitting large-library teardown across work slices. Avoid quadratic duplicate-name scans while preparing large libraries. Production replica publication remains pending (delta 8).

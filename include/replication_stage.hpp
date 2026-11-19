@@ -6,8 +6,10 @@
 #include "replication_load.hpp"
 
 #include <optional>
+#include <span>
 
 namespace peadb {
+struct SessionState;
 
 // Single-use private decoder target. Construct on the Lua owner thread BEFORE decoding;
 // live objects and the retirement queue must outlive it. All methods/destruction stay on
@@ -32,8 +34,13 @@ class ReplicationLoadStage {
             const RdbLoadControl* control = nullptr);
   // Only one complete validated frame with the exact current generation AND attempt may
   // exchange. A stale identity permanently discards the stage. No allocation/free, Lua
-  // calls, key/function traversal or callbacks occur in publish()/discard().
-  bool publish(ReplicationLoadIdentity current) noexcept;
+  // calls, keyspace/function traversal or callbacks occur in publish()/discard().
+  // Pin these clients and finish all fallible server preparation before calling. Their
+  // watches are invalidated as Redis touchAllWatchedKeysInDb immediately before exchange;
+  // missing/expired watch transitions are preserved. No callbacks/yields occur here.
+  // Work includes the supplied watches, never a keyspace scan. Omitted clients are not touched.
+  bool publish(ReplicationLoadIdentity current,
+               std::span<SessionState* const> clients = {}) noexcept;
   void discard() noexcept;
   // Prospective outputs for fallible history preparation; meaningful after load succeeds.
   const RdbLoadStats& stats() const;

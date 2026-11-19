@@ -6753,8 +6753,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                             session.in_multi = false;
                             session.multi_dirty = false;
                             session.queued.clear();
-                            session.watched_epoch.reset();
-                            session.watched_digests.clear();
+                            session.clear_watches();
                             return encode_simple("OK");
                           }});
 
@@ -6768,9 +6767,16 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           [](const std::vector<std::string>& args, SessionState& session, bool&) {
                             if (session.in_multi)
                               return encode_error("WATCH inside MULTI is not allowed");
+                            if (session.watched_dirty) return encode_simple("OK");
                             session.watched_epoch = store().mutation_epoch();
                             for (std::size_t i = 1; i < args.size(); ++i) {
-                              session.watched_digests[args[i]] = store().watch_digest(args[i]);
+                              const auto key = std::make_pair(session.db_index, args[i]);
+                              if (session.watched_digests.count(key)) continue;
+                              const auto state = store().watch_state(session.db_index, args[i],
+                                                                     DataStore::now_ms());
+                              session.watched_digests.emplace(
+                                  key, SessionState::WatchedKey{store().watch_digest(args[i]),
+                                                                state.expired});
                             }
                             return encode_simple("OK");
                           }});
@@ -6783,8 +6789,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                           0,
                           0,
                           [](const std::vector<std::string>&, SessionState& session, bool&) {
-                            session.watched_epoch.reset();
-                            session.watched_digests.clear();
+                            session.clear_watches();
                             return encode_simple("OK");
                           }});
 
@@ -6802,25 +6807,33 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                         session.in_multi = false;
                         session.multi_dirty = false;
                         session.queued.clear();
-                        session.watched_epoch.reset();
-                        session.watched_digests.clear();
+                        session.clear_watches();
                         return std::string(
                             "-EXECABORT Transaction discarded because of previous errors.\r\n");
                       }
                       if (!session.watched_digests.empty()) {
-                        bool changed = false;
-                        for (const auto& [key, digest] : session.watched_digests) {
-                          if (store().watch_digest(key) != digest) {
-                            changed = true;
-                            break;
+                        bool changed = session.watched_dirty;
+                        {
+                          struct RestoreDb {
+                            int db = store().current_db();
+                            ~RestoreDb() {
+                              store().select_db(db);
+                            }
+                          } restore;
+                          for (const auto& [key, watch] : session.watched_digests) {
+                            if (changed) break;
+                            store().select_db(key.first);
+                            if (store().watch_digest(key.second) != watch.digest) {
+                              changed = true;
+                              break;
+                            }
                           }
                         }
                         if (changed) {
                           session.in_multi = false;
                           session.multi_dirty = false;
                           session.queued.clear();
-                          session.watched_epoch.reset();
-                          session.watched_digests.clear();
+                          session.clear_watches();
                           return encode_null_array();
                         }
                       }
@@ -6829,8 +6842,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                       session.in_multi = false;
                       session.multi_dirty = false;
                       session.queued.clear();
-                      session.watched_epoch.reset();
-                      session.watched_digests.clear();
+                      session.clear_watches();
                       // The dispatch has checked EXEC by the commands it queued (-OOM, -MISCONF,
                       // -NOREPLICAS, -READONLY, -MASTERDOWN, as processCommand() does), so the
                       // commands run without those checks, as Redis's execCommand() calls them. The
@@ -13057,8 +13069,7 @@ const std::unordered_map<std::string, CommandSpec>& command_table() {
                                      session.in_multi = false;
                                      session.multi_dirty = false;
                                      session.queued.clear();
-                                     session.watched_epoch.reset();
-                                     session.watched_digests.clear();
+                                     session.clear_watches();
                                      session.client_name.clear();
                                      session.resp_version = RespVersion::Resp2;
                                      // RESET exits pub/sub (all channel + pattern + shard
@@ -16215,8 +16226,7 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
         session.in_multi = false;
         session.multi_dirty = false;
         session.queued.clear();
-        session.watched_epoch.reset();
-        session.watched_digests.clear();
+        session.clear_watches();
         return "-EXECABORT Transaction discarded because of previous errors: BUSY Redis is busy "
                "running a script. You can only call SCRIPT KILL or SHUTDOWN NOSAVE.\r\n";
       }
@@ -16347,8 +16357,7 @@ static std::string handle_command_impl(const std::vector<std::string>& args, Ses
     session.in_multi = false;
     session.multi_dirty = false;
     session.queued.clear();
-    session.watched_epoch.reset();
-    session.watched_digests.clear();
+    session.clear_watches();
     feed_monitors(cmd, args, session);
     return "-EXECABORT Transaction discarded because of: " + refusal.substr(1);
   };
@@ -17592,7 +17601,15 @@ bool production_loading_checkpoint(std::size_t bytes, std::size_t total, const s
     p.last_service_bytes = bytes;
     service_loading_events(g_loading_service_cb);
   }
-  return !shutdown_signal_pending() && !shutdown_requested();
+  // A signal can arrive just AFTER the pump's shutdown_cron. Finalize it while
+  // loading is still active, before cancellation unwinds that scope. Returning false
+  // with only a pending signal would make startup report corruption (or later SAVE
+  // partial data after the loading guard has gone away).
+  if (shutdown_signal_pending() || shutdown_requested()) {
+    shutdown_cron();
+    return false;
+  }
+  return true;
 }
 }  // namespace
 

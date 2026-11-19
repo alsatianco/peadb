@@ -3541,6 +3541,20 @@ std::optional<std::string> DataStore::watch_digest(const std::string& key) const
   return entry_digest(it->second);
 }
 
+DataStore::WatchState DataStore::watch_state(int db, const std::string& key,
+                                             std::int64_t now) const noexcept {
+  if (db < 0 || static_cast<std::size_t>(db) >= dbs_.size()) return {};
+  for (const auto* databases : {&dbs_, &hidden_expired_, &replica_hidden_}) {
+    const auto& entries = (*databases)[db];
+    const auto it = entries.find(key);
+    if (it != entries.end()) {
+      const auto expiry = it->second.expire_at_ms;
+      return {true, expiry && now > *expiry};
+    }
+  }
+  return {};
+}
+
 bool DataStore::key_exists_raw(const std::string& key) const {
   return dbs_[current_db_].count(key) > 0;
 }
