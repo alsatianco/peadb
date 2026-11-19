@@ -35,6 +35,7 @@ extern "C" int luaopen_struct(lua_State*);
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <thread>
 #include <new>
@@ -73,6 +74,7 @@ std::thread::id g_lua_owner;
 bool g_function_load_cpp_oom = false;
 bool g_in_function_load = false;                  // true only during a FUNCTION LOAD pcall
 std::vector<LoadingFn>* g_loading_fns = nullptr;  // accumulator during a load
+std::unordered_set<std::string>* g_loading_function_names = nullptr;
 int g_load_redis_ref = -1;  // registry ref: the restricted load-time `redis` table
 int g_libenv_ref = -1;      // registry ref: the shared library environment table
 std::chrono::steady_clock::time_point g_func_load_start;
@@ -1269,9 +1271,8 @@ int lua_func_register_impl(lua_State* L) {
   } guard{L, ref};
   // Only C++ allocations below this point; unwind before asking Lua to raise an error.
   const std::string function_name(name, name_size);
-  for (const auto& f : *g_loading_fns)
-    if (lower(f.name) == lower(function_name))
-      throw RegisterError{"Function already exists in the library"};
+  if (!g_loading_function_names->insert(lower(function_name)).second)
+    throw RegisterError{"Function already exists in the library"};
   g_loading_fns->push_back({function_name, description, flags, ref});
   guard.ref = LUA_NOREF;
   return 0;
@@ -1591,10 +1592,12 @@ bool lua_engine_load_library(const std::string& body, std::vector<LuaRegisteredF
   struct LoadGuard {
     int top = lua_gettop(g_L);
     std::vector<LoadingFn> fns;
+    std::unordered_set<std::string> names;
     ~LoadGuard() {
       lua_sethook(g_L, nullptr, 0, 0);
       g_in_function_load = false;
       g_loading_fns = nullptr;
+      g_loading_function_names = nullptr;
       for (const auto& f : fns) luaL_unref(g_L, LUA_REGISTRYINDEX, f.ref);
       lua_settop(g_L, top);
     }
@@ -1612,6 +1615,7 @@ bool lua_engine_load_library(const std::string& body, std::vector<LuaRegisteredF
 
   auto& fns = guard.fns;
   g_loading_fns = &fns;
+  g_loading_function_names = &guard.names;
   g_function_load_cpp_oom = false;
   g_in_function_load = true;
   g_func_load_timed_out = false;
@@ -1623,6 +1627,7 @@ bool lua_engine_load_library(const std::string& body, std::vector<LuaRegisteredF
   lua_sethook(g_L, nullptr, 0, 0);
   g_in_function_load = false;
   g_loading_fns = nullptr;
+  g_loading_function_names = nullptr;
 
   if (g_function_load_cpp_oom) throw std::bad_alloc();
   if (rc != 0) {

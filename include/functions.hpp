@@ -16,8 +16,8 @@ struct FunctionEntry {
   std::string canonical_name;
 };
 
-// Immutable after installation. The last registry retaining a library releases its Lua
-// callback references on the owning thread, without recompiling any surviving callbacks.
+// Immutable while retained outside a retirement queue. The last registry retaining a
+// library releases its Lua callbacks on the owner thread without recompiling survivors.
 struct FunctionLibrary {
   FunctionLibrary() = default;
   FunctionLibrary(const FunctionLibrary&) = delete;
@@ -56,10 +56,54 @@ class FunctionRegistry {
   }
 
  private:
+  friend class FunctionRetirementQueue;
   void check_owner() const noexcept;
   const std::thread::id owner_ = std::this_thread::get_id();
   std::map<std::string, std::shared_ptr<const FunctionLibrary>> libraries_;
   std::map<std::string, std::string> index_;
+};
+
+// Internal retirement for a detached old/failed staging registry. All operations and
+// destruction belong to the Lua owner thread, before engine shutdown. Preparation may
+// throw without changing registries. Submission only swaps/links prepared owners; it
+// performs no allocation, free, Lua call or registry traversal. The caller chooses when
+// to drain, outside Lua/command execution; this does not enable replication publication.
+class FunctionRetirementQueue {
+ public:
+  class Ticket {
+   public:
+    ~Ticket();
+
+   private:
+    friend class FunctionRetirementQueue;
+    explicit Ticket(FunctionRetirementQueue* owner) : owner_(owner) {
+    }
+    FunctionRetirementQueue* owner_;
+    FunctionRegistry registry_;
+    std::unique_ptr<Ticket> next_;
+  };
+
+  FunctionRetirementQueue() = default;
+  FunctionRetirementQueue(const FunctionRetirementQueue&) = delete;
+  FunctionRetirementQueue& operator=(const FunctionRetirementQueue&) = delete;
+  ~FunctionRetirementQueue();
+
+  std::unique_ptr<Ticket> prepare();
+  void retire(FunctionRegistry& detached, std::unique_ptr<Ticket> ticket) noexcept;
+  // One unit erases an index node, releases one callback and its metadata, releases a
+  // library owner, or destroys an empty ticket. Shared libraries are never modified.
+  // Returns units used, <= budget; zero does no work. This is a work bound, not a wall
+  // clock/GC bound. External strong library owners remain responsible for final release;
+  // weak observers must not access a library after its last external owner is dropped.
+  std::size_t drain(std::size_t budget) noexcept;
+  std::size_t pending() const noexcept;
+
+ private:
+  void check_owner() const noexcept;
+  const std::thread::id owner_ = std::this_thread::get_id();
+  std::unique_ptr<Ticket> head_;
+  Ticket* tail_ = nullptr;
+  std::size_t pending_ = 0;
 };
 
 FunctionRegistry& live_functions();

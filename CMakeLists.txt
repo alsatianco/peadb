@@ -182,6 +182,11 @@ if(BUILD_TESTING)
   target_link_libraries(function_registry_allocation_test PRIVATE peadb_core)
   add_test(NAME function_registry_allocation_test COMMAND function_registry_allocation_test)
 
+  add_executable(function_retirement_test tests/unit/function_retirement_test.cpp)
+  target_link_libraries(function_retirement_test PRIVATE peadb_core)
+  add_test(NAME function_retirement_test COMMAND function_retirement_test)
+  set_tests_properties(function_retirement_test PROPERTIES TIMEOUT 60)
+
   add_executable(rdb_target_test tests/unit/rdb_target_test.cpp)
   target_link_libraries(rdb_target_test PRIVATE peadb_core)
   add_test(NAME rdb_target_test COMMAND rdb_target_test)

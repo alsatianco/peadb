@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cctype>
 #include <exception>
+#include <limits>
 #include <utility>
 
 namespace peadb {
@@ -208,5 +209,73 @@ bool FunctionRegistry::restore(const std::vector<std::string>& codes, const std:
 FunctionRegistry& live_functions() {
   static FunctionRegistry registry;
   return registry;
+}
+
+FunctionRetirementQueue::Ticket::~Ticket() = default;
+
+void FunctionRetirementQueue::check_owner() const noexcept {
+  if (owner_ != std::this_thread::get_id()) std::terminate();
+}
+
+FunctionRetirementQueue::~FunctionRetirementQueue() {
+  // Pop each intrusive link before destruction, including at shutdown: a long queue
+  // must not recursively destroy its successors on the C++ stack.
+  while (pending()) drain(std::numeric_limits<std::size_t>::max());
+}
+
+std::unique_ptr<FunctionRetirementQueue::Ticket> FunctionRetirementQueue::prepare() {
+  check_owner();
+  return std::unique_ptr<Ticket>(new Ticket(this));
+}
+
+void FunctionRetirementQueue::retire(FunctionRegistry& detached,
+                                     std::unique_ptr<Ticket> ticket) noexcept {
+  check_owner();
+  detached.check_owner();
+  if (!ticket || ticket->owner_ != this || !ticket->registry_.libraries_.empty() ||
+      !ticket->registry_.index_.empty() || ticket->next_)
+    std::terminate();
+  ticket->registry_.swap(detached);
+  auto* tail = ticket.get();
+  if (tail_)
+    tail_->next_ = std::move(ticket);
+  else
+    head_ = std::move(ticket);
+  tail_ = tail;
+  ++pending_;
+}
+
+std::size_t FunctionRetirementQueue::pending() const noexcept {
+  check_owner();
+  return pending_;
+}
+
+std::size_t FunctionRetirementQueue::drain(std::size_t budget) noexcept {
+  check_owner();
+  std::size_t used = 0;
+  while (head_ && used < budget) {
+    auto& registry = head_->registry_;
+    if (!registry.index_.empty()) {
+      registry.index_.erase(registry.index_.begin());
+    } else if (!registry.libraries_.empty()) {
+      auto it = registry.libraries_.begin();
+      if (it->second.use_count() == 1 && !it->second->functions.empty()) {
+        // load() creates a mutable FunctionLibrary, then exports const owners. Only
+        // this private retired registry retains it now; no live/copy owner is touched.
+        auto& library = const_cast<FunctionLibrary&>(*it->second);
+        lua_engine_unref_function(library.functions.back().callback_ref);
+        library.functions.pop_back();
+      } else {
+        registry.libraries_.erase(it);
+      }
+    } else {
+      auto retired = std::move(head_);
+      head_ = std::move(retired->next_);
+      if (!head_) tail_ = nullptr;
+      --pending_;
+    }
+    ++used;
+  }
+  return used;
 }
 }  // namespace peadb

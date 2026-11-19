@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Add internal prepared, budgeted function-registry retirement on the Lua-owning thread, preserving shared callbacks and splitting large-library teardown across work slices. Avoid quadratic duplicate-name scans while preparing large libraries. Production replica publication remains pending (delta 8).
+
 - Add internal stable-address datastore exchange and preallocated background retirement for old or failed staging datasets; preparation failures preserve both datasets. Production replica publication remains pending (delta 8).
 
 - Give each replica file-load handoff an owned generation/attempt-tagged socket session and exception-safe completion. Add an internal cancellable event-loop socket source and Redis load-strategy selector; production direct/swapdb loading still awaits transactional publication (delta 8).
