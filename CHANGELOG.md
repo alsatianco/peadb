@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Add a single-use private replica load stage that prepares paired key/function retirement, validates complete frames before exchange, rejects stale generation/attempt completion and safely discards partial loads on exceptions. Production direct loading and full publication remain pending (delta 8).
+
 - Add internal prepared, budgeted function-registry retirement on the Lua-owning thread, preserving shared callbacks and splitting large-library teardown across work slices. Avoid quadratic duplicate-name scans while preparing large libraries. Production replica publication remains pending (delta 8).
 
 - Add internal stable-address datastore exchange and preallocated background retirement for old or failed staging datasets; preparation failures preserve both datasets. Production replica publication remains pending (delta 8).

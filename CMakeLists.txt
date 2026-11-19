@@ -52,6 +52,7 @@ add_library(peadb_core
     src/watchdog.cpp
     src/protocol.cpp
     src/replication_load.cpp
+    src/replication_stage.cpp
     src/server.cpp
     src/sha256.cpp
     src/functions.cpp
@@ -117,6 +118,11 @@ if(BUILD_TESTING)
   target_link_libraries(replication_load_test PRIVATE peadb_core)
   add_test(NAME replication_load_test COMMAND replication_load_test)
   set_tests_properties(replication_load_test PROPERTIES TIMEOUT 30)
+
+  add_executable(replication_stage_test tests/unit/replication_stage_test.cpp)
+  target_link_libraries(replication_stage_test PRIVATE peadb_core)
+  add_test(NAME replication_stage_test COMMAND replication_stage_test)
+  set_tests_properties(replication_stage_test PROPERTIES TIMEOUT 60)
 
   add_executable(config_parser_test tests/unit/config_parser_test.cpp)
   target_link_libraries(config_parser_test PRIVATE peadb_core)
