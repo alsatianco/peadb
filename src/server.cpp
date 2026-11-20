@@ -3,6 +3,7 @@
 
 #include "command.hpp"
 #include "datastore.hpp"
+#include "functions.hpp"
 #include "logger.hpp"
 #include "poller.hpp"
 #include "rdb.hpp"
@@ -234,6 +235,9 @@ int adjust_open_files_limit(int max_clients) {
 }
 
 int run_server(const ServerConfig& config, const std::function<int()>& startup) {
+  // Owner-thread callbacks must be released before main shuts down Lua, including
+  // partial loads and early shutdown. This lifetime encloses every loader/pump.
+  FunctionRetirementQueue function_retirement;
   configure_max_clients(config.maxclients);
   {
     const int wanted = configured_max_clients();
@@ -1846,6 +1850,9 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
     add_pending_input(events);
     const auto ids = event_ids(events);
     client_io(events, ids, true, relay.read_fd, relay.generation);
+    // Callback teardown is safe here: service_loading_events isolated command state,
+    // and no decoder iterator, library compilation or Lua invocation is suspended.
+    service_replica_function_retirement(function_retirement);
     // No released pipelines, replica queue, wakeups, persistence, eviction or expiration.
     close_deferred();
     auto overflow = std::move(obuf_overflow_fds);
@@ -1871,7 +1878,9 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
     // Poll timeout: default 100 ms housekeeping tick, but clamp to the nearest blocked-
     // client deadline so BLPOP-style timeouts fire with millisecond precision instead
     // of up to a tick late (the upstream suite asserts ~150 ms slack on a 1 s timeout).
-    int poll_ms = 100;
+    // Retired callbacks are useful pending work, not an idle wait. Still poll and
+    // serve clients between every bounded slice instead of draining the queue inline.
+    int poll_ms = function_retirement.pending() ? 0 : 100;
     if (blocked_count > 0) {
       const auto pnow = DataStore::now_ms();
       for (const auto& [bfd, bsession] : sessions) {
@@ -1916,7 +1925,8 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
     databases_cron();      // shrink sparse keyspace tables, as Redis's databasesCron() does
     reap_background_children();
     replication_snapshot_cron(loop_now_ms);
-    drain_replica_cmd_queue();
+    service_replica_function_retirement(function_retirement);
+    drain_replica_cmd_queue(function_retirement);
 
     // ── Idle-client timeout reaping ──────────────────────────────────────
     // Close normal clients idle longer than `timeout` seconds. Replicas, blocked/waiting

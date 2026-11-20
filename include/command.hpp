@@ -341,7 +341,13 @@ std::string try_unblock_client(SessionState& session);
 // Dispatch already counted the call; retain that stats key (including command renames).
 void record_blocked_error(const SessionState& session, const std::string& reply);
 // Apply replication commands queued by the streaming thread onto the event loop thread.
-void drain_replica_cmd_queue();
+class FunctionRetirementQueue;
+void drain_replica_cmd_queue(FunctionRetirementQueue& retirement);
+// Server/Lua-owner thread only. Drain at most 64 index/callback/library/ticket
+// units between commands or inside guarded loading service. Lua, nested command
+// dispatch and unguarded decoder contexts do no work. Queue outlives all loads
+// and must be destroyed before lua_engine_shutdown().
+std::size_t service_replica_function_retirement(FunctionRetirementQueue& retirement);
 
 // ── Lua script context (set by lua_engine, read by blocking command handlers) ──
 void set_lua_script_context(bool in_script);

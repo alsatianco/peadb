@@ -18274,7 +18274,14 @@ void aof_cron(std::int64_t now) {
   }
 }
 
-void drain_replica_cmd_queue() {
+std::size_t service_replica_function_retirement(FunctionRetirementQueue& retirement) {
+  if (in_lua_script_context() || g_execution_nesting != 0 ||
+      (loading_mode() != LoadingMode::None && !g_loading_events_active))
+    return 0;
+  return retirement.drain(64);
+}
+
+void drain_replica_cmd_queue(FunctionRetirementQueue& retirement) {
   std::shared_ptr<MasterLinkRequest> request;
   {
     std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
@@ -18354,6 +18361,9 @@ void drain_replica_cmd_queue() {
       // the sync is tried again.
       RdbReplicationInfo loaded_repl;
       try {
+        // Prepare before validation/publication: allocation failure cannot detach old
+        // callbacks. The server queue outlives the loader and drains on the Lua owner.
+        auto function_ticket = retirement.prepare();
         const LoadingScope loading(LoadingMode::Blocking);
         ok = load_rdb_with_events(
             path, err,
@@ -18388,7 +18398,7 @@ void drain_replica_cmd_queue() {
                     "Failed trying to sync DB directory in MASTER <-> REPLICA synchronization: " +
                     std::string(std::strerror(errno)));
               }
-              functions_flush_all();
+              retirement.retire(live_functions(), std::move(function_ticket));
             },
             &loaded_repl);
       } catch (const std::exception& e) {

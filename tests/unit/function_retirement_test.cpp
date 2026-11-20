@@ -188,6 +188,58 @@ int main() {
   }
   lua_engine_init();
   {
+    // Exercise the server service entry point, not only the queue primitive. A large
+    // single library must span turns, and neither Lua nor an unguarded decoder may
+    // retire callbacks while its temporary references are live.
+    FunctionRetirementQueue service;
+    FunctionRegistry detached;
+    std::string code = "#!lua name=service\n", name, err;
+    for (int i = 0; i < 257; ++i)
+      code += "redis.register_function('s" + std::to_string(i) + "',function() return 1 end)\n";
+    check(detached.load(code, false, name, err), "server service fixture installed");
+    std::weak_ptr<const FunctionLibrary> retired = detached.libraries().at("service");
+    submit(service, detached, service.prepare());
+    lua_engine_set_dispatch([&](const auto&, SessionState&, bool&) {
+      return ":" + std::to_string(service_replica_function_retirement(service)) + "\r\n";
+    });
+    SessionState session;
+    check(lua_engine_eval("return redis.call('PING')", {}, {}, session) == ":0\r\n",
+          "real Lua dispatch cannot retire callbacks");
+    g_client_list_callback = [&] {
+      check(service_replica_function_retirement(service) == 0,
+            "nested command dispatch cannot retire callbacks");
+      return std::string();
+    };
+    bool close = false;
+    check(handle_command({"CLIENT", "LIST"}, session, close) == "$0\r\n\r\n",
+          "nested command fixture dispatched");
+    g_client_list_callback = nullptr;
+    std::size_t units = 0;
+    for (const auto mode : {LoadingMode::Blocking, LoadingMode::Async}) {
+      const LoadingScope loading(mode);
+      check(service_replica_function_retirement(service) == 0,
+            "unguarded decoder context cannot drain");
+      service_loading_events([&] { units += service_replica_function_retirement(service); });
+      check(service.pending() == 1 && !retired.expired(), "loading pump retains partial work");
+    }
+    check(units == 128, "each guarded loading pump drains exactly 64 work units");
+    unsigned turns = 0;
+    while (service.pending()) {
+      fail_after = 0;
+      const auto used = service_replica_function_retirement(service);
+      const bool no_allocation = fail_after == 0;
+      fail_after = -1;
+      check(no_allocation && used > 0 && used <= 64,
+            "normal turn has bounded allocation-free work");
+      units += used;
+      ++turns;
+    }
+    check(turns == 7 && units == 516 && retired.expired(),
+          "normal turns finish every index/callback/library/ticket exactly once");
+    check(service_replica_function_retirement(service) == 0, "empty normal service is harmless");
+    lua_engine_set_dispatch({});
+  }
+  {
     std::string name, err;
     FunctionRegistry live;
     check(live.load(old_code, false, name, err), "old closure installed");

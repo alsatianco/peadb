@@ -9,6 +9,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Retire function registries replaced by disk-spooled replica full sync in bounded owner-thread server/loading slices, and drain unfinished callbacks before Lua shutdown (delta 8).
+
 - Finalize signals received after loading event service before returning cancellation, preserving clean startup shutdown and preventing partial-data saves (delta 70).
 
 - Keep WATCH subscriptions tied to their database across SELECT and retain repeated observations. Add internal validated-stage WATCH replacement invalidation, including identical values and expired/missing keys; production direct/swapdb loading remains pending (delta 8).
