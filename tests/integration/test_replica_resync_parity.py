@@ -55,9 +55,11 @@ def run(master_binary, replica_binary):
             old_id = info(m, 'master_replid', 'replication')
             # Promote the replica, then demote its former master. Redis synthesizes a cached
             # master from its own stream; both directions can continue without a snapshot.
+            # Promotion disconnects the chain, which may reconnect before the next
+            # request. Count both expected partial resyncs from BEFORE that action.
+            before = int(info(r, 'sync_partial_ok', 'stats'))
             r('REPLICAOF', 'NO', 'ONE')
             r('CONFIG', 'SET', 'repl-ping-replica-period', '1')
-            before = int(info(r, 'sync_partial_ok', 'stats'))
             m('REPLICAOF', '127.0.0.1', p[1])
             wait_link(m); wait_link(s)
             wait_for(lambda: int(info(r, 'sync_partial_ok', 'stats')) >= before + 2,
