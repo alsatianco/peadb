@@ -137,6 +137,18 @@ log() {
   printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" | tee -a "$STATE_DIR/loop.log"
 }
 
+pause_after_iteration() {
+  printf '%s\n' 1 2 3 4 5
+  # Prefer the Mac's audible alert; terminal bells depend on terminal settings.
+  if command -v osascript >/dev/null 2>&1; then
+    osascript -e 'beep 2' >/dev/null 2>&1 || printf '\a\a'
+  else
+    printf '\a\a'
+  fi
+  log "session $runs: pausing for 60 seconds after this iteration"
+  sleep 60
+}
+
 fmt_time() {
   date -r "$1" '+%Y-%m-%d %H:%M' 2>/dev/null || date -d "@$1" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$1"
 }
@@ -677,6 +689,8 @@ while :; do
   if [ "$STATUS" = task_done ] && cmp -s "$RUN_DIR/plan-before.md" "$PLAN"; then
     log "  warning: the session did not change $PLAN"
   fi
+
+  pause_after_iteration
 
   if [ "$STATUS" = task_done ] || [ "$STATUS" = all_done ]; then
     finish_session

@@ -151,6 +151,14 @@ class LoopTests(unittest.TestCase):
         gh = mock.with_name('gh')
         gh.write_text(GH_MOCK)
         gh.chmod(0o755)
+        # Keep iteration alerts silent and skip their minute-long pause in fixtures.
+        for name, body in (
+            ('osascript', 'printf "%s\\n" "$*" >> AI-TEMP/mock-alerts.txt\n'),
+            ('sleep', 'if [ "$*" = 60 ]; then printf "%s\\n" "$*" >> AI-TEMP/mock-pauses.txt; else exec /bin/sleep "$@"; fi\n'),
+        ):
+            stub = mock.with_name(name)
+            stub.write_text('#!/bin/sh\n' + body)
+            stub.chmod(0o755)
         self.env = {k:v for k,v in os.environ.items() if k not in ('MODEL', 'EFFORT', 'MAX_BUDGET_USD', 'MAX_RUNS', 'MAX_FAILS', 'MAX_IDLE', 'LIMIT_WAIT', 'MAX_LIMIT_WAITS', 'ALLOW_UNTRACKED', 'MOCK_ACTIONS', 'MOCK_CLEANUP', 'MOCK_GH_ERROR', 'MOCK_GH_INVALID')}
         self.env.update(GH_TOKEN='fixture-read-token', PATH=str(mock.parent) + os.pathsep + os.environ['PATH'], AUTO_IMPROVE_AWAKE='1', MAX_RUNS='1', MAX_FAILS='1', LIMIT_WAIT='0', MAX_LIMIT_WAITS='2')
 
@@ -170,6 +178,9 @@ class LoopTests(unittest.TestCase):
 
     def test_task_commit_plan_and_token_summary(self):
         out = self.run_loop([{'commit':True, 'tick':True}])
+        self.assertIn('1\n2\n3\n4\n5\n', out)
+        self.assertEqual((self.root / 'AI-TEMP/mock-alerts.txt').read_text(), '-e beep 2\n')
+        self.assertEqual((self.root / 'AI-TEMP/mock-pauses.txt').read_text(), '60\n')
         self.assertIn('completion has not been audited twice', out)
         self.assertEqual(len(self.calls()), 1)
         self.assertEqual(self.git('status', '--porcelain'), '')
