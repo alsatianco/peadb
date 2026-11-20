@@ -10,6 +10,7 @@
 #include "errors.hpp"
 #include "lua_engine.hpp"
 #include "functions.hpp"
+#include "replication_stage.hpp"
 #include <map>
 #include "protocol.hpp"
 #include "replication_snapshot.hpp"
@@ -382,13 +383,15 @@ void disconnect_replicas() {
   bool kill_self = false;
   g_client_kill_cb(filter, kill_self);
 }
-// Post-spool handoff, under g_replica_cmd_queue_mu. Each attempt owns its completion and
-// socket lease, so a superseded link cannot observe a later attempt's result or close an fd
-// still borrowed by the event loop. Raw socket decoding/transactional publication is pending.
+// Raw-header or post-spool handoff, under g_replica_cmd_queue_mu. Each attempt owns its completion
+// and socket lease, so a superseded link cannot observe a later attempt's result or close an fd
+// still borrowed by the event loop. The event loop decides the strategy before consuming input.
 struct PendingReplicaLoad {
   std::shared_ptr<ReplicationLoadSession> session;
   std::string path, replid;
   std::int64_t offset;
+  RdbStreamFrame frame;
+  bool spool = false;  // written by consumer before synchronized session completion
 };
 std::shared_ptr<PendingReplicaLoad> g_replica_load;
 std::atomic<std::uint64_t> g_replica_load_attempt{0};
@@ -5382,6 +5385,15 @@ const std::unordered_map<std::string, LiveConfig>& live_configs() {
           },
           nullptr}},
         {"appendfilename", {[] { return g_aof_path.string(); }, nullptr}},
+        {"repl-diskless-load",
+         {[] {
+            const auto it = g_config_values.find("repl-diskless-load");
+            return it == g_config_values.end() ? std::string("disabled") : it->second;
+          },
+          [](const std::string& value, std::string&) {
+            g_config_values["repl-diskless-load"] = value;
+            return true;
+          }}},
         {"cluster-enabled",
          {[] { return std::string(g_cluster_enabled ? "yes" : "no"); }, nullptr}},
         {"rdbchecksum", {[] { return std::string(rdb_checksum() ? "yes" : "no"); }, nullptr}},
@@ -18274,12 +18286,118 @@ void aof_cron(std::int64_t now) {
   }
 }
 
+std::function<std::vector<SessionState*>()> g_replica_publication_clients_cb;
+
 std::size_t service_replica_function_retirement(FunctionRetirementQueue& retirement) {
   if (in_lua_script_context() || g_execution_nesting != 0 ||
       (loading_mode() != LoadingMode::None && !g_loading_events_active))
     return 0;
   return retirement.drain(64);
 }
+
+namespace {
+// Called only by the event loop holding the raw-header socket lease. All fallible
+// preparation/decoding precedes paired exchange; no nested master queue drain is allowed.
+bool load_replica_socket(PendingReplicaLoad& load, ReplicationLoadLease& lease,
+                         FunctionRetirementQueue& retirement, std::string& read_ahead) {
+  const auto mode_name = config_value(*find_redis_config("repl-diskless-load"));
+  const auto mode = mode_name == "swapdb"        ? ReplicationLoadMode::SwapDb
+                    : mode_name == "on-empty-db" ? ReplicationLoadMode::OnEmptyDb
+                                                 : ReplicationLoadMode::Disabled;
+  const auto strategy = replication_load_strategy(mode, store(), g_master_replid, load.replid);
+  if (strategy == ReplicationLoadStrategy::Disk) {
+    load.spool = true;
+    return true;  // return exclusive ownership to the link for the existing disk receiver
+  }
+  const auto identity = load.session->identity;
+  const LoadingScope loading(strategy == ReplicationLoadStrategy::DirectAsync
+                                 ? LoadingMode::Async
+                                 : LoadingMode::Blocking);
+  const LoadingProgressScope progress;
+  std::string err;
+  try {
+    ReplicationLoadStage stage(store(), live_functions(), retirement, identity);
+    // Empty-db loading clears old functions even if the incoming frame later fails.
+    // Prepare that detach before touching children, history or callback identity.
+    auto empty_functions = mode == ReplicationLoadMode::OnEmptyDb ? retirement.prepare() : nullptr;
+    std::string incoming_id = load.replid, cleared_id(40, '0');
+    kill_rdb_child();
+    if (g_appendonly && !g_aof_sync_suspended) {
+      stop_append_only();
+      g_appendonly = true;
+      g_aof_sync_suspended = true;
+    }
+    if (empty_functions) {
+      retirement.retire(live_functions(), std::move(empty_functions));
+      g_cached_master = false;
+      disconnect_replicas();
+    }
+    std::size_t received = 0;
+    const auto total = load.frame.kind == RdbStreamFrame::Kind::Length ? load.frame.length : 0;
+    auto checkpoint = [&] {
+      if (identity.generation != g_repl_generation.load() || load.session->cancelled())
+        return false;
+      return production_loading_checkpoint(received, total, "rdb-apply");
+    };
+    ReplicationSocketSource source(
+        lease, [] { return g_repl_generation.load(); },
+        [] { return std::chrono::milliseconds(g_repl_timeout.load() * 1000LL); }, checkpoint);
+    RdbLoadControl control;
+    control.key_delay = rdb_key_load_delay();
+    control.checkpoint = [&](const RdbLoadProgress& p) {
+      received = p.bytes;
+      control.key_delay = rdb_key_load_delay();
+      return checkpoint();
+    };
+    const bool decoded = stage.load(
+        [&](void* bytes, std::size_t size) {
+          const auto n = source.read(bytes, size);
+          if (n > 0) {
+            std::lock_guard<std::mutex> lock(g_replica_link_mu);
+            g_repl_transfer_read += n;
+            g_repl_transfer_lastio_ms = now_ms();
+          }
+          return n;
+        },
+        load.frame, err, &control);
+    if (!decoded || !checkpoint()) {
+      log(LogLevel::Error, "REPLICAOF: direct RDB load failed: " + err);
+      return false;
+    }
+    // The guarded pump may have accepted/killed clients. Gather only after its final
+    // invocation, then never yield until data/functions/history/read-ahead agree.
+    auto clients = g_replica_publication_clients_cb ? g_replica_publication_clients_cb()
+                                                    : std::vector<SessionState*>{};
+    std::unique_ptr<char[]> backlog;
+    if (!g_repl_backlog.buf) backlog.reset(new char[g_repl_backlog.size_]);
+    if (identity.generation != g_repl_generation.load() || load.session->cancelled()) return false;
+    if (!stage.publish(identity, clients)) return false;
+    for (auto* client : clients)
+      if (client->replica_stream) client->repl_close_after_publication = true;
+    g_cached_master = true;
+    g_master_replid.swap(incoming_id);
+    g_master_replid2.swap(cleared_id);
+    g_second_replid_offset = -1;
+    g_master_repl_offset = load.offset;
+    if (backlog) g_repl_backlog.buf.swap(backlog);
+    start_backlog();
+    g_master_stream_session = SessionState{};
+    if (stage.replication().stream_db >= 0)
+      g_master_stream_session.db_index = stage.replication().stream_db;
+    g_master_stream_multi.clear();
+    g_last_repl_db = -1;
+    rdb_publish_load_stats(stage.stats());
+    // exchange_dataset marked this mutation; it is never a persistent save / LASTSAVE update.
+    auto result = stage.take_result();
+    read_ahead.swap(result->read_ahead);
+    if (g_aof_sync_suspended) restart_aof_after_sync();
+    return true;
+  } catch (const std::exception& e) {
+    log(LogLevel::Error, std::string("REPLICAOF: direct RDB load failed: ") + e.what());
+    return false;
+  }
+}
+}  // namespace
 
 void drain_replica_cmd_queue(FunctionRetirementQueue& retirement) {
   std::shared_ptr<MasterLinkRequest> request;
@@ -18350,6 +18468,11 @@ void drain_replica_cmd_queue(FunctionRetirementQueue& retirement) {
     bool ok = false;
     if (!current) {
       log(LogLevel::Warn, "REPLICAOF: dropping a full sync from a master link that was replaced");
+    } else if (path.empty()) {
+      std::string read_ahead;
+      ok = load_replica_socket(*load, lease, retirement, read_ahead);
+      lease.finish(ok && load->session->identity.generation == g_repl_generation.load(),
+                   std::move(read_ahead));
     } else {
       std::string err;
       // A full resync replaces the entire dataset, including server-level function libraries.
@@ -18423,6 +18546,10 @@ void drain_replica_cmd_queue(FunctionRetirementQueue& retirement) {
       }
     }
     lease.finish(ok && load->session->identity.generation == g_repl_generation.load());
+    // A returned direct socket can immediately enqueue its unread command suffix. Let
+    // the server close marked old downstreams before any of those bytes feed a backlog.
+    // Disk decisions likewise return to the server before a second file handoff.
+    if (path.empty()) return;
   }
 
   {
@@ -18797,101 +18924,112 @@ bool replica_do_fullsync(const std::string& host, int port, std::uint64_t gen) {
     update_master_link(gen,
                        [&] { g_repl_transfer_size = std::max<std::int64_t>(snapshot.size(), 0); });
 
-    // Stream the RDB into a temp file in the working directory (`dir`), created new like Redis's
-    // readSyncBulkPayload() creates temp-<unixtime>.<pid>.rdb; the link's generation in the name
-    // keeps two links (an old one not stopped yet and a new one) apart.
-    const std::string tmp_path = "temp-" + std::to_string(std::time(nullptr)) + "." +
-                                 std::to_string(::getpid()) + "." + std::to_string(gen) + ".rdb";
-    {
-      int rfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
-      if (rfd < 0) {
-        log(LogLevel::Error,
-            "Opening the temp file needed for MASTER <-> REPLICA synchronization: " +
-                std::string(strerror(errno)));
-        ::close(fd);
-        return false;
+    // Offer before consuming the first RDB byte. The event loop reads the live setting
+    // and all databases; a disk decision returns ownership without reading the socket.
+    std::shared_ptr<PendingReplicaLoad> pending;
+    auto handoff = [&](const std::string& path) {
+      auto session = std::make_shared<ReplicationLoadSession>(
+          fd, ReplicationLoadIdentity{gen, g_replica_load_attempt.fetch_add(1) + 1});
+      session->offer();
+      pending = std::make_shared<PendingReplicaLoad>(
+          PendingReplicaLoad{session, path, fullresync_replid, fullresync_offset, {}});
+      pending->frame.kind =
+          snapshot.size() < 0 ? RdbStreamFrame::Kind::Eof : RdbStreamFrame::Kind::Length;
+      pending->frame.length = static_cast<std::size_t>(std::max<std::int64_t>(snapshot.size(), 0));
+      if (pending->frame.kind == RdbStreamFrame::Kind::Eof)
+        pending->frame.eof_marker = line.substr(5);
+      for (;;) {
+        {
+          std::lock_guard<std::mutex> lock(g_replica_cmd_queue_mu);
+          if (g_repl_generation.load() != gen) {
+            session->cancel();
+            break;
+          }
+          if (!g_replica_load) {
+            g_replica_load = pending;
+            break;
+          }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
-      std::vector<char> chunk(ReplicationSnapshot::kChunk);
-      auto write_chunk = [&](std::string_view bytes) {
-        std::size_t written = 0;
-        while (written < bytes.size()) {
-          const ssize_t n = ::write(rfd, bytes.data() + written, bytes.size() - written);
-          if (n < 0 && errno == EINTR) continue;
-          if (n <= 0) return false;
-          written += static_cast<std::size_t>(n);
-        }
-        return true;
-      };
-      bool write_ok = true;
-      while (!snapshot.done()) {
-        const ssize_t n = io.readSome(chunk.data(), chunk.size());
-        if (n <= 0 || !snapshot.feed(std::string_view(chunk.data(), static_cast<std::size_t>(n)),
-                                     write_chunk, stream_read_ahead)) {
-          write_ok = false;
-          break;
-        }
-        if (!update_master_link(gen, [&] {
-              // INFO counts bytes received, including the uncommitted rolling suffix.
-              // These transfer counters never drive replication ACK offsets.
-              g_repl_transfer_read = snapshot.received() + snapshot.pending();
-              g_repl_transfer_size = std::max<std::int64_t>(snapshot.size(), 0);
-            })) {
-          write_ok = false;
-          break;
-        }
-      }
-      if (write_ok && ::fsync(rfd) != 0) write_ok = false;
-      if (::close(rfd) != 0) write_ok = false;
-      if (!write_ok) {
-        ::unlink(tmp_path.c_str());
-        ::close(fd);
-        log(LogLevel::Error, "REPLICAOF: failed streaming RDB data");
-        return false;
-      }
-    }
-    // Note: keep fd open for command streaming after RDB load.
-
-    // Hand the RDB load off to the event loop so flushall+restore happens on the same
-    // thread that serves client reads/writes — eliminating the DataStore race that the
-    // previous in-thread rdb_load() created (libstdc++ unordered_map mutations are not
-    // safe under concurrent access). The streaming thread waits here until completion.
-    // One hand-off at a time: an older link's may still wait for the event loop. A newer REPLICAOF
-    // makes this one give up.
-    auto session = std::make_shared<ReplicationLoadSession>(
-        fd, ReplicationLoadIdentity{gen, g_replica_load_attempt.fetch_add(1) + 1});
-    session->offer();
-    auto pending = std::make_shared<PendingReplicaLoad>(
-        PendingReplicaLoad{session, tmp_path, fullresync_replid, fullresync_offset});
-    for (;;) {
-      {
-        std::lock_guard<std::mutex> lk(g_replica_cmd_queue_mu);
-        if (g_repl_generation.load() != gen) {
-          session->cancel();
-          break;
-        }
-        if (!g_replica_load) {
-          g_replica_load = pending;
-          break;
-        }
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    wake_event_loop_for_replica();
-    // Never abandon a claimed socket, even if a newer REPLICAOF supersedes this attempt.
-    // Cancellation before claim wakes immediately; a live lease returns only after unwinding.
-    const auto completion = session->wait([&] { return g_repl_generation.load() == gen; });
-    fd = session->take_socket();
-    const bool load_ok = completion.ok && g_repl_generation.load() == gen;
-    transfer_state.done();
-    ::unlink(tmp_path.c_str());
-    if (!load_ok) {
+      wake_event_loop_for_replica();
+      const auto completion = session->wait([&] { return g_repl_generation.load() == gen; });
+      fd = session->take_socket();
+      if (completion.ok) stream_read_ahead += completion.read_ahead;
+      return completion.ok && g_repl_generation.load() == gen;
+    };
+    if (!handoff({})) {
       ::close(fd);
-      log(LogLevel::Error, "REPLICAOF: rdb_load failed (event-loop)");
       return false;
     }
-    cached->offset = fullresync_offset;
-    log(LogLevel::Info,
-        "REPLICAOF: full sync complete, loaded " + std::to_string(snapshot.received()) + " bytes");
+    if (pending->spool) {
+      // Stream the RDB into a temp file in the working directory (`dir`), created new like Redis's
+      // readSyncBulkPayload() creates temp-<unixtime>.<pid>.rdb; the link's generation in the name
+      // keeps two links (an old one not stopped yet and a new one) apart.
+      const std::string tmp_path = "temp-" + std::to_string(std::time(nullptr)) + "." +
+                                   std::to_string(::getpid()) + "." + std::to_string(gen) + ".rdb";
+      {
+        int rfd = ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (rfd < 0) {
+          log(LogLevel::Error,
+              "Opening the temp file needed for MASTER <-> REPLICA synchronization: " +
+                  std::string(strerror(errno)));
+          ::close(fd);
+          return false;
+        }
+        std::vector<char> chunk(ReplicationSnapshot::kChunk);
+        auto write_chunk = [&](std::string_view bytes) {
+          std::size_t written = 0;
+          while (written < bytes.size()) {
+            const ssize_t n = ::write(rfd, bytes.data() + written, bytes.size() - written);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return false;
+            written += static_cast<std::size_t>(n);
+          }
+          return true;
+        };
+        bool write_ok = true;
+        while (!snapshot.done()) {
+          const ssize_t n = io.readSome(chunk.data(), chunk.size());
+          if (n <= 0 || !snapshot.feed(std::string_view(chunk.data(), static_cast<std::size_t>(n)),
+                                       write_chunk, stream_read_ahead)) {
+            write_ok = false;
+            break;
+          }
+          if (!update_master_link(gen, [&] {
+                // INFO counts bytes received, including the uncommitted rolling suffix.
+                // These transfer counters never drive replication ACK offsets.
+                g_repl_transfer_read = snapshot.received() + snapshot.pending();
+                g_repl_transfer_size = std::max<std::int64_t>(snapshot.size(), 0);
+              })) {
+            write_ok = false;
+            break;
+          }
+        }
+        if (write_ok && ::fsync(rfd) != 0) write_ok = false;
+        if (::close(rfd) != 0) write_ok = false;
+        if (!write_ok) {
+          ::unlink(tmp_path.c_str());
+          ::close(fd);
+          log(LogLevel::Error, "REPLICAOF: failed streaming RDB data");
+          return false;
+        }
+      }
+      if (!handoff(tmp_path)) {
+        ::unlink(tmp_path.c_str());
+        ::close(fd);
+        log(LogLevel::Error, "REPLICAOF: rdb_load failed (event-loop)");
+        return false;
+      }
+      ::unlink(tmp_path.c_str());
+      cached->offset = fullresync_offset;
+      log(LogLevel::Info, "REPLICAOF: full sync complete, loaded " +
+                              std::to_string(snapshot.received()) + " bytes");
+    } else {
+      cached->offset = fullresync_offset;
+      log(LogLevel::Info, "REPLICAOF: direct full sync complete");
+    }
+    transfer_state.done();
 
   }  // full resync; CONTINUE keeps the dataset and backlog
 

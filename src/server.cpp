@@ -1838,6 +1838,14 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
       if (it != sessions.end() && it->second.client_id == id) close_client(fd);
     }
   };
+  bool replica_publication_prepared = false;
+  g_replica_publication_clients_cb = [&] {
+    std::vector<SessionState*> clients;
+    clients.reserve(sessions.size());
+    for (auto& [fd, session] : sessions) clients.push_back(&session);
+    replica_publication_prepared = true;
+    return clients;
+  };
   g_loading_service_cb = [&] {
     watchdog_rearm();
     shutdown_cron();
@@ -1927,6 +1935,17 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
     replication_snapshot_cron(loop_now_ms);
     service_replica_function_retirement(function_retirement);
     drain_replica_cmd_queue(function_retirement);
+    // Publication cannot close sessions while its pinned WATCH span is in use. No I/O or
+    // backlog feeding occurs between exchange and this identity-stable close pass.
+    if (replica_publication_prepared) {
+      replica_publication_prepared = false;
+      for (auto it = sessions.begin(); it != sessions.end();) {
+        const int fd = it->first;
+        const bool replaced = it->second.repl_close_after_publication;
+        ++it;
+        if (replaced) close_client(fd);
+      }
+    }
 
     // ── Idle-client timeout reaping ──────────────────────────────────────
     // Close normal clients idle longer than `timeout` seconds. Replicas, blocked/waiting
@@ -2030,6 +2049,7 @@ int run_server(const ServerConfig& config, const std::function<int()>& startup) 
   cancel_replication_pipe();
   close_relay_pipes();
   g_loading_service_cb = nullptr;
+  g_replica_publication_clients_cb = nullptr;
   g_replication_sync_cb = nullptr;
   g_replication_pipe_done_cb = nullptr;
   g_replication_snapshot_done_cb = nullptr;

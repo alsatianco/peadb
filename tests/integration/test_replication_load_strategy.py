@@ -114,7 +114,10 @@ def run(redis, helper, mode, occupied, matching, work):
                     assert old == 'old-value', old
                 return True
             if 'loading:1\r\n' in state:
-                observed = 'disk' if (work / 'dump.rdb').exists() else 'blocking'
+                # PeaDB validates its owned spool before renaming it; Redis renames
+                # before parsing. Either owned file proves disk reception during loading.
+                spooled = (work / 'dump.rdb').exists() or any(work.glob('temp-*.rdb'))
+                observed = 'disk' if spooled else 'blocking'
                 return True
             return False
 
@@ -122,6 +125,7 @@ def run(redis, helper, mode, occupied, matching, work):
         wait_until_ready(port, process=proc, timeout=8)
         wait_for(lambda: c('GET', 'key:159') == 'new', 'complete snapshot')
         assert (work / 'dump.rdb').exists() == (observed == 'disk')
+        assert not list(work.glob('temp-*.rdb')), 'owned spool cleaned after publication'
         selected = subprocess.check_output([str(helper), '--strategy', mode,
             'occupied' if occupied else 'empty', 'matching' if matching else 'different'],
             text=True, timeout=10).strip()

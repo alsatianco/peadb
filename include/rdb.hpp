@@ -120,6 +120,8 @@ struct RdbLoadStats {
   std::uint64_t expired = 0;
 };
 const RdbLoadStats& rdb_last_load_stats();
+// Successful explicit-target publication, never validation/failed staging.
+void rdb_publish_load_stats(const RdbLoadStats& stats) noexcept;
 
 class FunctionRegistry;
 // Independent load inputs/outputs: no singleton, live hooks or runtime role is consulted.
@@ -204,6 +206,7 @@ void rdb_store_dump_value(const std::string& key, DumpValue&& value,
 // DEBUG SET-SKIP-CHECKSUM-VALIDATION: when set, RESTORE skips the DUMP-payload CRC64
 // check (the upstream Redis test suite uses this to feed synthetic payloads).
 void rdb_set_skip_checksum_validation(bool skip);
+bool rdb_skip_checksum_validation();
 
 // rdbchecksum (startup-only, like Redis's IMMUTABLE_CONFIG): when off, RDB files and full syncs
 // are written with a zero checksum and loaded without checking it. DUMP payloads always carry one.

@@ -92,6 +92,8 @@ struct SessionState {
   // Socket-target snapshots are online before their first post-load ACK, but must not
   // send command bytes until that handshake completes.
   bool repl_start_stream_on_ack = false;
+  // No-yield replacement marks old downstreams; the server closes them before further I/O.
+  bool repl_close_after_publication = false;
   // A replica's last REPLCONF ACK (set when it starts streaming, as Redis's repl_ack_time), and
   // what it said with REPLCONF listening-port and ip-address: the shutdown's "Lagging replica"
   // log line names it by them (Redis's replicationGetSlaveName()).
@@ -343,6 +345,9 @@ void record_blocked_error(const SessionState& session, const std::string& reply)
 // Apply replication commands queued by the streaming thread onto the event loop thread.
 class FunctionRetirementQueue;
 void drain_replica_cmd_queue(FunctionRetirementQueue& retirement);
+// Collect/pin every live session after decoding and before the no-yield exchange.
+// Allocation is permitted here; no callbacks or client I/O may run until publication ends.
+extern std::function<std::vector<SessionState*>()> g_replica_publication_clients_cb;
 // Server/Lua-owner thread only. Drain at most 64 index/callback/library/ticket
 // units between commands or inside guarded loading service. Lua, nested command
 // dispatch and unguarded decoder contexts do no work. Queue outlives all loads

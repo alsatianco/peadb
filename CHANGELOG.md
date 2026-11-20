@@ -9,21 +9,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/); versioning i
 
 ## [Unreleased]
 
+- Enable live direct replica loading and transactional swapdb through raw-header socket leases, with matching-ID old-data service, validated paired keys/functions/history/client publication, bounded retirement and exact command read-ahead. Preserve old state on abort and coordinate children, AOF recovery and promotion (delta 8).
+
 - Retire function registries replaced by disk-spooled replica full sync in bounded owner-thread server/loading slices, and drain unfinished callbacks before Lua shutdown (delta 8).
 
 - Finalize signals received after loading event service before returning cancellation, preserving clean startup shutdown and preventing partial-data saves (delta 70).
 
-- Keep WATCH subscriptions tied to their database across SELECT and retain repeated observations. Add internal validated-stage WATCH replacement invalidation, including identical values and expired/missing keys; production direct/swapdb loading remains pending (delta 8).
+- Keep WATCH subscriptions tied to their database across SELECT and retain repeated observations. Add internal validated-stage WATCH replacement invalidation, including identical values and expired/missing keys (delta 8).
 
-- Add a single-use private replica load stage that prepares paired key/function retirement, validates complete frames before exchange, rejects stale generation/attempt completion and safely discards partial loads on exceptions. Production direct loading and full publication remain pending (delta 8).
+- Add a single-use private replica load stage that prepares paired key/function retirement, validates complete frames before exchange, rejects stale generation/attempt completion and safely discards partial loads on exceptions. Production integration is described in delta 8.
 
 - Add internal prepared, budgeted function-registry retirement on the Lua-owning thread, preserving shared callbacks and splitting large-library teardown across work slices. Avoid quadratic duplicate-name scans while preparing large libraries. Production replica publication remains pending (delta 8).
 
 - Add internal stable-address datastore exchange and preallocated background retirement for old or failed staging datasets; preparation failures preserve both datasets. Production replica publication remains pending (delta 8).
 
-- Give each replica file-load handoff an owned generation/attempt-tagged socket session and exception-safe completion. Add an internal cancellable event-loop socket source and Redis load-strategy selector; production direct/swapdb loading still awaits transactional publication (delta 8).
+- Give each replica file-load handoff an owned generation/attempt-tagged socket session and exception-safe completion. Add an internal cancellable event-loop socket source and Redis load-strategy selector (delta 8).
 
-- Add an explicit single-pass RDB source decoder for length and EOF frames, sharing file value/function/stream decoding, validating incremental CRC and exact trailers, and returning bounded command read-ahead. Production replica socket handoff and transactional swapdb remain pending (delta 8).
+- Add an explicit single-pass RDB source decoder for length and EOF frames, sharing file value/function/stream decoding, validating incremental CRC and exact trailers, and returning bounded command read-ahead. Production integration is described in delta 8.
 
 - Serve authenticated INFO and Redis loading refusals while startup RDB/AOF and disk-spooled full sync load. Bound client I/O at safe decoder checkpoints, preserve nested dispatch/client lifetimes, report phased consumed-byte progress, and cancel loading shutdowns promptly without saving partial data. DEBUG other than LOG is deliberately refused during loading service to prevent reentrant dataset mutation (delta 70).
 

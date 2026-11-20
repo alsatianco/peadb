@@ -18,7 +18,7 @@ enum class ReplicationLoadMode { Disabled, OnEmptyDb, SwapDb };
 enum class ReplicationLoadStrategy { Disk, DirectBlocking, DirectAsync };
 // Redis useDisklessLoad()/readSyncBulkPayload(): count physical keys in ALL databases,
 // without expiry, then permit async admission only for a matching, known full replication ID.
-// Main-thread only; this internal decision does not enable the public direct-load setting.
+// Main-thread only; called at the raw-header handoff before consuming snapshot bytes.
 ReplicationLoadStrategy replication_load_strategy(ReplicationLoadMode mode, DataStore& data,
                                                   std::string_view current_id,
                                                   std::string_view incoming_id);

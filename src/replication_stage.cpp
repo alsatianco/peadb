@@ -39,6 +39,8 @@ bool ReplicationLoadStage::load(const RdbReadFn& source, const RdbStreamFrame& f
   target.expiry = RdbLoadTarget::Expiry::KeepExpired;
   target.replication = &replication_;
   target.control = control;
+  target.checksum = rdb_checksum();
+  target.skip_checksum_validation = rdb_skip_checksum_validation();
   if (!rdb_load_stream_into(source, frame, target, result_, err)) return false;
   state_ = State::Ready;
   return true;

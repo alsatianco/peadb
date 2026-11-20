@@ -558,6 +558,7 @@ const std::unordered_set<std::string>& raw_applied_settings() {
                                                        "repl-timeout",
                                                        "repl-ping-replica-period",
                                                        "repl-backlog-ttl",
+                                                       "repl-diskless-load",
                                                        "repl-diskless-sync",
                                                        "repl-diskless-sync-delay",
                                                        "repl-diskless-sync-max-replicas",

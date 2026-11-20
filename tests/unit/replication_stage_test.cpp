@@ -539,6 +539,35 @@ void watch_publication() {
   }
 }
 
+void checksum_policy() {
+  for (int mode = 0; mode < 3; ++mode) {
+    DataStore live;
+    FunctionRegistry functions;
+    FunctionRetirementQueue queue;
+    seed(live, functions);
+    auto bytes = snapshot();
+    bytes.back() = 1;  // nonzero invalid CRC
+    RdbStreamFrame frame;
+    frame.length = bytes.size();
+    std::size_t pos = 0;
+    std::string err;
+    rdb_set_checksum(mode != 1);
+    rdb_set_skip_checksum_validation(mode == 2);
+    {
+      ReplicationLoadStage stage(live, functions, queue, identity);
+      check(stage.load(reader(bytes, pos), frame, err) == (mode != 0),
+            "paired direct target honors configured checksum and explicit debug skip");
+    }
+    rdb_set_checksum(true);
+    rdb_set_skip_checksum_validation(false);
+    live.select_db(15);
+    check(live.get("old") == "old-value" && functions.libraries().count("old") == 1,
+          "checksum policy decoding never publishes staging");
+    live.select_db(0);
+    drain(live, queue);
+  }
+}
+
 void exception_unwind() {
   DataStore live;
   FunctionRegistry functions;
@@ -569,6 +598,7 @@ int main() {
   rejected_loads();
   decode_allocation_failures();
   watch_publication();
+  checksum_policy();
   exception_unwind();
   large_discard_and_shutdown();
   peadb::lua_engine_shutdown();

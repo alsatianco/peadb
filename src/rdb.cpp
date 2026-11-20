@@ -66,8 +66,15 @@ const RdbLoadStats& rdb_last_load_stats() {
   return g_rdb_load_stats;
 }
 
+void rdb_publish_load_stats(const RdbLoadStats& stats) noexcept {
+  g_rdb_load_stats = stats;
+}
+
 void rdb_set_skip_checksum_validation(bool skip) {
   g_skip_checksum_validation = skip;
+}
+bool rdb_skip_checksum_validation() {
+  return g_skip_checksum_validation;
 }
 void rdb_set_checksum(bool enabled) {
   g_rdb_checksum = enabled;
